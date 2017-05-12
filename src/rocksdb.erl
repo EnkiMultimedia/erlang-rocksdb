@@ -420,34 +420,19 @@ fold_keys(_DBHandle, _CFHandle, _Fun, _Acc0, _ReadOpts) ->
 
 %% @doc is the database empty
 -spec  is_empty(DBHandle::db_handle()) -> true | false.
-is_empty(DbHandle) ->
-  CallerRef = make_ref(),
-  async_is_empty(CallerRef, DbHandle),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_is_empty(_CallerRef, _DBHandle) ->
+is_empty(_DbHandle) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Destroy the contents of the specified database.
 %% Be very careful using this method.
 -spec destroy(Name::file:filename_all(), DBOpts::db_options()) -> ok | {error, any()}.
-destroy(Name, DBOpts) ->
-  CallerRef = make_ref(),
-  async_destroy(CallerRef, Name, DBOpts),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_destroy(_CallerRef, _Name, _DBOpts) ->
+destroy(_Name, _DBOpts) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Try to repair as much of the contents of the database as possible.
 %% Some data may be lost, so be careful when calling this function
 -spec repair(Name::file:filename_all(), DBOpts::db_options()) -> ok | {error, any()}.
-repair(Name, DBOpts) ->
-  CallerRef = make_ref(),
-  async_repair(CallerRef, Name, DBOpts),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_repair(_CallerRef, _Name, _DbOpts) ->
+repair(_Name, _DBOpts) ->
    erlang:nif_error({error, not_loaded}).
 
 %% @doc take a snapshot of a running RocksDB database in a separate directory
@@ -455,12 +440,7 @@ async_repair(_CallerRef, _Name, _DbOpts) ->
 -spec checkpoint(
   DbHandle::db_handle(), Path::file:filename_all()
 ) -> ok | {error, any()}.
-checkpoint(DbHandle, Path) ->
-  CallerRef = make_ref(),
-  async_checkpoint(CallerRef, DbHandle, Path),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_checkpoint(_Callerfef, _DbHandle, _Path) ->
+checkpoint(_DbHandle, _Path) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Return the approximate number of keys in the default column family.

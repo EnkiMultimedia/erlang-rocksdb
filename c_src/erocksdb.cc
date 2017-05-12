@@ -62,10 +62,14 @@ static ErlNifFunc nif_funcs[] =
   {"close", 1, erocksdb::Close, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"get_approximate_size", 4, erocksdb::GetApproximateSize, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
+  // db management
+  {"checkpoint", 2, erocksdb::Checkpoint, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"repair", 2, erocksdb::Repair, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"is_empty", 1, erocksdb::IsEmpty, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"destroy", 2, erocksdb::Destroy, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"get_property", 2, erocksdb::GetProperty},
   {"get_property", 3, erocksdb::GetProperty},
-  {"async_destroy", 3, erocksdb::AsyncDestroy},
-
+  
   // column families
   {"list_column_families", 2, erocksdb::ListColumnFamilies, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"create_column_family", 3, erocksdb::CreateColumnFamily, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -85,13 +89,10 @@ static ErlNifFunc nif_funcs[] =
   {"iterators", 3, erocksdb::Iterators, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"iterators", 4, erocksdb::Iterators, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"iterator_move", 2, erocksdb::IteratorMove, ERL_NIF_DIRTY_JOB_IO_BOUND},
-  {"iterator_close", 1, erocksdb::IteratorClose, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"iterator_close", 1, erocksdb::IteratorClose, ERL_NIF_DIRTY_JOB_IO_BOUND}
 
 
-  // db management
-  {"async_checkpoint", 3, erocksdb::AsyncCheckpoint},
-  {"async_repair", 3, erocksdb::AsyncRepair},
-  {"async_is_empty", 2, erocksdb::AsyncIsEmpty},
+  
 
 };
 

@@ -1197,124 +1197,108 @@ Get(
 
 
 ERL_NIF_TERM
-AsyncCheckpoint(
+Checkpoint(
     ErlNifEnv* env,
     int argc,
     const ERL_NIF_TERM argv[])
 {
-    const ERL_NIF_TERM& caller_ref = argv[0];
-    const ERL_NIF_TERM& handle_ref = argv[1];
-
-    char path[4096];
-
+        char path[4096];
+    rocksdb::Checkpoint* checkpoint;
+    rocksdb::Status status;
 
     ReferencePtr<DbObject> db_ptr;
-
-    db_ptr.assign(DbObject::RetrieveDbObject(env, handle_ref));
-
-    if(NULL==db_ptr.get())
-    {
+    if(!enif_get_db(env, argv[0], &db_ptr))
         return enif_make_badarg(env);
-    }
 
-    // is this even possible?
-    if(NULL == db_ptr->m_Db)
-        return send_reply(env, caller_ref, error_einval(env));
-
-    if(!enif_get_string(env, argv[2], path, sizeof(path), ERL_NIF_LATIN1))
-    {
+    if(!enif_get_string(env, argv[1], path, sizeof(path), ERL_NIF_LATIN1))
         return enif_make_badarg(env);
-    }
 
-    erocksdb::PrivData& priv = *static_cast<erocksdb::PrivData *>(enif_priv_data(env));
-    erocksdb::WorkTask* work_item = new erocksdb::CheckpointTask(env, caller_ref, db_ptr.get(), path);
-    if(false == priv.thread_pool.submit(work_item))
+    status = rocksdb::Checkpoint::Create(db_ptr->m_Db, &checkpoint);
+    if (status.ok())
     {
-        delete work_item;
-        return send_reply(env, caller_ref,
-                          enif_make_tuple2(env, erocksdb::ATOM_ERROR, caller_ref));
+        status = checkpoint->CreateCheckpoint(path);
+        if (status.ok())
+        {
+            return ATOM_OK;
+        }
     }
-    return erocksdb::ATOM_OK;
+    delete checkpoint;
 
-}   // async_checkpoint
+    return error_tuple(env, ATOM_ERROR, status);
+
+}   // Checkpoint
 
 ERL_NIF_TERM
-AsyncDestroy(
+Destroy(
     ErlNifEnv* env,
     int argc,
     const ERL_NIF_TERM argv[])
 {
-    char db_name[4096];
-    const ERL_NIF_TERM& caller_ref = argv[0];
-    if (!enif_get_string(env, argv[1], db_name, sizeof(db_name), ERL_NIF_LATIN1) &&
-        ! enif_is_list(env, argv[2]))
-    {
+    char name[4096];
+    if (!enif_get_string(env, argv[0], name, sizeof(name), ERL_NIF_LATIN1) ||
+            !enif_is_list(env, argv[1]))
         return enif_make_badarg(env);
-    }
 
     // Parse out the options
     rocksdb::Options opts;
-    fold(env, argv[2], parse_db_option, opts);
-    erocksdb::PrivData& priv = *static_cast<erocksdb::PrivData *>(enif_priv_data(env));
-    erocksdb::WorkTask* work_item = new erocksdb::DestroyTask(env, caller_ref, db_name, opts);
-    if(false == priv.thread_pool.submit(work_item))
+    fold(env, argv[1], parse_db_option, opts);
+
+    rocksdb::Status status = rocksdb::DestroyDB(name, opts);
+    if (!status.ok())
     {
-        delete work_item;
-        return send_reply(env, caller_ref,
-                            enif_make_tuple2(env, erocksdb::ATOM_ERROR, caller_ref));
+        return error_tuple(env, ATOM_ERROR_DB_DESTROY, status);
     }
-    return erocksdb::ATOM_OK;
-}   // erocksdb_destroy
+    return ATOM_OK;
+}   // Destroy
 
 ERL_NIF_TERM
-AsyncRepair(
+Repair(
     ErlNifEnv* env,
     int argc,
     const ERL_NIF_TERM argv[])
 {
-    char db_name[4096];
-    const ERL_NIF_TERM& caller_ref = argv[0];
-    if (!enif_get_string(env, argv[1], db_name, sizeof(db_name), ERL_NIF_LATIN1) &&
-        ! enif_is_list(env, argv[2]))
-    {
+    char name[4096];
+    if (!enif_get_string(env, argv[0], name, sizeof(name), ERL_NIF_LATIN1) ||
+            !enif_is_list(env, argv[1]))
         return enif_make_badarg(env);
-    }
 
     // Parse out the options
     rocksdb::Options opts;
-    fold(env, argv[2], parse_db_option, opts);
-    erocksdb::PrivData& priv = *static_cast<erocksdb::PrivData *>(enif_priv_data(env));
-    erocksdb::WorkTask* work_item = new erocksdb::RepairTask(env, caller_ref, db_name, opts);
-    if(false == priv.thread_pool.submit(work_item))
+    fold(env, argv[1], parse_db_option, opts);
+
+    rocksdb::Status status = rocksdb::RepairDB(name, opts);
+    if (!status.ok())
     {
-        delete work_item;
-        return send_reply(env, caller_ref,
-                            enif_make_tuple2(env, erocksdb::ATOM_ERROR, caller_ref));
+        return error_tuple(env, erocksdb::ATOM_ERROR_DB_REPAIR, status);
     }
     return erocksdb::ATOM_OK;
 }   // erocksdb_repair
 
 ERL_NIF_TERM
-AsyncIsEmpty(
+IsEmpty(
     ErlNifEnv* env,
     int argc,
     const ERL_NIF_TERM argv[])
 {
-    const ERL_NIF_TERM& caller_ref = argv[0];
-
     ReferencePtr<DbObject> db_ptr;
-    if(!enif_get_db(env, argv[1], &db_ptr))
+    if(!enif_get_db(env, argv[0], &db_ptr))
         return enif_make_badarg(env);
 
-    erocksdb::PrivData& priv = *static_cast<erocksdb::PrivData *>(enif_priv_data(env));
-    erocksdb::WorkTask* work_item = new erocksdb::IsEmptyTask(env, caller_ref, db_ptr.get());
-    if(false == priv.thread_pool.submit(work_item))
+    rocksdb::ReadOptions opts;
+    rocksdb::Iterator* itr = db_ptr->m_Db->NewIterator(opts);
+    itr->SeekToFirst();
+    ERL_NIF_TERM result;
+    if (itr->Valid())
     {
-        delete work_item;
-        return send_reply(env, caller_ref,
-                          enif_make_tuple2(env, erocksdb::ATOM_ERROR, caller_ref));
+        result = erocksdb::ATOM_FALSE;
     }
-    return erocksdb::ATOM_OK;
+    else
+    {
+        result = erocksdb::ATOM_TRUE;
+    }
+    delete itr;
+
+    return result;
 }   // erocksdb_is_empty
 
 
