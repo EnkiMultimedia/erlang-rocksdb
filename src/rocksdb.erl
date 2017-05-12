@@ -284,19 +284,14 @@ delete(DBHandle, Key, WriteOpts) ->
 delete(DBHandle, CFHandle, Key, WriteOpts) ->
   write(DBHandle, [{delete, CFHandle, Key}], WriteOpts).
 
-async_write(_CallerRef, _DBHandle, _WriteActions, _WriteOpts) ->
-  erlang:nif_error({error, not_loaded}).
-
 %% @doc Apply the specified updates to the database.
 -spec write(DBHandle, WriteActions, WriteOpts) -> Res when
   DBHandle::db_handle(),
    WriteActions::write_actions(),
    WriteOpts::write_options(),
    Res :: ok | {error, any()}.
-write(DBHandle, WriteActions, WriteOpts) ->
-  CallerRef = make_ref(),
-  async_write(CallerRef, DBHandle, WriteActions, WriteOpts),
-  ?WAIT_FOR_REPLY(CallerRef).
+write(_DBHandle, _WriteActions, _WriteOpts) ->
+  erlang:nif_error({error, not_loaded}).
 
 %% @doc Retrieve a key/value pair in the default column family
 -spec get(DBHandle, Key, ReadOpts) ->  Res when
@@ -304,12 +299,7 @@ write(DBHandle, WriteActions, WriteOpts) ->
   Key::binary(),
   ReadOpts::read_options(),
    Res :: {ok, binary()} | not_found | {error, any()}.
-get(DBHandle, Key, ReadOpts) ->
-  CallerRef = make_ref(),
-  async_get(CallerRef, DBHandle, Key, ReadOpts),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_get(_CallerRef, _DBHandle, _Key, _ReadOpts) ->
+get(_DBHandle, _Key, _ReadOpts) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Retrieve a key/value pair in the specified column family
@@ -319,12 +309,7 @@ async_get(_CallerRef, _DBHandle, _Key, _ReadOpts) ->
   Key::binary(),
   ReadOpts::read_options(),
   Res :: {ok, binary()} | not_found | {error, any()}.
-get(DBHandle, CFHandle, Key, ReadOpts) ->
-  CallerRef = make_ref(),
-  async_get(CallerRef, DBHandle, CFHandle, Key, ReadOpts),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_get(_CallerRef, _DBHandle, _CfHandle, _Key, _ReadOpts) ->
+get(_DBHandle, _CFHandle, _Key, _ReadOpts) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Return a iterator over the contents of the database.

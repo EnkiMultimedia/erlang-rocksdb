@@ -72,9 +72,9 @@ static ErlNifFunc nif_funcs[] =
   {"drop_column_family", 1, erocksdb::DropColumnFamily, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
   // kv operations
-  {"async_write", 4, erocksdb::AsyncWrite},
-  {"async_get", 4, erocksdb::AsyncGet},
-  {"async_get", 5, erocksdb::AsyncGet},
+  {"write", 3, erocksdb::Write, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"get", 3, erocksdb::Get, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"get", 4, erocksdb::Get, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
   {"snapshot", 1, erocksdb::Snapshot},
   {"release_snapshot", 1, erocksdb::ReleaseSnapshot},
