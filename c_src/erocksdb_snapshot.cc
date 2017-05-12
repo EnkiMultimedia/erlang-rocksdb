@@ -28,14 +28,6 @@
     #include "refobjects.h"
 #endif
 
-#ifndef INCL_THREADING_H
-    #include "threading.h"
-#endif
-
-#ifndef INCL_WORKITEMS_H
-    #include "workitems.h"
-#endif
-
 #ifndef INCL_REFOBJECTS_H
     #include "refobjects.h"
 #endif
@@ -44,7 +36,6 @@
     #include "atoms.h"
 #endif
 
-#include "work_result.hpp"
 #include "detail.hpp"
 
 #ifndef INCL_UTIL_H

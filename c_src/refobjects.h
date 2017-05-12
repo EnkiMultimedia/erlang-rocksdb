@@ -29,18 +29,19 @@
 #include "rocksdb/db.h"
 #include "rocksdb/write_batch.h"
 
-#ifndef INCL_THREADING_H
-    #include "threading.h"
+
+#ifndef INCL_MUTEX_H
+    #include "mutex.h"
 #endif
 
-#ifndef __WORK_RESULT_HPP
-    #include "work_result.hpp"
+#ifndef INCL_EROCKSDB_H
+    #include "erocksdb.h"
 #endif
+
 
 #ifndef ATOMS_H
     #include "atoms.h"
 #endif
-
 
 namespace erocksdb {
 

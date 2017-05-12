@@ -34,10 +34,6 @@
 
 #include "erocksdb.h"
 
-#ifndef INCL_THREADING_H
-    #include "threading.h"
-#endif
-
 #ifndef ATOMS_H
     #include "atoms.h"
 #endif
@@ -266,29 +262,6 @@ ERL_NIF_TERM ATOM_WRITE_THREADS;
 
 using std::nothrow;
 
-ERL_NIF_TERM parse_init_option(ErlNifEnv* env, ERL_NIF_TERM item, erocksdb::DbOptions& opts)
-{
-    int arity;
-    const ERL_NIF_TERM* option;
-    if (enif_get_tuple(env, item, &arity, &option) && 2==arity)
-    {
-        if (option[0] == erocksdb::ATOM_WRITE_THREADS)
-        {
-            unsigned long temp;
-            if (enif_get_ulong(env, option[1], &temp))
-            {
-                if (temp != 0)
-                {
-                    opts.m_DbThreads = temp;
-                }   // if
-            }   // if
-        }   // if
-    }
-
-    return erocksdb::ATOM_OK;
-}
-
-
 static void on_unload(ErlNifEnv *env, void *priv_data)
 {
     erocksdb::PrivData *p = static_cast<erocksdb::PrivData *>(priv_data);
@@ -480,17 +453,10 @@ try
   ATOM(erocksdb::ATOM_WRITE_THREADS, "write_threads");
 #undef ATOM
 
-  // read options that apply to global erocksdb environment
-  if(enif_is_list(env, load_info))
-  {
-      erocksdb::DbOptions load_options;
-      fold(env, load_info, parse_init_option, load_options);
-      /* Spin up the thread pool, set up all private data: */
-      erocksdb::PrivData *priv = new erocksdb::PrivData(load_options);
-      *priv_data = priv;
-      return 0;
-  }
-  return 1;
+erocksdb::PrivData *priv = new erocksdb::PrivData();
+*priv_data = priv;
+
+return 0;
 }
 catch(std::exception& e)
 {

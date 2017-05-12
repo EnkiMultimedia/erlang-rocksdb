@@ -25,27 +25,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/cache.h"
 
-#ifndef INCL_THREADING_H
-    #include "threading.h"
-#endif
-
 namespace erocksdb {
- /** struct for grabbing erocksdb environment options via fold
- *   ... then loading said options into erocksdb_priv_data
- */
-struct DbOptions
-{
-    int m_DbThreads;
-
-    DbOptions()
-        : m_DbThreads(71)
-        {};
-
-    void Dump()
-    {
-        syslog(LOG_ERR, "         m_ErocksdbThreads: %d\n", m_DbThreads);
-    }   // Dump
-};  // struct erocksdb::DbOptions
 
 static int kCapacity = 4194304; // default values, can be overridden
 
@@ -55,17 +35,11 @@ static int kCapacity = 4194304; // default values, can be overridden
 class PrivData
 {
 public:
-    DbOptions m_Opts;
-    erocksdb::erocksdb_thread_pool thread_pool;
     std::shared_ptr<rocksdb::Cache> block_cache;
 
-    explicit PrivData(DbOptions & Options)
-    : m_Opts(Options),
-      thread_pool(Options.m_DbThreads)
-        { block_cache = rocksdb::NewLRUCache(kCapacity); }
+    explicit PrivData() { block_cache = rocksdb::NewLRUCache(kCapacity); }
 
 private:
-    PrivData();                                      // no default constructor
     PrivData(const PrivData&);             // nocopy
     PrivData& operator=(const PrivData&);  // nocopyassign
 

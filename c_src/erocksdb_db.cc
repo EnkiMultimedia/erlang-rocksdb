@@ -27,24 +27,17 @@
 #include "rocksdb/table.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/slice_transform.h"
+#include "rocksdb/utilities/checkpoint.h"
+
 
 #ifndef ATOMS_H
     #include "atoms.h"
-#endif
-
-#ifndef INCL_THREADING_H
-    #include "threading.h"
-#endif
-
-#ifndef INCL_WORKITEMS_H
-    #include "workitems.h"
 #endif
 
 #ifndef INCL_REFOBJECTS_H
     #include "refobjects.h"
 #endif
 
-#include "work_result.hpp"
 #include "detail.hpp"
 
 #ifndef INCL_UTIL_H
