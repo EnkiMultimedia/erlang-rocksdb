@@ -230,12 +230,7 @@ async_close(_Callerfef, _DBHandle) ->
   Name::file:filename_all(),
   DBOpts::db_options(),
   Res :: {ok, list(string())} | {error, any()}.
-list_column_families(Name, DbOpts) ->
-  CallerRef = make_ref(),
-  async_list_column_families(CallerRef, Name, DbOpts),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_list_column_families(_Callerfef, _Name, _DbOpts) ->
+list_column_families(_Name, _DbOpts) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Create a new column family
@@ -244,24 +239,14 @@ async_list_column_families(_Callerfef, _Name, _DbOpts) ->
   Name ::string(),
   CFOpts :: cf_options(),
   Res :: {ok, cf_handle()} | {error, any()}.
-create_column_family(DBHandle, Name, CFOpts) ->
-  CallerRef = make_ref(),
-  async_create_column_family(CallerRef, DBHandle, Name, CFOpts),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_create_column_family(_Callerfef, _DBHandle, _Name, _CFOpts) ->
+create_column_family(_DBHandle, _Name, _CFOpts) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Drop a column family
 -spec drop_column_family(CFHandle) -> Res when
   CFHandle::cf_handle(),
   Res :: ok | {error, any()}.
-drop_column_family(CFHandle) ->
-  CallerRef = make_ref(),
-  async_drop_column_family(CallerRef, CFHandle),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_drop_column_family(_Callerfef, _CFHandle) ->
+drop_column_family(_CFHandle) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc return a database snapshot
