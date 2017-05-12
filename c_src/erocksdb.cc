@@ -76,8 +76,8 @@ static ErlNifFunc nif_funcs[] =
   {"async_get", 4, erocksdb::AsyncGet},
   {"async_get", 5, erocksdb::AsyncGet},
 
-  {"async_snapshot", 2, erocksdb::AsyncSnapshot},
-  {"async_release_snapshot", 2, erocksdb::AsyncReleaseSnapshot},
+  {"snapshot", 1, erocksdb::Snapshot},
+  {"release_snapshot", 1, erocksdb::ReleaseSnapshot},
 
   // iterator operations
   {"async_iterator", 3, erocksdb::AsyncIterator},

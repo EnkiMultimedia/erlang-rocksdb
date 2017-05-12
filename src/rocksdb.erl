@@ -252,22 +252,12 @@ drop_column_family(_CFHandle) ->
 %% @doc return a database snapshot
 %% Snapshots provide consistent read-only views over the entire state of the key-value store
 -spec snapshot(DbHandle::db_handle()) -> {ok, snapshot_handle()} | {error, any()}.
-snapshot(DbHandle) ->
-  CallerRef = make_ref(),
-  async_snapshot(CallerRef, DbHandle),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_snapshot(_CallerRef, _DbHandle) ->
+snapshot(_DbHandle) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc release a snapshot
 -spec release_snapshot(SnapshotHandle::snapshot_handle()) -> ok | {error, any()}.
-release_snapshot(SnapshotHandle) ->
-  CallerRef = make_ref(),
-  async_release_snapshot(CallerRef, SnapshotHandle),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_release_snapshot(_CallerRef, _SnapshotHandle) ->
+release_snapshot(_SnapshotHandle) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Put a key/value pair into the default column family

@@ -67,8 +67,8 @@ ERL_NIF_TERM AsyncWrite(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM AsyncGet(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 
-ERL_NIF_TERM AsyncSnapshot(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-ERL_NIF_TERM AsyncReleaseSnapshot(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM Snapshot(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM ReleaseSnapshot(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 
 ERL_NIF_TERM AsyncIterator(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);

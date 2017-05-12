@@ -59,73 +59,55 @@
 namespace erocksdb {
 
 ERL_NIF_TERM
-AsyncSnapshot(
+Snapshot(
     ErlNifEnv* env,
     int argc,
     const ERL_NIF_TERM argv[])
 {
-
-    const ERL_NIF_TERM& caller_ref = argv[0];
-    const ERL_NIF_TERM& handle_ref = argv[1];
-
     ReferencePtr<DbObject> db_ptr;
-
-    db_ptr.assign(DbObject::RetrieveDbObject(env, handle_ref));
-
-    if(NULL==db_ptr.get() || 0!=db_ptr->m_CloseRequested)
-    {
+    if(!enif_get_db(env, argv[0], &db_ptr))
         return enif_make_badarg(env);
-    }
 
-    // is this even possible?
-    if(NULL == db_ptr->m_Db)
-        return send_reply(env, caller_ref, error_einval(env));
+    SnapshotObject* snapshot_ptr;
+    const rocksdb::Snapshot* snapshot;
 
-    erocksdb::PrivData& priv = *static_cast<erocksdb::PrivData *>(enif_priv_data(env));
+    // create snapshot
+    snapshot = db_ptr->m_Db->GetSnapshot();
+    snapshot_ptr = SnapshotObject::CreateSnapshotObject(db_ptr.get(), snapshot);
 
-    erocksdb::WorkTask* work_item = new erocksdb::GetSnapshotTask(env, caller_ref, db_ptr.get());
+    // create a resource reference to send erlang
+    ERL_NIF_TERM result = enif_make_resource(env, snapshot_ptr);
+    // clear the automatic reference from enif_alloc_resource in SnapshotObject
+    enif_release_resource(snapshot_ptr);
+    snapshot = NULL;
 
-    if(false == priv.thread_pool.submit(work_item))
-    {
-        delete work_item;
-        return send_reply(env, caller_ref,
-                enif_make_tuple2(env, erocksdb::ATOM_ERROR, caller_ref));
-    }
-
-    return erocksdb::ATOM_OK;
-}   // erocksdb::AsyncSnapShot
+    return enif_make_tuple2(env, ATOM_OK, result);
+}   // erocksdb::SnapShot
 
 
 ERL_NIF_TERM
-AsyncReleaseSnapshot(
+ReleaseSnapshot(
     ErlNifEnv* env,
     int argc,
     const ERL_NIF_TERM argv[])
 {
-
-    const ERL_NIF_TERM& caller_ref = argv[0];
-    const ERL_NIF_TERM& handle_ref = argv[1];
-
+    const ERL_NIF_TERM& handle_ref = argv[0];
     ReferencePtr<SnapshotObject> snapshot_ptr;
-
     snapshot_ptr.assign(SnapshotObject::RetrieveSnapshotObject(env, handle_ref));
 
     if(NULL==snapshot_ptr.get())
     {
-        return send_reply(env, caller_ref, erocksdb::ATOM_OK);
+        return ATOM_OK;
     }
 
-    erocksdb::PrivData& priv = *static_cast<erocksdb::PrivData *>(enif_priv_data(env));
-    erocksdb::WorkTask* work_item = new erocksdb::ReleaseSnapshotTask(env, caller_ref, snapshot_ptr.get());
+    // release snapshot object
+    SnapshotObject* snapshot = snapshot_ptr.get();
+    snapshot->m_DbPtr->m_Db->ReleaseSnapshot(snapshot->m_Snapshot);
 
-    if(false == priv.thread_pool.submit(work_item))
-    {
-        delete work_item;
-        return send_reply(env, caller_ref,
-                          enif_make_tuple2(env, erocksdb::ATOM_ERROR, caller_ref));
-    }
+    // set closing flag
+    ErlRefObject::InitiateCloseRequest(snapshot);
 
-    return erocksdb::ATOM_OK;
-}   // erocksdb::AsyncReleaseSnapShot
+    return ATOM_OK;
+}   // erocksdb::ReleaseSnapShot
 
 } 
