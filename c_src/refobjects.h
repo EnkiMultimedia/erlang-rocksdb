@@ -235,6 +235,9 @@ public:
     rocksdb::ColumnFamilyHandle* m_ColumnFamily;
     ReferencePtr<DbObject> m_DbPtr;
 
+    Mutex m_ItrMutex;                         //!< mutex protecting m_ItrList
+    std::list<class ItrObject *> m_ItrList;   //!< ItrObjects holding ref count to this
+
 protected:
     static ErlNifResourceType* m_ColumnFamily_RESOURCE;
 
@@ -252,6 +255,11 @@ public:
     static ColumnFamilyObject * RetrieveColumnFamilyObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm);
 
     static void ColumnFamilyObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
+
+    // manual back link to ItrObjects holding reference to this
+    void AddItrReference(class ItrObject *);
+
+    void RemoveItrReference(class ItrObject *);
 
 private:
     ColumnFamilyObject();
@@ -356,21 +364,17 @@ private:
 class ItrObject : public ErlRefObject
 {
 public:
-    ReferencePtr<RocksIteratorWrapper> m_Iter;
-
+    ReferencePtr<ColumnFamilyObject> m_ColumnFamilyPtr;
     bool keys_only;
-    rocksdb::ReadOptions m_ReadOptions;
-
-    volatile class MoveTask * reuse_move;//!< iterator work object that is reused instead of lots malloc/free
-
+    rocksdb::Iterator * m_Iterator;
     ReferencePtr<DbObject> m_DbPtr;
-
 
 protected:
     static ErlNifResourceType* m_Itr_RESOURCE;
 
 public:
-    ItrObject(DbObject *, bool, rocksdb::ReadOptions &);
+    ItrObject(DbObject *, rocksdb::Iterator * Iterator, bool key_only);
+    ItrObject(DbObject *, rocksdb::Iterator * Iterator, bool key_only, ColumnFamilyObject *);
 
     virtual ~ItrObject(); // needs to perform free_itr
 
@@ -378,15 +382,16 @@ public:
 
     static void CreateItrObjectType(ErlNifEnv * Env);
 
-    static ItrObject * CreateItrObject(DbObject * Db, bool KeysOnly,
-                                       rocksdb::ReadOptions & Options);
+    static ItrObject * CreateItrObject(DbObject * Db,  rocksdb::Iterator * Iterator,
+                                       bool KeysOnly);
+
+    static ItrObject * CreateItrObject(DbObject * Db,  rocksdb::Iterator * Iterator,
+                                           bool KeysOnly, ColumnFamilyObject * Cf);
 
     static ItrObject * RetrieveItrObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm,
                                          bool ItrClosing=false);
 
     static void ItrObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
-
-    bool ReleaseReuseMove();
 
 private:
     ItrObject();

@@ -552,9 +552,55 @@ ColumnFamilyObject::~ColumnFamilyObject() {
 
 void
 ColumnFamilyObject::Shutdown() {
+#if 1
+    bool again;
+    ItrObject *itr_ptr;
+
+    do {
+        again = false;
+        itr_ptr = NULL;
+
+        // lock the ItrList
+        {
+            MutexLock lock(m_ItrMutex);
+
+            if (!m_ItrList.empty()) {
+                again = true;
+                itr_ptr = m_ItrList.front();
+                m_ItrList.pop_front();
+            }   // if
+        }
+
+        // must be outside lock so ItrObject can attempt
+        //  RemoveReference
+        if (again)
+            ItrObject::InitiateCloseRequest(itr_ptr);
+
+    } while (again);
+#endif
     RefDec();
     return;
 }   // ColumnFamilyObject::CloseRequest
+
+void
+ColumnFamilyObject::AddItrReference(
+        ItrObject *ItrPtr) {
+    MutexLock lock(m_ItrMutex);
+    m_ItrList.push_back(ItrPtr);
+    return;
+}   // DbObject::AddReference
+
+
+void
+ColumnFamilyObject::RemoveItrReference(
+        ItrObject *ItrPtr) {
+    MutexLock lock(m_ItrMutex);
+
+    m_ItrList.remove(ItrPtr);
+
+    return;
+
+}   // DbObject::RemoveReference
 
 /**
  * snapshot object
@@ -688,16 +734,15 @@ SnapshotObject::Shutdown()
 
 
 /**
- * Iterator management object
- */
+* Iterator management object
+*/
 
-ErlNifResourceType * ItrObject::m_Itr_RESOURCE(NULL);
+ErlNifResourceType *ItrObject::m_Itr_RESOURCE(NULL);
 
 
 void
 ItrObject::CreateItrObjectType(
-    ErlNifEnv * Env)
-{
+        ErlNifEnv *Env) {
     ErlNifResourceFlags flags = (ErlNifResourceFlags)(ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER);
 
     m_Itr_RESOURCE = enif_open_resource_type(Env, NULL, "erocksdb_ItrObject",
@@ -711,17 +756,16 @@ ItrObject::CreateItrObjectType(
 
 ItrObject *
 ItrObject::CreateItrObject(
-    DbObject * DbPtr,
-    bool KeysOnly,
-    rocksdb::ReadOptions & Options)
-{
-    ItrObject * ret_ptr;
-    void * alloc_ptr;
+        DbObject *DbPtr,
+        rocksdb::Iterator *Iterator,
+        bool KeysOnly) {
+    ItrObject *ret_ptr;
+    void *alloc_ptr;
 
     // the alloc call initializes the reference count to "one"
-    alloc_ptr=enif_alloc_resource(m_Itr_RESOURCE, sizeof(ItrObject));
+    alloc_ptr = enif_alloc_resource(m_Itr_RESOURCE, sizeof(ItrObject));
 
-    ret_ptr=new (alloc_ptr) ItrObject(DbPtr, KeysOnly, Options);
+    ret_ptr = new(alloc_ptr) ItrObject(DbPtr, Iterator, KeysOnly);
 
     // manual reference increase to keep active until "close" called
     //  only inc local counter
@@ -729,44 +773,64 @@ ItrObject::CreateItrObject(
 
     // see IterTask::operator() for release of reference count
 
-    return(ret_ptr);
+    return (ret_ptr);
+
+}   // ItrObject::CreateItrObject
+
+ItrObject *
+ItrObject::CreateItrObject(
+        DbObject *DbPtr,
+        rocksdb::Iterator *Iterator,
+        bool KeysOnly,
+        ColumnFamilyObject *ColumnFamilyPtr) {
+    ItrObject *ret_ptr;
+    void *alloc_ptr;
+
+    // the alloc call initializes the reference count to "one"
+    alloc_ptr = enif_alloc_resource(m_Itr_RESOURCE, sizeof(ItrObject));
+
+    ret_ptr = new(alloc_ptr) ItrObject(DbPtr, Iterator, KeysOnly, ColumnFamilyPtr);
+
+    // manual reference increase to keep active until "close" called
+    //  only inc local counter
+    ret_ptr->RefInc();
+
+    // see IterTask::operator() for release of reference count
+
+    return (ret_ptr);
 
 }   // ItrObject::CreateItrObject
 
 
 ItrObject *
 ItrObject::RetrieveItrObject(
-    ErlNifEnv * Env,
-    const ERL_NIF_TERM & ItrTerm, bool ItrClosing)
-{
-    ItrObject * ret_ptr;
+        ErlNifEnv *Env,
+        const ERL_NIF_TERM &ItrTerm, bool ItrClosing) {
+    ItrObject *ret_ptr;
 
-    ret_ptr=NULL;
+    ret_ptr = NULL;
 
-    if (enif_get_resource(Env, ItrTerm, m_Itr_RESOURCE, (void **)&ret_ptr))
-    {
+    if (enif_get_resource(Env, ItrTerm, m_Itr_RESOURCE, (void **) &ret_ptr)) {
         // has close been requested?
         if (ret_ptr->m_CloseRequested
-            || (!ItrClosing && ret_ptr->m_DbPtr->m_CloseRequested))
-        {
+            || (!ItrClosing && ret_ptr->m_DbPtr->m_CloseRequested)) {
             // object already closing
-            ret_ptr=NULL;
+            ret_ptr = NULL;
         }   // else
     }   // if
 
-    return(ret_ptr);
+    return (ret_ptr);
 
 }   // ItrObject::RetrieveItrObject
 
 
 void
 ItrObject::ItrObjectResourceCleanup(
-    ErlNifEnv * Env,
-    void * Arg)
-{
-    ItrObject * itr_ptr;
+        ErlNifEnv *Env,
+        void *Arg) {
+    ItrObject *itr_ptr;
 
-    itr_ptr=(ItrObject *)Arg;
+    itr_ptr = (ItrObject *) Arg;
 
     // vtable for itr_ptr could be invalid if close already
     //  occurred
@@ -781,63 +845,59 @@ ItrObject::ItrObjectResourceCleanup(
 
 
 ItrObject::ItrObject(
-    DbObject * DbPtr,
-    bool KeysOnly,
-    rocksdb::ReadOptions & Options)
-    : keys_only(KeysOnly), m_ReadOptions(Options), reuse_move(NULL), m_DbPtr(DbPtr)
-{
-    if (NULL!=DbPtr)
+        DbObject *DbPtr,
+        rocksdb::Iterator *Iterator,
+        bool KeysOnly)
+        : keys_only(KeysOnly), m_Iterator(Iterator), m_DbPtr(DbPtr) {
+    if (NULL != DbPtr)
         DbPtr->AddReference(this);
+
 }   // ItrObject::ItrObject
 
 
-ItrObject::~ItrObject()
-{
+ItrObject::ItrObject(
+        DbObject *DbPtr,
+        rocksdb::Iterator *Iterator,
+        bool KeysOnly,
+        ColumnFamilyObject *ColumnFamilyPtr)
+        : m_ColumnFamilyPtr(ColumnFamilyPtr), keys_only(KeysOnly), m_Iterator(Iterator), m_DbPtr(DbPtr) {
+    if (NULL != DbPtr)
+        DbPtr->AddReference(this);
+
+    if (NULL != ColumnFamilyPtr)
+        m_ColumnFamilyPtr->AddItrReference(this);
+
+}   // ItrObject::ItrObject
+
+
+
+ItrObject::~ItrObject() {
     // not likely to have active reuse item since it would
     //  block destruction
-    ReleaseReuseMove();
 
-    if (NULL!=m_DbPtr.get())
+    if (NULL != m_DbPtr.get())
         m_DbPtr->RemoveReference(this);
 
+    if (NULL != m_ColumnFamilyPtr.get())
+        m_ColumnFamilyPtr->RemoveItrReference(this);
+
     // do not clean up m_CloseMutex and m_CloseCond
+
     return;
 
 }   // ItrObject::~ItrObject
 
 
 void
-ItrObject::Shutdown()
-{
+ItrObject::Shutdown() {
     // if there is an active move object, set it up to delete
     //  (reuse_move holds a counter to this object, which will
     //   release when move object destructs)
-    ReleaseReuseMove();
-
     RefDec();
 
     return;
 
 }   // ItrObject::CloseRequest
-
-
-bool
-ItrObject::ReleaseReuseMove()
-{
-    MoveTask * ptr;
-
-    // move pointer off ItrObject first, then decrement ...
-    //  otherwise there is potential for infinite loop
-    ptr=(MoveTask *)reuse_move;
-    if (compare_and_swap(&reuse_move, ptr, (MoveTask *)NULL)
-        && NULL!=ptr)
-    {
-        ptr->RefDec();
-    }   // if
-
-    return(NULL!=ptr);
-
-}   // ItrObject::ReleaseReuseMove()
 
 
 } // namespace erocksdb

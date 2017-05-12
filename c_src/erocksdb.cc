@@ -80,12 +80,13 @@ static ErlNifFunc nif_funcs[] =
   {"release_snapshot", 1, erocksdb::ReleaseSnapshot},
 
   // iterator operations
-  {"async_iterator", 3, erocksdb::AsyncIterator},
-  {"async_iterator", 4, erocksdb::AsyncIterator},
-  {"async_iterator_move", 3, erocksdb::AsyncIteratorMove},
-  {"async_iterator_close", 2, erocksdb::AsyncIteratorClose},
-  {"async_iterators", 4, erocksdb::AsyncIterators},
-  {"async_iterators", 5, erocksdb::AsyncIterators},
+  {"iterator", 2, erocksdb::Iterator, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"iterator", 3, erocksdb::Iterator, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"iterators", 3, erocksdb::Iterators, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"iterators", 4, erocksdb::Iterators, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"iterator_move", 2, erocksdb::IteratorMove, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"iterator_close", 1, erocksdb::IteratorClose, ERL_NIF_DIRTY_JOB_IO_BOUND},
+
 
   // db management
   {"async_checkpoint", 3, erocksdb::AsyncCheckpoint},

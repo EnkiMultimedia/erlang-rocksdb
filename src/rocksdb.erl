@@ -319,12 +319,7 @@ get(_DBHandle, _CFHandle, _Key, _ReadOpts) ->
   DBHandle::db_handle(),
   ReadOpts::read_options(),
   Res :: {ok, itr_handle()} | {error, any()}.
-iterator(DBHandle, ReadOpts) ->
-  CallerRef = make_ref(),
-  async_iterator(CallerRef, DBHandle, ReadOpts),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_iterator(_CallerRef, _DBHandle, _ReadOpts) ->
+iterator(_DBHandle, _ReadOpts) ->
   erlang:nif_error({error, not_loaded}).
 
 -spec iterator(DBHandle, ReadOpts, keys_only) -> Res when
@@ -332,75 +327,38 @@ async_iterator(_CallerRef, _DBHandle, _ReadOpts) ->
   ReadOpts::read_options(),
   Res :: {ok, itr_handle()} | {error, any()}.
 
-iterator(DBHandle, ReadOpts, keys_only) ->
-  CallerRef = make_ref(),
-  async_iterator(CallerRef, DBHandle, ReadOpts, keys_only),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-
-async_iterator(_CallerRef, _DBHandle, _ReadOpts, keys_only) ->
+iterator(_DBHandle, _ReadOpts, keys_only) ->
   erlang:nif_error({error, not_loaded}).
 
-%% @doc Return a iterator over the contents of the specified column families.
--spec iterators(DBHandle, CFHandles, ReadOpts) -> Res when
-  DBHandle ::db_handle(),
-  CFHandles :: [cf_handle()],
-  ReadOpts :: read_options(),
-  Res :: {ok, itr_handle()} | {error, any()}.
-iterators(DBHandle, CFHandles, ReadOpts) ->
-  CallerRef = make_ref(),
-  async_iterators(CallerRef, DBHandle, CFHandles, ReadOpts),
-  ?WAIT_FOR_REPLY(CallerRef).
+%% @doc
+%% Return a iterator over the contents of the specified column family.
+-spec(iterators(DBHandle, CFHandle, ReadOpts) ->
+             {ok, itr_handle()} | {error, any()} when DBHandle::db_handle(),
+                                                      CFHandle::cf_handle(),
+                                                      ReadOpts::read_options()).
+iterators(_DBHandle, _CFHandle, _ReadOpts) ->
+    erlang:nif_error({error, not_loaded}).
 
-async_iterators(_CallerRef, _DBHandle, _CFHandles, _ReadOpts) ->
-  erlang:nif_error({error, not_loaded}).
+iterators(_DBHandle, _CFHandle, _ReadOpts, keys_only) ->
+    erlang:nif_error({error, not_loaded}).
 
 
-%% @doc Return keys iterator over the contents of the specified column families.
-iterators(DBHandle, CFHandles, ReadOpts, keys_only) ->
-  CallerRef = make_ref(),
-  async_iterators(CallerRef, DBHandle, CFHandles, ReadOpts, keys_only),
-  ?WAIT_FOR_REPLY(CallerRef);
+%% @doc
+%% Move to the specified place
+-spec(iterator_move(ITRHandle, ITRAction) ->
+             {ok, Key::binary(), Value::binary()} |
+             {ok, Key::binary()} |
+             {error, invalid_iterator} |
+             {error, iterator_closed} when ITRHandle::itr_handle(),
+                                           ITRAction::iterator_action()).
+iterator_move(_ITRHandle, _ITRAction) ->
+    erlang:nif_error({error, not_loaded}).
 
-iterators(_, _, _, _) ->
-  erlang:error(badarg).
-
-async_iterators(_CallerRef, _DBHandle, _CFHandles, _ReadOpts, keys_only) ->
-  erlang:nif_error({error, not_loaded}).
-
-%% @doc  Move to the specified place
--spec iterator_move(ITRHandle, ITRAction) -> Res when
-  ITRHandle::itr_handle(),
-  ITRAction::iterator_action(),
-  Res ::  {ok, Key::binary(), Value::binary()} |
-      {ok, Key::binary()} |
-      {error, invalid_iterator} |
-      {error, iterator_closed}.
-iterator_move(ITRHandle, ITRAction) ->
-  case async_iterator_move(undefined, ITRHandle, ITRAction) of
-    Ref when is_reference(Ref) ->
-      receive
-        {Ref, X} -> X
-      end;
-    {ok, _} = Key -> Key;
-    {ok, _, _} = KeyVal -> KeyVal;
-    ER -> ER
-  end.
-
-async_iterator_move(_CallerRef, _ITRHandle, _ITRAction) ->
-  erlang:nif_error({error, not_loaded}).
-
-
-%% @doc Close a iterator
--spec iterator_close(ITRHandle::itr_handle()) -> ok.
-iterator_close(ITRHandle) ->
-  CallerRef = make_ref(),
-  async_iterator_close(CallerRef, ITRHandle),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_iterator_close(_CallerRef, _ITRHandle) ->
-  erlang:nif_error({error, not_loaded}).
-
+%% @doc
+%% Close a iterator
+-spec(iterator_close(ITRHandle) -> ok when ITRHandle::itr_handle()).
+iterator_close(_ITRHandle) ->
+    erlang:nif_error({error, not_loaded}).
 
 -type fold_fun() :: fun(({Key::binary(), Value::binary()}, any()) -> any()).
 
