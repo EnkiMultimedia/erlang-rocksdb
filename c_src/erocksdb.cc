@@ -57,10 +57,10 @@ static ErlNifFunc nif_funcs[] =
 {
 
 
-  {"async_open", 3, erocksdb::AsyncOpen},
-  {"async_open_with_cf", 4, erocksdb::AsyncOpenWithCf},
-  {"async_close", 2, erocksdb::AsyncClose},
-  {"get_approximate_size", 4, erocksdb::GetApproximateSize},
+  {"open", 2, erocksdb::Open, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"open_with_cf", 3, erocksdb::OpenWithCf, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"close", 1, erocksdb::Close, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"get_approximate_size", 4, erocksdb::GetApproximateSize, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
   {"get_property", 2, erocksdb::GetProperty},
   {"get_property", 3, erocksdb::GetProperty},

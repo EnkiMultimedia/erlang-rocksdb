@@ -187,12 +187,7 @@ init() ->
   Name :: file:filename_all(),
   DBOpts :: db_options(),
   Result :: {ok, db_handle()} | {error, any()}.
-open(Name, DBOpts) ->
-  CallerRef = make_ref(),
-  async_open(CallerRef, Name, DBOpts),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_open(_CallerRef, _Name, _DBOpts) ->
+open(_Name, _DBOpts) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Open RocksDB with the specified column families
@@ -201,24 +196,14 @@ async_open(_CallerRef, _Name, _DBOpts) ->
          when Name::file:filename_all(),
           DBOpts :: db_options(),
           CFDescriptors :: list(#cf_descriptor{})).
-open_with_cf(Name, DBOpts, CFDescriptors) ->
-  CallerRef = make_ref(),
-  async_open_with_cf(CallerRef, Name, DBOpts, CFDescriptors),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_open_with_cf(_Callerfef, _Name, _DBOpts, _CFDescriptors) ->
+open_with_cf(_Name, _DBOpts, _CFDescriptors) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Close RocksDB
 -spec close(DBHandle) -> Res when
   DBHandle :: db_handle(),
   Res :: ok | {error, any()}.
-close(DBHandle) ->
-  CallerRef = make_ref(),
-  async_close(CallerRef, DBHandle),
-  ?WAIT_FOR_REPLY(CallerRef).
-
-async_close(_Callerfef, _DBHandle) ->
+close(_DBHandle) ->
   erlang:nif_error({error, not_loaded}).
 
 %% ===============================================
