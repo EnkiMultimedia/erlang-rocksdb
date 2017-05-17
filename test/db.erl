@@ -104,7 +104,7 @@ randomstring(Len) ->
 key(I) when is_integer(I) ->
   <<I:128/unsigned>>.
 
-approximate_size_test_() ->
+approximate_size_() ->
   Db = destroy_reopen("erocksdb_approximate_size.db",
                       [{create_if_missing, true},
                        {write_buffer_size, 100000000},
