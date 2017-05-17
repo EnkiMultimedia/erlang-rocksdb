@@ -19,7 +19,10 @@
 %% @doc Erlang Wrapper for RocksDB
 -module(rocksdb).
 
--export([open/2, open_with_cf/3, close/1]).
+-export([open/2, open/3,
+         open_with_cf/3, open_with_cf/4,
+         close/1]).
+
 -export([snapshot/1, release_snapshot/1]).
 -export([list_column_families/2, create_column_family/3, drop_column_family/1]).
 -export([put/4, put/5, delete/3, delete/4, write/3, get/3, get/4]).
@@ -29,14 +32,21 @@
 -export([checkpoint/2]).
 -export([count/1, count/2, stats/1, stats/2, get_approximate_size/4, get_property/2, get_property/3]).
 
--export_type([db_handle/0,
-        cf_handle/0,
-        itr_handle/0,
-        snapshot_handle/0,
-        compression_type/0,
-        compaction_style/0,
-        access_hint/0,
-        wal_recovery_mode/0]).
+-export([default_env/0,
+         mem_env/0,
+         set_background_threads/2, set_background_threads/3,
+         destroy_env/1]).
+
+
+-export_type([env_handle/0,
+              db_handle/0,
+              cf_handle/0,
+              itr_handle/0,
+              snapshot_handle/0,
+              compression_type/0,
+              compaction_style/0,
+              access_hint/0,
+              wal_recovery_mode/0]).
 
 -on_load(init/0).
 
@@ -76,10 +86,13 @@ init() ->
                point_in_time_recovery |
                skip_any_corrupted_records.
 
+-opaque env_handle() :: binary().
 -opaque db_handle() :: binary().
 -opaque cf_handle() :: binary().
 -opaque itr_handle() :: binary().
 -opaque snapshot_handle() :: binary().
+
+-type env_priority() :: priority_high | priority_low.
 
 -type block_based_table_options() :: [{no_block_cache, boolean()} |
                     {block_size, pos_integer()} |
@@ -190,6 +203,9 @@ init() ->
 open(_Name, _DBOpts) ->
   erlang:nif_error({error, not_loaded}).
 
+open(_Env, _Name, _DbOpts) ->
+  erlang:nif_error({error, not_loaded}).
+
 %% @doc Open RocksDB with the specified column families
 -spec(open_with_cf(Name, DBOpts, CFDescriptors) ->
        {ok, db_handle(), list(cf_handle())} | {error, any()}
@@ -197,6 +213,10 @@ open(_Name, _DBOpts) ->
           DBOpts :: db_options(),
           CFDescriptors :: list(#cf_descriptor{})).
 open_with_cf(_Name, _DBOpts, _CFDescriptors) ->
+  erlang:nif_error({error, not_loaded}).
+
+
+open_with_cf(_Env, _Name, _DbOpts, _CFDescriptors) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc Close RocksDB
@@ -493,6 +513,34 @@ get_property(_DBHandle, _Property) ->
 ) -> string() | {error, any()}.
 get_property(_DBHandle, _CFHandle, _Property) ->
   erlang:nif_error({error, not_loaded}).
+
+%% @doc return a default db environment
+-spec default_env() -> env_handle().
+default_env() ->
+  erlang:nif_error({error, not_loaded}).
+
+%% @doc return a memory environment
+-spec mem_env() -> env_handle().
+mem_env() ->
+  erlang:nif_error({error, not_loaded}).
+
+%% @doc set background threads of an environment
+-spec set_background_threads(Env :: env_handle(), N :: non_neg_integer()) -> ok.
+set_background_threads(_Env, _N) ->
+  erlang:nif_error({error, not_loaded}).
+
+%% @doc set background threads of low and high prioriry threads pool of an environment
+%% Flush threads are in the HIGH priority pool, while compaction threads are in the
+%% LOW priority pool. To increase the number of threads in each pool call:
+-spec set_background_threads(Env :: env_handle(), N :: non_neg_integer(), Priority :: env_priority()) -> ok.
+set_background_threads(_Env, _N, _PRIORITY) ->
+  erlang:nif_error({error, not_loaded}).
+
+%% @doc destroy an environment
+-spec destroy_env(Env :: env_handle()) -> ok.
+destroy_env(_Env) ->
+  erlang:nif_error({error, not_loaded}).
+
 
 %% ===================================================================
 %% Internal functions

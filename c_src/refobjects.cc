@@ -226,6 +226,32 @@ DbObject::CreateDbObject(
 
 }   // DbObject::CreateDbObject
 
+DbObject *
+DbObject::CreateDbObject(
+    rocksdb::DB * Db,
+    rocksdb::Options * Options,
+    EnvObject *EnvPtr)
+{
+    DbObject * ret_ptr;
+    void * alloc_ptr;
+
+    // the alloc call initializes the reference count to "one"
+    alloc_ptr=enif_alloc_resource(m_Db_RESOURCE, sizeof(DbObject));
+    ret_ptr=new (alloc_ptr) DbObject(Db, Options, EnvPtr);
+
+    // manual reference increase to keep active until "close" called
+    //  only inc local counter, leave erl ref count alone ... will force
+    //  erlang to call us if process holding ref dies
+    ret_ptr->RefInc();
+
+    // see OpenTask::operator() for release of reference count
+
+    return(ret_ptr);
+
+}   // DbObject::CreateDbObject
+
+
+
 
 DbObject *
 DbObject::RetrieveDbObject(
@@ -277,6 +303,18 @@ DbObject::DbObject(
     : m_Db(DbPtr), m_DbOptions(Options)
     {}   // DbObject::DbObject
 
+DbObject::DbObject(
+    rocksdb::DB * DbPtr,
+    rocksdb::Options * Options,
+    EnvObject *EnvPtr)
+    : m_Db(DbPtr), m_DbOptions(Options), m_EnvPtr(EnvPtr)
+{
+    if (NULL != EnvPtr)
+        m_EnvPtr->AddReference(this);
+
+}   // DbObject::DbObject
+
+
 
 DbObject::~DbObject()
 {
@@ -290,6 +328,10 @@ DbObject::~DbObject()
         delete m_DbOptions;
         m_DbOptions = NULL;
     }   // if
+
+
+    if (NULL != m_EnvPtr.get())
+        m_EnvPtr->RemoveReference(this);
 
     // do not clean up m_CloseMutex and m_CloseCond
 
@@ -409,7 +451,7 @@ DbObject::AddReference(
 {
     bool ret_flag;
     MutexLock lock(m_ItrMutex);
-    
+
     ret_flag=(0==m_CloseRequested);
     if (ret_flag)
         m_ItrList.push_back(ItrPtr);
@@ -892,6 +934,161 @@ ItrObject::Shutdown() {
 }   // ItrObject::CloseRequest
 
 
+
+/**
+ * EnvObject Functions
+ */
+
+ErlNifResourceType * EnvObject::m_Env_RESOURCE(NULL);
+
+
+void
+EnvObject::CreateEnvObjectType(
+    ErlNifEnv * Env)
+{
+    ErlNifResourceFlags flags = (ErlNifResourceFlags)(ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER);
+
+    m_Env_RESOURCE = enif_open_resource_type(Env, NULL, "erocksdb_EnvObject",
+                                            &EnvObject::EnvObjectResourceCleanup,
+                                            flags, NULL);
+
+    return;
+
+}   // EnvObject::CreateEnvObjectType
+
+
+EnvObject *
+EnvObject::CreateEnvObject(
+    rocksdb::Env * Env)
+{
+    EnvObject * ret_ptr;
+    void * alloc_ptr;
+
+    alloc_ptr=enif_alloc_resource(m_Env_RESOURCE, sizeof(EnvObject));
+    ret_ptr=new (alloc_ptr) EnvObject(Env);
+    ret_ptr->RefInc();
+    return(ret_ptr);
+
+}   // EnvObject::CreateEnvObject
+
+
+EnvObject *
+EnvObject::RetrieveEnvObject(
+    ErlNifEnv * Env,
+    const ERL_NIF_TERM & EnvTerm)
+{
+    EnvObject * ret_ptr;
+
+    ret_ptr=NULL;
+
+    if (enif_get_resource(Env, EnvTerm, m_Env_RESOURCE, (void **)&ret_ptr))
+    {
+        // has close been requested?
+        if (ret_ptr->m_CloseRequested)
+        {
+            // object already closing
+            ret_ptr=NULL;
+        }   // else
+    }   // if
+
+    return(ret_ptr);
+
+}   // EnvObject::RetrieveEnvObject
+
+
+void
+EnvObject::EnvObjectResourceCleanup(
+    ErlNifEnv * Env,
+    void * Arg)
+{
+    EnvObject * env_ptr;
+
+    env_ptr=(EnvObject *)Arg;
+
+    // YES, the destructor may already have been called
+    InitiateCloseRequest(env_ptr);
+
+    // YES, the destructor may already have been called
+    AwaitCloseAndDestructor(env_ptr);
+
+    return;
+
+}   // EnvObject::EnvObjectResourceCleanup
+
+
+EnvObject::EnvObject(
+    rocksdb::Env * EnvPtr)
+    : m_Env(EnvPtr)
+    {}   // EnvObject::EnvObject
+
+
+EnvObject::~EnvObject()
+{
+
+    // close the db
+    delete m_Env;
+    m_Env=NULL;
+
+    // do not clean up m_CloseMutex and m_CloseCond
+    return;
+
+}   // EnvObject::~EnvObject
+
+
+void
+EnvObject::Shutdown()
+{
+#if 1
+    bool again;
+    DbObject * db_ptr;
+
+    do
+    {
+        again=false;
+        db_ptr=NULL;
+
+        // lock the ItrList
+        {
+            MutexLock lock(m_DbMutex);
+
+            if (!m_DbList.empty())
+            {
+                again=true;
+                db_ptr=m_DbList.front();
+                m_DbList.pop_front();
+            }   // if
+        }
+
+        // must be outside lock so ItrObject can attempt
+        //  RemoveReference
+        if (again)
+            DbObject::InitiateCloseRequest(db_ptr);
+
+    } while(again);
+#endif
+
+    RefDec();
+
+    return;
+
+}   // EnvObject::Shutdown
+
+void
+EnvObject::AddReference(
+        DbObject *DbPtr) {
+    MutexLock lock(m_DbMutex);
+    m_DbList.push_back(DbPtr);
+    return;
+}   // DbObject::AddReference
+
+
+void
+EnvObject::RemoveReference(
+        DbObject *DbPtr) {
+    MutexLock lock(m_DbMutex);
+    m_DbList.remove(DbPtr);
+    return;
+}   // DbObject::RemoveReference
 
 } // namespace erocksdb
 

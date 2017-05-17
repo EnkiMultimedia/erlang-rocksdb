@@ -133,7 +133,7 @@ extern ERL_NIF_TERM ATOM_DISABLE_WAL;
 extern ERL_NIF_TERM ATOM_TIMEOUT_HINT_US;
 extern ERL_NIF_TERM ATOM_IGNORE_MISSING_COLUMN_FAMILIES;
 
-// Related to Write Actions 
+// Related to Write Actions
 extern ERL_NIF_TERM ATOM_CLEAR;
 extern ERL_NIF_TERM ATOM_PUT;
 extern ERL_NIF_TERM ATOM_DELETE;
@@ -188,6 +188,10 @@ extern ERL_NIF_TERM ATOM_INVALID_ITERATOR;
 
 // Related to NIF initialize parameters
 extern ERL_NIF_TERM ATOM_WRITE_THREADS;
+
+// thread priority
+extern ERL_NIF_TERM ATOM_PRIORITY_HIGH;
+extern ERL_NIF_TERM ATOM_PRIORITY_LOW;
 
 }   // namespace erocksdb
 

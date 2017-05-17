@@ -28,6 +28,8 @@
 #endif
 
 #include "rocksdb/db.h"
+#include "rocksdb/env.h"
+
 
 // Erlang helpers:
 ERL_NIF_TERM error_einval(ErlNifEnv* env)
@@ -59,6 +61,20 @@ binary_to_slice(ErlNifEnv* env, ERL_NIF_TERM val, rocksdb::Slice* slice)
     if(!enif_inspect_binary(env, val, &bin))
         return 0;
     *slice = rocksdb::Slice((const char *)bin.data, bin.size);
+    return 1;
+}
+
+int
+enif_get_db_env(ErlNifEnv* env, ERL_NIF_TERM envval, erocksdb::ReferencePtr<erocksdb::EnvObject>* env_ptr)
+{
+    env_ptr->assign(erocksdb::EnvObject::RetrieveEnvObject(env, envval));
+
+    if(NULL==env_ptr->get())
+        return 0;
+
+    if(NULL==env_ptr->get()->m_Env)
+        return 0;
+
     return 1;
 }
 

@@ -56,7 +56,9 @@ static ErlNifFunc nif_funcs[] =
 
 
   {"open", 2, erocksdb::Open, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"open", 3, erocksdb::Open, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"open_with_cf", 3, erocksdb::OpenWithCf, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"open_with_cf", 4, erocksdb::OpenWithCf, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"close", 1, erocksdb::Close, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"get_approximate_size", 4, erocksdb::GetApproximateSize, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
@@ -86,7 +88,13 @@ static ErlNifFunc nif_funcs[] =
   {"iterator", 3, erocksdb::Iterator, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"iterators", 3, erocksdb::Iterators, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"iterator_move", 2, erocksdb::IteratorMove, ERL_NIF_DIRTY_JOB_IO_BOUND},
-  {"iterator_close", 1, erocksdb::IteratorClose, ERL_NIF_DIRTY_JOB_IO_BOUND}
+  {"iterator_close", 1, erocksdb::IteratorClose, ERL_NIF_DIRTY_JOB_IO_BOUND},
+
+  {"default_env", 0, erocksdb::DefaultEnv},
+  {"mem_env", 0, erocksdb::MemEnv},
+  {"set_background_threads", 2, erocksdb::SetBackgroundThreads},
+  {"set_background_threads", 3, erocksdb::SetBackgroundThreads},
+  {"destroy_env", 1, erocksdb::DestroyEnv}
 
 
 };
@@ -256,6 +264,9 @@ ERL_NIF_TERM ATOM_INVALID_ITERATOR;
 // Related to NIF initialize parameters
 ERL_NIF_TERM ATOM_WRITE_THREADS;
 
+ERL_NIF_TERM ATOM_PRIORITY_HIGH;
+ERL_NIF_TERM ATOM_PRIORITY_LOW;
+
 }   // namespace erocksdb
 
 
@@ -282,6 +293,7 @@ try
   rocksdb::Env::Default();
 
   // inform erlang of our two resource types
+  erocksdb::EnvObject::CreateEnvObjectType(env);
   erocksdb::DbObject::CreateDbObjectType(env);
   erocksdb::ColumnFamilyObject::CreateColumnFamilyObjectType(env);
   erocksdb::ItrObject::CreateItrObjectType(env);
@@ -450,6 +462,9 @@ try
 
   // Related to NIF initialize parameters
   ATOM(erocksdb::ATOM_WRITE_THREADS, "write_threads");
+
+  ATOM(erocksdb::ATOM_PRIORITY_HIGH, "priority_high");
+  ATOM(erocksdb::ATOM_PRIORITY_LOW, "priority_low");
 #undef ATOM
 
 erocksdb::PrivData *priv = new erocksdb::PrivData();

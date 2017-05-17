@@ -94,7 +94,7 @@ close_fold_test_Z() ->
 
 destroy_reopen(DbName, Options) ->
   _ = rocksdb:destroy(DbName, []),
-  os:cmd("rm -rf " ++ DbName),
+  _ = os:cmd("rm -rf " ++ DbName),
   {ok, Db} = rocksdb:open(DbName, Options),
   Db.
 
