@@ -1,4 +1,14 @@
-erlang-rocksdb 0.15.0, released on 2018/0210
+erlang-rocksdb 0.16.0, released on 2018/03/13
+=================================================
+
+- add single_delete operation (to key/value and batch api)
+- add iterator_refresh function
+- add support for level_compaction_dynamic_level_bytes for column family options
+- add rate_limiter support
+- many optimisations to the source code and build
+- bump to rocksdb 5.10.4
+
+erlang-rocksdb 0.15.0, released on 2018/02/10
 =================================================
 
 - add support for lz4 compression

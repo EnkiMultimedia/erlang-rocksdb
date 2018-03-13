@@ -81,7 +81,7 @@ __abstract datatype__: `cf_handle()`
 
 
 <pre><code>
-cf_options() = [{block_cache_size_mb_for_point_lookup, non_neg_integer()} | {memtable_memory_budget, pos_integer()} | {write_buffer_size, pos_integer()} | {max_write_buffer_number, pos_integer()} | {min_write_buffer_number_to_merge, pos_integer()} | {compression, <a href="#type-compression_type">compression_type()</a>} | {num_levels, pos_integer()} | {level0_file_num_compaction_trigger, integer()} | {level0_slowdown_writes_trigger, integer()} | {level0_stop_writes_trigger, integer()} | {max_mem_compaction_level, pos_integer()} | {target_file_size_base, pos_integer()} | {target_file_size_multiplier, pos_integer()} | {max_bytes_for_level_base, pos_integer()} | {max_bytes_for_level_multiplier, pos_integer()} | {max_compaction_bytes, pos_integer()} | {soft_rate_limit, float()} | {hard_rate_limit, float()} | {arena_block_size, integer()} | {disable_auto_compactions, boolean()} | {purge_redundant_kvs_while_flush, boolean()} | {compaction_style, <a href="#type-compaction_style">compaction_style()</a>} | {filter_deletes, boolean()} | {max_sequential_skip_in_iterations, pos_integer()} | {inplace_update_support, boolean()} | {inplace_update_num_locks, pos_integer()} | {table_factory_block_cache_size, pos_integer()} | {in_memory_mode, boolean()} | {block_based_table_options, <a href="#type-block_based_table_options">block_based_table_options()</a>}]
+cf_options() = [{block_cache_size_mb_for_point_lookup, non_neg_integer()} | {memtable_memory_budget, pos_integer()} | {write_buffer_size, pos_integer()} | {max_write_buffer_number, pos_integer()} | {min_write_buffer_number_to_merge, pos_integer()} | {compression, <a href="#type-compression_type">compression_type()</a>} | {num_levels, pos_integer()} | {level0_file_num_compaction_trigger, integer()} | {level0_slowdown_writes_trigger, integer()} | {level0_stop_writes_trigger, integer()} | {max_mem_compaction_level, pos_integer()} | {target_file_size_base, pos_integer()} | {target_file_size_multiplier, pos_integer()} | {max_bytes_for_level_base, pos_integer()} | {max_bytes_for_level_multiplier, pos_integer()} | {max_compaction_bytes, pos_integer()} | {soft_rate_limit, float()} | {hard_rate_limit, float()} | {arena_block_size, integer()} | {disable_auto_compactions, boolean()} | {purge_redundant_kvs_while_flush, boolean()} | {compaction_style, <a href="#type-compaction_style">compaction_style()</a>} | {filter_deletes, boolean()} | {max_sequential_skip_in_iterations, pos_integer()} | {inplace_update_support, boolean()} | {inplace_update_num_locks, pos_integer()} | {table_factory_block_cache_size, pos_integer()} | {in_memory_mode, boolean()} | {block_based_table_options, <a href="#type-block_based_table_options">block_based_table_options()</a>} | {level_compaction_dynamic_level_bytes, boolean()}]
 </code></pre>
 
 
@@ -119,7 +119,7 @@ __abstract datatype__: `db_handle()`
 
 
 <pre><code>
-db_options() = [{env, <a href="#type-env">env()</a>} | {total_threads, pos_integer()} | {create_if_missing, boolean()} | {create_missing_column_families, boolean()} | {error_if_exists, boolean()} | {paranoid_checks, boolean()} | {max_open_files, integer()} | {max_total_wal_size, non_neg_integer()} | {use_fsync, boolean()} | {db_paths, [#db_path{path = <a href="file.md#type-filename_all">file:filename_all()</a>, target_size = non_neg_integer()}]} | {db_log_dir, <a href="file.md#type-filename_all">file:filename_all()</a>} | {wal_dir, <a href="file.md#type-filename_all">file:filename_all()</a>} | {delete_obsolete_files_period_micros, pos_integer()} | {max_background_jobs, pos_integer()} | {max_background_compactions, pos_integer()} | {max_background_flushes, pos_integer()} | {max_log_file_size, non_neg_integer()} | {log_file_time_to_roll, non_neg_integer()} | {keep_log_file_num, pos_integer()} | {max_manifest_file_size, pos_integer()} | {table_cache_numshardbits, pos_integer()} | {wal_ttl_seconds, non_neg_integer()} | {wal_size_limit_mb, non_neg_integer()} | {manifest_preallocation_size, pos_integer()} | {allow_mmap_reads, boolean()} | {allow_mmap_writes, boolean()} | {is_fd_close_on_exec, boolean()} | {skip_log_error_on_recovery, boolean()} | {stats_dump_period_sec, non_neg_integer()} | {advise_random_on_open, boolean()} | {access_hint, <a href="#type-access_hint">access_hint()</a>} | {compaction_readahead_size, non_neg_integer()} | {use_adaptive_mutex, boolean()} | {bytes_per_sync, non_neg_integer()} | {skip_stats_update_on_db_open, boolean()} | {wal_recovery_mode, <a href="#type-wal_recovery_mode">wal_recovery_mode()</a>} | {allow_concurrent_memtable_write, boolean()} | {enable_write_thread_adaptive_yield, boolean()} | {db_write_buffer_size, non_neg_integer()} | {in_memory, boolean()}]
+db_options() = [{env, <a href="#type-env">env()</a>} | {total_threads, pos_integer()} | {create_if_missing, boolean()} | {create_missing_column_families, boolean()} | {error_if_exists, boolean()} | {paranoid_checks, boolean()} | {max_open_files, integer()} | {max_total_wal_size, non_neg_integer()} | {use_fsync, boolean()} | {db_paths, [#db_path{path = <a href="file.md#type-filename_all">file:filename_all()</a>, target_size = non_neg_integer()}]} | {db_log_dir, <a href="file.md#type-filename_all">file:filename_all()</a>} | {wal_dir, <a href="file.md#type-filename_all">file:filename_all()</a>} | {delete_obsolete_files_period_micros, pos_integer()} | {max_background_jobs, pos_integer()} | {max_background_compactions, pos_integer()} | {max_background_flushes, pos_integer()} | {max_log_file_size, non_neg_integer()} | {log_file_time_to_roll, non_neg_integer()} | {keep_log_file_num, pos_integer()} | {max_manifest_file_size, pos_integer()} | {table_cache_numshardbits, pos_integer()} | {wal_ttl_seconds, non_neg_integer()} | {wal_size_limit_mb, non_neg_integer()} | {manifest_preallocation_size, pos_integer()} | {allow_mmap_reads, boolean()} | {allow_mmap_writes, boolean()} | {is_fd_close_on_exec, boolean()} | {skip_log_error_on_recovery, boolean()} | {stats_dump_period_sec, non_neg_integer()} | {advise_random_on_open, boolean()} | {access_hint, <a href="#type-access_hint">access_hint()</a>} | {compaction_readahead_size, non_neg_integer()} | {use_adaptive_mutex, boolean()} | {bytes_per_sync, non_neg_integer()} | {skip_stats_update_on_db_open, boolean()} | {wal_recovery_mode, <a href="#type-wal_recovery_mode">wal_recovery_mode()</a>} | {allow_concurrent_memtable_write, boolean()} | {enable_write_thread_adaptive_yield, boolean()} | {db_write_buffer_size, non_neg_integer()} | {in_memory, boolean()} | {rate_limiter, <a href="#type-rate_limiter_handle">rate_limiter_handle()</a>}]
 </code></pre>
 
 
@@ -199,6 +199,14 @@ options() = <a href="#type-db_options">db_options()</a> | <a href="#type-cf_opti
 
 
 
+### <a name="type-rate_limiter_handle">rate_limiter_handle()</a> ###
+
+
+__abstract datatype__: `rate_limiter_handle()`
+
+
+
+
 ### <a name="type-read_options">read_options()</a> ###
 
 
@@ -231,7 +239,7 @@ wal_recovery_mode() = tolerate_corrupted_tail_records | absolute_consistency | p
 
 
 <pre><code>
-write_actions() = [{put, Key::binary(), Value::binary()} | {put, ColumnFamilyHandle::<a href="#type-cf_handle">cf_handle()</a>, Key::binary(), Value::binary()} | {delete, Key::binary()} | {delete, ColumnFamilyHandle::<a href="#type-cf_handle">cf_handle()</a>, Key::binary()} | clear]
+write_actions() = [{put, Key::binary(), Value::binary()} | {put, ColumnFamilyHandle::<a href="#type-cf_handle">cf_handle()</a>, Key::binary(), Value::binary()} | {delete, Key::binary()} | {delete, ColumnFamilyHandle::<a href="#type-cf_handle">cf_handle()</a>, Key::binary()} | {single_delete, Key::binary()} | {single_delete, ColumnFamilyHandle::<a href="#type-cf_handle">cf_handle()</a>, Key::binary()} | clear]
 </code></pre>
 
 
@@ -249,7 +257,7 @@ write_options() = [{sync, boolean()} | {disable_wal, boolean()} | {ignore_missin
 ## Function Index ##
 
 
-<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#batch-0">batch/0</a></td><td>create a new batch in memory.</td></tr><tr><td valign="top"><a href="#batch_clear-1">batch_clear/1</a></td><td>reset the batch, clear all operations.</td></tr><tr><td valign="top"><a href="#batch_count-1">batch_count/1</a></td><td>return the number of operations in the batch.</td></tr><tr><td valign="top"><a href="#batch_delete-2">batch_delete/2</a></td><td>add a delete operation to the batch.</td></tr><tr><td valign="top"><a href="#batch_delete-3">batch_delete/3</a></td><td>like <code>delete/2</code> but apply the operation to a column family.</td></tr><tr><td valign="top"><a href="#batch_put-3">batch_put/3</a></td><td>add a put operation to the batch.</td></tr><tr><td valign="top"><a href="#batch_put-4">batch_put/4</a></td><td>like <code>put/3</code> but apply the operation to a column family.</td></tr><tr><td valign="top"><a href="#batch_rollback-1">batch_rollback/1</a></td><td>rollback the operations to the latest checkpoint.</td></tr><tr><td valign="top"><a href="#batch_savepoint-1">batch_savepoint/1</a></td><td>store a checkpoint in the batch to which you can rollback later.</td></tr><tr><td valign="top"><a href="#batch_tolist-1">batch_tolist/1</a></td><td>return all the operation sin the batch as a list of operations.</td></tr><tr><td valign="top"><a href="#checkpoint-2">checkpoint/2</a></td><td>take a snapshot of a running RocksDB database in a separate directory
+<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#batch-0">batch/0</a></td><td>create a new batch in memory.</td></tr><tr><td valign="top"><a href="#batch_clear-1">batch_clear/1</a></td><td>reset the batch, clear all operations.</td></tr><tr><td valign="top"><a href="#batch_count-1">batch_count/1</a></td><td>return the number of operations in the batch.</td></tr><tr><td valign="top"><a href="#batch_delete-2">batch_delete/2</a></td><td>batch implementation of delete operation to the batch.</td></tr><tr><td valign="top"><a href="#batch_delete-3">batch_delete/3</a></td><td>like <code>batch_delete/2</code> but apply the operation to a column family.</td></tr><tr><td valign="top"><a href="#batch_put-3">batch_put/3</a></td><td>add a put operation to the batch.</td></tr><tr><td valign="top"><a href="#batch_put-4">batch_put/4</a></td><td>like <code>put/3</code> but apply the operation to a column family.</td></tr><tr><td valign="top"><a href="#batch_rollback-1">batch_rollback/1</a></td><td>rollback the operations to the latest checkpoint.</td></tr><tr><td valign="top"><a href="#batch_savepoint-1">batch_savepoint/1</a></td><td>store a checkpoint in the batch to which you can rollback later.</td></tr><tr><td valign="top"><a href="#batch_single_delete-2">batch_single_delete/2</a></td><td>batch implementation of single_delete operation to the batch.</td></tr><tr><td valign="top"><a href="#batch_single_delete-3">batch_single_delete/3</a></td><td>like <code>batch_single_delete/2</code> but apply the operation to a column family.</td></tr><tr><td valign="top"><a href="#batch_tolist-1">batch_tolist/1</a></td><td>return all the operation sin the batch as a list of operations.</td></tr><tr><td valign="top"><a href="#checkpoint-2">checkpoint/2</a></td><td>take a snapshot of a running RocksDB database in a separate directory
 http://rocksdb.org/blog/2609/use-checkpoints-for-efficient-snapshots/.</td></tr><tr><td valign="top"><a href="#close-1">close/1</a></td><td>Close RocksDB.</td></tr><tr><td valign="top"><a href="#close_backup-1">close_backup/1</a></td><td>stop and close the backup
 note: experimental for testing only.</td></tr><tr><td valign="top"><a href="#close_batch-1">close_batch/1</a></td><td></td></tr><tr><td valign="top"><a href="#close_updates_iterator-1">close_updates_iterator/1</a></td><td>close the transaction log.</td></tr><tr><td valign="top"><a href="#count-1">count/1</a></td><td>Return the approximate number of keys in the default column family.</td></tr><tr><td valign="top"><a href="#count-2">count/2</a></td><td>
 Return the approximate number of keys in the specified column family.</td></tr><tr><td valign="top"><a href="#create_column_family-3">create_column_family/3</a></td><td>Create a new column family.</td></tr><tr><td valign="top"><a href="#create_new_backup-2">create_new_backup/2</a></td><td>Captures the state of the database in the latest backup.</td></tr><tr><td valign="top"><a href="#default_env-0">default_env/0</a></td><td>return a default db environment.</td></tr><tr><td valign="top"><a href="#delete-3">delete/3</a></td><td>Delete a key/value pair in the default column family.</td></tr><tr><td valign="top"><a href="#delete-4">delete/4</a></td><td>Delete a key/value pair in the specified column family.</td></tr><tr><td valign="top"><a href="#delete_backup-2">delete_backup/2</a></td><td>deletes a specific backup.</td></tr><tr><td valign="top"><a href="#delete_range-4">delete_range/4</a></td><td>Removes the database entries in the range ["BeginKey", "EndKey"), i.e.,
@@ -261,13 +269,14 @@ Other specs are same with fold_keys/4.</td></tr><tr><td valign="top"><a href="#g
 It will do the full scan of the files/ directory and delete all the
 files that are not referenced.</td></tr><tr><td valign="top"><a href="#get-3">get/3</a></td><td>Retrieve a key/value pair in the default column family.</td></tr><tr><td valign="top"><a href="#get-4">get/4</a></td><td>Retrieve a key/value pair in the specified column family.</td></tr><tr><td valign="top"><a href="#get_backup_info-1">get_backup_info/1</a></td><td>Returns info about backups in backup_info.</td></tr><tr><td valign="top"><a href="#get_capacity-1">get_capacity/1</a></td><td> returns the maximum configured capacity of the cache.</td></tr><tr><td valign="top"><a href="#get_latest_sequence_number-1">get_latest_sequence_number/1</a></td><td>get latest sequence from the log.</td></tr><tr><td valign="top"><a href="#get_pinned_usage-1">get_pinned_usage/1</a></td><td> returns the memory size for the entries in use by the system.</td></tr><tr><td valign="top"><a href="#get_property-2">get_property/2</a></td><td>Return the RocksDB internal status of the default column family specified at Property.</td></tr><tr><td valign="top"><a href="#get_property-3">get_property/3</a></td><td>Return the RocksDB internal status of the specified column family specified at Property.</td></tr><tr><td valign="top"><a href="#get_snapshot_sequence-1">get_snapshot_sequence/1</a></td><td>returns Snapshot's sequence number.</td></tr><tr><td valign="top"><a href="#get_usage-1">get_usage/1</a></td><td>returns the memory size for a specific entry in the cache.</td></tr><tr><td valign="top"><a href="#is_empty-1">is_empty/1</a></td><td>is the database empty.</td></tr><tr><td valign="top"><a href="#iterator-2">iterator/2</a></td><td>Return a iterator over the contents of the database.</td></tr><tr><td valign="top"><a href="#iterator-3">iterator/3</a></td><td>Return a iterator over the contents of the database.</td></tr><tr><td valign="top"><a href="#iterator_close-1">iterator_close/1</a></td><td>
 Close a iterator.</td></tr><tr><td valign="top"><a href="#iterator_move-2">iterator_move/2</a></td><td>
-Move to the specified place.</td></tr><tr><td valign="top"><a href="#iterators-3">iterators/3</a></td><td>
+Move to the specified place.</td></tr><tr><td valign="top"><a href="#iterator_refresh-1">iterator_refresh/1</a></td><td>
+Refresh iterator.</td></tr><tr><td valign="top"><a href="#iterators-3">iterators/3</a></td><td>
 Return a iterator over the contents of the specified column family.</td></tr><tr><td valign="top"><a href="#list_column_families-2">list_column_families/2</a></td><td>List column families.</td></tr><tr><td valign="top"><a href="#mem_env-0">mem_env/0</a></td><td>return a memory environment.</td></tr><tr><td valign="top"><a href="#new_clock_cache-1">new_clock_cache/1</a></td><td>Similar to NewLRUCache, but create a cache based on CLOCK algorithm with
-better concurrent performance in some cases.</td></tr><tr><td valign="top"><a href="#new_lru_cache-1">new_lru_cache/1</a></td><td>// Create a new cache with a fixed size capacity.</td></tr><tr><td valign="top"><a href="#next_binary_update-1">next_binary_update/1</a></td><td>go to the last update as a binary in the transaction log, can be ussed with the write_binary_update function.</td></tr><tr><td valign="top"><a href="#next_update-1">next_update/1</a></td><td>like binary update but also return the batch as a list of operations.</td></tr><tr><td valign="top"><a href="#open-2">open/2</a></td><td>Open RocksDB with the defalut column family.</td></tr><tr><td valign="top"><a href="#open_backup_engine-1">open_backup_engine/1</a></td><td>open a new backup engine.</td></tr><tr><td valign="top"><a href="#open_with_cf-3">open_with_cf/3</a></td><td>Open RocksDB with the specified column families.</td></tr><tr><td valign="top"><a href="#purge_old_backup-2">purge_old_backup/2</a></td><td>deletes old backups, keeping latest num_backups_to_keep alive.</td></tr><tr><td valign="top"><a href="#put-4">put/4</a></td><td>Put a key/value pair into the default column family.</td></tr><tr><td valign="top"><a href="#put-5">put/5</a></td><td>Put a key/value pair into the specified column family.</td></tr><tr><td valign="top"><a href="#release_cache-1">release_cache/1</a></td><td>release the cache.</td></tr><tr><td valign="top"><a href="#release_snapshot-1">release_snapshot/1</a></td><td>release a snapshot.</td></tr><tr><td valign="top"><a href="#repair-2">repair/2</a></td><td>Try to repair as much of the contents of the database as possible.</td></tr><tr><td valign="top"><a href="#restore_db_from_backup-3">restore_db_from_backup/3</a></td><td>restore from backup with backup_id.</td></tr><tr><td valign="top"><a href="#restore_db_from_backup-4">restore_db_from_backup/4</a></td><td>restore from backup with backup_id.</td></tr><tr><td valign="top"><a href="#restore_db_from_latest_backup-2">restore_db_from_latest_backup/2</a></td><td>restore from the latest backup.</td></tr><tr><td valign="top"><a href="#restore_db_from_latest_backup-3">restore_db_from_latest_backup/3</a></td><td>restore from the latest backup.</td></tr><tr><td valign="top"><a href="#set_capacity-2">set_capacity/2</a></td><td>sets the maximum configured capacity of the cache.</td></tr><tr><td valign="top"><a href="#set_db_background_threads-2">set_db_background_threads/2</a></td><td>set background threads of a database.</td></tr><tr><td valign="top"><a href="#set_db_background_threads-3">set_db_background_threads/3</a></td><td>set database background threads of low and high prioriry threads pool of an environment
+better concurrent performance in some cases.</td></tr><tr><td valign="top"><a href="#new_lru_cache-1">new_lru_cache/1</a></td><td>// Create a new cache with a fixed size capacity.</td></tr><tr><td valign="top"><a href="#new_rate_limiter-2">new_rate_limiter/2</a></td><td>create new Limiter.</td></tr><tr><td valign="top"><a href="#next_binary_update-1">next_binary_update/1</a></td><td>go to the last update as a binary in the transaction log, can be ussed with the write_binary_update function.</td></tr><tr><td valign="top"><a href="#next_update-1">next_update/1</a></td><td>like binary update but also return the batch as a list of operations.</td></tr><tr><td valign="top"><a href="#open-2">open/2</a></td><td>Open RocksDB with the defalut column family.</td></tr><tr><td valign="top"><a href="#open_backup_engine-1">open_backup_engine/1</a></td><td>open a new backup engine.</td></tr><tr><td valign="top"><a href="#open_with_cf-3">open_with_cf/3</a></td><td>Open RocksDB with the specified column families.</td></tr><tr><td valign="top"><a href="#purge_old_backup-2">purge_old_backup/2</a></td><td>deletes old backups, keeping latest num_backups_to_keep alive.</td></tr><tr><td valign="top"><a href="#put-4">put/4</a></td><td>Put a key/value pair into the default column family.</td></tr><tr><td valign="top"><a href="#put-5">put/5</a></td><td>Put a key/value pair into the specified column family.</td></tr><tr><td valign="top"><a href="#release_cache-1">release_cache/1</a></td><td>release the cache.</td></tr><tr><td valign="top"><a href="#release_rate_limiter-1">release_rate_limiter/1</a></td><td>release the limiter.</td></tr><tr><td valign="top"><a href="#release_snapshot-1">release_snapshot/1</a></td><td>release a snapshot.</td></tr><tr><td valign="top"><a href="#repair-2">repair/2</a></td><td>Try to repair as much of the contents of the database as possible.</td></tr><tr><td valign="top"><a href="#restore_db_from_backup-3">restore_db_from_backup/3</a></td><td>restore from backup with backup_id.</td></tr><tr><td valign="top"><a href="#restore_db_from_backup-4">restore_db_from_backup/4</a></td><td>restore from backup with backup_id.</td></tr><tr><td valign="top"><a href="#restore_db_from_latest_backup-2">restore_db_from_latest_backup/2</a></td><td>restore from the latest backup.</td></tr><tr><td valign="top"><a href="#restore_db_from_latest_backup-3">restore_db_from_latest_backup/3</a></td><td>restore from the latest backup.</td></tr><tr><td valign="top"><a href="#set_capacity-2">set_capacity/2</a></td><td>sets the maximum configured capacity of the cache.</td></tr><tr><td valign="top"><a href="#set_db_background_threads-2">set_db_background_threads/2</a></td><td>set background threads of a database.</td></tr><tr><td valign="top"><a href="#set_db_background_threads-3">set_db_background_threads/3</a></td><td>set database background threads of low and high prioriry threads pool of an environment
 Flush threads are in the HIGH priority pool, while compaction threads are in the
 LOW priority pool.</td></tr><tr><td valign="top"><a href="#set_env_background_threads-2">set_env_background_threads/2</a></td><td>set background threads of an environment.</td></tr><tr><td valign="top"><a href="#set_env_background_threads-3">set_env_background_threads/3</a></td><td>set background threads of low and high prioriry threads pool of an environment
 Flush threads are in the HIGH priority pool, while compaction threads are in the
-LOW priority pool.</td></tr><tr><td valign="top"><a href="#snapshot-1">snapshot/1</a></td><td>return a database snapshot
+LOW priority pool.</td></tr><tr><td valign="top"><a href="#single_delete-3">single_delete/3</a></td><td>Remove the database entry for "key".</td></tr><tr><td valign="top"><a href="#single_delete-4">single_delete/4</a></td><td>like <code>single_delete/3</code> but on the specified column family.</td></tr><tr><td valign="top"><a href="#snapshot-1">snapshot/1</a></td><td>return a database snapshot
 Snapshots provide consistent read-only views over the entire state of the key-value store.</td></tr><tr><td valign="top"><a href="#stats-1">stats/1</a></td><td>Return the current stats of the default column family
 Implemented by calling GetProperty with "rocksdb.stats".</td></tr><tr><td valign="top"><a href="#stats-2">stats/2</a></td><td>Return the current stats of the specified column family
 Implemented by calling GetProperty with "rocksdb.stats".</td></tr><tr><td valign="top"><a href="#stop_backup-1">stop_backup/1</a></td><td></td></tr><tr><td valign="top"><a href="#sync_wal-1">sync_wal/1</a></td><td> Sync the wal.</td></tr><tr><td valign="top"><a href="#updates_iterator-2">updates_iterator/2</a></td><td>create a new iterator to retrive ethe transaction log since a sequce.</td></tr><tr><td valign="top"><a href="#verify_backup-2">verify_backup/2</a></td><td>checks that each file exists and that the size of the file matches
@@ -322,7 +331,7 @@ batch_delete(Batch::<a href="#type-batch_handle">batch_handle()</a>, Key::binary
 </code></pre>
 <br />
 
-add a delete operation to the batch
+batch implementation of delete operation to the batch
 
 <a name="batch_delete-3"></a>
 
@@ -333,7 +342,7 @@ batch_delete(Batch::<a href="#type-batch_handle">batch_handle()</a>, ColumnFamil
 </code></pre>
 <br />
 
-like `delete/2` but apply the operation to a column family
+like `batch_delete/2` but apply the operation to a column family
 
 <a name="batch_put-3"></a>
 
@@ -378,6 +387,28 @@ batch_savepoint(Batch::<a href="#type-batch_handle">batch_handle()</a>) -&gt; ok
 <br />
 
 store a checkpoint in the batch to which you can rollback later
+
+<a name="batch_single_delete-2"></a>
+
+### batch_single_delete/2 ###
+
+<pre><code>
+batch_single_delete(Batch::<a href="#type-batch_handle">batch_handle()</a>, Key::binary()) -&gt; ok
+</code></pre>
+<br />
+
+batch implementation of single_delete operation to the batch
+
+<a name="batch_single_delete-3"></a>
+
+### batch_single_delete/3 ###
+
+<pre><code>
+batch_single_delete(Batch::<a href="#type-batch_handle">batch_handle()</a>, ColumnFamily::<a href="#type-cf_handle">cf_handle()</a>, Key::binary()) -&gt; ok
+</code></pre>
+<br />
+
+like `batch_single_delete/2` but apply the operation to a column family
 
 <a name="batch_tolist-1"></a>
 
@@ -889,6 +920,18 @@ iterator_move(ITRHandle, ITRAction) -&gt; {ok, Key::binary(), Value::binary()} |
 
 Move to the specified place
 
+<a name="iterator_refresh-1"></a>
+
+### iterator_refresh/1 ###
+
+<pre><code>
+iterator_refresh(ITRHandle) -&gt; ok
+</code></pre>
+
+<ul class="definitions"><li><code>ITRHandle = <a href="#type-itr_handle">itr_handle()</a></code></li></ul>
+
+Refresh iterator
+
 <a name="iterators-3"></a>
 
 ### iterators/3 ###
@@ -949,6 +992,14 @@ new_lru_cache(Capacity::non_neg_integer()) -&gt; {ok, <a href="#type-cache_handl
 // Create a new cache with a fixed size capacity. The cache is sharded
 to 2^num_shard_bits shards, by hash of the key. The total capacity
 is divided and evenly assigned to each shard.
+
+<a name="new_rate_limiter-2"></a>
+
+### new_rate_limiter/2 ###
+
+`new_rate_limiter(RateBytesPerSec, Auto) -> any()`
+
+create new Limiter
 
 <a name="next_binary_update-1"></a>
 
@@ -1049,6 +1100,14 @@ Put a key/value pair into the specified column family
 `release_cache(Cache) -> any()`
 
 release the cache
+
+<a name="release_rate_limiter-1"></a>
+
+### release_rate_limiter/1 ###
+
+`release_rate_limiter(Limiter) -> any()`
+
+release the limiter
 
 <a name="release_snapshot-1"></a>
 
@@ -1182,6 +1241,45 @@ set_env_background_threads(Env::<a href="#type-env_handle">env_handle()</a>, N::
 set background threads of low and high prioriry threads pool of an environment
 Flush threads are in the HIGH priority pool, while compaction threads are in the
 LOW priority pool. To increase the number of threads in each pool call:
+
+<a name="single_delete-3"></a>
+
+### single_delete/3 ###
+
+<pre><code>
+single_delete(DBHandle, Key, WriteOpts) -&gt; ok | {error, any()}
+</code></pre>
+
+<ul class="definitions"><li><code>DBHandle = <a href="#type-db_handle">db_handle()</a></code></li><li><code>Key = binary()</code></li><li><code>WriteOpts = <a href="#type-write_options">write_options()</a></code></li></ul>
+
+Remove the database entry for "key". Requires that the key exists
+and was not overwritten. Returns OK on success, and a non-OK status
+on error.  It is not an error if "key" did not exist in the database.
+
+If a key is overwritten (by calling Put() multiple times), then the result
+of calling SingleDelete() on this key is undefined.  SingleDelete() only
+behaves correctly if there has been only one Put() for this key since the
+previous call to SingleDelete() for this key.
+
+This feature is currently an experimental performance optimization
+for a very specific workload.  It is up to the caller to ensure that
+SingleDelete is only used for a key that is not deleted using Delete() or
+written using Merge().  Mixing SingleDelete operations with Deletes
+can result in undefined behavior.
+
+Note: consider setting options `{sync, true}`.
+
+<a name="single_delete-4"></a>
+
+### single_delete/4 ###
+
+<pre><code>
+single_delete(DBHandle, CFHandle, Key, WriteOpts) -&gt; Res
+</code></pre>
+
+<ul class="definitions"><li><code>DBHandle = <a href="#type-db_handle">db_handle()</a></code></li><li><code>CFHandle = <a href="#type-cf_handle">cf_handle()</a></code></li><li><code>Key = binary()</code></li><li><code>WriteOpts = <a href="#type-write_options">write_options()</a></code></li><li><code>Res = ok | {error, any()}</code></li></ul>
+
+like `single_delete/3` but on the specified column family
 
 <a name="snapshot-1"></a>
 

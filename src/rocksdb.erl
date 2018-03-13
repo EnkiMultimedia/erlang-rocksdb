@@ -446,7 +446,7 @@ delete(DBHandle, CFHandle, Key, WriteOpts) ->
 single_delete(DBHandle, Key, WriteOpts) ->
   write(DBHandle, [{single_delete, Key}], WriteOpts).
 
-%% @doc like `single_delete/3` but on the specified column family
+%% @doc like `single_delete/3' but on the specified column family
 -spec single_delete(DBHandle, CFHandle, Key, WriteOpts) -> Res when
   DBHandle::db_handle(),
   CFHandle::cf_handle(),
