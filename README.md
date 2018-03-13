@@ -38,6 +38,6 @@ Erlang RocksDB is licensed under the Apache License 2.
 
 
 <table width="100%" border="0" summary="list of modules">
-<tr><td><a href="http://gitlab.com/barrel-db/erlang-rocksdb/blob/38-bump-to-0-16-0/doc/rocksdb.md" class="module">rocksdb</a></td></tr>
-<tr><td><a href="http://gitlab.com/barrel-db/erlang-rocksdb/blob/38-bump-to-0-16-0/doc/rocksdb_bump.md" class="module">rocksdb_bump</a></td></tr></table>
+<tr><td><a href="http://gitlab.com/barrel-db/erlang-rocksdb/blob/master/doc/rocksdb.md" class="module">rocksdb</a></td></tr>
+<tr><td><a href="http://gitlab.com/barrel-db/erlang-rocksdb/blob/master/doc/rocksdb_bump.md" class="module">rocksdb_bump</a></td></tr></table>
 
