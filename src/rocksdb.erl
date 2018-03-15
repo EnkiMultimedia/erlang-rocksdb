@@ -393,7 +393,7 @@ get_snapshot_sequence(_SnapshotHandle) ->
   Res :: ok | {error, any()}.
 put(DBHandle, Key, Value, WriteOpts) ->
   write(DBHandle, [{put, Key, Value}], WriteOpts).
-
+  
 %% @doc Put a key/value pair into the specified column family
 -spec put(DBHandle, CFHandle, Key, Value, WriteOpts) -> Res when
   DBHandle::db_handle(),
@@ -403,7 +403,7 @@ put(DBHandle, Key, Value, WriteOpts) ->
   WriteOpts::write_options(),
   Res :: ok | {error, any()}.
 put(DBHandle, CFHandle, Key, Value, WriteOpts) ->
-  write(DBHandle, [{put, CFHandle, Key, Value}], WriteOpts).
+   write(DBHandle, [{put, CFHandle, Key, Value}], WriteOpts).
 
 %% @doc Delete a key/value pair in the default column family
 -spec(delete(DBHandle, Key, WriteOpts) ->
@@ -411,7 +411,7 @@ put(DBHandle, CFHandle, Key, Value, WriteOpts) ->
                     Key::binary(),
                     WriteOpts::write_options()).
 delete(DBHandle, Key, WriteOpts) ->
-  write(DBHandle, [{delete, Key}], WriteOpts).
+   write(DBHandle, [{delete, Key}], WriteOpts).
 
 %% @doc Delete a key/value pair in the specified column family
 -spec delete(DBHandle, CFHandle, Key, WriteOpts) -> Res when
@@ -426,18 +426,18 @@ delete(DBHandle, CFHandle, Key, WriteOpts) ->
 %% @doc Remove the database entry for "key". Requires that the key exists
 %% and was not overwritten. Returns OK on success, and a non-OK status
 %% on error.  It is not an error if "key" did not exist in the database.
-%% 
+%%
 %% If a key is overwritten (by calling Put() multiple times), then the result
 %% of calling SingleDelete() on this key is undefined.  SingleDelete() only
 %% behaves correctly if there has been only one Put() for this key since the
 %% previous call to SingleDelete() for this key.
-%% 
+%%
 %%  This feature is currently an experimental performance optimization
 %% for a very specific workload.  It is up to the caller to ensure that
 %% SingleDelete is only used for a key that is not deleted using Delete() or
 %% written using Merge().  Mixing SingleDelete operations with Deletes
 %%  can result in undefined behavior.
-%% 
+%%
 %% Note: consider setting options `{sync, true}'.
 -spec(single_delete(DBHandle, Key, WriteOpts) ->
         ok | {error, any()} when DBHandle::db_handle(),
@@ -462,8 +462,33 @@ single_delete(DBHandle, CFHandle, Key, WriteOpts) ->
    WriteActions::write_actions(),
    WriteOpts::write_options(),
    Res :: ok | {error, any()}.
-write(_DBHandle, _WriteActions, _WriteOpts) ->
-  erlang:nif_error({error, not_loaded}).
+write(DBHandle, WriteOps, WriteOpts) ->
+  {ok, Batch} = batch(),
+  write_1(WriteOps, Batch, DBHandle, WriteOpts).
+
+write_1([{put, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
+  batch_put(Batch, Key, Value),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{put, CfHandle, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
+  batch_put(Batch, CfHandle, Key, Value),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{delete, Key} | Rest], Batch, DbHandle, WriteOpts) ->
+  batch_delete(Batch, Key),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{delete, CfHandle, Key} | Rest], Batch, DbHandle, WriteOpts) ->
+  batch_delete(Batch, CfHandle, Key),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{single_delete, Key} | Rest], Batch, DbHandle, WriteOpts) ->
+  batch_single_delete(Batch, Key),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{single_delete, CfHandle, Key} | Rest], Batch, DbHandle, WriteOpts) ->
+  batch_single_delete(Batch, CfHandle, Key),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([_ | _], _Batch, _DbHandle, _WriteOpts) ->
+  erlang:error(badarg);
+write_1([], Batch, DbHandle, WriteOpts) ->
+  write_batch(DbHandle, Batch, WriteOpts).
+
 
 %% @doc Retrieve a key/value pair in the default column family
 -spec get(DBHandle, Key, ReadOpts) ->  Res when

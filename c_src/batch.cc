@@ -37,9 +37,7 @@ ErlNifResourceType *m_Batch_RESOURCE;
 void
 batch_resource_cleanup(ErlNifEnv *env, void *res)
 {
-
 }
-
 
 void
 CreateBatchType(ErlNifEnv *env)
@@ -196,11 +194,7 @@ WriteBatch(
     rocksdb::Status status = db_ptr->m_Db->Write(*opts, batch_ptr);
     if(!status.ok())
         return error_tuple(env, ATOM_ERROR, status);
-
-    batch_ptr->Clear();
-
     opts = NULL;
-
     return ATOM_OK;
 }
 
@@ -295,10 +289,8 @@ CloseBatch(
         const ERL_NIF_TERM argv[])
 {
     rocksdb::WriteBatch* batch_ptr;
-
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
-
     batch_ptr->Clear();
     return ATOM_OK;
 }

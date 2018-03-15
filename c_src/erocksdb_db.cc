@@ -589,91 +589,6 @@ ERL_NIF_TERM parse_write_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::Writ
     return erocksdb::ATOM_OK;
 }
 
-ERL_NIF_TERM write_batch_item(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::WriteBatch& batch)
-{
-    int arity;
-    const ERL_NIF_TERM* action;
-    if (enif_get_tuple(env, item, &arity, &action) ||
-        enif_is_atom(env, item))
-    {
-        if (item == erocksdb::ATOM_CLEAR)
-        {
-            batch.Clear();
-            return erocksdb::ATOM_OK;
-        }
-
-        ErlNifBinary key, value;
-        erocksdb::ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
-
-        if (action[0] == erocksdb::ATOM_PUT)
-        {
-            if(arity == 3  &&
-               enif_inspect_binary(env, action[1], &key) &&
-               enif_inspect_binary(env, action[2], &value))
-            {
-                rocksdb::Slice key_slice((const char*)key.data, key.size);
-                rocksdb::Slice value_slice((const char*)value.data, value.size);
-                batch.Put(key_slice, value_slice);
-                return erocksdb::ATOM_OK;
-            }
-            else
-            {
-                const ERL_NIF_TERM& cf_ref = action[1];
-                cf_ptr.assign(erocksdb::ColumnFamilyObject::RetrieveColumnFamilyObject(env, cf_ref));
-                erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
-
-                if(NULL!=cf_ptr.get() &&
-                   enif_inspect_binary(env, action[2], &key) &&
-                   enif_inspect_binary(env, action[3], &value))
-                {
-                    rocksdb::Slice key_slice((const char*)key.data, key.size);
-                    rocksdb::Slice value_slice((const char*)value.data, value.size);
-                    batch.Put(cf->m_ColumnFamily, key_slice, value_slice);
-                    return erocksdb::ATOM_OK;
-                }
-            }
-        }
-
-        if ((action[0] == erocksdb::ATOM_DELETE) || (action[0] == erocksdb::ATOM_SINGLE_DELETE))
-        {
-            if(arity == 2 && enif_inspect_binary(env, action[1], &key))
-            {
-                rocksdb::Slice key_slice((const char*)key.data, key.size);
-                if (action[0] == erocksdb::ATOM_DELETE) {
-                    batch.Delete(key_slice);
-                }
-                else
-                {
-                    batch.SingleDelete(key_slice);
-                }
-                return erocksdb::ATOM_OK;
-            }
-            else
-            {
-                const ERL_NIF_TERM& cf_ref = action[1];
-                cf_ptr.assign(erocksdb::ColumnFamilyObject::RetrieveColumnFamilyObject(env, cf_ref));
-                erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
-                if(NULL!=cf_ptr.get() && enif_inspect_binary(env, action[2], &key))
-                {
-                    rocksdb::Slice key_slice((const char*)key.data, key.size);
-
-                    if (action[0] == erocksdb::ATOM_DELETE) {
-                        batch.Delete(cf->m_ColumnFamily, key_slice);
-                    }
-                    else
-                    {
-                        batch.SingleDelete(cf->m_ColumnFamily, key_slice);
-                    }
-                    return erocksdb::ATOM_OK;
-                }
-            }
-        }
-    }
-
-    // Failed to match clear/put/delete; return the failing item
-    return item;
-}
-
 ERL_NIF_TERM
 parse_cf_descriptor(ErlNifEnv* env, ERL_NIF_TERM item,
                     std::vector<rocksdb::ColumnFamilyDescriptor>& column_families)
@@ -872,46 +787,6 @@ GetProperty(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
     return erocksdb::ATOM_ERROR;
 }   // erocksdb_status
-
-
-ERL_NIF_TERM
-Write(
-    ErlNifEnv* env,
-    int argc,
-    const ERL_NIF_TERM argv[])
-{
-    ReferencePtr<DbObject> db_ptr;
-    if(!enif_get_db(env, argv[0], &db_ptr))
-        return enif_make_badarg(env);
-
-    if(!enif_is_list(env, argv[1]) || !enif_is_list(env, argv[2]))
-        return enif_make_badarg(env);
-
-    // Construct a write batch:
-    rocksdb::WriteBatch* batch = new rocksdb::WriteBatch;
-    ERL_NIF_TERM result = fold(env, argv[1], write_batch_item, *batch);
-    if(ATOM_OK != result)
-    {
-        delete batch;
-        return enif_make_tuple2(env, ATOM_ERROR,
-                enif_make_tuple2(env, ATOM_BAD_WRITE_ACTION, result));
-    }   // if
-
-    rocksdb::WriteOptions* opts = new rocksdb::WriteOptions;
-    fold(env, argv[2], parse_write_option, *opts);
-
-    rocksdb::Status status = db_ptr->m_Db->Write(*opts, batch);
-
-    delete batch;
-    delete opts;
-
-    if (status.ok())
-    {
-        return ATOM_OK;
-    }
-
-    return error_tuple(env, ATOM_ERROR, status);
-} // erocksdb::Write
 
 ERL_NIF_TERM
 Get(
