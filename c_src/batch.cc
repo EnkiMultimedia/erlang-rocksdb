@@ -57,7 +57,6 @@ static void cleanup_batch(Batch* batch)
 
 namespace erocksdb {
 
-
 ErlNifResourceType *m_Batch_RESOURCE;
 
 void
@@ -65,7 +64,6 @@ batch_resource_cleanup(ErlNifEnv *env, void *arg)
 {
     Batch* batch = (Batch*)arg;
     cleanup_batch(batch);
-
 }
 
 void
@@ -104,7 +102,6 @@ PutBatch(
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
     wb = batch_ptr->wb;
-
     if (argc > 3)
     {
         if(!enif_get_cf(env, argv[1], &cf_ptr) ||
@@ -141,11 +138,9 @@ DeleteBatch(
     Batch* batch_ptr = nullptr;
     ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
     ErlNifBinary key;
-
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
     wb = batch_ptr->wb;
-
     if (argc > 2)
     {
         if(!enif_get_cf(env, argv[1], &cf_ptr) ||
@@ -176,7 +171,6 @@ SingleDeleteBatch(
     Batch* batch_ptr = nullptr;
     ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
     ErlNifBinary key;
-
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
     wb = batch_ptr->wb;
@@ -185,17 +179,14 @@ SingleDeleteBatch(
         if(!enif_get_cf(env, argv[1], &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key))
             return enif_make_badarg(env);
-
         rocksdb::Slice key_slice((const char*)key.data, key.size);
         erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
-
         wb->SingleDelete(cf->m_ColumnFamily, key_slice);
     }
     else
     {
         if(!enif_inspect_binary(env, argv[1], &key))
             return enif_make_badarg(env);
-
         rocksdb::Slice key_slice((const char*)key.data, key.size);
         wb->SingleDelete(key_slice);
     }
@@ -219,7 +210,6 @@ WriteBatch(
     rocksdb::WriteOptions* opts = new rocksdb::WriteOptions;
     fold(env, argv[2], parse_write_option, *opts);
     rocksdb::Status status = db_ptr->m_Db->Write(*opts, wb);
-    cleanup_batch(batch_ptr);
     opts = NULL;
     if(!status.ok())
         return error_tuple(env, ATOM_ERROR, status);
@@ -260,14 +250,11 @@ BatchRollbackToSavePoint(
         const ERL_NIF_TERM argv[])
 {
     Batch* batch_ptr = nullptr;
-
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
-
     rocksdb::Status status = batch_ptr->wb->RollbackToSavePoint();
     if(!status.ok())
         return error_tuple(env, ATOM_ERROR, status);
-
     return ATOM_OK;
 }
 
@@ -297,7 +284,6 @@ BatchToList(
     batch_ptr->wb->Iterate(&handler);
     ERL_NIF_TERM log;
     enif_make_reverse_list(env, handler.t_List, &log);
-
     return log;
 }
 
