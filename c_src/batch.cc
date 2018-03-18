@@ -30,13 +30,43 @@
 #include "erocksdb_db.h"
 #include "transactions.h"
 
+// Cleanup function for C++ object created with enif allocator via C++
+// placement syntax which necessitates explicit invocation of the object's
+// destructor. This is used in the NIF resource cleanup callback and in a
+// unique_ptr's deleter.
+template <typename T>
+void cleanup_obj_ptr(T*& ptr)
+{
+    if (ptr != nullptr) {
+        ptr->~T();
+        enif_free(ptr);
+        ptr = nullptr;
+    }
+}
+
+
+struct Batch
+{
+    rocksdb::WriteBatch* wb;
+};
+
+static void cleanup_batch(Batch* batch)
+{
+    cleanup_obj_ptr(batch->wb);
+}
+
+
 namespace erocksdb {
+
 
 ErlNifResourceType *m_Batch_RESOURCE;
 
 void
-batch_resource_cleanup(ErlNifEnv *env, void *res)
+batch_resource_cleanup(ErlNifEnv *env, void *arg)
 {
+    Batch* batch = (Batch*)arg;
+    cleanup_batch(batch);
+
 }
 
 void
@@ -53,11 +83,9 @@ NewBatch(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-
-    rocksdb::WriteBatch * batch;
-    void *alloc_ptr;
-    alloc_ptr = enif_alloc_resource(m_Batch_RESOURCE, sizeof(rocksdb::WriteBatch));
-    batch = new(alloc_ptr) rocksdb::WriteBatch();
+    rocksdb::WriteBatch* wb = (rocksdb::WriteBatch*)enif_alloc(sizeof(rocksdb::WriteBatch));
+    Batch* batch = (Batch*)enif_alloc_resource(m_Batch_RESOURCE, sizeof(Batch));
+    batch->wb = new(wb) rocksdb::WriteBatch();
     ERL_NIF_TERM result = enif_make_resource(env, batch);
     enif_release_resource(batch);
     return enif_make_tuple2(env, ATOM_OK, result);
@@ -69,13 +97,14 @@ PutBatch(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-    rocksdb::WriteBatch* batch_ptr;
+    rocksdb::WriteBatch* wb = nullptr;
+    Batch* batch_ptr = nullptr;
     ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
     ErlNifBinary key, value;
 
-
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
+    wb = batch_ptr->wb;
 
     if (argc > 3)
     {
@@ -87,8 +116,7 @@ PutBatch(
         rocksdb::Slice key_slice((const char*)key.data, key.size);
         rocksdb::Slice value_slice((const char*)value.data, value.size);
         erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
-
-        batch_ptr->Put(cf->m_ColumnFamily, key_slice, value_slice);
+        wb->Put(cf->m_ColumnFamily, key_slice, value_slice);
     }
     else
     {
@@ -98,8 +126,9 @@ PutBatch(
 
         rocksdb::Slice key_slice((const char*)key.data, key.size);
         rocksdb::Slice value_slice((const char*)value.data, value.size);
-        batch_ptr->Put(key_slice, value_slice);
+        wb->Put(key_slice, value_slice);
     }
+    batch_ptr = nullptr;
     return ATOM_OK;
 }
 
@@ -109,12 +138,14 @@ DeleteBatch(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-    rocksdb::WriteBatch* batch_ptr;
+    rocksdb::WriteBatch* wb = nullptr;
+    Batch* batch_ptr = nullptr;
     ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
     ErlNifBinary key;
 
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
+    wb = batch_ptr->wb;
 
     if (argc > 2)
     {
@@ -124,16 +155,14 @@ DeleteBatch(
 
         rocksdb::Slice key_slice((const char*)key.data, key.size);
         erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
-
-        batch_ptr->Delete(cf->m_ColumnFamily, key_slice);
+        wb->Delete(cf->m_ColumnFamily, key_slice);
     }
     else
     {
         if(!enif_inspect_binary(env, argv[1], &key))
             return enif_make_badarg(env);
-
         rocksdb::Slice key_slice((const char*)key.data, key.size);
-        batch_ptr->Delete(key_slice);
+        wb->Delete(key_slice);
     }
     return ATOM_OK;
 }
@@ -144,13 +173,14 @@ SingleDeleteBatch(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-    rocksdb::WriteBatch* batch_ptr;
+    rocksdb::WriteBatch* wb = nullptr;
+    Batch* batch_ptr = nullptr;
     ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
     ErlNifBinary key;
 
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
-
+    wb = batch_ptr->wb;
     if (argc > 2)
     {
         if(!enif_get_cf(env, argv[1], &cf_ptr) ||
@@ -160,7 +190,7 @@ SingleDeleteBatch(
         rocksdb::Slice key_slice((const char*)key.data, key.size);
         erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
 
-        batch_ptr->SingleDelete(cf->m_ColumnFamily, key_slice);
+        wb->SingleDelete(cf->m_ColumnFamily, key_slice);
     }
     else
     {
@@ -168,7 +198,7 @@ SingleDeleteBatch(
             return enif_make_badarg(env);
 
         rocksdb::Slice key_slice((const char*)key.data, key.size);
-        batch_ptr->SingleDelete(key_slice);
+        wb->SingleDelete(key_slice);
     }
     return ATOM_OK;
 }
@@ -179,22 +209,21 @@ WriteBatch(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-    rocksdb::WriteBatch* batch_ptr;
+    rocksdb::WriteBatch* wb = nullptr;
+    Batch* batch_ptr = nullptr;
     ReferencePtr<DbObject> db_ptr;
-
     if(!enif_get_db(env, argv[0], &db_ptr))
         return enif_make_badarg(env);
-
     if(!enif_get_resource(env, argv[1], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
-
+    wb = batch_ptr->wb;
     rocksdb::WriteOptions* opts = new rocksdb::WriteOptions;
     fold(env, argv[2], parse_write_option, *opts);
-
-    rocksdb::Status status = db_ptr->m_Db->Write(*opts, batch_ptr);
+    rocksdb::Status status = db_ptr->m_Db->Write(*opts, wb);
+    cleanup_batch(batch_ptr);
+    opts = NULL;
     if(!status.ok())
         return error_tuple(env, ATOM_ERROR, status);
-    opts = NULL;
     return ATOM_OK;
 }
 
@@ -204,12 +233,10 @@ ClearBatch(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-    rocksdb::WriteBatch* batch_ptr;
-
+    Batch* batch_ptr = nullptr;
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
-
-    batch_ptr->Clear();
+    batch_ptr->wb->Clear();
     return ATOM_OK;
 }
 
@@ -220,12 +247,10 @@ BatchSetSavePoint(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-    rocksdb::WriteBatch* batch_ptr;
-
+    Batch* batch_ptr = nullptr;
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
-
-    batch_ptr->SetSavePoint();
+    batch_ptr->wb->SetSavePoint();
     return ATOM_OK;
 }
 
@@ -235,12 +260,12 @@ BatchRollbackToSavePoint(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-    rocksdb::WriteBatch* batch_ptr;
+    Batch* batch_ptr = nullptr;
 
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
 
-    rocksdb::Status status = batch_ptr->RollbackToSavePoint();
+    rocksdb::Status status = batch_ptr->wb->RollbackToSavePoint();
     if(!status.ok())
         return error_tuple(env, ATOM_ERROR, status);
 
@@ -253,13 +278,10 @@ BatchCount(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-    rocksdb::WriteBatch* batch_ptr;
-
+    Batch* batch_ptr = nullptr;
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
-
-
-    int count = batch_ptr->Count();
+    int count = batch_ptr->wb->Count();
     return enif_make_int(env, count);
 }
 
@@ -269,13 +291,11 @@ BatchToList(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-    rocksdb::WriteBatch* batch_ptr;
-
+    Batch* batch_ptr = nullptr;
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
-
     TransactionLogHandler handler = TransactionLogHandler(env);
-    batch_ptr->Iterate(&handler);
+    batch_ptr->wb->Iterate(&handler);
     ERL_NIF_TERM log;
     enif_make_reverse_list(env, handler.t_List, &log);
 
@@ -288,10 +308,11 @@ CloseBatch(
         int argc,
         const ERL_NIF_TERM argv[])
 {
-    rocksdb::WriteBatch* batch_ptr;
+    Batch* batch_ptr = nullptr;
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
-    batch_ptr->Clear();
+    cleanup_batch(batch_ptr);
+    batch_ptr = NULL;
     return ATOM_OK;
 }
 
