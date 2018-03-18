@@ -32,8 +32,7 @@
 
 // Cleanup function for C++ object created with enif allocator via C++
 // placement syntax which necessitates explicit invocation of the object's
-// destructor. This is used in the NIF resource cleanup callback and in a
-// unique_ptr's deleter.
+// destructor.
 template <typename T>
 void cleanup_obj_ptr(T*& ptr)
 {
