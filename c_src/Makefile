@@ -10,7 +10,6 @@ PROJECT := rocksdb
 ERTS_INCLUDE_DIR ?= $(shell erl -noshell -s init stop -eval "io:format(\"~s/erts-~s/include/\", [code:root_dir(), erlang:system_info(version)]).")
 ERL_INTERFACE_INCLUDE_DIR ?= $(shell erl -noshell -s init stop -eval "io:format(\"~s\", [code:lib_dir(erl_interface, include)]).")
 ERL_INTERFACE_LIB_DIR ?= $(shell erl -noshell -s init stop -eval "io:format(\"~s\", [code:lib_dir(erl_interface, lib)]).")
-ERL_SCHEDULERS ?= $(shell erl -noshell -s init stop -eval "io:format(\"~p\", [erlang:max(3, erlang:system_info(schedulers))]).")
 
 C_SRC_DIR = $(CURDIR)
 C_SRC_OUTPUT ?= $(CURDIR)/../priv/$(PROJECT).so
@@ -133,8 +132,8 @@ ifdef BIN_ROCKSDB
 		tar -xzf $(BIN_ROCKSDB);\
 	fi
 else
-	@echo "==> num schedulers: $(ERL_SCHEDULERS)"
-	env ERL_SCHEDULERS="$(ERL_SCHEDULERS)" ./build_deps.sh
+	@echo "==> makeflags: $(MAKEFLAGS)"
+	@./build_deps.sh
 endif
 
 clean: ## Clean all files
