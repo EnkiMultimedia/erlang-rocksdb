@@ -123,7 +123,7 @@ case "$1" in
 
         sh $SCRIPT get-deps
         if [ ! -f rocksdb/librocksdb.a ]; then
-            (cd rocksdb && USE_RTTI=1 CXXFLAGS="$CXXFLAGS" PORTABLE=1 $MAKE  -j$BUILD_JOBS static_lib)
+            (cd rocksdb && MAKEFLAGS= USE_RTTI=1 CXXFLAGS="$CXXFLAGS" PORTABLE=1 $MAKE -j$BUILD_JOBS static_lib)
         fi
         ;;
 esac
