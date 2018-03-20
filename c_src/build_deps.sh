@@ -49,7 +49,6 @@ which gmake 1>/dev/null 2>/dev/null && MAKE=gmake
 MAKE=${MAKE:-make}
 
 MAKEFLAGS=
-
 BUILD_JOBS=$( erl -noshell -s init stop -eval "io:format(\"~p\", [erlang:max(3, erlang:system_info(schedulers))])." )
 
 
@@ -97,7 +96,7 @@ case "$1" in
         fi
 
         if [ ! -f system/lib/libsnappy.a ]; then
-            (cd snappy-$SNAPPY_VSN && $MAKE  -j${ERL_SCHEDULERS} && $MAKE install)
+            (cd snappy-$SNAPPY_VSN && $MAKE  -j${BUILD_JOBS} && $MAKE install)
         fi
 
         if [ ! -d lz4-$LZ4_VSN ]; then
@@ -105,7 +104,7 @@ case "$1" in
         fi
 
         if [ ! -f system/lib/liblz4.a ]; then
-            (cd lz4-$LZ4_VSN/lib && $MAKE  -j${ERL_SCHEDULERS} CFLAGS="-O3 -fPIC" && $MAKE install PREFIX=$BASEDIR/system)
+            (cd lz4-$LZ4_VSN/lib && $MAKE  -j${BUILD_JOBS} CFLAGS="-O3 -fPIC" && $MAKE install PREFIX=$BASEDIR/system)
         fi
 
         export CXXFLAGS="-std=c++11 -pthread -D_GLIBCXX_USE_C99 -DNDEBUG"
