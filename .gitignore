@@ -25,4 +25,13 @@ deps/snappy/snappy.pc
 deps/snappy/stamp-h1
 ltest/
 rebar.lock
-#
+
+
+.vagrant/
+deps/snappy/.libs/
+deps/snappy/libsnappy.la
+deps/snappy/snappy-c.lo
+deps/snappy/snappy-sinksource.lo
+deps/snappy/snappy-stubs-internal.lo
+deps/snappy/snappy.lo
+deps/snappy/snappy_unittest
