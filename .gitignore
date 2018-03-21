@@ -1,5 +1,4 @@
 .eunit/*
-deps/*
 priv/*
 *.o
 *.beam
