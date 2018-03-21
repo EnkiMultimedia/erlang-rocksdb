@@ -1,0 +1,9 @@
+[submodule "deps/snappy"]
+	path = deps/snappy
+	url = https://gitlab.com/barrel-db/Deps/snappy.git
+[submodule "deps/lz4"]
+	path = deps/lz4
+	url = https://gitlab.com/barrel-db/Deps/lz4.git
+[submodule "deps/rocksdb"]
+	path = deps/rocksdb
+	url = https://gitlab.com/barrel-db/Deps/rocksdb.git
