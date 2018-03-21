@@ -53,7 +53,7 @@ else ifeq ($(UNAME_SYS), Linux)
 endif
 
 
-RDB_CXXFLAGS="$(CXXFLAGS) -DNDEBUG -Isnappy/ -Ilz4/lib" 
+RDB_CXXFLAGS="$(CXXFLAGS) -DNDEBUG -Isnappy/ -Ilz4/lib -fPIC"
 RDB_CFLAGS="$(CFLAGS) -DNDEBUG -Isnappy/ -Ilz4/lib"
 RDB_LDFLAGS="$(LDFLAGS) -Lsnappy/.libs -Llz4/lib"
 
