@@ -2,8 +2,9 @@ image: erlang:20
 
 test:
   script:
-    - ./rebar3 eunit
+    - ./deps/rebar3 eunit
   cache:
     paths:
-    - c_src/rocksdb
-    - c_src/system
+    - deps/snappy
+    - deps/lz4
+    - deps/rocksdb
