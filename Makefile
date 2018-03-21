@@ -1,4 +1,4 @@
-REBAR ?= ./rebar3
+REBAR ?= ./deps/rebar3
 
 all: compile test
 

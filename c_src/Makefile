@@ -70,12 +70,12 @@ else ifeq ($(UNAME_SYS), Linux)
 	CXXFLAGS ?= -O2 -finline-functions -Wall
 endif
 
-ROCKSDBLIBS = rocksdb/librocksdb.a system/lib/libsnappy.a system/lib/liblz4.a
+ROCKSDBLIBS = ../deps/rocksdb/librocksdb.a ../deps/snappy/.libs/libsnappy.a ../deps/lz4/lib/liblz4.a
 
-ROCKSDB_PLATFORM_LDFLAGS=$(shell cat rocksdb/make_config.mk | grep PLATFORM_LDFLAGS | cut -d' ' -f2- | sed -e 's/-lsnappy//' | sed -e 's/-llz4//')
+ROCKSDB_PLATFORM_LDFLAGS=$(shell cat ../deps/rocksdb/make_config.mk | grep PLATFORM_LDFLAGS | cut -d' ' -f2- | sed -e 's/-lsnappy//' | sed -e 's/-llz4//')
 
-CFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I rocksdb/include
-CXXFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I rocksdb/include -std=c++11
+CFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I ../deps/rocksdb/include
+CXXFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I ../deps/rocksdb/include -std=c++11
 
 LDLIBS += -L $(ERL_INTERFACE_LIB_DIR) -lerl_interface -lei
 ifeq ($(UNAME_SYS), OpenBSD)
@@ -104,6 +104,8 @@ OBJECTS = $(addsuffix .o, $(basename $(SOURCES)))
 COMPILE_C = $(c_verbose) $(CC) $(CFLAGS) $(CPPFLAGS) -c
 COMPILE_CPP = $(cpp_verbose) $(CXX) $(CXXFLAGS) $(CPPFLAGS) -c
 
+ROCKSDBLIB = ../deps/rocksdb/librocksdb.a
+
 help: ## This documentation
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
@@ -125,28 +127,14 @@ $(C_SRC_OUTPUT): $(ROCKSDBLIBS) $(OBJECTS)
 %.o: %.cpp
 	$(COMPILE_CPP) $(OUTPUT_OPTION) $<
 
-$(ROCKSDBLIBS): deps
 
-deps: ## Build deps for rocksdb
-ifdef BIN_ROCKSDB
-	if [ ! -d rocksdb ]; then \
-		tar -xzf $(BIN_ROCKSDB);\
-	fi
-else
-	./build_deps.sh
-endif
+$(ROCKSDBLIBS): deps 
 
-clean: ## Clean all files
-	./build_deps.sh clean
+deps:
+	-(cd ../deps && $(MAKE) rocksdb)
+
+clean: distclean 
 	@rm -f $(C_SRC_OUTPUT) $(OBJECTS)
 
-tar: all ## Creates a tar.gz file containing a pre-build rocksdb library (with src)
-	set -e ;\
-	TAG=$$(git describe --tags) ;\
-	TAR_FILE=rocksdb-e-$$TAG.tar.gz ;\
-	tar -cvzf $$TAR_FILE rocksdb/* system/*;\
-	echo "";\
-	echo "Created tar archive $$TAR_FILE";\
-	echo 'Reuse with BIN_ROCKSDB variable:';\
-	echo '$ BIN_ROCKSDB=<path to tar> rebar3 compile';\
-	echo '$ BIN_ROCKSDB=http://<url to tar> rebar3 compile';\
+distclean:
+	-(cd ../deps && $(MAKE) distclean)

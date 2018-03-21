@@ -14,3 +14,15 @@ CMakeLists.txt
 _build
 c_src/*.d
 *.db
+
+deps/snappy/.deps/
+deps/snappy/Makefile
+deps/snappy/config.h
+deps/snappy/config.log
+deps/snappy/config.status
+deps/snappy/libtool
+deps/snappy/snappy.pc
+deps/snappy/stamp-h1
+ltest/
+rebar.lock
+#
