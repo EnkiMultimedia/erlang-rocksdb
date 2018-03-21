@@ -104,7 +104,6 @@ OBJECTS = $(addsuffix .o, $(basename $(SOURCES)))
 COMPILE_C = $(c_verbose) $(CC) $(CFLAGS) $(CPPFLAGS) -c
 COMPILE_CPP = $(cpp_verbose) $(CXX) $(CXXFLAGS) $(CPPFLAGS) -c
 
-ROCKSDBLIB = ../deps/rocksdb/librocksdb.a
 
 help: ## This documentation
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -127,13 +126,12 @@ $(C_SRC_OUTPUT): $(ROCKSDBLIBS) $(OBJECTS)
 %.o: %.cpp
 	$(COMPILE_CPP) $(OUTPUT_OPTION) $<
 
-
-$(ROCKSDBLIBS): deps 
+$(ROCKSDBLIBS): deps
 
 deps:
 	-(cd ../deps && $(MAKE) rocksdb)
 
-clean: distclean 
+clean: distclean
 	@rm -f $(C_SRC_OUTPUT) $(OBJECTS)
 
 distclean:
