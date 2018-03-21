@@ -80,6 +80,7 @@ distclean:
 .PHONT: distclean
 
 $(SNAPPYLIB):
+	cd snappy && ./autogen.sh -y
 	cd snappy &&  ./configure --with-pic --disable-gtest
 	cd snappy && $(MAKE)
 
