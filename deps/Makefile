@@ -65,6 +65,7 @@ ifeq ($(UNAME_SYS),OpenBSD)
 endif
 
 SNAPPYLIB=snappy/.libs/libsnappy.a
+SNAPPY_CONFIGURE=snappy/configure
 LZ4LIB=lz4/lib/liblz4.a
 
 default:
@@ -79,8 +80,10 @@ distclean:
 
 .PHONT: distclean
 
-$(SNAPPYLIB):
+$(SNAPPY_CONFIGURE):
 	cd snappy && ./autogen.sh -y
+
+$(SNAPPYLIB): $(SNAPPY_CONFIGURE)
 	cd snappy &&  ./configure --with-pic --disable-gtest
 	cd snappy && $(MAKE)
 
