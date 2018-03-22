@@ -131,10 +131,10 @@ $(C_SRC_OUTPUT): $(ROCKSDBLIBS) $(OBJECTS)
 $(ROCKSDBLIBS): deps 
 
 deps:
-	-(cd ../deps && $(MAKE) rocksdb)
+	@-(cd ../deps && $(MAKE) rocksdb)
 
 clean: distclean 
 	@rm -f $(C_SRC_OUTPUT) $(OBJECTS)
 
 distclean:
-	-(cd ../deps && $(MAKE) distclean)
+	@-(cd ../deps && $(MAKE) distclean)

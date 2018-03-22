@@ -73,25 +73,25 @@ default:
 .PHONY: default
 
 distclean:
-	-(cd rocksdb && $(MAKE) clean) > /dev/null || true
-	-(cd snappy && $(MAKE) clean) > /dev/null || true
-	-(cd lz4 && $(MAKE) clean) > /dev/null || true
+	@-(cd rocksdb && $(MAKE) clean) > /dev/null || true
+	@-(cd snappy && $(MAKE) clean) > /dev/null || true
+	@-(cd lz4 && $(MAKE) clean) > /dev/null || true
 
 .PHONT: distclean
 
 $(SNAPPYLIB):
-	cd snappy &&  ./configure --with-pic --disable-gtest
-	cd snappy && $(MAKE)
+	@cd snappy &&  ./configure --with-pic --disable-gtest
+	@cd snappy && $(MAKE)
 
 .PHONY: snappy
 
 $(LZ4LIB):
-	cd lz4 && $(MAKE) CFLAGS="-O3 -fPIC"
+	@cd lz4 && $(MAKE) CFLAGS="-O3 -fPIC"
 
 .PHONY: lz4
 
 rocksdb: $(SNAPPYLIB) $(LZ4LIB)
-	cd rocksdb && \
+	@cd rocksdb && \
 		USE_RTTI=1 CXXFLAGS=$(RDB_CXXFLAGS) LDFLAGS=$(RDB_LDFLAGS) PORTABLE=1 $(MAKE) static_lib
 
 .PHONY: rocksdb
