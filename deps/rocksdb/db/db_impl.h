@@ -148,7 +148,8 @@ class DBImpl : public DB {
                                       ColumnFamilyData* cfd,
                                       SequenceNumber snapshot,
                                       ReadCallback* read_callback,
-                                      bool allow_blob = false);
+                                      bool allow_blob = false,
+                                      bool allow_refresh = true);
 
   virtual const Snapshot* GetSnapshot() override;
   virtual void ReleaseSnapshot(const Snapshot* snapshot) override;
@@ -228,10 +229,6 @@ class DBImpl : public DB {
   SequenceNumber TEST_GetLastVisibleSequence() const;
 
   virtual bool SetPreserveDeletesSequenceNumber(SequenceNumber seqnum) override;
-
-  // Whether there is an active snapshot in range [lower_bound, upper_bound).
-  bool HasActiveSnapshotInRange(SequenceNumber lower_bound,
-                                SequenceNumber upper_bound);
 
 #ifndef ROCKSDB_LITE
   using DB::ResetStats;
@@ -954,7 +951,7 @@ class DBImpl : public DB {
   // from the same write_thread_ without any locks.
   uint64_t logfile_number_;
   std::deque<uint64_t>
-      log_recycle_files;  // a list of log files that we can recycle
+      log_recycle_files_;  // a list of log files that we can recycle
   bool log_dir_synced_;
   // Without two_write_queues, read and writes to log_empty_ are protected by
   // mutex_. Since it is currently updated/read only in write_thread_, it can be

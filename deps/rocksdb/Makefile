@@ -509,6 +509,7 @@ PARALLEL_TEST = \
 	backupable_db_test \
 	db_compaction_filter_test \
 	db_compaction_test \
+	db_merge_operator_test \
 	db_sst_test \
 	db_test \
 	db_universal_compaction_test \
@@ -520,7 +521,7 @@ PARALLEL_TEST = \
 	persistent_cache_test \
 	table_test \
 	transaction_test \
-	write_prepared_transaction_test
+	write_prepared_transaction_test \
 
 SUBSET := $(TESTS)
 ifdef ROCKSDBTESTS_START
@@ -1555,11 +1556,11 @@ BZIP2_DOWNLOAD_BASE ?= http://www.bzip.org
 SNAPPY_VER ?= 1.1.4
 SNAPPY_SHA256 ?= 134bfe122fd25599bb807bb8130e7ba6d9bdb851e0b16efcb83ac4f5d0b70057
 SNAPPY_DOWNLOAD_BASE ?= https://github.com/google/snappy/releases/download
-LZ4_VER ?= 1.7.5
-LZ4_SHA256 ?= 0190cacd63022ccb86f44fa5041dc6c3804407ad61550ca21c382827319e7e7e
+LZ4_VER ?= 1.8.0
+LZ4_SHA256 ?= 2ca482ea7a9bb103603108b5a7510b7592b90158c151ff50a28f1ca8389fccf6
 LZ4_DOWNLOAD_BASE ?= https://github.com/lz4/lz4/archive
-ZSTD_VER ?= 1.2.0
-ZSTD_SHA256 ?= 4a7e4593a3638276ca7f2a09dc4f38e674d8317bbea51626393ca73fc047cbfb
+ZSTD_VER ?= 1.3.3
+ZSTD_SHA256 ?= a77c47153ee7de02626c5b2a097005786b71688be61e9fb81806a011f90b297b
 ZSTD_DOWNLOAD_BASE ?= https://github.com/facebook/zstd/archive
 
 ifeq ($(PLATFORM), OS_MACOSX)

@@ -1510,7 +1510,8 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(const ReadOptions& read_options,
                                             ColumnFamilyData* cfd,
                                             SequenceNumber snapshot,
                                             ReadCallback* read_callback,
-                                            bool allow_blob) {
+                                            bool allow_blob,
+                                            bool allow_refresh) {
   SuperVersion* sv = cfd->GetReferencedSuperVersion(&mutex_);
 
   // Try to generate a DB iterator tree in continuous memory area to be
@@ -1559,7 +1560,8 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(const ReadOptions& read_options,
       env_, read_options, *cfd->ioptions(), snapshot,
       sv->mutable_cf_options.max_sequential_skip_in_iterations,
       sv->version_number, read_callback,
-      ((read_options.snapshot != nullptr) ? nullptr : this), cfd, allow_blob);
+      ((read_options.snapshot != nullptr) ? nullptr : this), cfd, allow_blob,
+      allow_refresh);
 
   InternalIterator* internal_iter =
       NewInternalIterator(read_options, cfd, sv, db_iter->GetArena(),
@@ -1680,12 +1682,6 @@ void DBImpl::ReleaseSnapshot(const Snapshot* s) {
     }
   }
   delete casted_s;
-}
-
-bool DBImpl::HasActiveSnapshotInRange(SequenceNumber lower_bound,
-                                      SequenceNumber upper_bound) {
-  InstrumentedMutexLock l(&mutex_);
-  return snapshots_.HasSnapshotInRange(lower_bound, upper_bound);
 }
 
 #ifndef ROCKSDB_LITE

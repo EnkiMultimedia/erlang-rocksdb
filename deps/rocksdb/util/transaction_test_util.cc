@@ -81,6 +81,7 @@ Status RandomTransactionInserter::DBGet(
   // end char.
   char prefix_buf[6];
   // Pad prefix appropriately so we can iterate over each set
+  assert(set_i + 1 <= 9999);
   snprintf(prefix_buf, sizeof(prefix_buf), "%.4u", set_i + 1);
   // key format:  [SET#][random#]
   std::string skey = ToString(ikey);

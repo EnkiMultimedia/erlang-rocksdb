@@ -1,19 +1,27 @@
 # Rocksdb Change Log
-## 5.10.4 (02/22/2018)
+## 5.11.2 (02/24/2018)
+### Bug Fixes
+* Fix bug in iterator readahead causing blocks to incorrectly be considered truncated (corrupted).
+
+## 5.11.1 (02/22/2018)
 ### New Features
 * Follow rsync-style naming convention for BackupEngine tempfiles. This enables some optimizations when run on GlusterFS.
-* Fix regression of Java build break on Windows.
 
-## 5.10.3 (02/21/2018)
-### Bug fixes
-* Fix build break regression using gcc-7
-* Direct I/O writable file should do fsync in Close()
+## 5.11.0 (01/08/2018)
+### Public API Change
+* Add `autoTune` and `getBytesPerSecond()` to RocksJava RateLimiter
 
 ### New Features
-* Add rocksdb.iterator.internal-key property
+* Add a new histogram stat called rocksdb.db.flush.micros for memtable flush.
+* Add "--use_txn" option to use transactional API in db_stress.
+* Disable onboard cache for compaction output in Windows platform.
+* Improve the performance of iterators doing long range scans by using readahead.
 
-## 5.10.1 (01/18/2018)
 ### Bug Fixes
+* Fix a stack-use-after-scope bug in ForwardIterator.
+* Fix builds on platforms including Linux, Windows, and PowerPC.
+* Fix buffer overrun in backup engine for DBs with huge number of files.
+* Fix a mislabel bug for bottom-pri compaction threads.
 * Fix DB::Flush() keep waiting after flush finish under certain condition.
 
 ## 5.10.0 (12/11/2017)
@@ -21,10 +29,11 @@
 * When running `make` with environment variable `USE_SSE` set and `PORTABLE` unset, will use all machine features available locally. Previously this combination only compiled SSE-related features.
 
 ### New Features
-* CRC32C is now using the 3-way pipelined SSE algorithm `crc32c_3way` on supported platforms to improve performance. The system will choose to use this algorithm on supported platforms automatically whenever possible. If PCLMULQDQ is not supported it will fall back to the old Fast_CRC32 algorithm.
 * Provide lifetime hints when writing files on Linux. This reduces hardware write-amp on storage devices supporting multiple streams.
 * Add a DB stat, `NUMBER_ITER_SKIP`, which returns how many internal keys were skipped during iterations (e.g., due to being tombstones or duplicate versions of a key).
 * Add PerfContext counters, `key_lock_wait_count` and `key_lock_wait_time`, which measure the number of times transactions wait on key locks and total amount of time waiting.
+* Support dynamically changing `ColumnFamilyOptions::compaction_options_universal`.
+* Batch update stats at the end of each `Get`, rather than for each block cache access.
 
 ### Bug Fixes
 * Fix IOError on WAL write doesn't propagate to write group follower
@@ -43,6 +52,7 @@
 * Return an error on write if write_options.sync = true and write_options.disableWAL = true to warn user of inconsistent options. Previously we will not write to WAL and not respecting the sync options in this case.
 
 ### New Features
+* CRC32C is now using the 3-way pipelined SSE algorithm `crc32c_3way` on supported platforms to improve performance. The system will choose to use this algorithm on supported platforms automatically whenever possible. If PCLMULQDQ is not supported it will fall back to the old Fast_CRC32 algorithm.
 * `DBOptions::writable_file_max_buffer_size` can now be changed dynamically.
 * `DBOptions::bytes_per_sync`, `DBOptions::compaction_readahead_size`, and `DBOptions::wal_bytes_per_sync` can now be changed dynamically, `DBOptions::wal_bytes_per_sync` will flush all memtables and switch to a new WAL file.
 * Support dynamic adjustment of rate limit according to demand for background I/O. It can be enabled by passing `true` to the `auto_tuned` parameter in `NewGenericRateLimiter()`. The value passed as `rate_bytes_per_sec` will still be respected as an upper-bound.

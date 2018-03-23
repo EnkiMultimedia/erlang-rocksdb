@@ -72,6 +72,11 @@ class TransactionTest : public ::testing::TestWithParam<
 
   ~TransactionTest() {
     delete db;
+    // This is to skip the assert statement in FaultInjectionTestEnv. There
+    // seems to be a bug in btrfs that the makes readdir return recently
+    // unlink-ed files. By using the default fs we simply ignore errors resulted
+    // from attempting to delete such files in DestroyDB.
+    options.env = Env::Default();
     DestroyDB(dbname, options);
     delete env;
   }
@@ -143,8 +148,10 @@ class TransactionTest : public ::testing::TestWithParam<
     } else {
       // Consume one seq per batch
       exp_seq++;
+      if (options.two_write_queues) {
         // Consume one seq for commit
         exp_seq++;
+      }
     }
   };
   std::function<void(size_t)> txn_t0 = [&](size_t index) {
@@ -166,8 +173,10 @@ class TransactionTest : public ::testing::TestWithParam<
     } else {
       // Consume one seq per batch
       exp_seq++;
+      if (options.two_write_queues) {
         // Consume one seq for commit
         exp_seq++;
+      }
     }
     ASSERT_OK(s);
   };
@@ -192,8 +201,10 @@ class TransactionTest : public ::testing::TestWithParam<
     } else {
       // Consume one seq per batch
       exp_seq++;
+      if (options.two_write_queues) {
         // Consume one seq for commit
         exp_seq++;
+      }
     }
     auto pdb = reinterpret_cast<PessimisticTransactionDB*>(db);
     pdb->UnregisterTransaction(txn);
@@ -258,8 +269,10 @@ class TransactionTest : public ::testing::TestWithParam<
       exp_seq++;
       // Consume one seq per rollback batch
       exp_seq++;
+      if (options.two_write_queues) {
         // Consume one seq for rollback commit
         exp_seq++;
+      }
     }
     delete txn;
   };
