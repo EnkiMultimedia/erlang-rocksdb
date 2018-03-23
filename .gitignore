@@ -27,6 +27,7 @@ ltest/
 rebar.lock
 
 
+deps/snappy/autom4te.cache
 .vagrant/
 deps/snappy/.libs/
 deps/snappy/libsnappy.la
