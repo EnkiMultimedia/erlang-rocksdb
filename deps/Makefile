@@ -66,6 +66,7 @@ endif
 
 SNAPPYLIB=snappy/.libs/libsnappy.a
 LZ4LIB=lz4/lib/liblz4.a
+RDBLIB=rocksdb/librocksdb.a
 
 default:
 	@echo "Explicit target required"
@@ -90,7 +91,9 @@ $(LZ4LIB):
 
 .PHONY: lz4
 
-rocksdb: $(SNAPPYLIB) $(LZ4LIB)
+rocksdb: $(RDBLIB)
+
+$(RDBLIB): $(SNAPPYLIB) $(LZ4LIB)
 	@cd rocksdb && \
 		USE_RTTI=1 CXXFLAGS=$(RDB_CXXFLAGS) LDFLAGS=$(RDB_LDFLAGS) PORTABLE=1 $(MAKE) static_lib
 

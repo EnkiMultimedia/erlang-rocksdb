@@ -72,7 +72,7 @@ endif
 
 ROCKSDBLIBS = ../deps/rocksdb/librocksdb.a ../deps/snappy/.libs/libsnappy.a ../deps/lz4/lib/liblz4.a
 
-ROCKSDB_PLATFORM_LDFLAGS=$(shell cat ../deps/rocksdb/make_config.mk | grep PLATFORM_LDFLAGS | cut -d' ' -f2- | sed -e 's/-lsnappy//' | sed -e 's/-llz4//')
+#ROCKSDB_PLATFORM_LDFLAGS=$(shell cat ../deps/rocksdb/make_config.mk | grep PLATFORM_LDFLAGS | cut -d' ' -f2- | sed -e 's/-lsnappy//' | sed -e 's/-llz4//')
 
 CFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I ../deps/rocksdb/include
 CXXFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I ../deps/rocksdb/include -std=c++11
@@ -85,7 +85,7 @@ else
 endif
 LDLIBS += $(ROCKSDBLIBS)
 
-LDFLAGS += -shared $(ROCKSDB_PLATFORM_LDFLAGS)
+LDFLAGS += -shared
 
 # Verbosity.
 
@@ -111,9 +111,11 @@ help: ## This documentation
 
 all: $(C_SRC_OUTPUT) ## Build all
 
+$(C_SRC_OUTPUT): ROCKSDB_PLATFORM_LDFLAGS=$(shell cat ../deps/rocksdb/make_config.mk | grep PLATFORM_LDFLAGS | cut -d' ' -f2- | sed -e 's/-lsnappy//' | sed -e 's/-llz4//')
+
 $(C_SRC_OUTPUT): $(ROCKSDBLIBS) $(OBJECTS)
 	@mkdir -p $(BASEDIR)/priv/
-	$(link_verbose) $(CC) $(OBJECTS) $(LDLIBS)  $(LDFLAGS) -o $(C_SRC_OUTPUT)
+	$(link_verbose) $(CC) $(OBJECTS) $(LDLIBS) $(LDFLAGS) $(ROCKSDB_PLATFORM_LDFLAGS) -o $(C_SRC_OUTPUT)
 
 %.o: %.c rocksdb
 	$(COMPILE_C) $(OUTPUT_OPTION) $<
