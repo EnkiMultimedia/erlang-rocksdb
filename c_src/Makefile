@@ -70,7 +70,7 @@ else ifeq ($(UNAME_SYS), Linux)
 	CXXFLAGS ?= -O2 -finline-functions -Wall
 endif
 
-ROCKSDBLIBS = ../deps/rocksdb/librocksdb.a ../deps/snappy/.libs/libsnappy.a ../deps/lz4/lib/liblz4.a
+ROCKSDBLIBS = ../deps/rocksdb/librocksdb.a ../deps/out/lib/libsnappy.a ../deps/out/lib/liblz4.a
 
 #ROCKSDB_PLATFORM_LDFLAGS=$(shell cat ../deps/rocksdb/make_config.mk | grep PLATFORM_LDFLAGS | cut -d' ' -f2- | sed -e 's/-lsnappy//' | sed -e 's/-llz4//')
 

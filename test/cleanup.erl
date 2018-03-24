@@ -36,6 +36,7 @@
 
 %% Purposely reopen an already opened database to test failure assumption
 assumption_test() ->
+  os:cmd("rm -rf " ++ ?COMMON_INSTANCE_DIR),
   DB = open(),
   try
     io:format(user, "assumption_test: top\n", []),
@@ -45,7 +46,8 @@ assumption_test() ->
   after
     rocksdb:close(DB),
     timer:sleep(500)
-  end.
+  end,
+  rocksdb:destroy(?COMMON_INSTANCE_DIR, []).
 
 %% Open/close
 open_close_test() ->
@@ -59,7 +61,8 @@ open_exit_test() ->
              _DB = open()
          end),
   timer:sleep(500),
-  check().
+  check(),
+  rocksdb:destroy(?COMMON_INSTANCE_DIR, []).
 
 %% Iterator open/close
 iterator_test() ->
@@ -75,7 +78,8 @@ iterator_test() ->
   after
     catch rocksdb:close(DB),
     timer:sleep(500)
-  end.
+  end,
+  rocksdb:destroy(?COMMON_INSTANCE_DIR, []).
 
 %% Close DB while iterator running
 %% Expected: reopen should fail while iterator reference alive
@@ -113,7 +117,8 @@ iterator_db_close_test() ->
   after
     catch rocksdb:close(DB),
     timer:sleep(500)
-  end.
+  end,
+  rocksdb:destroy(?COMMON_INSTANCE_DIR, []).
 
 %% Iterate open, iterator process exit w/o close
 iterator_exit_test() ->
@@ -130,10 +135,12 @@ iterator_exit_test() ->
   after
     catch rocksdb:close(DB),
     timer:sleep(500)
-  end.
+  end,
+  rocksdb:destroy(?COMMON_INSTANCE_DIR, []).
 
 
 iterator_with_cf_exit_test() ->
+  os:cmd("rm -rf " ++ ?CF_INSTANCE_DIR),
   {ok, DB, _} = open_cf(),
   {ok, CF} = rocksdb:create_column_family(DB, "test", []),
   try
@@ -148,7 +155,8 @@ iterator_with_cf_exit_test() ->
   after
     catch rocksdb:close(DB),
     timer:sleep(500)
-  end.
+  end,
+  rocksdb:destroy(?CF_INSTANCE_DIR, []).
 
 
 spawn_wait(F) ->
@@ -172,7 +180,6 @@ check_cf() ->
   {ok, DB, _CFs} = open_cf(),
   rocksdb:close(DB),
   timer:sleep(500),
-  catch rocksdb:destroy(?CF_INSTANCE_DIR, []),
   ok.
 
 

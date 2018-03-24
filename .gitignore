@@ -14,7 +14,15 @@ CMakeLists.txt
 _build
 c_src/*.d
 *.db
+.vagrant
+rebar.lock
+ltest
 
+*.o
+*.a
+*.la
+*.so
+deps/out
 deps/snappy/.deps/
 deps/snappy/Makefile
 deps/snappy/config.h
@@ -23,11 +31,6 @@ deps/snappy/config.status
 deps/snappy/libtool
 deps/snappy/snappy.pc
 deps/snappy/stamp-h1
-ltest/
-rebar.lock
-
-
-.vagrant/
 deps/snappy/.libs/
 deps/snappy/libsnappy.la
 deps/snappy/snappy-c.lo
@@ -35,3 +38,4 @@ deps/snappy/snappy-sinksource.lo
 deps/snappy/snappy-stubs-internal.lo
 deps/snappy/snappy.lo
 deps/snappy/snappy_unittest
+deps/snappy/autom4te.cache/

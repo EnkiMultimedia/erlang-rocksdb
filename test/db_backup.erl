@@ -45,8 +45,8 @@ simple_test() ->
 
   rocksdb:close_backup(Backup),
   rocksdb:close(DB),
-
-
+  rocksdb:destroy(?source, []),
+  rocksdb:destroy(?target, []),
   ok.
 
 restore_latest_test() ->
@@ -81,6 +81,11 @@ restore_latest_test() ->
 
   rocksdb:close_backup(Backup2),
   rocksdb:close(LatestDb),
+
+  rocksdb:destroy(?source, []),
+  rocksdb:destroy(?target, []),
+  rocksdb:destroy(?source, []),
+  rocksdb:destroy(?latest, []),
   ok.
 
 open() ->

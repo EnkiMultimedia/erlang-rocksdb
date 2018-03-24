@@ -32,4 +32,5 @@ simple_rate_limiter_test() ->
   {ok, Data} = rocksdb:get(Ref, Key, []),
   ?assertEqual(Data, OriginalData),
   ok = rocksdb:close(Ref),
+  ok = rocksdb:destroy("/tmp/rocksdb_rate_limiter.test", []),
   ok = rocksdb:release_rate_limiter(Limiter).
