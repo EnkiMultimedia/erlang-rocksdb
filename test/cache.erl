@@ -26,12 +26,12 @@
 shared_cacheleak_test_() ->
   {ok, Cache} = rocksdb:new_lru_cache(83886080),
   {timeout, 10*60, fun() ->
-    [] = os:cmd("rm -rf /tmp/erocksdb.sharedcacheleak.test"),
-    Blobs = [{<<I:128/unsigned>>, compressible_bytes(10240)} ||
-      I <- lists:seq(1, 10000)],
-    ok = sharedcacheleak_loop(10, Cache, Blobs, 500000),
-    rocksdb:release_cache(Cache),
-    erlang:garbage_collect()
+                       [] = os:cmd("rm -rf /tmp/erocksdb.sharedcacheleak.test"),
+                       Blobs = [{<<I:128/unsigned>>, compressible_bytes(10240)} ||
+                                I <- lists:seq(1, 10000)],
+                       ok = sharedcacheleak_loop(10, Cache, Blobs, 500000),
+                       rocksdb:release_cache(Cache),
+                       erlang:garbage_collect()
                    end}.
 
 %% It's very important for this test that the data is compressible. Otherwise,
@@ -47,18 +47,18 @@ sharedcacheleak_loop(Count, Cache ,Blobs, MaxFinalRSS) ->
   %% ref will get GC'd and we can re-evaluate the memory footprint of the
   %% process to make sure everything got cleaned up as expected.
   F = fun() ->
-    BlockOptions = [{block_cache, Cache}],
-    {ok, Ref} = rocksdb:open("/tmp/erocksdb.sharedcacheleak.test",
-      [{create_if_missing, true},
-        {block_based_table_options, BlockOptions}]),
-    ?assertEqual(83886080, rocksdb:get_capacity(Cache)),
-    [ok = rocksdb:put(Ref, I, B, []) || {I, B} <- Blobs],
-    rocksdb:fold(Ref, fun({_K, _V}, A) -> A end, [], [{fill_cache, true}]),
-    [{ok, B} = rocksdb:get(Ref, I, []) || {I, B} <- Blobs],
-    ok = rocksdb:close(Ref),
-    erlang:garbage_collect(),
-    io:format(user, "cache usage: ~p\n", [rocksdb:get_usage(Cache)]),
-    io:format(user, "RSS1: ~p\n", [rssmem()])
+          BlockOptions = [{block_cache, Cache}],
+          {ok, Ref} = rocksdb:open("/tmp/erocksdb.sharedcacheleak.test",
+                                   [{create_if_missing, true},
+                                    {block_based_table_options, BlockOptions}]),
+          ?assertEqual(83886080, rocksdb:get_capacity(Cache)),
+          [ok = rocksdb:put(Ref, I, B, []) || {I, B} <- Blobs],
+          rocksdb:fold(Ref, fun({_K, _V}, A) -> A end, [], [{fill_cache, true}]),
+          [{ok, B} = rocksdb:get(Ref, I, []) || {I, B} <- Blobs],
+          ok = rocksdb:close(Ref),
+          erlang:garbage_collect(),
+          io:format(user, "cache usage: ~p\n", [rocksdb:get_usage(Cache)]),
+          io:format(user, "RSS1: ~p\n", [rssmem()])
       end,
   {_Pid, Mref} = spawn_monitor(F),
   receive
