@@ -52,11 +52,9 @@ else ifeq ($(UNAME_SYS), Linux)
 	CXXFLAGS ?= -O2 -finline-functions -Wall
 endif
 
-OUTDIR=$(CURDIR)/out
-
-RDB_CXXFLAGS="$(CXXFLAGS) -DNDEBUG -I$(OUTDIR)/include -fPIC"
-RDB_CFLAGS="$(CFLAGS) -DNDEBUG -I$(OUTDIR)/include"
-RDB_LDFLAGS="$(LDFLAGS) -L$(OUTDIR)/lib"
+RDB_CXXFLAGS="$(CXXFLAGS) -DNDEBUG -I$(CURDIR)/snappy -I$(CURDIR)/lz4/lib -fPIC"
+RDB_CFLAGS="$(CFLAGS) -DNDEBUG -I$(CURDIR)/snappy -I$(CURDIR)/lz4/lib"
+RDB_LDFLAGS="$(LDFLAGS) -L$(CURDIR)/snappy/.libs -L$(CURDIR)/lz4"
 
 ifeq ($(UNAME_SYS),OpenBSD)
 	RDB_CXXFLAGS="$(RDB_CXXFLAGS) -DOS_OPENBSD"
@@ -65,8 +63,8 @@ ifeq ($(UNAME_SYS),OpenBSD)
 	RDB_CPPFLAGS="-DOS_OPENBSD"
 endif
 
-SNAPPYLIB=out/lib/libsnappy.a
-LZ4LIB=out/lib/liblz4.a
+SNAPPYLIB=snappy/.libs/libsnappy.a
+LZ4LIB=lz4/lib/liblz4.a
 RDBLIB=rocksdb/librocksdb.a
 
 default:
@@ -78,19 +76,18 @@ distclean:
 	@-(cd rocksdb && $(MAKE) clean) > /dev/null || true
 	@-(cd snappy && $(MAKE) clean) > /dev/null || true
 	@-(cd lz4 && $(MAKE) clean) > /dev/null || true
-	@-(rm -rf $(OUTDIR)) > /dev/null || true
 
 .PHONT: distclean
 
 $(SNAPPYLIB):
 	@cd snappy && touch configure.ac aclocal.m4 configure Makefile.am Makefile.in
-	@cd snappy &&  ./configure --prefix=$(OUTDIR) --libdir=$(OUTDIR)/lib --with-pic --disable-gtest
-	@cd snappy && $(MAKE) && $(MAKE) install
+	@cd snappy &&  ./configure --with-pic --disable-gtest
+	@cd snappy && $(MAKE)
 
 .PHONY: snappy
 
 $(LZ4LIB):
-	@cd lz4 && $(MAKE) CFLAGS="-O3 -fPIC" && $(MAKE) install PREFIX=$(OUTDIR)
+	@cd lz4 && $(MAKE) CFLAGS="-O3 -fPIC"
 
 .PHONY: lz4
 
