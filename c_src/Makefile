@@ -70,12 +70,12 @@ else ifeq ($(UNAME_SYS), Linux)
 	CXXFLAGS ?= -O2 -finline-functions -Wall
 endif
 
-ROCKSDBLIBS = ../deps/rocksdb/librocksdb.a ../deps/snappy/.libs/libsnappy.a ../deps/lz4/lib/liblz4.a
+ROCKSDBLIBS = $(BASEDIR)/deps/rocksdb/librocksdb.a $(BASEDIR)/deps/snappy/.libs/libsnappy.a $(BASEDIR)/deps/lz4/lib/liblz4.a
 
 #ROCKSDB_PLATFORM_LDFLAGS=$(shell cat ../deps/rocksdb/make_config.mk | grep PLATFORM_LDFLAGS | cut -d' ' -f2- | sed -e 's/-lsnappy//' | sed -e 's/-llz4//')
 
-CFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I ../deps/rocksdb/include
-CXXFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I ../deps/rocksdb/include -std=c++11
+CFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I $(BASEDIR)/deps/rocksdb/include
+CXXFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I $(BASEDIR)/deps/rocksdb/include -std=c++11
 
 LDLIBS += -L $(ERL_INTERFACE_LIB_DIR) -lerl_interface -lei
 ifeq ($(UNAME_SYS), OpenBSD)
@@ -104,7 +104,7 @@ OBJECTS = $(addsuffix .o, $(basename $(SOURCES)))
 COMPILE_C = $(c_verbose) $(CC) $(CFLAGS) $(CPPFLAGS) -c
 COMPILE_CPP = $(cpp_verbose) $(CXX) $(CXXFLAGS) $(CPPFLAGS) -c
 
-ROCKSDBLIB = ../deps/rocksdb/librocksdb.a
+ROCKSDBLIB = $(BASEDIR)/deps/rocksdb/librocksdb.a
 
 help: ## This documentation
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'

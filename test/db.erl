@@ -36,6 +36,20 @@ open_test_Z() ->
   not_found = rocksdb:get(Ref, <<"abc">>, []),
   true = rocksdb:is_empty(Ref).
 
+open_with_snappy_test() ->
+  os:cmd("rm -rf /tmp/erocksdb.snapppy.test"),
+  {ok, Ref} = rocksdb:open("/tmp/erocksdb.snapppy.test", [{create_if_missing, true}, {compression, snappy}]),
+  ok = rocksdb:close(Ref),
+  rocksdb:destroy("/tmp/erocksdb.snapppy.test", []),
+  ok.
+
+open_with_lz4_test() ->
+  os:cmd("rm -rf /tmp/erocksdb.lz4.test"),
+  {ok, Ref} = rocksdb:open("/tmp/erocksdb.lz4.test", [{create_if_missing, true}, {compression, lz4}]),
+  ok = rocksdb:close(Ref),
+  rocksdb:destroy("/tmp/erocksdb.lz4.test", []),
+  ok.
+
 fold_test() -> [{fold_test_Z(), l} || l <- lists:seq(1, 20)].
 fold_test_Z() ->
   os:cmd("rm -rf /tmp/erocksdb.fold.test"),
