@@ -9,16 +9,14 @@ ifeq ($(UNAME_SYS), Darwin)
 else ifeq ($(UNAME_SYS), FreeBSD)
 	CC = clang
 	CXX = clang++
-	CFLAGS ?= -O2 -std=c99 -Wall -Wmissing-prototypes
-	CFLAGS += -D_GCLIBCXX_USE_C99
-	CXXFLAGS ?= -O2 -Wall
-	CXXFLAGS += -std=c++11 -stdlib=libc++ -D_GCLIBCXX_USE_C99
+	CFLAGS ?= -O2 -D_GCLIBCXX_USE_C99
+	CXXFLAGS ?= -O2 -std=c++11 -stdlib=libc++ -D_GCLIBCXX_USE_C99
 else ifeq ($(UNAME_SYS), OpenBSD)
 	CC = egcc
 	CXX = eg++
 	CFLAGS ?= -O2 -std=c99 -finline-functions -Wall -Wmissing-prototypes
 	CFLAGS += -D_GCLIBCXX_USE_C99
-	CXXFLAGS ?= -O2 -Wall
+	CXXFLAGS ?= -O2
 	CXXFLAGS += -std=c++11 -pthread -finline-functions -D_GCLIBCXX_USE_C99
 else ifeq ($(UNAME_SYS), DragonFly)
 	CC = c++48
@@ -32,7 +30,7 @@ else ifeq ($(UNAME_SYS), NetBSD)
 	CXX = c++48
 	CFLAGS ?= -O2 -std=c99 -finline-functions -Wall -Wmissing-prototypes
 	CFLAGS += -D_GCLIBCXX_USE_C99
-	CXXFLAGS ?= -O2 -finline-functions -Wall
+	CXXFLAGS ?= -O2 -finline-functions
 	CXXFLAGS += -D_GCLIBCXX_USE_C99
 else ifeq ($(UNAME_SYS), SunOS)
 	ifeq ($(shell uname -v | sed 's/_.*$$//'), joyent)
@@ -83,7 +81,7 @@ distclean:
 
 $(SNAPPYLIB):
 	@cd snappy && touch configure.ac aclocal.m4 configure Makefile.am Makefile.in
-	@cd snappy &&  CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDFLAGS) ./configure --with-pic --disable-gtest --enable-static --disable-shared
+	@cd snappy &&  CXXFLAGS="$(CXXFLAGS)" LDFLAGS="$(LDFLAGS)" ./configure --with-pic --disable-gtest --enable-static --disable-shared
 	@cd snappy && $(MAKE)
 
 .PHONY: snappy
