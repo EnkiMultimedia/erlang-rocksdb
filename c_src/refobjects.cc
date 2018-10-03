@@ -822,6 +822,7 @@ ItrObject::~ItrObject() {
 
     delete m_Iterator;
     //m_Iterator = nullptr;
+    //
 
     return;
 
