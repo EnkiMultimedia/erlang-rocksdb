@@ -1316,7 +1316,7 @@ GetApproximateSizes(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     {
         if (!enif_get_cf(env, argv[1], &cf_ptr))
             return enif_make_badarg(env);
-
+        column_family = cf_ptr->m_ColumnFamily;
         i = 2;
     } else {
         column_family = db_ptr->m_Db->DefaultColumnFamily();
@@ -1398,7 +1398,7 @@ GetApproximateMemTableStats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     {
         if (!enif_get_cf(env, argv[1], &cf_ptr))
             return enif_make_badarg(env);
-
+        column_family = cf_ptr->m_ColumnFamily;
         i = 2;
     }
     else
