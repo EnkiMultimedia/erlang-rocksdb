@@ -4,7 +4,7 @@ UNAME_SYS := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 ifeq ($(UNAME_SYS), Darwin)
 	CC ?= cc
 	CFLAGS ?= -O2 -std=c99 -Wall -Wmissing-prototypes
-	CXXFLAGS ?= -g -O2
+	CXXFLAGS ?= -O2
 	#LDFLAGS ?= -arch x86_64 -flat_namespace -undefined suppress
 else ifeq ($(UNAME_SYS), FreeBSD)
 	CC = clang

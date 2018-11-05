@@ -185,7 +185,7 @@ aproximate_sizes_test() ->
     fun(Ref) ->
       N = 128,
       rand:seed(exs64),
-      _ = [ok = rocksdb:put(Ref, key(I), random_string(1024), []) || I <- lists:seq(1, N)],
+      _ = [ok = rocksdb:put(Ref, key(I), random_string(1024), []) || I <- lists:seq(1, N)],
       R = {key(50), key(60)},
       [Size] = rocksdb:get_approximate_sizes(Ref, [R], include_both),
       ?assert(6000 =< Size),
@@ -193,7 +193,7 @@ aproximate_sizes_test() ->
       [0] = rocksdb:get_approximate_sizes(Ref, [R], include_files),
       R2 = {key(500), key(600)},
       [0] = rocksdb:get_approximate_sizes(Ref, [R2], include_both),
-      _ = [ok = rocksdb:put(Ref, key(1000 + I), random_string(1024), []) || I <- lists:seq(1, N)],
+      _ = [ok = rocksdb:put(Ref, key(1000 + I), random_string(1024), []) || I <- lists:seq(1, N)],
       [0] = rocksdb:get_approximate_sizes(Ref, [R2], include_both),
       R3 = {key(100), key(1020)},
       [Size2] = rocksdb:get_approximate_sizes(Ref, [R3], include_both),
@@ -221,7 +221,7 @@ approximate_memtable_stats_test() ->
       ?assert(Size =< 204800),
       R2 = {key(500), key(600)},
       {ok, {0, 0}} = rocksdb:get_approximate_memtable_stats(Ref, R2),
-      _ = [ok = rocksdb:put(Ref, key(1000 + I), random_string(1024), []) || I <- lists:seq(1, N)],
+      _ = [ok = rocksdb:put(Ref, key(1000 + I), random_string(1024), []) || I <- lists:seq(1, N)],
       {ok, {0, 0}} = rocksdb:get_approximate_memtable_stats(Ref, R2),
       ok
     end
