@@ -177,7 +177,7 @@ capped_prefix_extractor_test() ->
 
 aproximate_sizes_test() ->
   DbOptions = [{create_if_missing, true},
-               {write_bufeer_size, 100000000},
+               {write_buffer_size, 100000000},
                {compression, none}],
   with_db(
     "/tmp/erocksdb_aproximate_sizes.test",
@@ -204,7 +204,7 @@ aproximate_sizes_test() ->
 
 approximate_memtable_stats_test() ->
   DbOptions = [{create_if_missing, true},
-               {write_bufeer_size, 100000000},
+               {write_buffer_size, 100000000},
                {compression, none}],
   with_db(
     "/tmp/approximate_memtable_stats.test",
