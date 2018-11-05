@@ -4,7 +4,7 @@ UNAME_SYS := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 ifeq ($(UNAME_SYS), Darwin)
 	CC ?= cc
 	CFLAGS ?= -O2 -std=c99 -Wall -Wmissing-prototypes
-	CXXFLAGS ?= -O2
+	CXXFLAGS ?= -g -O2
 	#LDFLAGS ?= -arch x86_64 -flat_namespace -undefined suppress
 else ifeq ($(UNAME_SYS), FreeBSD)
 	CC = clang
@@ -95,7 +95,7 @@ rocksdb: $(RDBLIB)
 
 $(RDBLIB): $(SNAPPYLIB) $(LZ4LIB)
 	@cd rocksdb && \
-		CXX=$(CXX) CC=$(CC) $(MAKE) static_lib EXTRA_CXXFLAGS=$(RDB_CXXFLAGS) EXTRA_LDFLAGS=$(RDB_LDFLAGS) USE_RTTI=1 DISABLE_JEMALLOC=1 ROCKSDB_DISABLE_ZSTD=1 DEBUG_LEVEL=0 PORTABLE=1
+		CXX=$(CXX) CC=$(CC) $(MAKE) static_lib DEBUG_LEVEL=2 EXTRA_CXXFLAGS=$(RDB_CXXFLAGS) EXTRA_LDFLAGS=$(RDB_LDFLAGS) USE_RTTI=1 DISABLE_JEMALLOC=1 ROCKSDB_DISABLE_ZSTD=1 DEBUG_LEVEL=0 PORTABLE=1
 
 .PHONY: rocksdb
 

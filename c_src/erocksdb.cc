@@ -41,6 +41,9 @@ static ErlNifFunc nif_funcs[] =
         {"sync_wal", 1, erocksdb::SyncWal, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"set_db_background_threads", 2, erocksdb::SetDBBackgroundThreads},
 
+        {"get_approximate_sizes", 3, erocksdb::GetApproximateSizes, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"get_approximate_sizes", 4, erocksdb::GetApproximateSizes, ERL_NIF_DIRTY_JOB_IO_BOUND},
+
         {"delete_range", 4, erocksdb::DeleteRange, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"delete_range", 5, erocksdb::DeleteRange, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
@@ -374,6 +377,13 @@ ERL_NIF_TERM ATOM_COMPARATOR;
 ERL_NIF_TERM ATOM_BYTEWISE_COMPARATOR;
 ERL_NIF_TERM ATOM_REVERSE_BYTEWISE_COMPARATOR;
 
+// range
+
+ERL_NIF_TERM ATOM_NONE;
+ERL_NIF_TERM ATOM_INCLUDE_MEMTABLES;
+ERL_NIF_TERM ATOM_INCLUDE_FILES;
+ERL_NIF_TERM ATOM_INCLUDE_BOTH;
+
 }   // namespace erocksdb
 
 
@@ -638,7 +648,13 @@ try
   // comparator
   ATOM(erocksdb::ATOM_COMPARATOR, "comparator");
   ATOM(erocksdb::ATOM_BYTEWISE_COMPARATOR, "bytewise_comparator");
-  ATOM(erocksdb::ATOM_REVERSE_BYTEWISE_COMPARATOR, "reverse_bytewise_comparator")
+  ATOM(erocksdb::ATOM_REVERSE_BYTEWISE_COMPARATOR, "reverse_bytewise_comparator");
+
+  // range
+  ATOM(erocksdb::ATOM_NONE, "none");
+  ATOM(erocksdb::ATOM_INCLUDE_MEMTABLES, "include_memtables");
+  ATOM(erocksdb::ATOM_INCLUDE_FILES, "include_files");
+  ATOM(erocksdb::ATOM_INCLUDE_BOTH, "include_both");
 
 #undef ATOM
 

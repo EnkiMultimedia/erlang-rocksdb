@@ -36,7 +36,8 @@
   sync_wal/1,
   count/1, count/2,
   stats/1, stats/2,
-  get_property/2, get_property/3
+  get_property/2, get_property/3,
+  get_approximate_sizes/3, get_approximate_sizes/4
 ]).
 
 
@@ -335,6 +336,10 @@ init() ->
 }.
 
 
+-type size_approximation_flag() :: none | include_memtables | include_files | include_both.
+-type range() :: {Start::binary(), Limit::binary()}.
+
+
 %% @doc Open RocksDB with the defalut column family
 -spec open(Name, DBOpts) -> Result when
   Name :: file:filename_all(),
@@ -564,6 +569,33 @@ get(_DBHandle, _Key, _ReadOpts) ->
 get(_DBHandle, _CFHandle, _Key, _ReadOpts) ->
   erlang:nif_error({error, not_loaded}).
 
+
+%% @doc For each i in [0,n-1], store in "Sizes[i]", the approximate
+%% file system space used by keys in "[range[i].start .. range[i].limit)".
+%%
+%% Note that the returned sizes measure file system space usage, so
+%% if the user data compresses by a factor of ten, the returned
+%% sizes will be one-tenth the size of the corresponding user data size.
+%%
+%% If `IncludeFlags' defines whether the returned size should include
+%% the recently written data in the mem-tables (if
+%% the mem-table type supports it), data serialized to disk, or both.
+-spec get_approximate_sizes(DBHandle, Ranges, IncludeFlags) -> Sizes when
+  DBHandle::db_handle(),
+  Ranges::[range()],
+  IncludeFlags::size_approximation_flag(),
+  Sizes :: [non_neg_integer()].
+get_approximate_sizes(_DBHandle, _Ranges, _IncludeFlags) ->
+  erlang:nif_error({error, not_loaded}).
+
+-spec get_approximate_sizes(DBHandle, CFHandle, Ranges, IncludeFlags) -> Sizes when
+  DBHandle::db_handle(),
+  CFHandle::cf_handle(),
+  Ranges::[range()],
+  IncludeFlags::size_approximation_flag(),
+  Sizes :: [non_neg_integer()].
+get_approximate_sizes(_DBHandle, _CFHandle, _Ranges, _IncludeFlags) ->
+  erlang:nif_error({error, not_loaded}).
 
 %% @doc Removes the database entries in the range ["BeginKey", "EndKey"), i.e.,
 %% including "BeginKey" and excluding "EndKey". Returns OK on success, and

@@ -21,8 +21,8 @@ C_SRC_OUTPUT ?= $(BASEDIR)/priv/$(PROJECT).so
 UNAME_SYS := $(shell uname -s)
 ifeq ($(UNAME_SYS), Darwin)
 	CC ?= cc
-	CFLAGS ?= -O2 -std=c99 -arch x86_64 -Wall -Wmissing-prototypes
-	CXXFLAGS ?= -O2 -arch x86_64 -Wall
+	CFLAGS ?= -g -O2 -std=c99 -arch x86_64 -Wall -Wmissing-prototypes
+	CXXFLAGS ?= -g -O2 -arch x86_64 -Wall
 	LDFLAGS ?= -arch x86_64 -flat_namespace -undefined suppress
 else ifeq ($(UNAME_SYS), FreeBSD)
 	CC = clang
