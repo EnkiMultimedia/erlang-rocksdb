@@ -188,7 +188,6 @@ aproximate_sizes_test() ->
       _ = [ok = rocksdb:put(Ref, key(I), random_string(1024), []) || I <- lists:seq(1, N)],
       R = {key(50), key(60)},
       [Size] = rocksdb:get_approximate_sizes(Ref, [R], include_both),
-      io:format(user, "size=~p~n", [Size]),
       ?assert(6000 =< Size),
       ?assert(Size =< 204800),
       [0] = rocksdb:get_approximate_sizes(Ref, [R], include_files),
@@ -198,15 +197,38 @@ aproximate_sizes_test() ->
       [0] = rocksdb:get_approximate_sizes(Ref, [R2], include_both),
       R3 = {key(100), key(1020)},
       [Size2] = rocksdb:get_approximate_sizes(Ref, [R3], include_both),
-      io:format(user, "size=~p~n", [Size2]),
       ?assert(Size2 >= 6000),
+      ok
+    end
+  ).
+
+approximate_memtable_stats_test() ->
+  DbOptions = [{create_if_missing, true},
+               {write_bufeer_size, 100000000},
+               {compression, none}],
+  with_db(
+    "/tmp/approximate_memtable_stats.test",
+    DbOptions,
+    fun(Ref) ->
+      N = 128,
+      rand:seed(exs64),
+      _ = [ok = rocksdb:put(Ref, key(I), random_string(1024), []) || I <- lists:seq(1, N)],
+      R = {key(50), key(60)},
+      {ok, {Count, Size}} = rocksdb:get_approximate_memtable_stats(Ref, R),
+      ?assert(Count > 0),
+      ?assert(Count < N),
+      ?assert(6000 =< Size),
+      ?assert(Size =< 204800),
+      R2 = {key(500), key(600)},
+      {ok, {0, 0}} = rocksdb:get_approximate_memtable_stats(Ref, R2),
+      _ = [ok = rocksdb:put(Ref, key(1000 + I), random_string(1024), []) || I <- lists:seq(1, N)],
+      {ok, {0, 0}} = rocksdb:get_approximate_memtable_stats(Ref, R2),
       ok
     end
   ).
 
 key(I) ->
   list_to_binary(io_lib:format("key~6..0B", [I])).
-  %%<< "key", (integer_to_binary(I))/binary >>.
 
 random_string(Len) ->
   iolist_to_binary([integer_to_binary(rand:uniform(95)) || _ <- lists:seq(1, Len)]).

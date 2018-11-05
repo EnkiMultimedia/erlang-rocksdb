@@ -1359,7 +1359,8 @@ GetApproximateSizes(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
             ranges[j].limit = limit;
             j++;
         }
-        else {
+        else
+        {
             delete[] ranges;
             return enif_make_badarg(env);
         }
@@ -1377,6 +1378,52 @@ GetApproximateSizes(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     
     delete[] ranges;
     return result_out;
+}
+
+ERL_NIF_TERM
+GetApproximateMemTableStats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    rocksdb::ColumnFamilyHandle *column_family;
+    rocksdb::Slice start;
+    rocksdb::Slice limit;
+    rocksdb::Status status;
+    ReferencePtr<ColumnFamilyObject> cf_ptr;
+    int i = 1;
+
+    if (!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    if (argc == 4)
+    {
+        if (!enif_get_cf(env, argv[1], &cf_ptr))
+            return enif_make_badarg(env);
+
+        i = 2;
+    }
+    else
+    {
+        column_family = db_ptr->m_Db->DefaultColumnFamily();
+    }
+
+    int arity;
+    const ERL_NIF_TERM *rterm;
+
+    if (!enif_get_tuple(env, argv[i], &arity, &rterm) && 2 == arity)
+        return enif_make_badarg(env);
+
+    if (!binary_to_slice(env, rterm[0], &start) || !binary_to_slice(env, rterm[1], &limit))
+            return enif_make_badarg(env);
+
+    auto range = rocksdb::Range(start, limit);
+
+    uint64_t size, count;
+    db_ptr->m_Db->GetApproximateMemTableStats(column_family, range, &count, &size);
+    return enif_make_tuple2(
+        env,
+        ATOM_OK,
+        enif_make_tuple2(env, enif_make_uint64(env, count),  enif_make_uint64(env, size))
+    );
 }
 
 ERL_NIF_TERM

@@ -43,7 +43,8 @@ static ErlNifFunc nif_funcs[] =
 
         {"get_approximate_sizes", 3, erocksdb::GetApproximateSizes, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"get_approximate_sizes", 4, erocksdb::GetApproximateSizes, ERL_NIF_DIRTY_JOB_IO_BOUND},
-
+        {"get_approximate_memtable_stats", 2, erocksdb::GetApproximateMemTableStats, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"get_approximate_memtable_stats", 3, erocksdb::GetApproximateMemTableStats, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"delete_range", 4, erocksdb::DeleteRange, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"delete_range", 5, erocksdb::DeleteRange, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
