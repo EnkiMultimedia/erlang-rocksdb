@@ -10,7 +10,6 @@ c_src/system
 *~
 .rebar
 .idea
-CMakeLists.txt
 _build
 c_src/*.d
 *.db
@@ -39,3 +38,8 @@ deps/snappy/snappy-stubs-internal.lo
 deps/snappy/snappy.lo
 deps/snappy/snappy_unittest
 deps/snappy/autom4te.cache/
+tags
+Makefile
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
