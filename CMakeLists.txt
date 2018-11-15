@@ -38,8 +38,6 @@ include(rocksdb-deps)
 include_directories(${ERLANG_ROCKSDB_DIR}/..)
 
 
-file(GLOB hfiles "${ERLANG_ROCKSDB_SRC_DIR}/*.h")
-file(GLOB files  "${ERLANG_ROCKSDB_SRC_DIR}/*.cc")
 
 
 set(ERLANG_ROCKSDB_EXTERNAL_DEPS
@@ -51,23 +49,4 @@ set(ERLANG_ROCKSDB_EXTERNAL_DEPS
   ${SNAPPY_LIBRARY}
   Threads::Threads)
 
-include_directories(
-  SYSTEM
-  ${Erlang_EI_INCLUDE_DIR}
-  ${Erlang_EI_DIR}/src
-)
-
-
-link_directories(
-  ${Erlang_EI_LIBRARY_DIR}
-)
-
-
-
-add_executable(rocksdb.so
-    ${hfiles}
-    ${files}
-)
-
-target_link_libraries(rocksdb.so ${Erlang_EI_LIBRARIES})
-target_link_libraries(rocksdb.so ${ERLANG_ROCKSDB_EXTERNAL_DEPS})
+add_subdirectory(c_src)
