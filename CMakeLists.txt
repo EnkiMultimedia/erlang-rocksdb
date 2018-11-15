@@ -15,13 +15,14 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 # Compiler Settings
 SET (CMAKE_CXX_FLAGS "-O2 -arch x86_64 -Wall")
 
-PROJECT(ROCKSDB)
+set(PACKAGE_NAME "rocksdb")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/priv)
 
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 project(${PACKAGE_NAME} CXX)
+
 
 # gtest_discover_tests was introduced in cmake 3.10
 if(${CMAKE_VERSION} VERSION_EQUAL "3.10" OR ${CMAKE_VERSION} VERSION_GREATER "3.10")

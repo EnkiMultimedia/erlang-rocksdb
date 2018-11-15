@@ -12,10 +12,14 @@ link_directories(
   ${Erlang_EI_LIBRARY_DIR}
 )
 
-add_executable(../priv/rocksdb.so
+add_executable(rocksdb.so
     ${hfiles}
     ${files}
 )
 
-target_link_libraries(../priv/rocksdb.so ${Erlang_EI_LIBRARIES})
-target_link_libraries(../priv/rocksdb.so ${ERLANG_ROCKSDB_EXTERNAL_DEPS}
+target_link_libraries(rocksdb.so 
+    ${Erlang_EI_LIBRARIES}
+    ${ERLANG_ROCKSDB_EXTERNAL_DEPS}
+)
+
+add_dependencies(rocksdb.so rocksdb)
