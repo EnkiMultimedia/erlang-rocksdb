@@ -188,17 +188,14 @@ aproximate_sizes_test() ->
     DbOptions,
     fun(Ref) ->
       _ = [ok = rocksdb:put(Ref, key(I), random_string(1024), []) || I <- lists:seq(0, N-1)],
-      R = {key(50), key(60)},
-      [Size] = rocksdb:get_approximate_sizes(Ref, [R], include_both),
+      Size = rocksdb:get_approximate_sizes(Ref, key(50), key(60), include_both),
       ?assert(Size >= 6000),
       ?assert(Size =< 204800),
-      [0] = rocksdb:get_approximate_sizes(Ref, [R], include_files),
-      R2 = {key(500), key(600)},
-      [0] = rocksdb:get_approximate_sizes(Ref, [R2], include_both),
+      0 = rocksdb:get_approximate_sizes(Ref, key(50), key(60), include_files),
+      0 = rocksdb:get_approximate_sizes(Ref, key(500), key(600), include_both),
       _ = [ok = rocksdb:put(Ref, key(1000 + I), random_string(1024), []) || I <- lists:seq(0, N-1)],
-      [0] = rocksdb:get_approximate_sizes(Ref, [R2], include_both),
-      R3 = {key(100), key(1020)},
-      [Size2] = rocksdb:get_approximate_sizes(Ref, [R3], include_both),
+      0 = rocksdb:get_approximate_sizes(Ref, key(500), key(600), include_both),
+      Size2 = rocksdb:get_approximate_sizes(Ref, key(100), key(1020), include_both),
       ?assert(Size2 >= 6000),
       ok
     end

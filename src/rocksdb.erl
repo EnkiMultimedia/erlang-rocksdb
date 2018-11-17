@@ -38,7 +38,7 @@
   count/1, count/2,
   stats/1, stats/2,
   get_property/2, get_property/3,
-  get_approximate_sizes/3, get_approximate_sizes/4,
+  get_approximate_sizes/4, get_approximate_sizes/5,
   get_approximate_memtable_stats/2, get_approximate_memtable_stats/3
 ]).
 
@@ -641,21 +641,23 @@ get(_DBHandle, _CFHandle, _Key, _ReadOpts) ->
 %% If `IncludeFlags' defines whether the returned size should include
 %% the recently written data in the mem-tables (if
 %% the mem-table type supports it), data serialized to disk, or both.
--spec get_approximate_sizes(DBHandle, Ranges, IncludeFlags) -> Sizes when
+-spec get_approximate_sizes(DBHandle, Start, Limit, IncludeFlags) -> Size when
   DBHandle::db_handle(),
-  Ranges::[range()],
+  Start :: binary(),
+  Limit :: binary(),
   IncludeFlags::size_approximation_flag(),
-  Sizes :: [non_neg_integer()].
-get_approximate_sizes(_DBHandle, _Ranges, _IncludeFlags) ->
-  erlang:nif_error({error, not_loaded}).
+  Size :: non_neg_integer().
+get_approximate_sizes(DBHandle, Start, Limit, IncludeFlags) ->
+  get_approximate_sizes(DBHandle, default_column_family, Start, Limit, IncludeFlags).
 
--spec get_approximate_sizes(DBHandle, CFHandle, Ranges, IncludeFlags) -> Sizes when
+-spec get_approximate_sizes(DBHandle, CFHandle, Start, Limit, IncludeFlags) -> Size when
   DBHandle::db_handle(),
   CFHandle::cf_handle(),
-  Ranges::[range()],
+  Start :: binary(),
+  Limit :: binary(),
   IncludeFlags::size_approximation_flag(),
-  Sizes :: [non_neg_integer()].
-get_approximate_sizes(_DBHandle, _CFHandle, _Ranges, _IncludeFlags) ->
+  Size:: non_neg_integer().
+get_approximate_sizes(_DBHandle, _CFHandle, _Start, _Limit, _IncludeFlags) ->
   erlang:nif_error({error, not_loaded}).
 
 %% @doc The method is similar to GetApproximateSizes, except it

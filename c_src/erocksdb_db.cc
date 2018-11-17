@@ -1390,27 +1390,26 @@ GetApproximateSizes(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
     ReferencePtr<DbObject> db_ptr;
     rocksdb::ColumnFamilyHandle *column_family;
-    rocksdb::Slice start;
-    rocksdb::Slice limit;
     rocksdb::Status status;
     ReferencePtr<ColumnFamilyObject> cf_ptr;
-    int i = 1;
     
     if (!enif_get_db(env, argv[0], &db_ptr))
         return enif_make_badarg(env);
 
-    if (argc == 5)
-    {
+    if (argv[1] == erocksdb::ATOM_DEFAULT_COLUMN_FAMILY) {
+        column_family = db_ptr->m_Db->DefaultColumnFamily();
+    } else {
         if (!enif_get_cf(env, argv[1], &cf_ptr))
             return enif_make_badarg(env);
         column_family = cf_ptr->m_ColumnFamily;
-        i = 2;
-    } else {
-        column_family = db_ptr->m_Db->DefaultColumnFamily();
     }
 
+    rocksdb::Slice start, limit;
+    if (!binary_to_slice(env, argv[2], &start) || !binary_to_slice(env, argv[3], &limit))
+        return enif_make_badarg(env);
+
     uint8_t flag;
-    ERL_NIF_TERM flag_term = argv[i + 1];
+    ERL_NIF_TERM flag_term = argv[4];
     if (flag_term == erocksdb::ATOM_NONE)
         flag = rocksdb::DB::SizeApproximationFlags::NONE;
     else if (flag_term == erocksdb::ATOM_INCLUDE_MEMTABLES)
@@ -1422,46 +1421,10 @@ GetApproximateSizes(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     else
         return enif_make_badarg(env);
 
-    unsigned int num_ranges;
-    if (!enif_get_list_length(env, argv[i], &num_ranges))
-        return enif_make_badarg(env);
-
-    ERL_NIF_TERM head, tail = argv[i];
-    int j = 0;
-    int arity;
-    const ERL_NIF_TERM *rterm;
-    
-    rocksdb::Range *ranges = new rocksdb::Range[num_ranges];
-    while (enif_get_list_cell(env, tail, &head, &tail))
-    {
-        if (enif_get_tuple(env, head, &arity, &rterm) && 2 == arity)
-        {
-            if (!binary_to_slice(env, rterm[0], &start) || !binary_to_slice(env, rterm[1], &limit)) 
-            {
-                return enif_make_badarg(env);
-            }
-            ranges[j].start = start;
-            ranges[j].limit = limit;
-            j++;
-        }
-        else
-        {
-            delete[] ranges;
-            return enif_make_badarg(env);
-        }
-    }
-
-    uint64_t sizes[num_ranges];
-    db_ptr->m_Db->GetApproximateSizes(column_family, ranges, num_ranges, sizes, flag);
-    ERL_NIF_TERM result = enif_make_list(env, 0);
-    for (int k = 0; k < num_ranges; k++)
-    {
-        result = enif_make_list_cell(env, enif_make_uint64(env, sizes[k]), result);
-    }
-    ERL_NIF_TERM result_out;
-    enif_make_reverse_list(env, result, &result_out);
-    delete[] ranges;
-    return result_out;
+    rocksdb::Range r(start, limit);
+    uint64_t size = 0;
+    db_ptr->m_Db->GetApproximateSizes(column_family, &r, 1, &size, flag);
+    return enif_make_uint64(env, size);
 }
 
 ERL_NIF_TERM
