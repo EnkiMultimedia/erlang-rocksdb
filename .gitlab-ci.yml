@@ -1,5 +1,9 @@
 image: erlang:20
 
+before_script:
+    - apt-get -q update
+    - apt-get -qy install cmake
+
 test:
   script:
     - MAKEFLAGS=-j4 ./deps/rebar3 eunit

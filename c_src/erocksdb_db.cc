@@ -687,7 +687,8 @@ ERL_NIF_TERM parse_flush_option(ErlNifEnv *env, ERL_NIF_TERM item, rocksdb::Flus
         if (option[0] == erocksdb::ATOM_WAIT)
             opts.wait = (option[1] == erocksdb::ATOM_TRUE);
         else if (option[0] == erocksdb::ATOM_ALLOW_WRITE_STALL)
-            opts.allow_write_stall = (option[1] == erocksdb::ATOM_TRUE);
+            //opts.allow_write_stall = (option[1] == erocksdb::ATOM_TRUE);
+		;
     }
 
     return erocksdb::ATOM_OK;

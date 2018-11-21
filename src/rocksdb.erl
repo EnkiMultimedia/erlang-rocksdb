@@ -166,12 +166,12 @@ init() ->
          {error, bad_name} ->
            case code:which(?MODULE) of
              Filename when is_list(Filename) ->
-               filename:join([filename:dirname(Filename),"../priv", "rocksdb"]);
+               filename:join([filename:dirname(Filename),"../priv", "liberocksdb"]);
              _ ->
-               filename:join("../priv", "rocksdb")
+               filename:join("../priv", "liberocksdb")
            end;
          Dir ->
-           filename:join(Dir, "rocksdb")
+           filename:join(Dir, "liberocksdb")
        end,
   erlang:load_nif(SoName, application:get_all_env(rocksdb)).
 

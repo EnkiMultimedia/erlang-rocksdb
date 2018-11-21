@@ -39,7 +39,11 @@ deps/snappy/snappy.lo
 deps/snappy/snappy_unittest
 deps/snappy/autom4te.cache/
 tags
-Makefile
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
+deps/snappy/build/
+c_src/build/
+deps/lz4/contrib/cmake_unofficial/CMakeLists.txt
+deps/rocksdb/CMakeLists.txt
+deps/rocksdb/java/CMakeLists.txt
+deps/rocksdb/third-party/gtest-1.7.0/fused-src/gtest/CMakeLists.txt
+deps/rocksdb/tools/CMakeLists.txt
+test_prefix

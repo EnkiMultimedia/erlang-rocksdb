@@ -14,8 +14,6 @@ FIND_PACKAGE_HANDLE_STANDARD_ARGS(
 
 if (NOT SNAPPY_FOUND)
   message(STATUS "Using third-party bundled Snappy")
-else()
-  message(STATUS "Found Snappy: ${SNAPPY_LIBRARY}")
 endif (NOT SNAPPY_FOUND)
 
 mark_as_advanced(SNAPPY_INCLUDE_DIR SNAPPY_LIBRARY)
