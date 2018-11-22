@@ -1437,7 +1437,7 @@ GetApproximateSizes(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     uint64_t sizes[num_ranges];
     db_ptr->m_Db->GetApproximateSizes(column_family, ranges, num_ranges, sizes, flag);
     ERL_NIF_TERM result = enif_make_list(env, 0);
-    for (int k = 0; k < num_ranges; k++)
+    for (auto k = 0U; k < num_ranges; k++)
     {
         result = enif_make_list_cell(env, enif_make_uint64(env, sizes[k]), result);
     }

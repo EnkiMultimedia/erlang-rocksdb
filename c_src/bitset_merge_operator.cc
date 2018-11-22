@@ -84,7 +84,7 @@ namespace erocksdb {
             return false;
         }
 
-        int ofs = pos >> 3;
+        size_t ofs = pos >> 3;
 
         if (ofs > size) {
             delete[] data;
