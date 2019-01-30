@@ -63,8 +63,9 @@ endif ()
 
 
 
-set(ErlangRocksDBNIF_TARGET erocksdb)
+set(ErlangRocksDBNIF_TARGET rocksdb_nif)
 add_library(${ErlangRocksDBNIF_TARGET} MODULE "")
+set_target_properties(${ErlangRocksDBNIF_TARGET} PROPERTIES PREFIX "" )
 
 set(CMAKE_BUILD_TYPE Release)
 
