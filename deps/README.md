@@ -3,12 +3,11 @@ This directory contains all Barrel dependencies, except for the libc and utiliti
 
 - **lz4** 1.8.3 : compression library
 - **snappy** 1.1.7 : compression library
-- **rocksdb** 5.17.2: db backend to store the data
+- **rocksdb** 5.18.3: db backend to store the data
 
 ## How to upgrade dependencies:
 
-- **rocksdb** can be upgraded using the `update_rocksdb.sh`  script. Or just replace the rocksdb foolder by the last
-  version
+- **rocksdb** follow instructions on our [rocksdb](https://gitlab.com/barrel-db/Deps/rocksdb) repository
 
 - **snappy**: download the latest archive, replace the `snappy` folder and  and make sure the configure script is available
 
