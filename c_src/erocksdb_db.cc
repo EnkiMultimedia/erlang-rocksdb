@@ -950,7 +950,6 @@ OpenOptimisticTransactionDB(
     DbObject * db_ptr;
     rocksdb::OptimisticTransactionDB *db;
 
-
     if(!enif_get_string(env, argv[0], db_name, sizeof(db_name), ERL_NIF_LATIN1) ||
        !enif_is_list(env, argv[1]) || !enif_is_list(env, argv[2]))
     {
@@ -971,6 +970,12 @@ OpenOptimisticTransactionDB(
             return result;
         }
     }
+    // parse column family options
+    rocksdb::ColumnFamilyOptions cf_opts;
+    fold(env, argv[1], parse_cf_option, cf_opts);
+
+    // final options
+    rocksdb::Options opts(db_opts, cf_opts);
 
     std::vector<rocksdb::ColumnFamilyHandle*> handles;
     rocksdb::Status status =
