@@ -8,15 +8,18 @@ else
     CMAKE=cmake
 fi
 
-CORES=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
-
-if [ "x$CORES" = "x" ]; then
-    PAR=""
+if [ "$ROCKSDB_COMPILE_PARALLEL" = "0" ]; then
+    ${CMAKE} --build . "$@" || exit 1
 else
-    PAR="-- -j $CORES"
-fi
+    CORES=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    if [ "x$CORES" = "x" ]; then
+        PAR=""
+    else
+        PAR="-- -j $CORES"
+    fi
 
-${CMAKE} --build . "$@" $PAR || exit 1
+    ${CMAKE} --build . "$@" $PAR || exit 1
+fi
 
 
 echo done.
