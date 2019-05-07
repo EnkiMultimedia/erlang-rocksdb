@@ -8,7 +8,7 @@ else
     CMAKE=cmake
 fi
 
-if [ "$1" = "-j" ]; then
+if [[ "$@" =~ "-j" ]]; then
     ${CMAKE} --build . -- "$@" || exit 1
 else
     CORES=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
@@ -18,7 +18,7 @@ else
     else
         PAR="-- -j $CORES"
     fi
-    ${CMAKE} --build . $PAR || exit 1
+    ${CMAKE} --build . $PAR $@ || exit 1
 fi
 
 echo done.
