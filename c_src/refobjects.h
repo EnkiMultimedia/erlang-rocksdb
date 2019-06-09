@@ -22,9 +22,10 @@
 #include <memory>
 #include <stdint.h>
 #include <list>
+#include <mutex>
+#include <atomic>
 
 #include "erl_nif.h"
-#include "mutex.h"
 
 namespace rocksdb {
     class DB;
@@ -65,20 +66,19 @@ class RefObject
 public:
 
 protected:
-    volatile uint32_t m_RefCount;     //!< simple count of reference, auto delete at zero
+    std::atomic<uint32_t> m_RefCount;     //!< simple count of reference, auto delete at zero
 
 public:
     RefObject();
+
+    RefObject(const RefObject&) = delete;              // nocopy
+    RefObject& operator=(const RefObject&) = delete;   // nocopyassign
 
     virtual ~RefObject();
 
     virtual uint32_t RefInc();
 
     virtual uint32_t RefDec();
-
-private:
-    RefObject(const RefObject&);              // nocopy
-    RefObject& operator=(const RefObject&);   // nocopyassign
 };  // class RefObject
 
 
@@ -92,18 +92,18 @@ public:
     // these member objects are public to simplify
     //  access by statics and external APIs
     //  (yes, wrapper functions would be welcome)
-    volatile uint32_t m_CloseRequested;  // 1 once api close called, 2 once thread starts destructor, 3 destructor done
+    std::atomic<uint32_t> m_CloseRequested;        // 1 once api close called, 2 once thread starts destructor, 3 destructor done
 
     // DO NOT USE CONTAINER OBJECTS
     //  ... these must be live after destructor called
-    pthread_mutex_t m_CloseMutex;        //!< for erlang forced close
-    pthread_cond_t  m_CloseCond;         //!< for erlang forced close
-
-protected:
-
+    std::mutex *m_CloseMutex;                     //!< for erlang forced close
+    std::condition_variable *m_CloseCond;         //!< for erlang forced close
 
 public:
     ErlRefObject();
+
+    ErlRefObject(const ErlRefObject&) = delete;              // nocopy
+    ErlRefObject& operator=(const ErlRefObject&) = delete;   // nocopyassign
 
     virtual ~ErlRefObject();
 
@@ -117,11 +117,6 @@ public:
     static bool InitiateCloseRequest(ErlRefObject * Object);
 
     static void AwaitCloseAndDestructor(ErlRefObject * Object);
-
-
-private:
-    ErlRefObject(const ErlRefObject&);              // nocopy
-    ErlRefObject& operator=(const ErlRefObject&);   // nocopyassign
 };  // class RefObject
 
 
@@ -150,6 +145,8 @@ public:
     ReferencePtr(const ReferencePtr &rhs)
     {t=rhs.t; if (NULL!=t) t->RefInc();};
 
+    ReferencePtr & operator=(const ReferencePtr & rhs) = delete; // no assignment
+
     ~ReferencePtr()
     {
         if (NULL!=t)
@@ -171,10 +168,6 @@ public:
     TargetT * get() {return(t);};
 
     TargetT * operator->() {return(t);};
-
-private:
- ReferencePtr & operator=(const ReferencePtr & rhs); // no assignment
-
 };  // ReferencePtr
 
 
@@ -186,14 +179,13 @@ private:
 class DbObject : public ErlRefObject
 {
 public:
-    rocksdb::DB* m_Db;                                   // NULL or rocksdb database object
+    rocksdb::DB* m_Db;                             // NULL or rocksdb database object
+    std::mutex m_ItrMutex;                         //!< mutex protecting m_ItrList
+    std::mutex m_SnapshotMutex;                    //!< mutex protecting m_SnapshotList
+    std::mutex m_ColumnFamilyMutex;                //!< mutex protecting m_ColumnFamily
+    std::mutex m_TLogItrMutex;                     //!< mutex protecting m_TransactionLogList
 
-    Mutex m_ItrMutex;                         //!< mutex protecting m_ItrList
-    Mutex m_SnapshotMutex;                    //!< mutext protecting m_SnapshotList
-    Mutex m_ColumnFamilyMutex;                //!< mutex ptotecting m_ColumnFamily
-    Mutex m_TLogItrMutex;              //!< mutex ptotecting m_TransactionLogList
-
-    std::list<class ItrObject *> m_ItrList;   //!< ItrObjects holding ref count to this
+    std::list<class ItrObject *> m_ItrList;        //!< ItrObjects holding ref count to this
     std::list<class SnapshotObject *> m_SnapshotList;
     std::list<class ColumnFamilyObject *> m_ColumnFamilyList;
     std::list<class TLogItrObject *> m_TLogItrList;
@@ -204,6 +196,10 @@ protected:
 public:
     DbObject(rocksdb::DB * DbPtr); // Open with default CF
 
+    DbObject() = delete;                             // no default construct
+    DbObject(const DbObject&) = delete;              // nocopy
+    DbObject& operator=(const DbObject&) = delete;   // nocopyassign
+
     virtual ~DbObject();
 
     virtual void Shutdown();
@@ -212,7 +208,6 @@ public:
     void AddColumnFamilyReference(class ColumnFamilyObject *);
 
     void RemoveColumnFamilyReference(class ColumnFamilyObject *);
-
 
     // manual back link to ItrObjects holding reference to this
     bool AddReference(class ItrObject *);
@@ -236,11 +231,6 @@ public:
     static DbObject * RetrieveDbObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm);
 
     static void DbObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
-
-private:
-    DbObject();
-    DbObject(const DbObject&);              // nocopy
-    DbObject& operator=(const DbObject&);   // nocopyassign
 };  // class DbObject
 
 /**
@@ -257,6 +247,9 @@ protected:
 
 public:
     ColumnFamilyObject(DbObject * Db, rocksdb::ColumnFamilyHandle* Handle);
+    ColumnFamilyObject() = delete;                                       // no default construct
+    ColumnFamilyObject(const ColumnFamilyObject &) = delete;             // no copy
+    ColumnFamilyObject & operator=(const ColumnFamilyObject &) = delete; // no assignment
 
     virtual ~ColumnFamilyObject(); // needs to perform free_itr
 
@@ -269,11 +262,6 @@ public:
     static ColumnFamilyObject * RetrieveColumnFamilyObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm);
 
     static void ColumnFamilyObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
-
-private:
-    ColumnFamilyObject();
-    ColumnFamilyObject(const ColumnFamilyObject &);            // no copy
-    ColumnFamilyObject & operator=(const ColumnFamilyObject &); // no assignment
 };  // class ColumnFamilyObject
 
 /**
@@ -286,7 +274,7 @@ public:
 
     ReferencePtr<DbObject> m_DbPtr;
 
-    Mutex m_ItrMutex;                         //!< mutex protecting m_ItrList
+    //Mutex m_ItrMutex;                       //!< mutex protecting m_ItrList -- NOT REALLY USED?
     std::list<class ItrObject *> m_ItrList;   //!< ItrObjects holding ref count to this
 
 protected:
@@ -294,6 +282,10 @@ protected:
 
 public:
     SnapshotObject(DbObject * Db, const rocksdb::Snapshot * Snapshot);
+
+    SnapshotObject() = delete;                                   // no default construct
+    SnapshotObject(const SnapshotObject &) = delete;             // no copy
+    SnapshotObject & operator=(const SnapshotObject &) = delete; // no assignment
 
     virtual ~SnapshotObject(); // needs to perform free_itr
 
@@ -306,13 +298,7 @@ public:
     static SnapshotObject * RetrieveSnapshotObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm);
 
     static void SnapshotObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
-
-private:
-    SnapshotObject();
-    SnapshotObject(const SnapshotObject &);            // no copy
-    SnapshotObject & operator=(const SnapshotObject &); // no assignment
 };  // class SnapshotObject
-
 
 
 /**
@@ -334,6 +320,10 @@ protected:
 public:
     ItrObject(DbObject *, std::shared_ptr<erocksdb::ErlEnvCtr> Env, rocksdb::Iterator * Iterator);
 
+    ItrObject() = delete;                              // no default construct
+    ItrObject(const ItrObject &) = delete;             // no copy
+    ItrObject & operator=(const ItrObject &) = delete; // no assignment
+
     virtual ~ItrObject(); // needs to perform free_itr
 
     virtual void Shutdown();
@@ -350,13 +340,6 @@ public:
     void SetUpperBoundSlice(rocksdb::Slice*);
 
     void SetLowerBoundSlice(rocksdb::Slice*);
-
-
-
-private:
-    ItrObject();
-    ItrObject(const ItrObject &);            // no copy
-    ItrObject & operator=(const ItrObject &); // no assignment
 };  // class ItrObject
 
 /**
@@ -374,6 +357,10 @@ protected:
 public:
     TLogItrObject(DbObject *, rocksdb::TransactionLogIterator * Itr);
 
+    TLogItrObject() = delete;                                  // no default construct
+    TLogItrObject(const TLogItrObject &) = delete;             // no copy
+    TLogItrObject & operator=(const TLogItrObject &) = delete; // no assignment
+
     virtual ~TLogItrObject(); // needs to perform free_itr
 
     virtual void Shutdown();
@@ -385,11 +372,6 @@ public:
     static TLogItrObject * RetrieveTLogItrObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerme);
 
     static void TLogItrObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
-
-private:
-    TLogItrObject();
-    TLogItrObject(const TLogItrObject &);            // no copy
-    TLogItrObject & operator=(const TLogItrObject &); // no assignment
 };  // class TLogItrObject
 
 
@@ -409,6 +391,10 @@ protected:
 public:
     BackupEngineObject(rocksdb::BackupEngine * BackupEnginePtr);
 
+    BackupEngineObject() = delete;                                       // no default construct
+    BackupEngineObject(const BackupEngineObject&) = delete;              // nocopy
+    BackupEngineObject& operator=(const BackupEngineObject&) = delete;   // nocopyassign
+
     virtual ~BackupEngineObject();
 
     virtual void Shutdown();
@@ -420,11 +406,6 @@ public:
     static BackupEngineObject * RetrieveBackupEngineObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm);
 
     static void BackupEngineObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
-
-private:
-    BackupEngineObject();
-    BackupEngineObject(const BackupEngineObject&);              // nocopy
-    BackupEngineObject& operator=(const BackupEngineObject&);   // nocopyassign
 };  // class BackupEngineObject
 
 } // namespace erocksdb

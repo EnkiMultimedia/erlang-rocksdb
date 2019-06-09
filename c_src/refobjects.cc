@@ -45,7 +45,7 @@ uint32_t
 RefObject::RefInc()
 {
 
-    return(erocksdb::inc_and_fetch(&m_RefCount));
+    return ++m_RefCount;
 
 }   // RefObject::RefInc
 
@@ -55,7 +55,7 @@ RefObject::RefDec()
 {
     uint32_t current_refs;
 
-    current_refs=erocksdb::dec_and_fetch(&m_RefCount);
+    current_refs = --m_RefCount;
     if (0==current_refs)
         delete this;
 
@@ -71,13 +71,8 @@ RefObject::RefDec()
 ErlRefObject::ErlRefObject()
     : m_CloseRequested(0)
 {
-    pthread_mutexattr_t attr;
-
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&m_CloseMutex, &attr);
-    pthread_cond_init(&m_CloseCond, NULL);
-    pthread_mutexattr_destroy(&attr);
+    m_CloseMutex = new std::mutex();
+    m_CloseCond = new std::condition_variable();
 
     return;
 
@@ -87,10 +82,10 @@ ErlRefObject::ErlRefObject()
 ErlRefObject::~ErlRefObject()
 {
 
-    pthread_mutex_lock(&m_CloseMutex);
+    std::unique_lock<std::mutex> lk(*m_CloseMutex);
     m_CloseRequested=3;
-    pthread_cond_broadcast(&m_CloseCond);
-    pthread_mutex_unlock(&m_CloseMutex);
+    m_CloseCond->notify_all();
+    lk.unlock();
 
     // DO NOT DESTROY m_CloseMutex or m_CloseCond here
 
@@ -107,7 +102,7 @@ ErlRefObject::InitiateCloseRequest(
 
     // special handling since destructor may have been called
     if (NULL!=Object && 0==Object->m_CloseRequested)
-        ret_flag=compare_and_swap(&Object->m_CloseRequested, 0, 1);
+        ret_flag=compare_and_swap(Object->m_CloseRequested, 0u, 1u);
 
     // vtable is still good, this thread is initiating close
     //   ask object to clean-up
@@ -134,18 +129,18 @@ ErlRefObject::AwaitCloseAndDestructor(
         // quick test if any work pending
         if (3!=Object->m_CloseRequested)
         {
-            pthread_mutex_lock(&Object->m_CloseMutex);
+            std::unique_lock<std::mutex> lk(*(Object->m_CloseMutex));
 
             // retest after mutex helc
             while (3!=Object->m_CloseRequested)
             {
-                pthread_cond_wait(&Object->m_CloseCond, &Object->m_CloseMutex);
+                Object->m_CloseCond->wait(lk);
             }   // while
-            pthread_mutex_unlock(&Object->m_CloseMutex);
+            lk.unlock();
         }   // if
 
-        pthread_mutex_destroy(&Object->m_CloseMutex);
-        pthread_cond_destroy(&Object->m_CloseCond);
+        delete Object->m_CloseMutex;
+        delete Object->m_CloseCond;
     }   // if
 
     return;
@@ -158,11 +153,10 @@ ErlRefObject::RefDec()
 {
     uint32_t cur_count;
 
-    cur_count=erocksdb::dec_and_fetch(&m_RefCount);
-
+    cur_count = --m_RefCount;
     // this the last active after close requested?
     //  (atomic swap should be unnecessary ... but going for safety)
-    if (0==cur_count && compare_and_swap(&m_CloseRequested, 1, 2))
+    if (0==cur_count && compare_and_swap(m_CloseRequested, 1u, 2u))
     {
         // deconstruct, but let erlang deallocate memory later
         this->~ErlRefObject();
@@ -297,7 +291,7 @@ DbObject::Shutdown()
 
         // lock the ItrList
         {
-            MutexLock lock(m_ItrMutex);
+            std::lock_guard<std::mutex> lock(m_ItrMutex);
 
             if (!m_ItrList.empty())
             {
@@ -321,7 +315,7 @@ DbObject::Shutdown()
 
         // lock the SnapshotList
         {
-            MutexLock lock(m_ColumnFamilyMutex);
+            std::lock_guard<std::mutex> lock(m_ColumnFamilyMutex);
 
             if (!m_ColumnFamilyList.empty()) {
                 again = true;
@@ -345,7 +339,7 @@ DbObject::Shutdown()
 
         // lock the SnapshotList
         {
-            MutexLock lock(m_SnapshotMutex);
+            std::lock_guard<std::mutex> lock(m_SnapshotMutex);
 
             if (!m_SnapshotList.empty())
             {
@@ -369,7 +363,7 @@ DbObject::Shutdown()
 
         // lock the SnapshotList
         {
-            MutexLock lock(m_TLogItrMutex);
+            std::lock_guard<std::mutex> lock(m_TLogItrMutex);
 
             if (!m_TLogItrList.empty()) {
                 again = true;
@@ -396,7 +390,7 @@ DbObject::Shutdown()
 void
 DbObject::AddColumnFamilyReference(
         ColumnFamilyObject *ColumnFamilyPtr) {
-    MutexLock lock(m_ColumnFamilyMutex);
+    std::lock_guard<std::mutex> lock(m_ColumnFamilyMutex);
     m_ColumnFamilyList.push_back(ColumnFamilyPtr);
     return;
 }   // DbObject::ColumnFamilyReference
@@ -405,7 +399,7 @@ DbObject::AddColumnFamilyReference(
 void
 DbObject::RemoveColumnFamilyReference(
         ColumnFamilyObject *ColumnFamilyPtr) {
-    MutexLock lock(m_ColumnFamilyMutex);
+    std::lock_guard<std::mutex> lock(m_ColumnFamilyMutex);
     m_ColumnFamilyList.remove(ColumnFamilyPtr);
     return;
 }   // DbObject::RemoveColumnFamilyReference
@@ -415,7 +409,7 @@ DbObject::AddReference(
     ItrObject * ItrPtr)
 {
     bool ret_flag;
-    MutexLock lock(m_ItrMutex);
+    std::lock_guard<std::mutex> lock(m_ItrMutex);
 
     ret_flag=(0==m_CloseRequested);
     if (ret_flag)
@@ -429,7 +423,7 @@ void
 DbObject::RemoveReference(
     ItrObject * ItrPtr)
 {
-    MutexLock lock(m_ItrMutex);
+    std::lock_guard<std::mutex> lock(m_ItrMutex);
     m_ItrList.remove(ItrPtr);
     return;
 
@@ -439,7 +433,7 @@ void
 DbObject::AddSnapshotReference(
     SnapshotObject * SnapshotPtr)
 {
-    MutexLock lock(m_SnapshotMutex);
+    std::lock_guard<std::mutex> lock(m_SnapshotMutex);
     m_SnapshotList.push_back(SnapshotPtr);
     return;
 
@@ -450,7 +444,7 @@ void
 DbObject::RemoveSnapshotReference(
     SnapshotObject * SnapshotPtr)
 {
-    MutexLock lock(m_SnapshotMutex);
+    std::lock_guard<std::mutex> lock(m_SnapshotMutex);
 
     m_SnapshotList.remove(SnapshotPtr);
 
@@ -459,7 +453,7 @@ DbObject::RemoveSnapshotReference(
 
 void
 DbObject::AddTLogReference(TLogItrObject *TLogItrPtr) {
-    MutexLock lock(m_TLogItrMutex);
+    std::lock_guard<std::mutex> lock(m_TLogItrMutex);
 
     m_TLogItrList.push_back(TLogItrPtr);
 
@@ -470,7 +464,7 @@ DbObject::AddTLogReference(TLogItrObject *TLogItrPtr) {
 
 void
 DbObject::RemoveTLogReference(TLogItrObject *TLogItrPtr) {
-    MutexLock lock(m_TLogItrMutex);
+    std::lock_guard<std::mutex> lock(m_TLogItrMutex);
 
     m_TLogItrList.remove(TLogItrPtr);
 
