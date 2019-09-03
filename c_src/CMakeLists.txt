@@ -26,6 +26,8 @@ if(POLICY CMP0075)
 endif()
 
 
+
+
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/CMake")
 
 # includes
@@ -44,7 +46,6 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${priv_dir})
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 
 if (NOT WIN32)
   # On platforms like FreeBSD where gmake is not the default, we need
@@ -139,7 +140,7 @@ include(build-rocksdb)
 
 option(WITH_AWS "build with S3 support" ON)
 if (WITH_AWS)
-    find_package(AWSSDK REQUIRED COMPONENTS s3 kinesis) 
+    find_package(AWSSDK REQUIRED COMPONENTS s3 kinesis)
     message(STATUS "AWS libraries: ${AWSSDK_LINK_LIBRARIES}")
 endif()
 
@@ -223,16 +224,17 @@ target_include_directories(${ErlangRocksDBNIF_TARGET}
     ${PROJECT_BINARY_DIR}
 )
 
-target_compile_options(${ErlangRocksDBNIF_TARGET}
-    PUBLIC
-    -Wall
-    -Wextra
-    -pedantic-errors
-)
+#target_compile_options(${ErlangRocksDBNIF_TARGET}
+#    PUBLIC
+#    -Wall
+#    -Wextra
+#    -pedantic-errors
+#)
+
 
 set(TARGET_LINKER_OPTIONS)
 if(APPLE)
-	set(TARGET_LINKER_OPTIONS "-flat_namespace -undefined suppress")
+    set(TARGET_LINKER_OPTIONS "-dylib -arch x86_64 -lSystem -L/usr/local/lib -L. -flat_namespace -undefined suppress -rpath @loader_path/")
 endif(APPLE)
 
 target_link_libraries(
@@ -241,8 +243,8 @@ target_link_libraries(
     ${TARGET_LINKER_OPTIONS}
     ${ERLANG_ERL_INTERFACE_LIB}
     ${ERLANG_EI_LIB}
-    ${ROCKSDB_LIBRARIES}
     ${AWSSDK_LINK_LIBRARIES}
+    ${ROCKSDB_LIBRARIES}
     ${ZSTD_LIBRARY}
     ${LZ4_LIBRARY}
     ${SNAPPY_LIBRARY}
