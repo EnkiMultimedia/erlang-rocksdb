@@ -3,15 +3,16 @@ image: erlang:21
 before_script:
     - apt-get update -qq && apt-get -y -qq install cmake sudo
     - ulimit -n 8192
-    - pushd /tmp && wget https://github.com/aws/aws-sdk-cpp/archive/1.7.80.tar.gz -O /tmp/aws-sdk.tar.gz && tar -xvf /tmp/aws-sdk.tar.gz > /dev/null && popd
-    - pushd /tmp/aws-sdk-cpp-1.7.80 && cmake -DBUILD_ONLY="s3;kinesis" -DENABLE_TESTING=OFF . && make -j4 all && sudo make install && popd
+    - pushd /tmp && wget https://github.com/aws/aws-sdk-cpp/archive/1.7.111.tar.gz -O /tmp/aws-sdk.tar.gz && tar -xvf /tmp/aws-sdk.tar.gz > /dev/null && popd
+    - pushd /tmp/aws-sdk-cpp-1.7.111 && cmake -DBUILD_ONLY='s3;kinesis' -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_TESTING=OFF . && make -j4 all && sudo make install
+    - popd
     - LIBRDKAFKA_VERSION=1.0.0
     - wget https://github.com/edenhill/librdkafka/archive/v${LIBRDKAFKA_VERSION}.tar.gz
     - tar -zxvf v${LIBRDKAFKA_VERSION}.tar.gz
     - sudo bash -c "cd librdkafka-${LIBRDKAFKA_VERSION} && ./configure && make && make install"
     - mkdir -p /tmp/data
-    - pushd /tmp && wget --no-check-certificate https://dl.min.io/server/minio/release/linux-amd64/minio && popd
-    - pushd /tmp && chmod a+x minio && popd
+    - wget --no-check-certificate https://dl.min.io/server/minio/release/linux-amd64/minio
+    - chmod a+x ./minio
 
 test:
     variables:
@@ -19,26 +20,27 @@ test:
         MINIO_ACCESS_KEY: "admin"
         MINIO_SECRET_KEY: "password"
     script:
-        - /tmp/minio server /tmp/data &
+        - ./minio server /tmp/data &
         - ./deps/rebar3 eunit
 
 test-shared_libs:
     before_script:
         - apt-get update -qq && apt-get -y -qq install cmake liblz4-dev libsnappy-dev sudo
         - ulimit -n 8192
-        - pushd /tmp && wget https://github.com/aws/aws-sdk-cpp/archive/1.7.80.tar.gz -O /tmp/aws-sdk.tar.gz && tar -xvf /tmp/aws-sdk.tar.gz > /dev/null && popd
-        - pushd /tmp/aws-sdk-cpp-1.7.80 && cmake -DBUILD_ONLY="s3;kinesis" -DENABLE_TESTING=OFF . && make -j4 all && sudo make install && popd
+        - pushd /tmp && wget https://github.com/aws/aws-sdk-cpp/archive/1.7.111.tar.gz -O /tmp/aws-sdk.tar.gz && tar -xvf /tmp/aws-sdk.tar.gz > /dev/null && popd
+        - pushd /tmp/aws-sdk-cpp-1.7.111 && cmake -DBUILD_ONLY='s3;kinesis' -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_TESTING=OFF . && make -j4 all && sudo make install
+        - popd
         - LIBRDKAFKA_VERSION=1.0.0
         - wget https://github.com/edenhill/librdkafka/archive/v${LIBRDKAFKA_VERSION}.tar.gz
         - tar -zxvf v${LIBRDKAFKA_VERSION}.tar.gz
         - sudo bash -c "cd librdkafka-${LIBRDKAFKA_VERSION} && ./configure && make && make install"
         - mkdir -p /tmp/data
-        - pushd /tmp && wget --no-check-certificate  https://dl.min.io/server/minio/release/linux-amd64/minio && popd
-        - pushd /tmp && chmod a+x minio && popd
+        - wget --no-check-certificate https://dl.min.io/server/minio/release/linux-amd64/minio
+        - chmod a+x ./minio
     variables:
         ERLANG_ROCKSDB_OPTS: "-DWITH_LZ4=ON -DWITH_SNAPPY=ON"
         MINIO_ACCESS_KEY: "admin"
         MINIO_SECRET_KEY: "password"
     script:
-        - /tmp/minio server /tmp/data &
+        - ./minio server /tmp/data &
         - ./deps/rebar3 eunit

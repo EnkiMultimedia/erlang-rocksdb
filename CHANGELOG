@@ -1,3 +1,8 @@
+erlang-rocksdb 1.0.1.cloud, released on 2019/04/15
+===========================================
+
+- fix build on OSX
+
 erlang-rocksdb 1.0.0.cloud, released on 2019/04/15
 ===========================================
 

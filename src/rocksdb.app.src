@@ -17,7 +17,7 @@
 {application, rocksdb,
  [
   {description, "RocksDB Cloud for Erlang"},
-  {vsn, "1.0.0"},
+  {vsn, "1.0.1"},
   {registered, []},
   {applications, [
           kernel,
@@ -26,7 +26,6 @@
   {env, []},
 
   {pkg_name, "rocksdb_cloud"},
-  {maintainers,["Benoit Chesneau"]},
   {licenses, ["Apache 2.0"]},
   {links, [{"Gitlab", "https://gitlab.com/barrel-db/erlang-rocksdb"}]},
   {files, ["rebar.config",

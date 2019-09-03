@@ -4,7 +4,7 @@
 
 Copyright (c) 2016-2019 Benoît Chesneau.
 
-__Version:__ 1.0.0 Erlang wrapper for RocksDB-Cloud.
+__Version:__ 1.0.1 Erlang wrapper for RocksDB-Cloud.
 
 This binding wrap [rocksdb-cloud](https://github.com/rockset/rocksdb-cloud/) . It's based on
 the [Erlang rocksdb binding](https://gitlab.com/barrel-db/erlang-rocksdb).

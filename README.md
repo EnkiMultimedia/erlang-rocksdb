@@ -4,7 +4,7 @@
 
 Copyright (c) 2016-2019 Benoît Chesneau.
 
-__Version:__ 1.0.0 Erlang wrapper for RocksDB-Cloud.
+__Version:__ 1.0.1 Erlang wrapper for RocksDB-Cloud.
 
 This binding wrap [rocksdb-cloud](https://github.com/rockset/rocksdb-cloud/) . It's based on
 the [Erlang rocksdb binding](https://gitlab.com/barrel-db/erlang-rocksdb).
@@ -35,7 +35,7 @@ the [RocksDB Cloud usage](https://gitlab.com/barrel-db/erlang-rocksdb/wikis/Gett
 
 ## Customized build ##
 
-See the [Customized builds](http://gitlab.com/barrel-db/erlang-rocksdb/blob/rocksdb-cloud/doc/customize_rocksdb_build.md) for more information.
+See the [Customized builds](http://gitlab.com/barrel-db/erlang-rocksdb/blob/108-error-building-rocksdb-cloud-with-latest-aws-sdk-from-homebrew/doc/customize_rocksdb_build.md) for more information.
 
 ## Support
 
@@ -50,5 +50,5 @@ Erlang RocksDB is licensed under the Apache License 2.
 
 
 <table width="100%" border="0" summary="list of modules">
-<tr><td><a href="http://gitlab.com/barrel-db/erlang-rocksdb/blob/rocksdb-cloud/doc/rocksdb.md" class="module">rocksdb</a></td></tr></table>
+<tr><td><a href="http://gitlab.com/barrel-db/erlang-rocksdb/blob/108-error-building-rocksdb-cloud-with-latest-aws-sdk-from-homebrew/doc/rocksdb.md" class="module">rocksdb</a></td></tr></table>
 
