@@ -20,8 +20,8 @@ basic_test() ->
 
     {ok, Transaction} = rocksdb:transaction(Db, []),
 
-    ok = rocksdb:transaction_put(Transaction, <<"a">>, <<"v1">>),
-    ok = rocksdb:transaction_put(Transaction, <<"b">>, <<"v2">>),
+    ok = rocksdb:transaction_put(Transaction, <<"a">>, [[<<"v">>], "1"]),
+    ok = rocksdb:transaction_put(Transaction, <<"b">>, [[<<"v">>], "2"]),
 
     ?assertEqual(not_found, rocksdb:get(Db, <<"a">>, [])),
     ?assertEqual(not_found, rocksdb:get(Db, <<"b">>, [])),

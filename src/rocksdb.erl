@@ -392,8 +392,8 @@
                           {no_slowdown, boolean()} |
                           {low_pri, boolean()}].
 
--type write_actions() :: [{put, Key::binary(), Value::binary()} |
-                          {put, ColumnFamilyHandle::cf_handle(), Key::binary(), Value::binary()} |
+-type write_actions() :: [{put, Key::binary(), Value::binary() | iolist()} |
+                          {put, ColumnFamilyHandle::cf_handle(), Key::binary(), Value::binary() | iolist()} |
                           {delete, Key::binary()} |
                           {delete, ColumnFamilyHandle::cf_handle(), Key::binary()} |
                           {single_delete, Key::binary()} |
@@ -597,7 +597,7 @@ get_snapshot_sequence(_SnapshotHandle) ->
 -spec put(DBHandle, Key, Value, WriteOpts) -> Res when
   DBHandle::db_handle(),
   Key::binary(),
-  Value::binary(),
+  Value::binary() | iolist(),
   WriteOpts::write_options(),
   Res :: ok | {error, any()}.
 put(_DBHandle, _Key, _Value, _WriteOpts) ->
@@ -608,7 +608,7 @@ put(_DBHandle, _Key, _Value, _WriteOpts) ->
   DBHandle::db_handle(),
   CFHandle::cf_handle(),
   Key::binary(),
-  Value::binary(),
+  Value::binary() | iolist(),
   WriteOpts::write_options(),
   Res :: ok | {error, any()}.
 put(_DBHandle, _CFHandle, _Key, _Value, _WriteOpts) ->
@@ -618,7 +618,7 @@ put(_DBHandle, _CFHandle, _Key, _Value, _WriteOpts) ->
 -spec merge(DBHandle, Key, Value, WriteOpts) -> Res when
   DBHandle::db_handle(),
   Key::binary(),
-  Value::binary(),
+  Value::binary() | iolist(),
   WriteOpts::write_options(),
   Res :: ok | {error, any()}.
 merge(_DBHandle, _Key, _Value, _WriteOpts) ->
@@ -629,7 +629,7 @@ merge(_DBHandle, _Key, _Value, _WriteOpts) ->
   DBHandle::db_handle(),
   CFHandle::cf_handle(),
   Key::binary(),
-  Value::binary(),
+  Value::binary() | iolist(),
   WriteOpts::write_options(),
   Res :: ok | {error, any()}.
 merge(_DBHandle, _CFHandle, _Key, _Value, _WriteOpts) ->
@@ -923,7 +923,7 @@ iterator_refresh(_ITRHandle) ->
 iterator_close(_ITRHandle) ->
     ?nif_stub.
 
--type fold_fun() :: fun(({Key::binary(), Value::binary()}, any()) -> any()).
+-type fold_fun() :: fun(({Key::binary(), Value::binary() | iolist()}, any()) -> any()).
 
 %% @doc Calls Fun(Elem, AccIn) on successive elements in the default column family
 %% starting with AccIn == Acc0.
@@ -1160,22 +1160,22 @@ write_batch(_DbHandle, _Batch, _WriteOptions) ->
   ?nif_stub.
 
 %% @doc add a put operation to the batch
--spec batch_put(Batch :: batch_handle(), Key :: binary(), Value :: binary()) -> ok.
+-spec batch_put(Batch :: batch_handle(), Key :: binary(), Value :: binary() | iolist()) -> ok.
 batch_put(_Batch, _Key, _Value) ->
   ?nif_stub.
 
 %% @doc like `batch_put/3' but apply the operation to a column family
--spec batch_put(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Key :: binary(), Value :: binary()) -> ok.
+-spec batch_put(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Key :: binary(), Value :: binary() | iolist()) -> ok.
 batch_put(_Batch, _ColumnFamily, _Key, _Value) ->
   ?nif_stub.
 
 %% @doc add a merge operation to the batch
--spec batch_merge(Batch :: batch_handle(), Key :: binary(), Value :: binary()) -> ok.
+-spec batch_merge(Batch :: batch_handle(), Key :: binary(), Value :: binary() | iolist()) -> ok.
 batch_merge(_Batch, _Key, _Value) ->
   ?nif_stub.
 
 %% @doc like `batch_mege/3' but apply the operation to a column family
--spec batch_merge(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Key :: binary(), Value :: binary()) -> ok.
+-spec batch_merge(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Key :: binary(), Value :: binary() | iolist()) -> ok.
 batch_merge(_Batch, _ColumnFamily, _Key, _Value) ->
   ?nif_stub.
 
@@ -1243,12 +1243,12 @@ transaction(_TransactionDB, _WriteOptions) ->
   ?nif_stub.
 
 %% @doc add a put operation to the transaction
--spec transaction_put(Transaction :: transaction_handle(), Key :: binary(), Value :: binary()) -> ok.
+-spec transaction_put(Transaction :: transaction_handle(), Key :: binary(), Value :: binary() | iolist()) -> ok.
 transaction_put(_Transaction, _Key, _Value) ->
   ?nif_stub.
 
 %% @doc like `transaction_put/3' but apply the operation to a column family
--spec transaction_put(Transaction :: transaction_handle(), ColumnFamily :: cf_handle(), Key :: binary(),  Value :: binary()) -> ok.
+-spec transaction_put(Transaction :: transaction_handle(), ColumnFamily :: cf_handle(), Key :: binary(),  Value :: binary() | iolist()) -> ok.
 transaction_put(_Transaction, _ColumnFamily, _Key, _Value) ->
   ?nif_stub.
 
@@ -1273,12 +1273,12 @@ transaction_get(_Transaction, _ColumnFamily, _Key) ->
 %% see comment in c_src/transaction.cc
 
 %% %% @doc add a merge operation to the transaction
-%% -spec transaction_merge(Transaction :: transaction_handle(), Key :: binary(), Value :: binary()) -> ok.
+%% -spec transaction_merge(Transaction :: transaction_handle(), Key :: binary(), Value :: binary() | iolist()) -> ok.
 %% transaction_merge(_Transaction, _Key, _Value) ->
 %%   ?nif_stub.
 
 %% %% @doc like `transaction_merge/3' but apply the operation to a column family
-%% -spec transaction_merge(Transaction :: transaction_handle(), ColumnFamily :: cf_handle(), Key :: binary(), Value :: binary()) -> ok.
+%% -spec transaction_merge(Transaction :: transaction_handle(), ColumnFamily :: cf_handle(), Key :: binary(), Value :: binary() | iolist()) -> ok.
 %% transaction_merge(_Transaction, _ColumnFamily, _Key, _Value) ->
 %%   ?nif_stub.
 

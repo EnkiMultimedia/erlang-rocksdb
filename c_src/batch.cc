@@ -143,7 +143,7 @@ PutBatch(
     {
         if(!enif_get_cf(env, argv[1], &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key) ||
-                !enif_inspect_binary(env, argv[3], &value))
+                !enif_inspect_iolist_as_binary(env, argv[3], &value))
             return enif_make_badarg(env);
 
         enif_make_copy(batch_ptr->env, argv[1]);
@@ -158,7 +158,7 @@ PutBatch(
     else
     {
         if(!enif_inspect_binary(env, argv[1], &key) ||
-                !enif_inspect_binary(env, argv[2], &value))
+                !enif_inspect_iolist_as_binary(env, argv[2], &value))
             return enif_make_badarg(env);
 
         enif_make_copy(batch_ptr->env, argv[1]);
@@ -191,7 +191,7 @@ MergeBatch(
     {
         if(!enif_get_cf(env, argv[1], &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key) ||
-                !enif_inspect_binary(env, argv[3], &value))
+                !enif_inspect_iolist_as_binary(env, argv[3], &value))
             return enif_make_badarg(env);
 
         enif_make_copy(batch_ptr->env, argv[1]);
@@ -206,7 +206,7 @@ MergeBatch(
     else
     {
         if(!enif_inspect_binary(env, argv[1], &key) ||
-                !enif_inspect_binary(env, argv[2], &value))
+                !enif_inspect_iolist_as_binary(env, argv[2], &value))
             return enif_make_badarg(env);
 
         enif_make_copy(batch_ptr->env, argv[1]);
