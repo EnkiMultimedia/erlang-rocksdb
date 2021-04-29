@@ -22,17 +22,25 @@ basic_test() ->
 
     ok = rocksdb:transaction_put(Transaction, <<"a">>, <<"v1">>),
     ok = rocksdb:transaction_put(Transaction, <<"b">>, <<"v2">>),
+    ok = rocksdb:transaction_put(Transaction, <<"c">>, [[<<"v">>], "3"]),
+    ok = rocksdb:transaction_put(Transaction, <<"d">>, [[<<"v">>], ["4"]]),
 
     ?assertEqual(not_found, rocksdb:get(Db, <<"a">>, [])),
     ?assertEqual(not_found, rocksdb:get(Db, <<"b">>, [])),
+    ?assertEqual(not_found, rocksdb:get(Db, <<"c">>, [])),
+    ?assertEqual(not_found, rocksdb:get(Db, <<"d">>, [])),
 
     ?assertEqual({ok, <<"v1">>}, rocksdb:transaction_get(Transaction, <<"a">>)),
     ?assertEqual({ok, <<"v2">>}, rocksdb:transaction_get(Transaction, <<"b">>)),
+    ?assertEqual({ok, <<"v3">>}, rocksdb:transaction_get(Transaction, <<"c">>)),
+    ?assertEqual({ok, <<"v4">>}, rocksdb:transaction_get(Transaction, <<"d">>)),
 
     ok = rocksdb:transaction_commit(Transaction),
 
     ?assertEqual({ok, <<"v1">>}, rocksdb:get(Db, <<"a">>, [])),
     ?assertEqual({ok, <<"v2">>}, rocksdb:get(Db, <<"b">>, [])),
+    ?assertEqual({ok, <<"v3">>}, rocksdb:get(Db, <<"c">>, [])),
+    ?assertEqual({ok, <<"v4">>}, rocksdb:get(Db, <<"d">>, [])),
 
     ?assertException(error, badarg, rocksdb:transaction_put(Transaction, <<"a">>, <<"v2">>)),
     close_destroy(Db, "transaction_testdb"),

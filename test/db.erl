@@ -19,6 +19,17 @@
 
 -define(rm_rf(Dir), rocksdb_test_util:rm_rf(Dir)).
 
+iolist_test() ->
+  Key = <<"abc">>,
+  ValAsIoList = ["1", [[[<<"2">>]]], ["3"]],
+  ValAsBin = <<"123">>,
+  {ok, Ref} = rocksdb:open("erocksdb.open.test", [{create_if_missing, true}]),
+  true = rocksdb:is_empty(Ref),
+  ok = rocksdb:put(Ref, Key, ValAsIoList, []),
+  false = rocksdb:is_empty(Ref),
+  {ok, ValAsBin} = rocksdb:get(Ref, Key, []),
+  ?rm_rf("erocksdb.open.test"),
+  ok.
 
 open_test() -> [{open_test_Z(), l} || l <- lists:seq(1, 20)].
 open_test_Z() ->

@@ -3,6 +3,18 @@
 -compile([export_all/1]).
 -include_lib("eunit/include/eunit.hrl").
 
+-define(KEY_1, <<"k1">>).
+-define(VAL_1_BIN, <<"v1">>).
+-define(VAL_1_IOL, [["v"], <<"1">>]).
+
+-define(KEY_2, <<"k2">>).
+-define(VAL_2_BIN, <<"v2">>).
+-define(VAL_2_IOL, [["v"], <<"2">>]).
+
+-define(KEY_3, <<"k3">>).
+-define(VAL_3_BIN, <<"v3">>).
+-define(VAL_3_IOL, [["v"], <<"3">>]).
+
 destroy_reopen(DbName, Options) ->
   _ = rocksdb:destroy(DbName, []),
   {ok, Db} = rocksdb:open(DbName, Options),
@@ -17,17 +29,20 @@ basic_test() ->
 
   {ok, Batch} = rocksdb:batch(),
 
-  ok = rocksdb:batch_put(Batch, <<"a">>, <<"v1">>),
-  ok = rocksdb:batch_put(Batch, <<"b">>, <<"v2">>),
-  ?assertEqual(2, rocksdb:batch_count(Batch)),
+  ok = rocksdb:batch_put(Batch, ?KEY_1, ?VAL_1_IOL),
+  ok = rocksdb:batch_put(Batch, ?KEY_2, ?VAL_2_IOL),
+  ok = rocksdb:batch_put(Batch, ?KEY_3, ?VAL_3_BIN),
+  ?assertEqual(3, rocksdb:batch_count(Batch)),
 
-  ?assertEqual(not_found, rocksdb:get(Db, <<"a">>, [])),
-  ?assertEqual(not_found, rocksdb:get(Db, <<"b">>, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, ?KEY_1, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, ?KEY_2, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, ?KEY_3, [])),
 
   ok = rocksdb:write_batch(Db, Batch, []),
 
-  ?assertEqual({ok, <<"v1">>}, rocksdb:get(Db, <<"a">>, [])),
-  ?assertEqual({ok, <<"v2">>}, rocksdb:get(Db, <<"b">>, [])),
+  ?assertEqual({ok, ?VAL_1_BIN}, rocksdb:get(Db, ?KEY_1, [])),
+  ?assertEqual({ok, ?VAL_2_BIN}, rocksdb:get(Db, ?KEY_2, [])),
+  ?assertEqual({ok, ?VAL_3_BIN}, rocksdb:get(Db, ?KEY_3, [])),
 
   ok = rocksdb:release_batch(Batch),
 
@@ -39,18 +54,21 @@ delete_test() ->
 
   {ok, Batch} = rocksdb:batch(),
 
-  ok = rocksdb:batch_put(Batch, <<"a">>, <<"v1">>),
-  ok = rocksdb:batch_put(Batch, <<"b">>, <<"v2">>),
-  ok = rocksdb:batch_delete(Batch, <<"b">>),
-  ?assertEqual(3, rocksdb:batch_count(Batch)),
+  ok = rocksdb:batch_put(Batch, ?KEY_1, ?VAL_1_IOL),
+  ok = rocksdb:batch_put(Batch, ?KEY_2, ?VAL_2_IOL),
+  ok = rocksdb:batch_delete(Batch, ?KEY_2),
+  ok = rocksdb:batch_put(Batch, ?KEY_3, ?VAL_3_BIN),
+  ?assertEqual(4, rocksdb:batch_count(Batch)),
 
-  ?assertEqual(not_found, rocksdb:get(Db, <<"a">>, [])),
-  ?assertEqual(not_found, rocksdb:get(Db, <<"b">>, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, ?KEY_1, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, ?KEY_2, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, ?KEY_3, [])),
 
   ok = rocksdb:write_batch(Db, Batch, []),
 
-  ?assertEqual({ok, <<"v1">>}, rocksdb:get(Db, <<"a">>, [])),
-  ?assertEqual(not_found, rocksdb:get(Db, <<"b">>, [])),
+  ?assertEqual({ok, ?VAL_1_BIN}, rocksdb:get(Db, ?KEY_1, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, ?KEY_2, [])),
+  ?assertEqual({ok, ?VAL_3_BIN}, rocksdb:get(Db, ?KEY_3, [])),
 
   ok = rocksdb:release_batch(Batch),
 
@@ -60,15 +78,15 @@ delete_test() ->
 single_delete_test() ->
   Db = destroy_reopen("test.db", [{create_if_missing, true}]),
   {ok, Batch} = rocksdb:batch(),
-  ok = rocksdb:batch_put(Batch, <<"a">>, <<"v1">>),
+  ok = rocksdb:batch_put(Batch, ?KEY_1, ?VAL_1_IOL),
   ok = rocksdb:write_batch(Db, Batch, []),
-  ?assertEqual({ok, <<"v1">>}, rocksdb:get(Db, <<"a">>, [])),
+  ?assertEqual({ok, ?VAL_1_BIN}, rocksdb:get(Db, ?KEY_1, [])),
   ok = rocksdb:release_batch(Batch),
   {ok, Batch1} = rocksdb:batch(),
-  ok = rocksdb:batch_single_delete(Batch1, <<"a">>),
+  ok = rocksdb:batch_single_delete(Batch1, ?KEY_1),
   ok = rocksdb:write_batch(Db, Batch1, []),
   ok = rocksdb:release_batch(Batch1),
-  ?assertEqual(not_found, rocksdb:get(Db, <<"a">>, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, ?KEY_1, [])),
   close_destroy(Db, "test.db"),
   ok.
 
@@ -77,18 +95,18 @@ delete_with_notfound_test() ->
 
   {ok, Batch} = rocksdb:batch(),
 
-  ok = rocksdb:batch_put(Batch, <<"a">>, <<"v1">>),
-  ok = rocksdb:batch_put(Batch, <<"b">>, <<"v2">>),
-  ok = rocksdb:batch_delete(Batch, <<"c">>),
+  ok = rocksdb:batch_put(Batch, ?KEY_1, ?VAL_1_IOL),
+  ok = rocksdb:batch_put(Batch, ?KEY_2, ?VAL_2_BIN),
+  ok = rocksdb:batch_delete(Batch, ?KEY_3),
   ?assertEqual(3, rocksdb:batch_count(Batch)),
 
-  ?assertEqual(not_found, rocksdb:get(Db, <<"a">>, [])),
-  ?assertEqual(not_found, rocksdb:get(Db, <<"b">>, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, ?KEY_1, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, ?KEY_2, [])),
 
   ok = rocksdb:write_batch(Db, Batch, []),
 
-  ?assertEqual({ok, <<"v1">>}, rocksdb:get(Db, <<"a">>, [])),
-  ?assertEqual({ok, <<"v2">>}, rocksdb:get(Db, <<"b">>, [])),
+  ?assertEqual({ok, ?VAL_1_BIN}, rocksdb:get(Db, ?KEY_1, [])),
+  ?assertEqual({ok, ?VAL_2_BIN}, rocksdb:get(Db, ?KEY_2, [])),
 
   ok = rocksdb:release_batch(Batch),
 
@@ -97,44 +115,47 @@ delete_with_notfound_test() ->
 
 tolist_test() ->
   {ok, Batch} = rocksdb:batch(),
-  ok = rocksdb:batch_put(Batch, <<"a">>, <<"v1">>),
-  ok = rocksdb:batch_put(Batch, <<"b">>, <<"v2">>),
-  ?assertEqual(2, rocksdb:batch_count(Batch)),
-  ?assertEqual([{put, <<"a">>, <<"v1">>}, {put, <<"b">>, <<"v2">>}], rocksdb:batch_tolist(Batch)),
+  ok = rocksdb:batch_put(Batch, ?KEY_1, ?VAL_1_IOL),
+  ok = rocksdb:batch_put(Batch, ?KEY_2, ?VAL_2_IOL),
+  ok = rocksdb:batch_put(Batch, ?KEY_3, ?VAL_3_BIN),
+  ?assertEqual(3, rocksdb:batch_count(Batch)),
+  ?assertEqual([{put, ?KEY_1, ?VAL_1_BIN},
+                {put, ?KEY_2, ?VAL_2_BIN},
+                {put, ?KEY_3, ?VAL_3_BIN}], rocksdb:batch_tolist(Batch)),
   ok = rocksdb:release_batch(Batch),
   ok.
 
 rollback_test() ->
   {ok, Batch} = rocksdb:batch(),
-  ok = rocksdb:batch_put(Batch, <<"a">>, <<"v1">>),
-  ok = rocksdb:batch_put(Batch, <<"b">>, <<"v2">>),
+  ok = rocksdb:batch_put(Batch, ?KEY_1, ?VAL_1_IOL),
+  ok = rocksdb:batch_put(Batch, ?KEY_2, ?VAL_2_BIN),
   ok = rocksdb:batch_savepoint(Batch),
-  ok = rocksdb:batch_put(Batch, <<"c">>, <<"v3">>),
+  ok = rocksdb:batch_put(Batch, ?KEY_3, ?VAL_3_IOL),
   ?assertEqual(3, rocksdb:batch_count(Batch)),
-  ?assertEqual([{put, <<"a">>, <<"v1">>},
-                {put, <<"b">>, <<"v2">>},
-                {put, <<"c">>, <<"v3">>}], rocksdb:batch_tolist(Batch)),
+  ?assertEqual([{put, ?KEY_1, ?VAL_1_BIN},
+                {put, ?KEY_2, ?VAL_2_BIN},
+                {put, ?KEY_3, ?VAL_3_BIN}], rocksdb:batch_tolist(Batch)),
   ok = rocksdb:batch_rollback(Batch),
   ?assertEqual(2, rocksdb:batch_count(Batch)),
-  ?assertEqual([{put, <<"a">>, <<"v1">>},
-                {put, <<"b">>, <<"v2">>}], rocksdb:batch_tolist(Batch)),
+  ?assertEqual([{put, ?KEY_1, ?VAL_1_BIN},
+                {put, ?KEY_2, ?VAL_2_BIN}], rocksdb:batch_tolist(Batch)),
   ok = rocksdb:release_batch(Batch).
 
 
 rollback_over_savepoint_test() ->
   {ok, Batch} = rocksdb:batch(),
-  ok = rocksdb:batch_put(Batch, <<"a">>, <<"v1">>),
-  ok = rocksdb:batch_put(Batch, <<"b">>, <<"v2">>),
+  ok = rocksdb:batch_put(Batch, ?KEY_1, ?VAL_1_IOL),
+  ok = rocksdb:batch_put(Batch, ?KEY_2, ?VAL_2_BIN),
   ok = rocksdb:batch_savepoint(Batch),
-  ok = rocksdb:batch_put(Batch, <<"c">>, <<"v3">>),
+  ok = rocksdb:batch_put(Batch, ?KEY_3, ?VAL_3_IOL),
   ?assertEqual(3, rocksdb:batch_count(Batch)),
-  ?assertEqual([{put, <<"a">>, <<"v1">>},
-                {put, <<"b">>, <<"v2">>},
-                {put, <<"c">>, <<"v3">>}], rocksdb:batch_tolist(Batch)),
+  ?assertEqual([{put, ?KEY_1, ?VAL_1_BIN},
+                {put, ?KEY_2, ?VAL_2_BIN},
+                {put, ?KEY_3, ?VAL_3_BIN}], rocksdb:batch_tolist(Batch)),
   ok = rocksdb:batch_rollback(Batch),
   ?assertEqual(2, rocksdb:batch_count(Batch)),
-  ?assertEqual([{put, <<"a">>, <<"v1">>},
-                {put, <<"b">>, <<"v2">>}], rocksdb:batch_tolist(Batch)),
+  ?assertEqual([{put, ?KEY_1, ?VAL_1_BIN},
+                {put, ?KEY_2, ?VAL_2_BIN}], rocksdb:batch_tolist(Batch)),
 
   ?assertMatch({error, _}, rocksdb:batch_rollback(Batch)),
 

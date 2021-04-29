@@ -127,7 +127,7 @@ namespace erocksdb {
 
         if( argc == 3 ) { // default
             if(!enif_inspect_binary(env, argv[1], &key) ||
-               !enif_inspect_binary(env, argv[2], &value)) {
+               !enif_inspect_iolist_as_binary(env, argv[2], &value)) {
                 return enif_make_badarg(env);
             }
 
@@ -141,7 +141,7 @@ namespace erocksdb {
         } else if( argc == 4 ) { // cf
             if(!enif_get_cf(env, argv[1], &cf_ptr) ||
                !enif_inspect_binary(env, argv[2], &key) ||
-               !enif_inspect_binary(env, argv[3], &value)) {
+               !enif_inspect_iolist_as_binary(env, argv[3], &value)) {
                 return enif_make_badarg(env);
             }
 
@@ -250,13 +250,13 @@ namespace erocksdb {
         if (argc == 4) {
             if(!enif_get_cf(env, argv[1], &cf_ptr) ||
                !enif_inspect_binary(env, argv[2], &key) ||
-               !enif_inspect_binary(env, argv[3], &value)) {
+               !enif_inspect_iolist_as_binary(env, argv[3], &value)) {
                 return enif_make_badarg(env);
             }
             cfh = cf_ptr->m_ColumnFamily;
         } else if (argc == 3) {
             if(!enif_inspect_binary(env, argv[1], &key) ||
-               !enif_inspect_binary(env, argv[2], &value)) {
+               !enif_inspect_iolist_as_binary(env, argv[2], &value)) {
                 return enif_make_badarg(env);
             }
             cfh = transaction->base_db->DefaultColumnFamily();
