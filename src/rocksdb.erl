@@ -1318,7 +1318,7 @@ transaction_iterator(_DBHandle, _TransactionHandle, _CfHandle, _ReadOpts) ->
   ?nif_stub.
 
 %% @doc commit a transaction to disk atomically (?)
--spec transaction_commit(Transaction :: transaction_handle()) -> ok.
+-spec transaction_commit(Transaction :: transaction_handle()) -> ok | {error, term()}.
 transaction_commit(_Transaction) ->
   ?nif_stub.
 
