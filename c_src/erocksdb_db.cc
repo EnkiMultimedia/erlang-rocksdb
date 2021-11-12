@@ -1308,14 +1308,14 @@ Put(
     {
         if(!enif_get_cf(env, argv[1], &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key) ||
-                !enif_inspect_binary(env, argv[3], &value))
+                !enif_inspect_iolist_as_binary(env, argv[3], &value))
             return enif_make_badarg(env);
         cfh = cf_ptr->m_ColumnFamily;
     }
     else
     {
         if(!enif_inspect_binary(env, argv[1], &key) ||
-                !enif_inspect_binary(env, argv[2], &value))
+                !enif_inspect_iolist_as_binary(env, argv[2], &value))
             return enif_make_badarg(env);
         cfh = db_ptr->m_Db->DefaultColumnFamily();
     }
@@ -1352,14 +1352,14 @@ Merge(
     {
         if(!enif_get_cf(env, argv[1], &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key) ||
-                !enif_inspect_binary(env, argv[3], &value))
+                !enif_inspect_iolist_as_binary(env, argv[3], &value))
             return enif_make_badarg(env);
         cfh = cf_ptr->m_ColumnFamily;
     }
     else
     {
         if(!enif_inspect_binary(env, argv[1], &key) ||
-                !enif_inspect_binary(env, argv[2], &value))
+                !enif_inspect_iolist_as_binary(env, argv[2], &value))
             return enif_make_badarg(env);
         cfh = db_ptr->m_Db->DefaultColumnFamily();
     }

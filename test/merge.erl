@@ -31,7 +31,8 @@ merge_int_test() ->
   {ok, IBin0} = rocksdb:get(Db, <<"i">>, []),
   0 = binary_to_term(IBin0),
 
-  ok = rocksdb:merge(Db, <<"i">>, term_to_binary({int_add, 1}), []),
+  % Wrap in list and add dummy empties just to test that an iolist is accepted:
+  ok = rocksdb:merge(Db, <<"i">>, [term_to_binary({int_add, 1}), <<>>, [<<>>]], []),
   {ok, IBin1} = rocksdb:get(Db, <<"i">>, []),
   1 = binary_to_term(IBin1),
 
