@@ -1,5 +1,6 @@
-set(ROCKSDB_ROOT_DIR "${PROJECT_SOURCE_DIR}/../deps/rocksdb")
-
+# Get absolute path to rocksdb sources (PROJECT_SOURCE_DIR is c_src)
+get_filename_component(ROCKSDB_ROOT_DIR "${PROJECT_SOURCE_DIR}/../deps/rocksdb" ABSOLUTE)
+message(STATUS "RocksDB source directory: ${ROCKSDB_ROOT_DIR}")
 
 set(rocksdb_CMAKE_ARGS -DCMAKE_POSITION_INDEPENDENT_CODE=ON)
 

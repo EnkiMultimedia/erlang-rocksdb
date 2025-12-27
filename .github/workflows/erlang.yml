@@ -21,6 +21,8 @@ jobs:
         rebar3: ['3.24.0']
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{matrix.otp}}
@@ -37,8 +39,13 @@ jobs:
       matrix:
         otp:  ["25.3", "26.2", "27.2"]
         rebar3: ['3.24.0']
+    env:
+      # Override global env to use system libraries instead of bundled
+      ERLANG_ROCKSDB_OPTS: "-DWITH_LZ4=ON -DWITH_SNAPPY=ON"
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{matrix.otp}}

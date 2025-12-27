@@ -119,22 +119,22 @@ if(WITH_CCACHE)
 endif(WITH_CCACHE)
 
 # Compression library options
-# WITH_* options default to ON (auto-detect system libraries)
-# WITH_BUNDLE_* options default to OFF
-# If WITH_BUNDLE_*=ON, the corresponding WITH_* is disabled (use bundled instead)
+# LZ4 and Snappy: auto-detect by default, unless WITH_BUNDLE_* is set
+# Other compression libs: only enabled if explicitly requested
 option(WITH_BUNDLE_LZ4 "Use bundled lz4 instead of system" OFF)
 option(WITH_BUNDLE_SNAPPY "Use bundled snappy instead of system" OFF)
-option(WITH_ZSTD "build with zstd" ON)
+option(WITH_ZSTD "build with zstd" OFF)
 option(WITH_ZLIB "build with zlib" OFF)
 option(WITH_BZ2 "build with bzip2" OFF)
 
-# If using bundled version, disable system version
+# LZ4: use bundled if requested, otherwise auto-detect
 if(WITH_BUNDLE_LZ4)
     set(WITH_LZ4 OFF)
 else()
     option(WITH_LZ4 "build with lz4" ON)
 endif()
 
+# Snappy: use bundled if requested, otherwise auto-detect
 if(WITH_BUNDLE_SNAPPY)
     set(WITH_SNAPPY OFF)
 else()
