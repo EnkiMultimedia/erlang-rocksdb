@@ -18,14 +18,6 @@
 -module(fifo_compaction).
 -include_lib("eunit/include/eunit.hrl").
 
--export([
-  no_fifo_compaction_test/0,
-  fifo_compaction_with_ttl_4_test/0,
-  fifo_compaction_with_ttl_8_test/0,
-  fifo_compaction_options_allow_compaction_settings_1_test/0,
-  fifo_compaction_options_allow_compaction_settings_2_test/0
-]).
-
 -define(rm_rf(Dir), rocksdb_test_util:rm_rf(Dir)).
 
 no_fifo_compaction_test() ->

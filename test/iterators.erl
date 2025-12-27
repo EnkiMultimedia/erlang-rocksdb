@@ -21,8 +21,6 @@
 %% -------------------------------------------------------------------
 -module(iterators).
 
--compile(export_all).
-
 -include_lib("eunit/include/eunit.hrl").
 
 prev_test() ->

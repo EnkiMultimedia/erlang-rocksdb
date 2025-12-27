@@ -25,8 +25,6 @@
 
 -module(cleanup).
 
--compile(export_all).
-
 -include_lib("eunit/include/eunit.hrl").
 
 -define(COMMON_INSTANCE_DIR, "erocksdb.cleanup.test").

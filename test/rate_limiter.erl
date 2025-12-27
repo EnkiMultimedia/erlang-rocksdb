@@ -18,8 +18,6 @@
 %% -------------------------------------------------------------------
 -module(rate_limiter).
 
--compile(export_all).
-
 -include_lib("eunit/include/eunit.hrl").
 
 simple_rate_limiter_test() ->
