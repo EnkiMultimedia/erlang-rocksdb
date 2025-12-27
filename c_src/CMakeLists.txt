@@ -28,6 +28,28 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/CMake")
 
+# Add standard package manager paths for macOS (MacPorts and Homebrew)
+if(APPLE)
+    # MacPorts
+    if(EXISTS "/opt/local")
+        list(APPEND CMAKE_PREFIX_PATH "/opt/local")
+        list(APPEND CMAKE_INCLUDE_PATH "/opt/local/include")
+        list(APPEND CMAKE_LIBRARY_PATH "/opt/local/lib")
+    endif()
+    # Homebrew on Apple Silicon
+    if(EXISTS "/opt/homebrew")
+        list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew")
+        list(APPEND CMAKE_INCLUDE_PATH "/opt/homebrew/include")
+        list(APPEND CMAKE_LIBRARY_PATH "/opt/homebrew/lib")
+    endif()
+    # Homebrew on Intel (default location)
+    if(EXISTS "/usr/local/include")
+        list(APPEND CMAKE_PREFIX_PATH "/usr/local")
+        list(APPEND CMAKE_INCLUDE_PATH "/usr/local/include")
+        list(APPEND CMAKE_LIBRARY_PATH "/usr/local/lib")
+    endif()
+endif()
+
 # includes
 # set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake" ${CMAKE_MODULE_PATH})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -96,10 +118,28 @@ if(WITH_CCACHE)
   endif(CCACHE_FOUND)
 endif(WITH_CCACHE)
 
-option(WITH_ZSTD "build with zstd" OFF)
-option(WITH_SNAPPY "build with SNAPPY" OFF)
-option(WITH_LZ4 "build with lz4" OFF)
+# Compression library options
+# WITH_* options default to ON (auto-detect system libraries)
+# WITH_BUNDLE_* options default to OFF
+# If WITH_BUNDLE_*=ON, the corresponding WITH_* is disabled (use bundled instead)
+option(WITH_BUNDLE_LZ4 "Use bundled lz4 instead of system" OFF)
+option(WITH_BUNDLE_SNAPPY "Use bundled snappy instead of system" OFF)
+option(WITH_ZSTD "build with zstd" ON)
 option(WITH_ZLIB "build with zlib" OFF)
+option(WITH_BZ2 "build with bzip2" OFF)
+
+# If using bundled version, disable system version
+if(WITH_BUNDLE_LZ4)
+    set(WITH_LZ4 OFF)
+else()
+    option(WITH_LZ4 "build with lz4" ON)
+endif()
+
+if(WITH_BUNDLE_SNAPPY)
+    set(WITH_SNAPPY OFF)
+else()
+    option(WITH_SNAPPY "build with SNAPPY" ON)
+endif()
 
 if(WITH_ZLIB)
     find_package(zlib REQUIRED)
@@ -114,33 +154,39 @@ if(WITH_ZLIB)
     list(APPEND THIRDPARTY_LIBS ${ZLIB_LIBRARIES})
 endif()
 
-option(WITH_BZ2 "build with bzip2" OFF)
 if(WITH_BZ2)
     find_package(BZip2 REQUIRED)
 endif()
 
-
-option(WITH_BUNDLE_LZ4 "Use bundle lz4" OFF)
-if (WITH_BUNDLE_LZ4 AND NOT WITH_LZ4)
+# LZ4: use bundled or find system library
+if(WITH_BUNDLE_LZ4)
     include(build-lz4)
+elseif(WITH_LZ4)
+    find_package(LZ4)
+    if(NOT LZ4_FOUND)
+        message(STATUS "LZ4 not found, disabling LZ4 support")
+        set(WITH_LZ4 OFF)
+    endif()
 endif()
 
-if(WITH_LZ4)
-    find_package(LZ4 REQUIRED)
-endif()
-
-option(WITH_BUNDLE_SNAPPY "Use bundle snappy" OFF)
-
-if(WITH_BUNDLE_SNAPPY AND NOT WITH_SNAPPY)
+# Snappy: use bundled or find system library
+if(WITH_BUNDLE_SNAPPY)
     include(build-snappy)
+elseif(WITH_SNAPPY)
+    find_package(Snappy)
+    if(NOT SNAPPY_FOUND AND NOT Snappy_FOUND)
+        message(STATUS "Snappy not found, disabling Snappy support")
+        set(WITH_SNAPPY OFF)
+    endif()
 endif()
 
-if(WITH_SNAPPY)
-    find_package(Snappy REQUIRED)
-endif()
-
+# Zstd: find system library
 if(WITH_ZSTD)
-  find_package(Zstd REQUIRED)
+    find_package(Zstd)
+    if(NOT ZSTD_FOUND AND NOT Zstd_FOUND)
+        message(STATUS "Zstd not found, disabling Zstd support")
+        set(WITH_ZSTD OFF)
+    endif()
 endif()
 
 
@@ -252,6 +298,15 @@ if(APPLE)
 	set(TARGET_LINKER_OPTIONS "-flat_namespace -undefined suppress")
 endif(APPLE)
 
+# On Linux with bundled snappy, we need --whole-archive to include all symbols
+# including RTTI symbols that are needed at runtime but not directly referenced
+if(WITH_BUNDLE_SNAPPY AND NOT APPLE AND NOT MSVC)
+    # Handle snappy separately with whole-archive wrapper
+    set(SNAPPY_LINK_LIBS "")
+else()
+    set(SNAPPY_LINK_LIBS ${SNAPPY_LIBRARY})
+endif()
+
 target_link_libraries(
     ${ErlangRocksDBNIF_TARGET}
     PRIVATE
@@ -259,11 +314,22 @@ target_link_libraries(
     ${ROCKSDB_LIBRARIES}
     ${ZSTD_LIBRARY}
     ${LZ4_LIBRARY}
-    ${SNAPPY_LIBRARY}
+    ${SNAPPY_LINK_LIBS}
     ${BZIP2_LIBRARIES}
     ${ZLIB_LIBRARY}
     ${TBB_LIBRARIES}
 )
+
+# Link bundled snappy with --whole-archive to include RTTI symbols
+if(WITH_BUNDLE_SNAPPY AND NOT APPLE AND NOT MSVC)
+    target_link_libraries(
+        ${ErlangRocksDBNIF_TARGET}
+        PRIVATE
+        "-Wl,--whole-archive"
+        "${SNAPPY_LIBRARY}"
+        "-Wl,--no-whole-archive"
+    )
+endif()
 
 if(MSVC)
 	target_link_libraries(
