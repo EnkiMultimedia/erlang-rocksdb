@@ -2938,7 +2938,6 @@ TEST_F(CreateEnvTest, CreateEncryptedFileSystem) {
   ASSERT_TRUE(fs->AreEquivalent(config_options_, copy.get(), &mismatch));
 }
 
-
 namespace {
 
 constexpr size_t kThreads = 8;
@@ -3468,7 +3467,6 @@ class ReadAsyncRandomAccessFile : public FSRandomAccessFileOwnerWrapper {
 
  private:
   ReadAsyncFS& fs_;
-  std::unique_ptr<FSRandomAccessFile> file_;
   int counter = 0;
 };
 
@@ -3656,6 +3654,60 @@ struct StaticDestructionTester {
 TEST(EnvTestMisc, StaticDestruction) {
   // Check for any crashes during static destruction.
   static_destruction_tester.activated = true;
+}
+
+// Test GetFileSize API
+class TestGetFileSize : public testing::Test {
+ public:
+  TestGetFileSize() { env_ = Env::Default(); }
+  Env* env_;
+};
+
+// Validate GetFileSize API returns the right value.
+// Use the default implementation from env
+TEST_F(TestGetFileSize, GetFileSize) {
+  EnvOptions soptions;
+  auto fs = env_->GetFileSystem();
+
+  std::string fname = test::PerThreadDBPath(env_, "getFileSizeTestfile");
+
+  // randomize file size
+  auto rnd = Random::GetTLSInstance();
+  auto expectedFileSize = rnd->Uniform(256 * 1024) + 1;
+  auto content = rnd->RandomBinaryString(static_cast<int>(expectedFileSize));
+
+  ASSERT_OK(CreateFile(fs.get(), fname, content, false));
+
+  std::unique_ptr<FSRandomAccessFile> file;
+  ASSERT_OK(fs->NewRandomAccessFile(fname, FileOptions(), &file, nullptr));
+
+  uint64_t fileSizeFromFileSystemAPI;
+  ASSERT_OK(
+      fs->GetFileSize(fname, IOOptions(), &fileSizeFromFileSystemAPI, nullptr));
+  ASSERT_EQ(fileSizeFromFileSystemAPI, expectedFileSize);
+
+  uint64_t fileSizeFromFsRandomAccessFileAPI;
+  ASSERT_OK(file->GetFileSize(&fileSizeFromFsRandomAccessFileAPI));
+
+  ASSERT_EQ(fileSizeFromFsRandomAccessFileAPI, expectedFileSize);
+}
+
+class TestIOActivity : public testing::Test {
+ public:
+  TestIOActivity() {}
+};
+
+TEST_F(TestIOActivity, IOActivityToString) {
+  ASSERT_EQ(Env::IOActivityToString(Env::IOActivity::kMultiGet), "MultiGet");
+
+  ASSERT_EQ(Env::IOActivityToString(Env::IOActivity::kCustomIOActivity80),
+            "CustomIOActivity80");
+  ASSERT_EQ(Env::IOActivityToString(Env::IOActivity::kCustomIOActivityA9),
+            "CustomIOActivityA9");
+  ASSERT_EQ(Env::IOActivityToString(Env::IOActivity::kCustomIOActivityFE),
+            "CustomIOActivityFE");
+
+  ASSERT_EQ(Env::IOActivityToString(Env::IOActivity::kUnknown), "Unknown");
 }
 
 }  // namespace ROCKSDB_NAMESPACE

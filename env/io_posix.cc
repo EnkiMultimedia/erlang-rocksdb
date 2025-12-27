@@ -607,6 +607,17 @@ PosixRandomAccessFile::PosixRandomAccessFile(
 
 PosixRandomAccessFile::~PosixRandomAccessFile() { close(fd_); }
 
+IOStatus PosixRandomAccessFile::GetFileSize(uint64_t* result) {
+  struct stat sbuf {};
+  if (fstat(fd_, &sbuf) != 0) {
+    *result = 0;
+    return IOError("While fstat with fd " + std::to_string(fd_), filename_,
+                   errno);
+  }
+  *result = sbuf.st_size;
+  return IOStatus::OK();
+}
+
 IOStatus PosixRandomAccessFile::Read(uint64_t offset, size_t n,
                                      const IOOptions& /*opts*/, Slice* result,
                                      char* scratch,
@@ -924,7 +935,8 @@ IOStatus PosixRandomAccessFile::ReadAsync(
 
   // Init failed, platform doesn't support io_uring.
   if (iu == nullptr) {
-    return IOStatus::NotSupported("ReadAsync");
+    fprintf(stderr, "failed to init io_uring\n");
+    return IOStatus::NotSupported("ReadAsync: failed to init io_uring");
   }
 
   // Allocate io_handle.
@@ -967,7 +979,8 @@ IOStatus PosixRandomAccessFile::ReadAsync(
   (void)cb_arg;
   (void)io_handle;
   (void)del_fn;
-  return IOStatus::NotSupported("ReadAsync");
+  return IOStatus::NotSupported(
+      "ReadAsync: ROCKSDB_IOURING_PRESENT is not set");
 #endif
 }
 
@@ -1056,6 +1069,11 @@ IOStatus PosixMmapReadableFile::InvalidateCache(size_t offset, size_t length) {
 #endif
 }
 
+IOStatus PosixMmapReadableFile::GetFileSize(uint64_t* result) {
+  *result = length_;
+  return IOStatus::OK();
+}
+
 /*
  * PosixMmapFile
  *
@@ -1138,7 +1156,8 @@ IOStatus PosixMmapFile::Msync() {
 }
 
 PosixMmapFile::PosixMmapFile(const std::string& fname, int fd, size_t page_size,
-                             const EnvOptions& options)
+                             const EnvOptions& options,
+                             uint64_t initial_file_size)
     : filename_(fname),
       fd_(fd),
       page_size_(page_size),
@@ -1147,7 +1166,7 @@ PosixMmapFile::PosixMmapFile(const std::string& fname, int fd, size_t page_size,
       limit_(nullptr),
       dst_(nullptr),
       last_sync_(nullptr),
-      file_offset_(0) {
+      file_offset_(initial_file_size) {
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   allow_fallocate_ = options.allow_fallocate;
   fallocate_with_keep_size_ = options.fallocate_with_keep_size;
@@ -1317,12 +1336,13 @@ IOStatus PosixMmapFile::Allocate(uint64_t offset, uint64_t len,
  */
 PosixWritableFile::PosixWritableFile(const std::string& fname, int fd,
                                      size_t logical_block_size,
-                                     const EnvOptions& options)
+                                     const EnvOptions& options,
+                                     uint64_t initial_file_size)
     : FSWritableFile(options),
       filename_(fname),
       use_direct_io_(options.use_direct_writes),
       fd_(fd),
-      filesize_(0),
+      filesize_(initial_file_size),
       logical_sector_size_(logical_block_size) {
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   allow_fallocate_ = options.allow_fallocate;

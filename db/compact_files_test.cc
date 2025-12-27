@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include <mutex>
 #include <string>
 #include <thread>
@@ -442,6 +441,10 @@ TEST_F(CompactFilesTest, SentinelCompressionType) {
 }
 
 TEST_F(CompactFilesTest, CompressionWithBlockAlign) {
+  if (!Snappy_Supported()) {
+    ROCKSDB_GTEST_SKIP("Test requires Snappy support");
+    return;
+  }
   Options options;
   options.compression = CompressionType::kNoCompression;
   options.create_if_missing = true;

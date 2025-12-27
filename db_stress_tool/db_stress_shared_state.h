@@ -89,11 +89,17 @@ class SharedState {
     // expected state. Only then should we permit bypassing the below feature
     // compatibility checks.
     if (!FLAGS_expected_values_dir.empty()) {
-      if (!std::atomic<uint32_t>{}.is_lock_free()) {
-        status = Status::InvalidArgument(
-            "Cannot use --expected_values_dir on platforms without lock-free "
-            "std::atomic<uint32_t>");
+      if (!std::atomic<uint32_t>{}.is_lock_free() ||
+          !std::atomic<uint64_t>{}.is_lock_free()) {
+        std::ostringstream status_s;
+        status_s << "Cannot use --expected_values_dir on platforms without "
+                    "lock-free "
+                 << (!std::atomic<uint32_t>{}.is_lock_free()
+                         ? "std::atomic<uint32_t>"
+                         : "std::atomic<uint64_t>");
+        status = Status::InvalidArgument(status_s.str());
       }
+
       if (status.ok() && FLAGS_clear_column_family_one_in > 0) {
         status = Status::InvalidArgument(
             "Cannot use --expected_values_dir on when "
@@ -131,7 +137,7 @@ class SharedState {
     for (int i = 0; i < FLAGS_column_families; ++i) {
       key_locks_[i].reset(new port::Mutex[num_locks]);
     }
-    if (FLAGS_read_fault_one_in) {
+    if (FLAGS_read_fault_one_in || FLAGS_metadata_read_fault_one_in) {
 #ifdef NDEBUG
       // Unsupported in release mode because it relies on
       // `IGNORE_STATUS_IF_ERROR` to distinguish faults not expected to lead to
@@ -258,6 +264,63 @@ class SharedState {
   // Requires external locking covering all keys in `cf`.
   void ClearColumnFamily(int cf) {
     return expected_state_manager_->ClearColumnFamily(cf);
+  }
+
+  void SetPersistedSeqno(SequenceNumber seqno) {
+    MutexLock l(&persist_seqno_mu_);
+    return expected_state_manager_->SetPersistedSeqno(seqno);
+  }
+
+  SequenceNumber GetPersistedSeqno() {
+    MutexLock l(&persist_seqno_mu_);
+    return expected_state_manager_->GetPersistedSeqno();
+  }
+
+  void EnqueueRemoteCompaction(const std::string& job_id,
+                               const CompactionServiceJobInfo& job_info,
+                               const std::string& serialized_input) {
+    MutexLock l(&remote_compaction_queue_mu_);
+    remote_compaction_queue_.emplace(job_id, job_info, serialized_input);
+  }
+
+  bool DequeueRemoteCompaction(std::string* job_id,
+                               CompactionServiceJobInfo* job_info,
+                               std::string* serialized_input) {
+    assert(job_id);
+    assert(job_info);
+    assert(serialized_input);
+    MutexLock l(&remote_compaction_queue_mu_);
+    if (!remote_compaction_queue_.empty()) {
+      const auto [id, info, input] = remote_compaction_queue_.front();
+      *job_id = id;
+      *job_info = info;
+      *serialized_input = input;
+      remote_compaction_queue_.pop();
+      return true;
+    }
+    return false;
+  }
+
+  void AddRemoteCompactionResult(const std::string& job_id,
+                                 const std::string& result) {
+    MutexLock l(&remote_compaction_result_map_mu_);
+    remote_compaction_result_map_.emplace(job_id, result);
+  }
+
+  Status GetRemoteCompactionResult(const std::string& job_id,
+                                   std::string* result) {
+    MutexLock l(&remote_compaction_result_map_mu_);
+    if (remote_compaction_result_map_.find(job_id) !=
+        remote_compaction_result_map_.end()) {
+      *result = remote_compaction_result_map_.at(job_id);
+      return Status::OK();
+    }
+    return Status::NotFound();
+  }
+
+  void RemoveRemoteCompactionResult(const std::string& job_id) {
+    MutexLock l(&remote_compaction_result_map_mu_);
+    remote_compaction_result_map_.erase(job_id);
   }
 
   // Prepare a Put that will be started but not finish yet
@@ -396,6 +459,7 @@ class SharedState {
 
   port::Mutex mu_;
   port::CondVar cv_;
+  port::Mutex persist_seqno_mu_;
   const uint32_t seed_;
   const int64_t max_key_;
   const uint32_t log2_keys_per_lock_;
@@ -412,6 +476,16 @@ class SharedState {
   StressTest* stress_test_;
   std::atomic<bool> verification_failure_;
   std::atomic<bool> should_stop_test_;
+
+  // Queue for the remote compaction. Tuple of job id, job info and serialized
+  // compaction_service_input
+  port::Mutex remote_compaction_queue_mu_;
+  std::queue<std::tuple<std::string, CompactionServiceJobInfo, std::string>>
+      remote_compaction_queue_;
+  // Result Map for the remote compaciton. Key is the scheduled_job_id and value
+  // is serialized compaction_service_result
+  port::Mutex remote_compaction_result_map_mu_;
+  std::unordered_map<std::string, std::string> remote_compaction_result_map_;
 
   // Keys that should not be overwritten
   const std::unordered_set<int64_t> no_overwrite_ids_;

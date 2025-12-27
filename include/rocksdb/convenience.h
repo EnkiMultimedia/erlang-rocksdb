@@ -109,7 +109,6 @@ struct ConfigOptions {
   }
 };
 
-
 // The following set of functions provide a way to construct RocksDB Options
 // from a string or a string-to-string map.  Here is the general rule of
 // setting option values from strings by type.  Some RocksDB types are also
@@ -411,7 +410,7 @@ Status GetStringFromColumnFamilyOptions(std::string* opts_str,
 Status GetStringFromCompressionType(std::string* compression_str,
                                     CompressionType compression_type);
 
-std::vector<CompressionType> GetSupportedCompressions();
+const std::vector<CompressionType>& GetSupportedCompressions();
 
 Status GetBlockBasedTableOptionsFromString(
     const ConfigOptions& config_options,
@@ -451,6 +450,22 @@ Status DeleteFilesInRange(DB* db, ColumnFamilyHandle* column_family,
 // Delete files in multiple ranges at once
 // Delete files in a lot of ranges one at a time can be slow, use this API for
 // better performance in that case.
+Status DeleteFilesInRanges(DB* db, ColumnFamilyHandle* column_family,
+                           const RangeOpt* ranges, size_t n,
+                           bool include_end = true);
+
+// DEPRECATED
+struct RangePtr {
+  // In case of user_defined timestamp, if enabled, `start` and `limit` should
+  // point to key without timestamp part.
+  const Slice* start;
+  const Slice* limit;
+
+  RangePtr() : start(nullptr), limit(nullptr) {}
+  RangePtr(const Slice* s, const Slice* l) : start(s), limit(l) {}
+};
+
+// DEPRECATED
 Status DeleteFilesInRanges(DB* db, ColumnFamilyHandle* column_family,
                            const RangePtr* ranges, size_t n,
                            bool include_end = true);

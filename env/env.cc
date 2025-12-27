@@ -9,6 +9,7 @@
 
 #include "rocksdb/env.h"
 
+#include <sstream>
 #include <thread>
 
 #include "env/composite_env_wrapper.h"
@@ -185,6 +186,10 @@ class LegacyRandomAccessFileWrapper : public FSRandomAccessFile {
   }
   IOStatus InvalidateCache(size_t offset, size_t length) override {
     return status_to_io_status(target_->InvalidateCache(offset, length));
+  }
+  IOStatus GetFileSize(uint64_t* result) override {
+    auto status = target_->GetFileSize(result);
+    return status_to_io_status(std::move(status));
   }
 
  private:
@@ -611,6 +616,7 @@ class LegacyFileSystemWrapper : public FileSystem {
     // would be part of the Env.  As such, do not serialize it here.
     return "";
   }
+
  private:
   Env* target_;
 };
@@ -728,6 +734,48 @@ std::string Env::PriorityToString(Env::Priority priority) {
     case Env::Priority::TOTAL:
       assert(false);
   }
+  return "Invalid";
+}
+
+std::string Env::IOActivityToString(IOActivity activity) {
+  switch (activity) {
+    case Env::IOActivity::kFlush:
+      return "Flush";
+    case Env::IOActivity::kCompaction:
+      return "Compaction";
+    case Env::IOActivity::kDBOpen:
+      return "DBOpen";
+    case Env::IOActivity::kGet:
+      return "Get";
+    case Env::IOActivity::kMultiGet:
+      return "MultiGet";
+    case Env::IOActivity::kDBIterator:
+      return "DBIterator";
+    case Env::IOActivity::kVerifyDBChecksum:
+      return "VerifyDBChecksum";
+    case Env::IOActivity::kVerifyFileChecksums:
+      return "VerifyFileChecksums";
+    case Env::IOActivity::kGetEntity:
+      return "GetEntity";
+    case Env::IOActivity::kMultiGetEntity:
+      return "MultiGetEntity";
+    case Env::IOActivity::kGetFileChecksumsFromCurrentManifest:
+      return "GetFileChecksumsFromCurrentManifest";
+    case Env::IOActivity::kUnknown:
+      return "Unknown";
+    default:
+      int activityIndex = static_cast<int>(activity);
+      if (activityIndex >=
+              static_cast<int>(Env::IOActivity::kFirstCustomIOActivity) &&
+          activityIndex <=
+              static_cast<int>(Env::IOActivity::kLastCustomIOActivity)) {
+        std::stringstream ss;
+        ss << std::hex << std::uppercase << activityIndex;
+        return "CustomIOActivity" + ss.str();
+      }
+      return "Invalid";
+  };
+  assert(false);
   return "Invalid";
 }
 
@@ -1086,8 +1134,6 @@ void AssignEnvOptions(EnvOptions* env_options, const DBOptions& options) {
   env_options->set_fd_cloexec = options.is_fd_close_on_exec;
   env_options->bytes_per_sync = options.bytes_per_sync;
   env_options->compaction_readahead_size = options.compaction_readahead_size;
-  env_options->random_access_max_buffer_size =
-      options.random_access_max_buffer_size;
   env_options->rate_limiter = options.rate_limiter.get();
   env_options->writable_file_max_buffer_size =
       options.writable_file_max_buffer_size;

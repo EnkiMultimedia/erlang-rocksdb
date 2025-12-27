@@ -7,7 +7,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-
 #include "rocksdb/utilities/env_mirror.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -94,6 +93,16 @@ class RandomAccessFileMirror : public RandomAccessFile {
   size_t GetUniqueId(char* id, size_t max_size) const override {
     // NOTE: not verified
     return a_->GetUniqueId(id, max_size);
+  }
+
+  Status GetFileSize(uint64_t* file_size) override {
+    uint64_t asize = 0, bsize = 0;
+    Status as = a_->GetFileSize(&asize);
+    Status bs = b_->GetFileSize(&bsize);
+    assert(as == bs);
+    assert(asize == bsize);
+    *file_size = asize;
+    return as;
   }
 };
 

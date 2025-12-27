@@ -49,6 +49,10 @@ class NonBatchedOpsStressTest : public StressTest {
       end = max_key;
     }
 
+    if (FLAGS_auto_refresh_iterator_with_snapshot) {
+      options.auto_refresh_iterator_with_snapshot = true;
+    }
+
     for (size_t cf = 0; cf < column_families_.size(); ++cf) {
       if (thread->shared->HasVerificationFailedYet()) {
         break;
@@ -68,11 +72,28 @@ class NonBatchedOpsStressTest : public StressTest {
       constexpr int num_methods =
           static_cast<int>(VerificationMethod::kNumberOfMethods);
 
-      const VerificationMethod method =
+      VerificationMethod method =
           static_cast<VerificationMethod>(thread->rand.Uniform(
               (FLAGS_user_timestamp_size > 0) ? num_methods - 1 : num_methods));
 
+      if (method == VerificationMethod::kGetEntity && !FLAGS_use_get_entity) {
+        method = VerificationMethod::kGet;
+      }
+      if (method == VerificationMethod::kMultiGetEntity &&
+          !FLAGS_use_multi_get_entity) {
+        method = VerificationMethod::kMultiGet;
+      }
+      if (method == VerificationMethod::kMultiGet && !FLAGS_use_multiget) {
+        method = VerificationMethod::kGet;
+      }
+
       if (method == VerificationMethod::kIterator) {
+        std::unique_ptr<ManagedSnapshot> snapshot = nullptr;
+        if (options.auto_refresh_iterator_with_snapshot) {
+          snapshot = std::make_unique<ManagedSnapshot>(db_);
+          options.snapshot = snapshot->snapshot();
+        }
+
         std::unique_ptr<Iterator> iter(
             db_->NewIterator(options, column_families_[cf]));
 
@@ -134,6 +155,10 @@ class NonBatchedOpsStressTest : public StressTest {
                           from_db.data(), from_db.size());
           }
         }
+
+        if (options.auto_refresh_iterator_with_snapshot) {
+          options.snapshot = nullptr;
+        }
       } else if (method == VerificationMethod::kGet) {
         for (int64_t i = start; i < end; ++i) {
           if (thread->shared->HasVerificationFailedYet()) {
@@ -151,6 +176,109 @@ class NonBatchedOpsStressTest : public StressTest {
           if (!from_db.empty()) {
             PrintKeyValue(static_cast<int>(cf), static_cast<uint32_t>(i),
                           from_db.data(), from_db.size());
+          }
+        }
+
+        if (secondary_db_) {
+          assert(secondary_cfhs_.size() == column_families_.size());
+          // We are going to read in the expected values before catching the
+          // secondary up to the primary. This sets the lower bound of the
+          // acceptable values that can be returned from the secondary. After
+          // each Get() to the secondary, we are going to read in the expected
+          // value again to determine the upper bound. As long as the returned
+          // value from Get() is within these bounds, we consider that okay. The
+          // lower bound will always be moving forwards anyways as
+          // TryCatchUpWithPrimary() gets called.
+          std::vector<ExpectedValue> pre_read_expected_values;
+          for (int64_t i = start; i < end; ++i) {
+            pre_read_expected_values.push_back(
+                shared->Get(static_cast<int>(cf), i));
+          }
+
+          if (FLAGS_disable_wal) {
+            // The secondary relies on the WAL to be able to catch up with the
+            // primary's memtable changes. If there is no WAL, before
+            // verification we should make sure the changes are reflected in the
+            // SST files
+            Status memtable_flush_status =
+                db_->Flush(FlushOptions(), column_families_[cf]);
+            if (!memtable_flush_status.ok()) {
+              if (IsErrorInjectedAndRetryable(memtable_flush_status)) {
+                fprintf(stdout,
+                        "Skipping secondary verification because error was "
+                        "injected into memtable flush\n");
+                continue;
+              }
+              VerificationAbort(shared,
+                                "Failed to flush primary's memtables before "
+                                "secondary verification");
+            }
+          } else if (FLAGS_manual_wal_flush_one_in > 0) {
+            // RocksDB maintains internal buffers of WAL data when
+            // manual_wal_flush is used. The secondary can read the WAL to catch
+            // up with the primary's memtable changes, but these changes need to
+            // be flushed first.
+            Status flush_wal_status = db_->FlushWAL(/*sync=*/true);
+            if (!flush_wal_status.ok()) {
+              if (IsErrorInjectedAndRetryable(flush_wal_status)) {
+                fprintf(stdout,
+                        "Skipping secondary verification because error was "
+                        "injected into WAL flush\n");
+                continue;
+              }
+              VerificationAbort(shared,
+                                "Failed to flush primary's WAL before "
+                                "secondary verification");
+            }
+          }
+
+          Status s = secondary_db_->TryCatchUpWithPrimary();
+#ifndef NDEBUG
+          uint64_t manifest_num = static_cast_with_check<DBImpl>(secondary_db_)
+                                      ->TEST_Current_Manifest_FileNo();
+#else
+          uint64_t manifest_num = 0;
+#endif
+
+          if (!s.ok()) {
+            VerificationAbort(shared,
+                              "Secondary failed to catch up to the primary");
+          }
+
+          for (int64_t i = start; i < end; ++i) {
+            if (thread->shared->HasVerificationFailedYet()) {
+              break;
+            }
+
+            const std::string key = Key(i);
+            std::string from_db;
+
+            // Temporarily disable error injection to verify the secondary
+            if (fault_fs_guard) {
+              fault_fs_guard->DisableThreadLocalErrorInjection(
+                  FaultInjectionIOType::kRead);
+              fault_fs_guard->DisableThreadLocalErrorInjection(
+                  FaultInjectionIOType::kMetadataRead);
+            }
+
+            s = secondary_db_->Get(options, secondary_cfhs_[cf], key, &from_db);
+
+            // Re-enable error injection after verifying the secondary
+            if (fault_fs_guard) {
+              fault_fs_guard->EnableThreadLocalErrorInjection(
+                  FaultInjectionIOType::kRead);
+              fault_fs_guard->EnableThreadLocalErrorInjection(
+                  FaultInjectionIOType::kMetadataRead);
+            }
+
+            assert(!pre_read_expected_values.empty() &&
+                   static_cast<size_t>(i - start) <
+                       pre_read_expected_values.size());
+            VerifyValueRange(
+                static_cast<int>(cf), i, options, shared, from_db,
+                /* msg_prefix */ "Secondary get verification, manifest: " +
+                    std::to_string(manifest_num),
+                s, pre_read_expected_values[i - start]);
           }
         }
       } else if (method == VerificationMethod::kGetEntity) {
@@ -333,12 +461,19 @@ class NonBatchedOpsStressTest : public StressTest {
   }
 
   void ContinuouslyVerifyDb(ThreadState* thread) const override {
-    if (!cmp_db_) {
+    // For automated crash tests, we only want to run this continous
+    // verification when continuous_verification_interval > 0 and there is
+    // a secondary db. This continous verification currently fails when there is
+    // a secondary db during the iterator scan. The stack trace mentions
+    // BlobReader/BlobSource but it may not necessarily be related to BlobDB.
+    // Regardless, we only want to run this function if we are experimenting and
+    // explicitly setting continuous_verification_interval.
+    if (!secondary_db_ || !FLAGS_continuous_verification_interval) {
       return;
     }
-    assert(cmp_db_);
-    assert(!cmp_cfhs_.empty());
-    Status s = cmp_db_->TryCatchUpWithPrimary();
+    assert(secondary_db_);
+    assert(!secondary_cfhs_.empty());
+    Status s = secondary_db_->TryCatchUpWithPrimary();
     if (!s.ok()) {
       assert(false);
       exit(1);
@@ -368,11 +503,18 @@ class NonBatchedOpsStressTest : public StressTest {
       read_opts.timestamp = &ts;
     }
 
+    std::unique_ptr<ManagedSnapshot> snapshot = nullptr;
+    if (FLAGS_auto_refresh_iterator_with_snapshot) {
+      snapshot = std::make_unique<ManagedSnapshot>(db_);
+      read_opts.snapshot = snapshot->snapshot();
+      read_opts.auto_refresh_iterator_with_snapshot = true;
+    }
+
     static Random64 rand64(shared->GetSeed());
 
     {
       uint32_t crc = 0;
-      std::unique_ptr<Iterator> it(cmp_db_->NewIterator(read_opts));
+      std::unique_ptr<Iterator> it(secondary_db_->NewIterator(read_opts));
       s = checksum_column_family(it.get(), &crc);
       if (!s.ok()) {
         fprintf(stderr, "Computing checksum of default cf: %s\n",
@@ -381,19 +523,25 @@ class NonBatchedOpsStressTest : public StressTest {
       }
     }
 
-    for (auto* handle : cmp_cfhs_) {
+    for (auto* handle : secondary_cfhs_) {
       if (thread->rand.OneInOpt(3)) {
         // Use Get()
         uint64_t key = rand64.Uniform(static_cast<uint64_t>(max_key));
         std::string key_str = Key(key);
         std::string value;
         std::string key_ts;
-        s = cmp_db_->Get(read_opts, handle, key_str, &value,
-                         FLAGS_user_timestamp_size > 0 ? &key_ts : nullptr);
+        s = secondary_db_->Get(
+            read_opts, handle, key_str, &value,
+            FLAGS_user_timestamp_size > 0 ? &key_ts : nullptr);
         s.PermitUncheckedError();
       } else {
         // Use range scan
-        std::unique_ptr<Iterator> iter(cmp_db_->NewIterator(read_opts, handle));
+        if (read_opts.auto_refresh_iterator_with_snapshot) {
+          snapshot = std::make_unique<ManagedSnapshot>(db_);
+          read_opts.snapshot = snapshot->snapshot();
+        }
+        std::unique_ptr<Iterator> iter(
+            secondary_db_->NewIterator(read_opts, handle));
         uint32_t rnd = (thread->rand.Next()) % 4;
         if (0 == rnd) {
           // SeekToFirst() + Next()*5
@@ -421,6 +569,9 @@ class NonBatchedOpsStressTest : public StressTest {
           iter->SeekForPrev(key_str);
           for (int i = 0; i < 5 && iter->Valid(); ++i, iter->Prev()) {
           }
+        }
+        if (read_opts.auto_refresh_iterator_with_snapshot) {
+          read_opts.snapshot = nullptr;
         }
       }
     }
@@ -1487,6 +1638,12 @@ class NonBatchedOpsStressTest : public StressTest {
       SharedState::ignore_read_error = false;
     }
 
+    std::unique_ptr<ManagedSnapshot> snapshot = nullptr;
+    if (ro_copy.snapshot == nullptr &&
+        ro_copy.auto_refresh_iterator_with_snapshot) {
+      snapshot = std::make_unique<ManagedSnapshot>(db_);
+      ro_copy.snapshot = snapshot->snapshot();
+    }
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro_copy, cfh));
 
     uint64_t count = 0;
@@ -1697,7 +1854,17 @@ class NonBatchedOpsStressTest : public StressTest {
       } else if (FLAGS_use_merge) {
         if (!FLAGS_use_txn) {
           if (FLAGS_user_timestamp_size == 0) {
-            s = db_->Merge(write_opts, cfh, k, v);
+            if (FLAGS_ingest_wbwi_one_in &&
+                thread->rand.OneIn(FLAGS_ingest_wbwi_one_in)) {
+              auto wbwi = std::make_shared<WriteBatchWithIndex>(
+                  options_.comparator, 0, /*overwrite_key=*/true);
+              s = wbwi->Merge(cfh, k, v);
+              if (s.ok()) {
+                s = db_->IngestWriteBatchWithIndex(write_opts, wbwi);
+              }
+            } else {
+              s = db_->Merge(write_opts, cfh, k, v);
+            }
           } else {
             s = db_->Merge(write_opts, cfh, k, write_ts, v);
           }
@@ -1709,7 +1876,17 @@ class NonBatchedOpsStressTest : public StressTest {
       } else {
         if (!FLAGS_use_txn) {
           if (FLAGS_user_timestamp_size == 0) {
-            s = db_->Put(write_opts, cfh, k, v);
+            if (FLAGS_ingest_wbwi_one_in &&
+                thread->rand.OneIn(FLAGS_ingest_wbwi_one_in)) {
+              auto wbwi = std::make_shared<WriteBatchWithIndex>(
+                  options_.comparator, 0, /*overwrite_key=*/true);
+              s = wbwi->Put(cfh, k, v);
+              if (s.ok()) {
+                s = db_->IngestWriteBatchWithIndex(write_opts, wbwi);
+              }
+            } else {
+              s = db_->Put(write_opts, cfh, k, v);
+            }
           } else {
             s = db_->Put(write_opts, cfh, k, write_ts, v);
           }
@@ -1801,7 +1978,17 @@ class NonBatchedOpsStressTest : public StressTest {
         }
         if (!FLAGS_use_txn) {
           if (FLAGS_user_timestamp_size == 0) {
-            s = db_->Delete(write_opts, cfh, key);
+            if (FLAGS_ingest_wbwi_one_in &&
+                thread->rand.OneIn(FLAGS_ingest_wbwi_one_in)) {
+              auto wbwi = std::make_shared<WriteBatchWithIndex>(
+                  options_.comparator, 0, /*overwrite_key=*/true);
+              s = wbwi->Delete(cfh, key);
+              if (s.ok()) {
+                s = db_->IngestWriteBatchWithIndex(write_opts, wbwi);
+              }
+            } else {
+              s = db_->Delete(write_opts, cfh, key);
+            }
           } else {
             s = db_->Delete(write_opts, cfh, key, write_ts);
           }
@@ -1858,7 +2045,17 @@ class NonBatchedOpsStressTest : public StressTest {
         }
         if (!FLAGS_use_txn) {
           if (FLAGS_user_timestamp_size == 0) {
-            s = db_->SingleDelete(write_opts, cfh, key);
+            if (FLAGS_ingest_wbwi_one_in &&
+                thread->rand.OneIn(FLAGS_ingest_wbwi_one_in)) {
+              auto wbwi = std::make_shared<WriteBatchWithIndex>(
+                  options_.comparator, 0, /*overwrite_key=*/true);
+              s = wbwi->SingleDelete(cfh, key);
+              if (s.ok()) {
+                s = db_->IngestWriteBatchWithIndex(write_opts, wbwi);
+              }
+            } else {
+              s = db_->SingleDelete(write_opts, cfh, key);
+            }
           } else {
             s = db_->SingleDelete(write_opts, cfh, key, write_ts);
           }
@@ -2237,6 +2434,7 @@ class NonBatchedOpsStressTest : public StressTest {
     }
 
     ReadOptions ro(read_opts);
+
     if (FLAGS_prefix_size > 0) {
       ro.total_order_seek = true;
     }
@@ -2278,6 +2476,16 @@ class NonBatchedOpsStressTest : public StressTest {
       pre_read_expected_values.push_back(
           shared->Get(rand_column_family, i + lb));
     }
+
+    // Snapshot initialization timing plays a crucial role here.
+    // We want the iterator to reflect the state of the DB between
+    // reading `pre_read_expected_values` and `post_read_expected_values`.
+    std::unique_ptr<ManagedSnapshot> snapshot = nullptr;
+    if (ro.auto_refresh_iterator_with_snapshot) {
+      snapshot = std::make_unique<ManagedSnapshot>(db_);
+      ro.snapshot = snapshot->snapshot();
+    }
+
     std::unique_ptr<Iterator> iter;
     if (FLAGS_use_multi_cf_iterator) {
       std::vector<ColumnFamilyHandle*> cfhs;
@@ -2520,7 +2728,11 @@ class NonBatchedOpsStressTest : public StressTest {
         pre_read_expected_values.push_back(
             shared->Get(rand_column_family, i + lb));
       }
-      Status rs = iter->Refresh();
+      if (ro.auto_refresh_iterator_with_snapshot) {
+        snapshot = std::make_unique<ManagedSnapshot>(db_);
+        ro.snapshot = snapshot->snapshot();
+      }
+      Status rs = iter->Refresh(ro.snapshot);
       if (!rs.ok() && IsErrorInjectedAndRetryable(rs)) {
         return rs;
       }
@@ -2810,6 +3022,84 @@ class NonBatchedOpsStressTest : public StressTest {
     return true;
   }
 
+  // Compared to VerifyOrSyncValue, VerifyValueRange takes in a
+  // pre_read_expected_value to determine the lower bound of acceptable values.
+  // Anything from the pre_read_expected_value to the post_read_expected_value
+  // is considered acceptable. VerifyValueRange does not perform the initial
+  // "sync" step and does not compare the exact data/lengths for the values.
+  // This verification is suitable for verifying secondary or follower databases
+  bool VerifyValueRange(int cf, int64_t key, const ReadOptions& opts,
+                        SharedState* shared, const std::string& value_from_db,
+                        const std::string& msg_prefix, const Status& s,
+                        const ExpectedValue& pre_read_expected_value) const {
+    if (shared->HasVerificationFailedYet()) {
+      return false;
+    }
+    const ExpectedValue post_read_expected_value = shared->Get(cf, key);
+    char expected_value_data[kValueMaxLen];
+    size_t expected_value_data_size =
+        GenerateValue(post_read_expected_value.GetValueBase(),
+                      expected_value_data, sizeof(expected_value_data));
+
+    std::ostringstream read_u64ts;
+    if (opts.timestamp) {
+      read_u64ts << " while read with timestamp: ";
+      uint64_t read_ts;
+      if (DecodeU64Ts(*opts.timestamp, &read_ts).ok()) {
+        read_u64ts << std::to_string(read_ts) << ", ";
+      } else {
+        read_u64ts << s.ToString()
+                   << " Encoded read timestamp: " << opts.timestamp->ToString()
+                   << ", ";
+      }
+    }
+
+    // Compare value_from_db with the range of possible values from
+    // pre_read_expected_value to post_read_expected_value
+    if (s.ok()) {
+      const Slice slice(value_from_db);
+      const uint32_t value_base_from_db = GetValueBase(slice);
+      if (ExpectedValueHelper::MustHaveNotExisted(pre_read_expected_value,
+                                                  post_read_expected_value)) {
+        VerificationAbort(shared,
+                          msg_prefix +
+                              ": Unexpected value found that should not exist" +
+                              read_u64ts.str(),
+                          cf, key, value_from_db, "");
+        return false;
+      }
+      if (!ExpectedValueHelper::InExpectedValueBaseRange(
+              value_base_from_db, pre_read_expected_value,
+              post_read_expected_value)) {
+        VerificationAbort(
+            shared,
+            msg_prefix +
+                ": Unexpected value found outside of the value base range" +
+                read_u64ts.str(),
+            cf, key, value_from_db,
+            Slice(expected_value_data, expected_value_data_size));
+        return false;
+      }
+    } else if (s.IsNotFound()) {
+      if (ExpectedValueHelper::MustHaveExisted(pre_read_expected_value,
+                                               post_read_expected_value)) {
+        VerificationAbort(shared,
+                          msg_prefix + ": Value not found which should exist" +
+                              read_u64ts.str() + s.ToString(),
+                          cf, key, "",
+                          Slice(expected_value_data, expected_value_data_size));
+        return false;
+      }
+    } else {
+      VerificationAbort(
+          shared,
+          msg_prefix + ": Non-OK status" + read_u64ts.str() + s.ToString(), cf,
+          key, "", Slice(expected_value_data, expected_value_data_size));
+      return false;
+    }
+    return true;
+  }
+
   void PrepareTxnDbOptions(SharedState* shared,
                            TransactionDBOptions& txn_db_opts) override {
     txn_db_opts.rollback_deletion_type_callback =
@@ -2866,13 +3156,15 @@ class NonBatchedOpsStressTest : public StressTest {
 
       Status s;
 
+      ExpectedValue new_expected_value;
+
       switch (op) {
         case Op::PutOrPutEntity:
         case Op::Merge: {
           ExpectedValue put_value;
           put_value.SyncPut(static_cast<uint32_t>(thread->rand.Uniform(
               static_cast<int>(ExpectedValue::GetValueBaseMask()))));
-          ryw_expected_values[k] = put_value;
+          new_expected_value = put_value;
 
           const uint32_t value_base = put_value.GetValueBase();
 
@@ -2896,7 +3188,7 @@ class NonBatchedOpsStressTest : public StressTest {
         case Op::Delete: {
           ExpectedValue delete_value;
           delete_value.SyncDelete();
-          ryw_expected_values[k] = delete_value;
+          new_expected_value = delete_value;
 
           s = txn->Delete(cfh, k);
           break;
@@ -2904,6 +3196,20 @@ class NonBatchedOpsStressTest : public StressTest {
         default:
           assert(false);
       }
+
+      // It is possible that multiple thread concurrently try to write to the
+      // same key, which could cause lock timeout or deadlock in the
+      // transactiondb layer, before transaction is rolled back.
+      // E.g.
+      // Timestamp 1: Transaction A: lock key M for write
+      // Timestamp 2: Transaction B: lock key N for write
+      // Timestamp 3: Transaction B: try to lock key M for write -> wait
+      // Timestamp 4: Transaction A: try to lock key N for write -> deadlock
+      if (s.IsTimedOut() || s.IsDeadlock()) {
+        return;
+      }
+
+      ryw_expected_values[k] = new_expected_value;
 
       if (!s.ok()) {
         fprintf(stderr,

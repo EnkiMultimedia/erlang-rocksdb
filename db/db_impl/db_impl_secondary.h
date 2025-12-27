@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <string>
 #include <vector>
 
@@ -53,7 +52,8 @@ class LogReaderContainer {
     Logger* info_log;
     std::string fname;
     Status* status;  // nullptr if immutable_db_options_.paranoid_checks==false
-    void Corruption(size_t bytes, const Status& s) override {
+    void Corruption(size_t bytes, const Status& s,
+                    uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       ROCKS_LOG_WARN(info_log, "%s%s: dropping %d bytes; %s",
                      (this->status == nullptr ? "(ignoring error) " : ""),
                      fname.c_str(), static_cast<int>(bytes),
@@ -247,12 +247,6 @@ class DBImplSecondary : public DBImpl {
   // if it doesn't exist
   Status MaybeInitLogReader(uint64_t log_number,
                             log::FragmentBufferedReader** log_reader);
-
-  // Check if all live files exist on file system and that their file sizes
-  // matche to the in-memory records. It is possible that some live files may
-  // have been deleted by the primary. In this case, CheckConsistency() does
-  // not flag the missing file as inconsistency.
-  Status CheckConsistency() override;
 
 #ifndef NDEBUG
   Status TEST_CompactWithoutInstallation(const OpenAndCompactOptions& options,

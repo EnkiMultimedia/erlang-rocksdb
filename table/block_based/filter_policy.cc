@@ -1012,9 +1012,6 @@ class Standard128RibbonBitsBuilder : public XXPH3FilterBitsBuilder {
   FastLocalBloomBitsBuilder bloom_fallback_;
 };
 
-// for the linker, at least with DEBUG_LEVEL=2
-constexpr uint32_t Standard128RibbonBitsBuilder::kMaxRibbonEntries;
-
 class Standard128RibbonBitsReader : public BuiltinFilterBitsReader {
  public:
   Standard128RibbonBitsReader(const char* data, size_t len_bytes,
@@ -1409,10 +1406,6 @@ bool BuiltinFilterPolicy::IsInstanceOf(const std::string& name) const {
 }
 
 static const char* kBuiltinFilterMetadataName = "rocksdb.BuiltinBloomFilter";
-
-const char* BuiltinFilterPolicy::kCompatibilityName() {
-  return kBuiltinFilterMetadataName;
-}
 
 const char* BuiltinFilterPolicy::CompatibilityName() const {
   return kBuiltinFilterMetadataName;

@@ -222,7 +222,6 @@ const std::string options_file_content = R"OPTIONS_FILE(
   stats_dump_period_sec=600
   allow_fallocate=true
   max_log_file_size=83886080
-  random_access_max_buffer_size=1048576
   advise_random_on_open=true
   dump_malloc_stats=true
 
@@ -254,7 +253,6 @@ const std::string options_file_content = R"OPTIONS_FILE(
   level0_slowdown_writes_trigger=50
   level0_file_num_compaction_trigger=10
   expanded_compaction_factor=25
-  max_write_buffer_number_to_maintain=0
   max_write_buffer_size_to_maintain=0
   verify_checksums_in_compaction=true
   merge_operator=nullptr

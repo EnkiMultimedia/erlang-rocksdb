@@ -37,7 +37,6 @@ Status PromoteL0(DB* db, ColumnFamilyHandle* column_family, int target_level) {
   return db->PromoteL0(column_family, target_level);
 }
 
-
 Status SuggestCompactRange(DB* db, const Slice* begin, const Slice* end) {
   return SuggestCompactRange(db, db->DefaultColumnFamily(), begin, end);
 }
@@ -58,7 +57,8 @@ Status GetFileChecksumsFromCurrentManifest(FileSystem* fs,
   }
   assert(checksum_list);
 
-  const ReadOptions read_options(Env::IOActivity::kReadManifest);
+  const ReadOptions read_options(
+      Env::IOActivity::kGetFileChecksumsFromCurrentManifest);
   checksum_list->reset();
 
   std::unique_ptr<SequentialFileReader> file_reader;
@@ -75,7 +75,8 @@ Status GetFileChecksumsFromCurrentManifest(FileSystem* fs,
 
   struct LogReporter : public log::Reader::Reporter {
     Status* status_ptr;
-    void Corruption(size_t /*bytes*/, const Status& st) override {
+    void Corruption(size_t /*bytes*/, const Status& st,
+                    uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       if (status_ptr->ok()) {
         *status_ptr = st;
       }
@@ -87,11 +88,12 @@ Status GetFileChecksumsFromCurrentManifest(FileSystem* fs,
 
   // Read all records from the manifest file...
   uint64_t manifest_file_size = std::numeric_limits<uint64_t>::max();
-  FileChecksumRetriever retriever(read_options, manifest_file_size,
-                                  *checksum_list);
+  FileChecksumRetriever retriever(read_options, manifest_file_size);
   retriever.Iterate(reader, &s);
-
-  return retriever.status();
+  if (!retriever.status().ok()) {
+    return retriever.status();
+  }
+  return retriever.FetchFileChecksumList(*checksum_list);
 }
 
 Status UpdateManifestForFilesState(

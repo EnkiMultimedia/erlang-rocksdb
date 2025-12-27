@@ -70,7 +70,9 @@ ImmutableMemTableOptions::ImmutableMemTableOptions(
       protection_bytes_per_key(
           mutable_cf_options.memtable_protection_bytes_per_key),
       allow_data_in_errors(ioptions.allow_data_in_errors),
-      paranoid_memory_checks(mutable_cf_options.paranoid_memory_checks) {}
+      paranoid_memory_checks(mutable_cf_options.paranoid_memory_checks),
+      memtable_veirfy_per_key_checksum_on_seek(
+          mutable_cf_options.memtable_veirfy_per_key_checksum_on_seek) {}
 
 MemTable::MemTable(const InternalKeyComparator& cmp,
                    const ImmutableOptions& ioptions,
@@ -115,7 +117,13 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
       oldest_key_time_(std::numeric_limits<uint64_t>::max()),
       approximate_memory_usage_(0),
       memtable_max_range_deletions_(
-          mutable_cf_options.memtable_max_range_deletions) {
+          mutable_cf_options.memtable_max_range_deletions),
+      key_validation_callback_(
+          (moptions_.protection_bytes_per_key != 0 &&
+           moptions_.memtable_veirfy_per_key_checksum_on_seek)
+              ? std::bind(&MemTable::ValidateKey, this, std::placeholders::_1,
+                          std::placeholders::_2)
+              : std::function<Status(const char*, bool)>(nullptr)) {
   UpdateFlushState();
   // something went wrong if we need to flush before inserting anything
   assert(!ShouldScheduleFlush());
@@ -134,6 +142,16 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
   auto new_cache = std::make_shared<FragmentedRangeTombstoneListCache>();
   size_t size = cached_range_tombstone_.Size();
   for (size_t i = 0; i < size; ++i) {
+#if defined(__cpp_lib_atomic_shared_ptr)
+    std::atomic<std::shared_ptr<FragmentedRangeTombstoneListCache>>*
+        local_cache_ref_ptr = cached_range_tombstone_.AccessAtCore(i);
+    auto new_local_cache_ref = std::make_shared<
+        const std::shared_ptr<FragmentedRangeTombstoneListCache>>(new_cache);
+    std::shared_ptr<FragmentedRangeTombstoneListCache> aliased_ptr(
+        new_local_cache_ref, new_cache.get());
+    local_cache_ref_ptr->store(std::move(aliased_ptr),
+                               std::memory_order_relaxed);
+#else
     std::shared_ptr<FragmentedRangeTombstoneListCache>* local_cache_ref_ptr =
         cached_range_tombstone_.AccessAtCore(i);
     auto new_local_cache_ref = std::make_shared<
@@ -143,11 +161,11 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
         std::shared_ptr<FragmentedRangeTombstoneListCache>(new_local_cache_ref,
                                                            new_cache.get()),
         std::memory_order_relaxed);
+#endif
   }
   const Comparator* ucmp = cmp.user_comparator();
   assert(ucmp);
   ts_sz_ = ucmp->timestamp_size();
-  persist_user_defined_timestamps_ = ioptions.persist_user_defined_timestamps;
 }
 
 MemTable::~MemTable() {
@@ -169,21 +187,26 @@ size_t MemTable::ApproximateMemoryUsage() {
     }
     total_usage += usage;
   }
-  approximate_memory_usage_.store(total_usage, std::memory_order_relaxed);
+  approximate_memory_usage_.StoreRelaxed(total_usage);
   // otherwise, return the actual usage
   return total_usage;
 }
 
 bool MemTable::ShouldFlushNow() {
+  if (IsMarkedForFlush()) {
+    // TODO: dedicated flush reason when marked for flush
+    return true;
+  }
+
   // This is set if memtable_max_range_deletions is > 0,
   // and that many range deletions are done
   if (memtable_max_range_deletions_ > 0 &&
-      num_range_deletes_.load(std::memory_order_relaxed) >=
+      num_range_deletes_.LoadRelaxed() >=
           static_cast<uint64_t>(memtable_max_range_deletions_)) {
     return true;
   }
 
-  size_t write_buffer_size = write_buffer_size_.load(std::memory_order_relaxed);
+  size_t write_buffer_size = write_buffer_size_.LoadRelaxed();
   // In a lot of times, we cannot allocate arena blocks that exactly matches the
   // buffer size. Thus we have to decide if we should over-allocate or
   // under-allocate.
@@ -192,13 +215,14 @@ bool MemTable::ShouldFlushNow() {
   // allocate one more block.
   const double kAllowOverAllocationRatio = 0.6;
 
+  // range deletion use skip list which allocates all memeory through `arena_`
+  assert(range_del_table_->ApproximateMemoryUsage() == 0);
   // If arena still have room for new block allocation, we can safely say it
   // shouldn't flush.
-  auto allocated_memory = table_->ApproximateMemoryUsage() +
-                          range_del_table_->ApproximateMemoryUsage() +
-                          arena_.MemoryAllocatedBytes();
+  auto allocated_memory =
+      table_->ApproximateMemoryUsage() + arena_.MemoryAllocatedBytes();
 
-  approximate_memory_usage_.store(allocated_memory, std::memory_order_relaxed);
+  approximate_memory_usage_.StoreRelaxed(allocated_memory);
 
   // if we can still allocate one more block without exceeding the
   // over-allocation ratio, then we should not flush.
@@ -378,7 +402,11 @@ class MemTableIterator : public InternalIterator {
             !mem.GetImmutableMemTableOptions()->inplace_update_support),
         arena_mode_(arena != nullptr),
         paranoid_memory_checks_(mem.moptions_.paranoid_memory_checks),
-        allow_data_in_error(mem.moptions_.allow_data_in_errors) {
+        validate_on_seek_(
+            mem.moptions_.paranoid_memory_checks ||
+            mem.moptions_.memtable_veirfy_per_key_checksum_on_seek),
+        allow_data_in_error_(mem.moptions_.allow_data_in_errors),
+        key_validation_callback_(mem.key_validation_callback_) {
     if (kind == kRangeDelEntries) {
       iter_ = mem.range_del_table_->GetIterator(arena);
     } else if (prefix_extractor_ != nullptr &&
@@ -447,8 +475,10 @@ class MemTableIterator : public InternalIterator {
         }
       }
     }
-    if (paranoid_memory_checks_) {
-      status_ = iter_->SeekAndValidate(k, nullptr, allow_data_in_error);
+    if (validate_on_seek_) {
+      status_ = iter_->SeekAndValidate(k, nullptr, allow_data_in_error_,
+                                       paranoid_memory_checks_,
+                                       key_validation_callback_);
     } else {
       iter_->Seek(k, nullptr);
     }
@@ -472,8 +502,10 @@ class MemTableIterator : public InternalIterator {
         }
       }
     }
-    if (paranoid_memory_checks_) {
-      status_ = iter_->SeekAndValidate(k, nullptr, allow_data_in_error);
+    if (validate_on_seek_) {
+      status_ = iter_->SeekAndValidate(k, nullptr, allow_data_in_error_,
+                                       paranoid_memory_checks_,
+                                       key_validation_callback_);
     } else {
       iter_->Seek(k, nullptr);
     }
@@ -502,7 +534,7 @@ class MemTableIterator : public InternalIterator {
     PERF_COUNTER_ADD(next_on_memtable_count, 1);
     assert(Valid());
     if (paranoid_memory_checks_) {
-      status_ = iter_->NextAndValidate(allow_data_in_error);
+      status_ = iter_->NextAndValidate(allow_data_in_error_);
     } else {
       iter_->Next();
       TEST_SYNC_POINT_CALLBACK("MemTableIterator::Next:0", iter_);
@@ -524,7 +556,7 @@ class MemTableIterator : public InternalIterator {
     PERF_COUNTER_ADD(prev_on_memtable_count, 1);
     assert(Valid());
     if (paranoid_memory_checks_) {
-      status_ = iter_->PrevAndValidate(allow_data_in_error);
+      status_ = iter_->PrevAndValidate(allow_data_in_error_);
     } else {
       iter_->Prev();
     }
@@ -583,7 +615,9 @@ class MemTableIterator : public InternalIterator {
   bool value_pinned_;
   bool arena_mode_;
   const bool paranoid_memory_checks_;
-  const bool allow_data_in_error;
+  const bool validate_on_seek_;
+  const bool allow_data_in_error_;
+  const std::function<Status(const char*, bool)> key_validation_callback_;
 
   void VerifyEntryChecksum() {
     if (protection_bytes_per_key_ > 0 && Valid()) {
@@ -618,8 +652,8 @@ class TimestampStrippingIterator : public InternalIterator {
       const SliceTransform* cf_prefix_extractor, size_t ts_sz)
       : arena_mode_(arena != nullptr), kind_(kind), ts_sz_(ts_sz) {
     assert(ts_sz_ != 0);
-    void* mem = arena ? arena->AllocateAligned(sizeof(MemTableIterator)) :
-                      operator new(sizeof(MemTableIterator));
+    void* mem = arena ? arena->AllocateAligned(sizeof(MemTableIterator))
+                      : operator new(sizeof(MemTableIterator));
     iter_ = new (mem)
         MemTableIterator(kind, memtable, read_options, seqno_to_time_mapping,
                          arena, cf_prefix_extractor);
@@ -740,7 +774,7 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIterator(
     const ReadOptions& read_options, SequenceNumber read_seq,
     bool immutable_memtable) {
   if (read_options.ignore_range_deletions ||
-      is_range_del_table_empty_.load(std::memory_order_relaxed)) {
+      is_range_del_table_empty_.LoadRelaxed()) {
     return nullptr;
   }
   return NewRangeTombstoneIteratorInternal(read_options, read_seq,
@@ -751,7 +785,7 @@ FragmentedRangeTombstoneIterator*
 MemTable::NewTimestampStrippingRangeTombstoneIterator(
     const ReadOptions& read_options, SequenceNumber read_seq, size_t ts_sz) {
   if (read_options.ignore_range_deletions ||
-      is_range_del_table_empty_.load(std::memory_order_relaxed)) {
+      is_range_del_table_empty_.LoadRelaxed()) {
     return nullptr;
   }
   if (!timestamp_stripping_fragmented_range_tombstone_list_) {
@@ -785,8 +819,13 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
 
   // takes current cache
   std::shared_ptr<FragmentedRangeTombstoneListCache> cache =
+#if defined(__cpp_lib_atomic_shared_ptr)
+      cached_range_tombstone_.Access()->load(std::memory_order_relaxed)
+#else
       std::atomic_load_explicit(cached_range_tombstone_.Access(),
-                                std::memory_order_relaxed);
+                                std::memory_order_relaxed)
+#endif
+      ;
   // construct fragmented tombstone list if necessary
   if (!cache->initialized.load(std::memory_order_acquire)) {
     cache->reader_mutex.lock();
@@ -810,7 +849,7 @@ void MemTable::ConstructFragmentedRangeTombstones() {
   // There should be no concurrent Construction.
   // We could also check fragmented_range_tombstone_list_ to avoid repeate
   // constructions. We just construct them here again to be safe.
-  if (!is_range_del_table_empty_.load(std::memory_order_relaxed)) {
+  if (!is_range_del_table_empty_.LoadRelaxed()) {
     // TODO: plumb Env::IOActivity, Env::IOPriority
     auto* unfragmented_iter = new MemTableIterator(
         MemTableIterator::kRangeDelEntries, *this, ReadOptions());
@@ -833,7 +872,7 @@ ReadOnlyMemTable::MemTableStats MemTable::ApproximateStats(
   if (entry_count == 0) {
     return {0, 0};
   }
-  uint64_t n = num_entries_.load(std::memory_order_relaxed);
+  uint64_t n = num_entries_.LoadRelaxed();
   if (n == 0) {
     return {0, 0};
   }
@@ -843,7 +882,7 @@ ReadOnlyMemTable::MemTableStats MemTable::ApproximateStats(
     // the inaccuracy.
     entry_count = n;
   }
-  uint64_t data_size = data_size_.load(std::memory_order_relaxed);
+  uint64_t data_size = data_size_.LoadRelaxed();
   return {entry_count * (data_size / n), entry_count};
 }
 
@@ -973,17 +1012,14 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
 
     // this is a bit ugly, but is the way to avoid locked instructions
     // when incrementing an atomic
-    num_entries_.store(num_entries_.load(std::memory_order_relaxed) + 1,
-                       std::memory_order_relaxed);
-    data_size_.store(data_size_.load(std::memory_order_relaxed) + encoded_len,
-                     std::memory_order_relaxed);
+    num_entries_.StoreRelaxed(num_entries_.LoadRelaxed() + 1);
+    data_size_.StoreRelaxed(data_size_.LoadRelaxed() + encoded_len);
     if (type == kTypeDeletion || type == kTypeSingleDeletion ||
         type == kTypeDeletionWithTimestamp) {
-      num_deletes_.store(num_deletes_.load(std::memory_order_relaxed) + 1,
-                         std::memory_order_relaxed);
+      num_deletes_.StoreRelaxed(num_deletes_.LoadRelaxed() + 1);
     } else if (type == kTypeRangeDeletion) {
-      uint64_t val = num_range_deletes_.load(std::memory_order_relaxed) + 1;
-      num_range_deletes_.store(val, std::memory_order_relaxed);
+      uint64_t val = num_range_deletes_.LoadRelaxed() + 1;
+      num_range_deletes_.StoreRelaxed(val);
     }
 
     if (bloom_filter_ && prefix_extractor_ &&
@@ -1054,6 +1090,16 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
       range_del_mutex_.lock();
     }
     for (size_t i = 0; i < size; ++i) {
+#if defined(__cpp_lib_atomic_shared_ptr)
+      std::atomic<std::shared_ptr<FragmentedRangeTombstoneListCache>>*
+          local_cache_ref_ptr = cached_range_tombstone_.AccessAtCore(i);
+      auto new_local_cache_ref = std::make_shared<
+          const std::shared_ptr<FragmentedRangeTombstoneListCache>>(new_cache);
+      std::shared_ptr<FragmentedRangeTombstoneListCache> aliased_ptr(
+          new_local_cache_ref, new_cache.get());
+      local_cache_ref_ptr->store(std::move(aliased_ptr),
+                                 std::memory_order_relaxed);
+#else
       std::shared_ptr<FragmentedRangeTombstoneListCache>* local_cache_ref_ptr =
           cached_range_tombstone_.AccessAtCore(i);
       auto new_local_cache_ref = std::make_shared<
@@ -1068,12 +1114,13 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
           std::shared_ptr<FragmentedRangeTombstoneListCache>(
               new_local_cache_ref, new_cache.get()),
           std::memory_order_relaxed);
+#endif
     }
 
     if (allow_concurrent) {
       range_del_mutex_.unlock();
     }
-    is_range_del_table_empty_.store(false, std::memory_order_relaxed);
+    is_range_del_table_empty_.StoreRelaxed(false);
   }
   UpdateOldestKeyTime();
 
@@ -1325,47 +1372,13 @@ static bool SaveValue(void* arg, const char* entry) {
         return false;
       }
       case kTypeMerge: {
-        if (!merge_operator) {
-          *(s->status) = Status::InvalidArgument(
-              "merge_operator is not properly initialized.");
-          // Normally we continue the loop (return true) when we see a merge
-          // operand.  But in case of an error, we should stop the loop
-          // immediately and pretend we have found the value to stop further
-          // seek.  Otherwise, the later call will override this error status.
-          *(s->found_final_value) = true;
-          return false;
-        }
         Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
         *(s->merge_in_progress) = true;
-        merge_context->PushOperand(
-            v, s->inplace_update_support == false /* operand_pinned */);
-        PERF_COUNTER_ADD(internal_merge_point_lookup_count, 1);
-
-        if (s->do_merge && merge_operator->ShouldMerge(
-                               merge_context->GetOperandsDirectionBackward())) {
-          if (s->value || s->columns) {
-            // `op_failure_scope` (an output parameter) is not provided (set to
-            // nullptr) since a failure must be propagated regardless of its
-            // value.
-            *(s->status) = MergeHelper::TimedFullMerge(
-                merge_operator, s->key->user_key(), MergeHelper::kNoBaseValue,
-                merge_context->GetOperands(), s->logger, s->statistics,
-                s->clock, /* update_num_ops_stats */ true,
-                /* op_failure_scope */ nullptr, s->value, s->columns);
-          }
-
-          *(s->found_final_value) = true;
-          return false;
-        }
-        if (merge_context->get_merge_operands_options != nullptr &&
-            merge_context->get_merge_operands_options->continue_cb != nullptr &&
-            !merge_context->get_merge_operands_options->continue_cb(v)) {
-          // We were told not to continue.
-          *(s->found_final_value) = true;
-          return false;
-        }
-
-        return true;
+        *(s->found_final_value) = ReadOnlyMemTable::HandleTypeMerge(
+            s->key->user_key(), v, s->inplace_update_support == false,
+            s->do_merge, merge_context, s->merge_operator, s->clock,
+            s->statistics, s->logger, s->status, s->value, s->columns);
+        return !*(s->found_final_value);
       }
       default: {
         std::string msg("Corrupted value not expected.");
@@ -1498,11 +1511,13 @@ void MemTable::GetFromTable(const LookupKey& key,
   saver.allow_data_in_errors = moptions_.allow_data_in_errors;
   saver.protection_bytes_per_key = moptions_.protection_bytes_per_key;
 
-  if (!moptions_.paranoid_memory_checks) {
+  if (!moptions_.paranoid_memory_checks &&
+      !moptions_.memtable_veirfy_per_key_checksum_on_seek) {
     table_->Get(key, &saver, SaveValue);
   } else {
-    Status check_s = table_->GetAndValidate(key, &saver, SaveValue,
-                                            moptions_.allow_data_in_errors);
+    Status check_s = table_->GetAndValidate(
+        key, &saver, SaveValue, moptions_.allow_data_in_errors,
+        moptions_.paranoid_memory_checks, key_validation_callback_);
     if (check_s.IsCorruption()) {
       *(saver.status) = check_s;
       // Should stop searching the LSM.
@@ -1511,6 +1526,11 @@ void MemTable::GetFromTable(const LookupKey& key,
   }
   assert(s->ok() || s->IsMergeInProgress() || *found_final_value);
   *seq = saver.seq;
+}
+
+Status MemTable::ValidateKey(const char* key, bool allow_data_in_errors) {
+  return VerifyEntryChecksum(key, moptions_.protection_bytes_per_key,
+                             allow_data_in_errors);
 }
 
 void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
@@ -1526,7 +1546,7 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
   // range tombstones. This is the simplest way to ensure range tombstones are
   // handled. TODO: allow Bloom checks where max_covering_tombstone_seq==0
   bool no_range_del = read_options.ignore_range_deletions ||
-                      is_range_del_table_empty_.load(std::memory_order_relaxed);
+                      is_range_del_table_empty_.LoadRelaxed();
   MultiGetRange temp_range(*range, range->begin(), range->end());
   if (bloom_filter_ && no_range_del) {
     bool whole_key =
@@ -1835,7 +1855,7 @@ uint64_t MemTable::GetMinLogContainingPrepSection() {
 }
 
 void MemTable::MaybeUpdateNewestUDT(const Slice& user_key) {
-  if (ts_sz_ == 0 || persist_user_defined_timestamps_) {
+  if (ts_sz_ == 0) {
     return;
   }
   const Comparator* ucmp = GetInternalKeyComparator().user_comparator();
@@ -1846,9 +1866,7 @@ void MemTable::MaybeUpdateNewestUDT(const Slice& user_key) {
 }
 
 const Slice& MemTable::GetNewestUDT() const {
-  // This path should not be invoked for MemTables that does not enable the UDT
-  // in Memtable only feature.
-  assert(ts_sz_ > 0 && !persist_user_defined_timestamps_);
+  assert(ts_sz_ > 0);
   return newest_udt_;
 }
 

@@ -53,6 +53,7 @@ class StressTest {
     Status s = db_->EnableAutoCompaction(column_families_);
     return s;
   }
+  Options GetOptions(int cf_id);
   void CleanUp();
 
  protected:
@@ -274,6 +275,10 @@ class StressTest {
     return Status::NotSupported();
   }
 
+  Status TestMultiScan(ThreadState* thread, const ReadOptions& read_opts,
+                       const std::vector<int>& rand_column_families,
+                       const std::vector<int64_t>& rand_keys);
+
   // Enum used by VerifyIterator() to identify the mode to validate.
   enum LastIterateOp {
     kLastOpSeek,
@@ -391,6 +396,8 @@ class StressTest {
                                           std::string& ts_str, Slice& ts_slice,
                                           ReadOptions& read_opts);
 
+  void CleanUpColumnFamilies();
+
   std::shared_ptr<Cache> cache_;
   std::shared_ptr<Cache> compressed_cache_;
   std::shared_ptr<const FilterPolicy> filter_policy_;
@@ -412,9 +419,8 @@ class StressTest {
   std::atomic<bool> db_preload_finished_;
   std::shared_ptr<SstQueryFilterConfigsManager::Factory> sqfc_factory_;
 
-  // Fields used for continuous verification from another thread
-  DB* cmp_db_;
-  std::vector<ColumnFamilyHandle*> cmp_cfhs_;
+  DB* secondary_db_;
+  std::vector<ColumnFamilyHandle*> secondary_cfhs_;
   bool is_db_stopped_;
 };
 

@@ -43,15 +43,13 @@ class SstFileDumper {
   Status getStatus() { return init_result_; }
 
   Status ShowAllCompressionSizes(
-      size_t block_size,
-      const std::vector<std::pair<CompressionType, const char*>>&
-          compression_types,
-      int32_t compress_level_from, int32_t compress_level_to,
-      uint32_t max_dict_bytes, uint32_t zstd_max_train_bytes,
-      uint64_t max_dict_buffer_bytes, bool use_zstd_dict_trainer);
+      const std::vector<CompressionType>& compression_types,
+      int32_t compress_level_from, int32_t compress_level_to);
 
-  Status ShowCompressionSize(size_t block_size, CompressionType compress_type,
+  Status ShowCompressionSize(CompressionType compress_type,
                              const CompressionOptions& compress_opt);
+
+  BlockContents& GetMetaIndexContents() { return meta_index_contents_; }
 
  private:
   // Get the TableReader implementation for the sst file
@@ -61,9 +59,9 @@ class SstFileDumper {
                              FilePrefetchBuffer* prefetch_buffer);
 
   Status CalculateCompressedTableSize(const TableBuilderOptions& tb_options,
-                                      size_t block_size,
-                                      uint64_t* num_data_blocks,
-                                      uint64_t* compressed_table_size);
+                                      TableProperties* props,
+                                      std::chrono::microseconds* write_time,
+                                      std::chrono::microseconds* read_time);
 
   Status SetTableOptionsByMagicNumber(uint64_t table_magic_number);
   Status SetOldTableOptions();
@@ -98,7 +96,7 @@ class SstFileDumper {
   ReadOptions read_options_;
   InternalKeyComparator internal_comparator_;
   std::unique_ptr<TableProperties> table_properties_;
+  BlockContents meta_index_contents_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

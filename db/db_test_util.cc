@@ -11,6 +11,7 @@
 
 #include "cache/cache_reservation_manager.h"
 #include "db/forward_iterator.h"
+#include "env/fs_readonly.h"
 #include "env/mock_env.h"
 #include "port/lang.h"
 #include "rocksdb/cache.h"
@@ -70,9 +71,9 @@ DBTestBase::DBTestBase(const std::string path, bool env_do_fsync)
   if (getenv("MEM_ENV")) {
     mem_env_ = MockEnv::Create(base_env, base_env->GetSystemClock());
   }
-  if (getenv("ENCRYPTED_ENV")) {
+  if (auto ee = getenv("ENCRYPTED_ENV")) {
     std::shared_ptr<EncryptionProvider> provider;
-    std::string provider_id = getenv("ENCRYPTED_ENV");
+    std::string provider_id = ee;
     if (provider_id.find('=') == std::string::npos &&
         !EndsWith(provider_id, "://test")) {
       provider_id = provider_id + "://test";
@@ -122,7 +123,6 @@ DBTestBase::~DBTestBase() {
 }
 
 bool DBTestBase::ShouldSkipOptions(int option_config, int skip_mask) {
-
   if ((skip_mask & kSkipUniversalCompaction) &&
       (option_config == kUniversalCompaction ||
        option_config == kUniversalCompactionMultiLevel ||
@@ -366,11 +366,6 @@ Options DBTestBase::GetOptions(
     table_options.block_cache = NewLRUCache(/* too small */ 1);
   }
 
-  // Test anticipated new default as much as reasonably possible (and remove
-  // this code when obsolete)
-  assert(!table_options.decouple_partitioned_filters);
-  table_options.decouple_partitioned_filters = true;
-
   bool can_allow_mmap = IsMemoryMappedAccessSupported();
   switch (option_config) {
     case kHashSkipList:
@@ -592,7 +587,6 @@ Options DBTestBase::GetOptions(
       options_override.level_compaction_dynamic_level_bytes;
   options.env = env_;
   options.create_if_missing = true;
-  options.fail_if_options_file_error = true;
   return options;
 }
 
@@ -715,6 +709,17 @@ Status DBTestBase::ReadOnlyReopen(const Options& options) {
   Close();
   MaybeInstallTimeElapseOnlySleep(options);
   return DB::OpenForReadOnly(options, dbname_, &db_);
+}
+
+Status DBTestBase::EnforcedReadOnlyReopen(const Options& options) {
+  Close();
+  Options options_copy = options;
+  MaybeInstallTimeElapseOnlySleep(options_copy);
+  auto fs_read_only =
+      std::make_shared<ReadOnlyFileSystem>(env_->GetFileSystem());
+  env_read_only_ = std::make_shared<CompositeEnvWrapper>(env_, fs_read_only);
+  options_copy.env = env_read_only_.get();
+  return DB::OpenForReadOnly(options_copy, dbname_, &db_);
 }
 
 Status DBTestBase::TryReopen(const Options& options) {
@@ -1149,16 +1154,18 @@ size_t DBTestBase::CountLiveFiles() {
 }
 
 int DBTestBase::NumTableFilesAtLevel(int level, int cf) {
-  std::string property;
-  if (cf == 0) {
-    // default cfd
-    EXPECT_TRUE(db_->GetProperty(
-        "rocksdb.num-files-at-level" + std::to_string(level), &property));
-  } else {
-    EXPECT_TRUE(db_->GetProperty(
-        handles_[cf], "rocksdb.num-files-at-level" + std::to_string(level),
-        &property));
+  return NumTableFilesAtLevel(level,
+                              cf ? handles_[cf] : db_->DefaultColumnFamily());
+}
+
+int DBTestBase::NumTableFilesAtLevel(int level, ColumnFamilyHandle* cfh,
+                                     DB* db) {
+  if (!db) {
+    db = db_;
   }
+  std::string property;
+  EXPECT_TRUE(db->GetProperty(
+      cfh, "rocksdb.num-files-at-level" + std::to_string(level), &property));
   return atoi(property.c_str());
 }
 
@@ -1191,12 +1198,22 @@ int DBTestBase::TotalTableFiles(int cf, int levels) {
 
 // Return spread of files per level
 std::string DBTestBase::FilesPerLevel(int cf) {
-  int num_levels =
-      (cf == 0) ? db_->NumberLevels() : db_->NumberLevels(handles_[cf]);
+  if (cf == 0) {
+    return FilesPerLevel(db_->DefaultColumnFamily());
+  } else {
+    return FilesPerLevel(handles_[cf]);
+  }
+}
+
+std::string DBTestBase::FilesPerLevel(ColumnFamilyHandle* cfh, DB* db) {
+  if (!db) {
+    db = db_;
+  }
+  int num_levels = db->NumberLevels(cfh);
   std::string result;
   size_t last_non_zero_offset = 0;
   for (int level = 0; level < num_levels; level++) {
-    int f = NumTableFilesAtLevel(level, cf);
+    int f = NumTableFilesAtLevel(level, cfh, db);
     char buf[100];
     snprintf(buf, sizeof(buf), "%s%d", (level ? "," : ""), f);
     result += buf;
@@ -1207,7 +1224,6 @@ std::string DBTestBase::FilesPerLevel(int cf) {
   result.resize(last_non_zero_offset);
   return result;
 }
-
 
 std::vector<uint64_t> DBTestBase::GetBlobFileNumbers() {
   VersionSet* const versions = dbfull()->GetVersionSet();
@@ -1330,12 +1346,14 @@ void DBTestBase::FillLevels(const std::string& smallest,
 }
 
 void DBTestBase::MoveFilesToLevel(int level, int cf) {
+  MoveFilesToLevel(level, cf ? handles_[cf] : db_->DefaultColumnFamily());
+}
+
+void DBTestBase::MoveFilesToLevel(int level, ColumnFamilyHandle* column_family,
+                                  DB* db) {
+  DBImpl* db_impl = db ? static_cast<DBImpl*>(db) : dbfull();
   for (int l = 0; l < level; ++l) {
-    if (cf > 0) {
-      EXPECT_OK(dbfull()->TEST_CompactRange(l, nullptr, nullptr, handles_[cf]));
-    } else {
-      EXPECT_OK(dbfull()->TEST_CompactRange(l, nullptr, nullptr));
-    }
+    EXPECT_OK(db_impl->TEST_CompactRange(l, nullptr, nullptr, column_family));
   }
 }
 
@@ -1667,7 +1685,7 @@ void DBTestBase::VerifyDBFromMap(
     data_iter = true_data.begin();
     for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++data_iter) {
       ASSERT_EQ(iter->key().ToString(), data_iter->first);
-        ASSERT_EQ(iter->value().ToString(), data_iter->second);
+      ASSERT_EQ(iter->value().ToString(), data_iter->second);
       iter_cnt++;
       total_reads++;
     }
@@ -1683,7 +1701,7 @@ void DBTestBase::VerifyDBFromMap(
     auto data_rev = true_data.rbegin();
     for (iter->SeekToLast(); iter->Valid(); iter->Prev(), data_rev++) {
       ASSERT_EQ(iter->key().ToString(), data_rev->first);
-        ASSERT_EQ(iter->value().ToString(), data_rev->second);
+      ASSERT_EQ(iter->value().ToString(), data_rev->second);
       iter_cnt++;
       total_reads++;
     }
@@ -1764,7 +1782,6 @@ void DBTestBase::VerifyDBInternal(
   ASSERT_FALSE(iter->Valid());
   iter->~InternalIterator();
 }
-
 
 uint64_t DBTestBase::GetNumberOfSstFilesForColumnFamily(
     DB* db, std::string column_family_name) {
@@ -1854,5 +1871,14 @@ template class TargetCacheChargeTrackingCache<
 template class TargetCacheChargeTrackingCache<
     CacheEntryRole::kBlockBasedTableReader>;
 template class TargetCacheChargeTrackingCache<CacheEntryRole::kFileMetadata>;
+
+const std::vector<Temperature> kKnownTemperatures = {
+    Temperature::kHot, Temperature::kWarm, Temperature::kCool,
+    Temperature::kCold, Temperature::kIce};
+
+Temperature RandomKnownTemperature() {
+  return kKnownTemperatures[Random::GetTLSInstance()->Uniform(
+      static_cast<int>(kKnownTemperatures.size()))];
+}
 
 }  // namespace ROCKSDB_NAMESPACE

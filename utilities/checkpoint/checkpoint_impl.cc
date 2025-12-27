@@ -7,7 +7,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-
 #include "utilities/checkpoint/checkpoint_impl.h"
 
 #include <algorithm>
@@ -341,6 +340,7 @@ Status CheckpointImpl::ExportColumnFamily(
   s = db_->GetEnv()->CreateDir(tmp_export_dir);
 
   if (s.ok()) {
+    // FIXME: should respect atomic_flush and flush all CFs if needed.
     s = db_->Flush(ROCKSDB_NAMESPACE::FlushOptions(), handle);
   }
 

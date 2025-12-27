@@ -94,21 +94,20 @@ class Compaction {
              std::vector<FileMetaData*> grandparents,
              std::optional<SequenceNumber> earliest_snapshot,
              const SnapshotChecker* snapshot_checker,
-             bool manual_compaction = false, const std::string& trim_ts = "",
-             double score = -1, bool deletion_compaction = false,
+             CompactionReason compaction_reason,
+             const std::string& trim_ts = "", double score = -1,
              bool l0_files_might_overlap = true,
-             CompactionReason compaction_reason = CompactionReason::kUnknown,
              BlobGarbageCollectionPolicy blob_garbage_collection_policy =
                  BlobGarbageCollectionPolicy::kUseDefault,
              double blob_garbage_collection_age_cutoff = -1);
 
-  // The type of the penultimate level output range
-  enum class PenultimateOutputRangeType : int {
-    kNotSupported,  // it cannot output to the penultimate level
-    kFullRange,     // any data could be output to the penultimate level
+  // The type of the proximal level output range
+  enum class ProximalOutputRangeType : int {
+    kNotSupported,  // it cannot output to the proximal level
+    kFullRange,     // any data could be output to the proximal level
     kNonLastRange,  // only the keys within non_last_level compaction inputs can
-                    // be outputted to the penultimate level
-    kDisabled,      // no data can be outputted to the penultimate level
+                    // be outputted to the proximal level
+    kDisabled,      // no data can be outputted to the proximal level
   };
 
   // No copying allowed
@@ -283,19 +282,26 @@ class Compaction {
   // are non-overlapping and can be trivially moved.
   bool is_trivial_move() const { return is_trivial_move_; }
 
+  bool is_trivial_copy_compaction() const {
+    return immutable_options_.compaction_style == kCompactionStyleFIFO &&
+           compaction_reason_ == CompactionReason::kChangeTemperature &&
+           mutable_cf_options_.compaction_options_fifo
+               .allow_trivial_copy_when_change_temperature;
+  }
+
   // How many total levels are there?
   int number_levels() const { return number_levels_; }
 
   // Return the ImmutableOptions that should be used throughout the compaction
   // procedure
-  const ImmutableOptions* immutable_options() const {
-    return &immutable_options_;
+  const ImmutableOptions& immutable_options() const {
+    return immutable_options_;
   }
 
   // Return the MutableCFOptions that should be used throughout the compaction
   // procedure
-  const MutableCFOptions* mutable_cf_options() const {
-    return &mutable_cf_options_;
+  const MutableCFOptions& mutable_cf_options() const {
+    return mutable_cf_options_;
   }
 
   // Returns the size in bytes that the output file should be preallocated to.
@@ -370,30 +376,30 @@ class Compaction {
 
   Slice GetLargestUserKey() const { return largest_user_key_; }
 
-  PenultimateOutputRangeType GetPenultimateOutputRangeType() const {
-    return penultimate_output_range_type_;
+  ProximalOutputRangeType GetProximalOutputRangeType() const {
+    return proximal_output_range_type_;
   }
 
   // Return true if the compaction supports per_key_placement
   bool SupportsPerKeyPlacement() const;
 
-  // Get per_key_placement penultimate output level, which is `last_level - 1`
+  // Get per_key_placement proximal output level, which is `last_level - 1`
   // if per_key_placement feature is supported. Otherwise, return -1.
-  int GetPenultimateLevel() const;
+  int GetProximalLevel() const;
 
-  // Return true if the given range is overlap with penultimate level output
+  // Return true if the given range is overlap with proximal level output
   // range.
   // Both smallest_key and largest_key include timestamps if user-defined
   // timestamp is enabled.
-  bool OverlapPenultimateLevelOutputRange(const Slice& smallest_key,
-                                          const Slice& largest_key) const;
+  bool OverlapProximalLevelOutputRange(const Slice& smallest_key,
+                                       const Slice& largest_key) const;
 
-  // Return true if the key is within penultimate level output range for
-  // per_key_placement feature, which is safe to place the key to the
-  // penultimate level. different compaction strategy has different rules.
-  // If per_key_placement is not supported, always return false.
-  //  key includes timestamp if user-defined timestamp is enabled.
-  bool WithinPenultimateLevelOutputRange(const ParsedInternalKey& ikey) const;
+  // For testing purposes, check that a key is within proximal level
+  // output range for per_key_placement feature, which is safe to place the key
+  // to the proximal level. Different compaction strategies have different
+  // rules. `user_key` includes timestamp if user-defined timestamp is enabled.
+  void TEST_AssertWithinProximalLevelOutputRange(
+      const Slice& user_key, bool expect_failure = false) const;
 
   CompactionReason compaction_reason() const { return compaction_reason_; }
 
@@ -441,26 +447,37 @@ class Compaction {
 
   static constexpr int kInvalidLevel = -1;
 
-  // Evaluate penultimate output level. If the compaction supports
-  // per_key_placement feature, it returns the penultimate level number.
+  // Evaluate proximal output level. If the compaction supports
+  // per_key_placement feature, it returns the proximal level number.
   // Otherwise, it's set to kInvalidLevel (-1), which means
-  // output_to_penultimate_level is not supported.
-  // Note: even the penultimate level output is supported (PenultimateLevel !=
+  // output_to_proximal_level is not supported.
+  // Note: even the proximal level output is supported (ProximalLevel !=
   // kInvalidLevel), some key range maybe unsafe to be outputted to the
-  // penultimate level. The safe key range is populated by
-  // `PopulatePenultimateLevelOutputRange()`.
-  // Which could potentially disable all penultimate level output.
-  static int EvaluatePenultimateLevel(
-      const VersionStorageInfo* vstorage,
-      const MutableCFOptions& mutable_cf_options,
-      const ImmutableOptions& immutable_options, const int start_level,
-      const int output_level);
+  // proximal level. The safe key range is populated by
+  // `PopulateProximalLevelOutputRange()`.
+  // Which could potentially disable all proximal level output.
+  static int EvaluateProximalLevel(const VersionStorageInfo* vstorage,
+                                   const MutableCFOptions& mutable_cf_options,
+                                   const ImmutableOptions& immutable_options,
+                                   const int start_level,
+                                   const int output_level);
+
+  static bool OutputToNonZeroMaxOutputLevel(int output_level,
+                                            int max_output_level) {
+    return output_level > 0 && output_level == max_output_level;
+  }
+
+  // If some data cannot be safely migrated "up" the LSM tree due to a change
+  // in the preclude_last_level_data_seconds setting, this indicates a sequence
+  // number for the newest data that must be kept in the last level.
+  SequenceNumber GetKeepInLastLevelThroughSeqno() const {
+    return keep_in_last_level_through_seqno_;
+  }
 
   // mark (or clear) all files that are being compacted
   void MarkFilesBeingCompacted(bool being_compacted) const;
 
  private:
-
   Status InitInputTableProperties();
 
   // get the smallest and largest key present in files to be compacted
@@ -476,10 +493,10 @@ class Compaction {
       InternalKey* smallest_key, InternalKey* largest_key,
       int exclude_level = -1);
 
-  // populate penultimate level output range, which will be used to determine if
-  // a key is safe to output to the penultimate level (details see
-  // `Compaction::WithinPenultimateLevelOutputRange()`.
-  void PopulatePenultimateLevelOutputRange();
+  // populate proximal level output range, which will be used to determine if
+  // a key is safe to output to the proximal level (details see
+  // `Compaction::WithinProximalLevelOutputRange()`.
+  void PopulateProximalLevelOutputRange();
 
   // If oldest snapshot is specified at Compaction construction time, we have
   // an opportunity to optimize inputs for compaction iterator for this case:
@@ -606,22 +623,24 @@ class Compaction {
   // Blob garbage collection age cutoff.
   double blob_garbage_collection_age_cutoff_;
 
+  SequenceNumber keep_in_last_level_through_seqno_ = kMaxSequenceNumber;
+
   // only set when per_key_placement feature is enabled, -1 (kInvalidLevel)
   // means not supported.
-  const int penultimate_level_;
+  const int proximal_level_;
 
-  // Key range for penultimate level output
+  // Key range for proximal level output
   // includes timestamp if user-defined timestamp is enabled.
-  // penultimate_output_range_type_ shows the range type
-  InternalKey penultimate_level_smallest_;
-  InternalKey penultimate_level_largest_;
-  PenultimateOutputRangeType penultimate_output_range_type_ =
-      PenultimateOutputRangeType::kNotSupported;
+  // proximal_output_range_type_ shows the range type
+  InternalKey proximal_level_smallest_;
+  InternalKey proximal_level_largest_;
+  ProximalOutputRangeType proximal_output_range_type_ =
+      ProximalOutputRangeType::kNotSupported;
 };
 
 #ifndef NDEBUG
 // Helper struct only for tests, which contains the data to decide if a key
-// should be output to the penultimate level.
+// should be output to the proximal level.
 // TODO: remove this when the public feature knob is available
 struct PerKeyPlacementContext {
   const int level;
@@ -629,16 +648,16 @@ struct PerKeyPlacementContext {
   const Slice value;
   const SequenceNumber seq_num;
 
-  bool& output_to_penultimate_level;
+  bool& output_to_proximal_level;
 
   PerKeyPlacementContext(int _level, Slice _key, Slice _value,
                          SequenceNumber _seq_num,
-                         bool& _output_to_penultimate_level)
+                         bool& _output_to_proximal_level)
       : level(_level),
         key(_key),
         value(_value),
         seq_num(_seq_num),
-        output_to_penultimate_level(_output_to_penultimate_level) {}
+        output_to_proximal_level(_output_to_proximal_level) {}
 };
 #endif /* !NDEBUG */
 

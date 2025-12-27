@@ -83,6 +83,8 @@ extern const ValueType kValueTypeForSeekForPrev;
 
 // A range of user keys used internally by RocksDB. Also see `Range` used by
 // public APIs.
+// TODO: merge with Range in pubic API, but this is generally inclusive limit
+// and it is maybe exclusive limit
 struct UserKeyRange {
   // In case of user_defined timestamp, if enabled, `start` and `limit` should
   // include user_defined timestamps.
@@ -93,18 +95,17 @@ struct UserKeyRange {
   UserKeyRange(const Slice& s, const Slice& l) : start(s), limit(l) {}
 };
 
-// A range of user keys used internally by RocksDB. Also see `RangePtr` used by
+// A range of user keys used internally by RocksDB. Also see `RangeOpt` used by
 // public APIs.
-struct UserKeyRangePtr {
+struct UserKeyRangeOpt {
   // In case of user_defined timestamp, if enabled, `start` and `limit` should
   // point to key with timestamp part.
   // An optional range start, if missing, indicating a start before all keys.
-  std::optional<Slice> start;
+  OptSlice start;
   // An optional range end, if missing, indicating an end after all keys.
-  std::optional<Slice> limit;
+  OptSlice limit;
 
-  UserKeyRangePtr(const std::optional<Slice>& s, const std::optional<Slice>& l)
-      : start(s), limit(l) {}
+  UserKeyRangeOpt(const OptSlice& s, const OptSlice& l) : start(s), limit(l) {}
 };
 
 // Checks whether a type is an inline value type
@@ -469,6 +470,7 @@ class InternalKey {
 
   Slice user_key() const { return ExtractUserKey(rep_); }
   size_t size() const { return rep_.size(); }
+  bool unset() const { return rep_.empty(); }
 
   void Set(const Slice& _user_key, SequenceNumber s, ValueType t) {
     SetFrom(ParsedInternalKey(_user_key, s, t));
@@ -497,6 +499,8 @@ class InternalKey {
   // The underlying representation.
   // Intended only to be used together with ConvertFromUserKey().
   std::string* rep() { return &rep_; }
+
+  const std::string* const_rep() const { return &rep_; }
 
   // Assuming that *rep() contains a user key, this method makes internal key
   // out of it in-place. This saves a memcpy compared to Set()/SetFrom().
@@ -1179,4 +1183,64 @@ struct ParsedInternalKeyComparator {
   const InternalKeyComparator* cmp;
 };
 
+class PredecessorWALInfo {
+ public:
+  PredecessorWALInfo()
+      : log_number_(0),
+        size_bytes_(0),
+        last_seqno_recorded_(0),
+        initialized_(false) {}
+
+  explicit PredecessorWALInfo(uint64_t log_number, uint64_t size_bytes,
+                              SequenceNumber last_seqno_recorded)
+      : log_number_(log_number),
+        size_bytes_(size_bytes),
+        last_seqno_recorded_(last_seqno_recorded),
+        initialized_(true) {}
+
+  uint64_t GetLogNumber() const {
+    assert(initialized_);
+    return log_number_;
+  }
+
+  uint64_t GetSizeBytes() const {
+    assert(initialized_);
+    return size_bytes_;
+  }
+
+  SequenceNumber GetLastSeqnoRecorded() const {
+    assert(initialized_);
+    return last_seqno_recorded_;
+  }
+
+  bool IsInitialized() const { return initialized_; }
+
+  inline void EncodeTo(std::string* dst) const {
+    assert(dst != nullptr);
+    assert(initialized_);
+    PutFixed64(dst, log_number_);
+    PutFixed64(dst, size_bytes_);
+    PutFixed64(dst, last_seqno_recorded_);
+  }
+
+  inline Status DecodeFrom(Slice* src) {
+    if (!GetFixed64(src, &log_number_)) {
+      return Status::Corruption("Error decoding log number");
+    }
+    if (!GetFixed64(src, &size_bytes_)) {
+      return Status::Corruption("Error decoding size bytes");
+    }
+    if (!GetFixed64(src, &last_seqno_recorded_)) {
+      return Status::Corruption("Error decoding last seqno recorded");
+    }
+    initialized_ = true;
+    return Status::OK();
+  }
+
+ private:
+  uint64_t log_number_;
+  uint64_t size_bytes_;
+  SequenceNumber last_seqno_recorded_;
+  bool initialized_;
+};
 }  // namespace ROCKSDB_NAMESPACE

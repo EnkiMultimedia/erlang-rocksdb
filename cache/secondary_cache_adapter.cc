@@ -121,7 +121,14 @@ CacheWithSecondaryAdapter::~CacheWithSecondaryAdapter() {
     assert(s.ok());
     assert(placeholder_usage_ == 0);
     assert(reserved_usage_ == 0);
-    assert(pri_cache_res_->GetTotalMemoryUsed() == sec_capacity);
+    if (pri_cache_res_->GetTotalMemoryUsed() != sec_capacity) {
+      fprintf(stdout,
+              "~CacheWithSecondaryAdapter: Primary cache reservation: "
+              "%zu, Secondary cache capacity: %zu, "
+              "Secondary cache reserved: %zu\n",
+              pri_cache_res_->GetTotalMemoryUsed(), sec_capacity,
+              sec_reserved_);
+    }
   }
 #endif  // NDEBUG
 }
@@ -479,12 +486,10 @@ const char* CacheWithSecondaryAdapter::Name() const {
 // as well. At the moment, we don't have a good way of handling the case
 // where the new capacity < total cache reservations.
 void CacheWithSecondaryAdapter::SetCapacity(size_t capacity) {
-  size_t sec_capacity = static_cast<size_t>(
-      capacity * (distribute_cache_res_ ? sec_cache_res_ratio_ : 0.0));
-  size_t old_sec_capacity = 0;
-
   if (distribute_cache_res_) {
     MutexLock m(&cache_res_mutex_);
+    size_t sec_capacity = static_cast<size_t>(capacity * sec_cache_res_ratio_);
+    size_t old_sec_capacity = 0;
 
     Status s = secondary_cache_->GetCapacity(old_sec_capacity);
     if (!s.ok()) {
@@ -579,7 +584,7 @@ Status CacheWithSecondaryAdapter::UpdateCacheReservationRatio(
   size_t pri_capacity = target_->GetCapacity();
   size_t sec_capacity =
       static_cast<size_t>(pri_capacity * compressed_secondary_ratio);
-  size_t old_sec_capacity;
+  size_t old_sec_capacity = 0;
   Status s = secondary_cache_->GetCapacity(old_sec_capacity);
   if (!s.ok()) {
     return s;
@@ -603,6 +608,7 @@ Status CacheWithSecondaryAdapter::UpdateCacheReservationRatio(
     //    cache utilization (increase in capacity - increase in share of cache
     //    reservation)
     // 3. Increase secondary cache capacity
+    assert(new_sec_reserved >= sec_reserved_);
     s = secondary_cache_->Deflate(new_sec_reserved - sec_reserved_);
     assert(s.ok());
     s = pri_cache_res_->UpdateCacheReservation(

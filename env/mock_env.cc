@@ -322,6 +322,11 @@ class MockRandomAccessFile : public FSRandomAccessFile {
     }
   }
 
+  IOStatus GetFileSize(uint64_t* size) override {
+    *size = file_->Size();
+    return IOStatus::OK();
+  }
+
  private:
   MemFile* file_;
   bool use_direct_io_;
@@ -1053,6 +1058,5 @@ Status MockEnv::CorruptBuffer(const std::string& fname) {
 
 // This is to maintain the behavior before swithcing from InMemoryEnv to MockEnv
 Env* NewMemEnv(Env* base_env) { return MockEnv::Create(base_env); }
-
 
 }  // namespace ROCKSDB_NAMESPACE

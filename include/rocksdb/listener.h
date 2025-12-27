@@ -183,6 +183,8 @@ enum class FlushReason : int {
   kWalFull = 0xd,
   // SwitchMemtable will not be called for this flush reason.
   kCatchUpAfterErrorRecovery = 0xe,
+
+  // When adding flush reason, make sure to also add it to FlushReason in Java.
 };
 
 const char* GetFlushReasonString(FlushReason flush_reason);
@@ -210,7 +212,6 @@ struct WriteStallInfo {
     WriteStallCondition prev;
   } condition;
 };
-
 
 struct FileDeletionInfo {
   FileDeletionInfo() = default;
@@ -437,6 +438,9 @@ struct CompactionJobInfo {
   uint64_t thread_id;
   // the job id, which is unique in the same thread.
   int job_id;
+
+  // the number of L0 files in the CF right before and after the compaction
+  int num_l0_files;
 
   // the smallest input level of the compaction.
   int base_input_level;
@@ -864,6 +868,5 @@ class EventListener : public Customizable {
 
   ~EventListener() override {}
 };
-
 
 }  // namespace ROCKSDB_NAMESPACE

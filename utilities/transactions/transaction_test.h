@@ -49,14 +49,18 @@ class TransactionTestBase : public ::testing::Test {
 
   TransactionDBOptions txn_db_options;
   bool use_stackable_db_;
+  int64_t deadlock_timeout_us_;
 
   TransactionTestBase(bool use_stackable_db, bool two_write_queue,
                       TxnDBWritePolicy write_policy,
-                      WriteOrdering write_ordering)
+                      WriteOrdering write_ordering,
+                      bool use_per_key_point_lock_mgr,
+                      int64_t deadlock_timeout_us)
       : db(nullptr),
         special_env(Env::Default()),
         env(nullptr),
-        use_stackable_db_(use_stackable_db) {
+        use_stackable_db_(use_stackable_db),
+        deadlock_timeout_us_(deadlock_timeout_us) {
     options.create_if_missing = true;
     options.max_write_buffer_number = 2;
     options.write_buffer_size = 4 * 1024;
@@ -77,6 +81,7 @@ class TransactionTestBase : public ::testing::Test {
     txn_db_options.default_lock_timeout = 0;
     txn_db_options.write_policy = write_policy;
     txn_db_options.rollback_merge_operands = true;
+    txn_db_options.use_per_key_point_lock_mgr = use_per_key_point_lock_mgr;
     // This will stress write unprepared, by forcing write batch flush on every
     // write.
     txn_db_options.default_write_batch_flush_threshold = 1;
@@ -163,7 +168,7 @@ class TransactionTestBase : public ::testing::Test {
                              std::vector<ColumnFamilyHandle*>* handles) {
     std::vector<size_t> compaction_enabled_cf_indices;
     TransactionDB::PrepareWrap(&options, &cfs, &compaction_enabled_cf_indices);
-    DB* root_db = nullptr;
+    std::unique_ptr<DB> root_db;
     Options options_copy(options);
     const bool use_seq_per_batch =
         txn_db_options.write_policy == WRITE_PREPARED ||
@@ -174,9 +179,8 @@ class TransactionTestBase : public ::testing::Test {
     Status s = DBImpl::Open(options_copy, dbname, cfs, handles, &root_db,
                             use_seq_per_batch, use_batch_per_txn,
                             /*is_retry=*/false, /*can_retry=*/nullptr);
-    auto stackable_db = std::make_unique<StackableDB>(root_db);
+    auto stackable_db = std::make_unique<StackableDB>(std::move(root_db));
     if (s.ok()) {
-      assert(root_db != nullptr);
       // If WrapStackableDB() returns non-ok, then stackable_db is already
       // deleted within WrapStackableDB().
       s = TransactionDB::WrapStackableDB(stackable_db.release(), txn_db_options,
@@ -194,7 +198,7 @@ class TransactionTestBase : public ::testing::Test {
     TransactionDB::PrepareWrap(&options, &column_families,
                                &compaction_enabled_cf_indices);
     std::vector<ColumnFamilyHandle*> handles;
-    DB* root_db = nullptr;
+    std::unique_ptr<DB> root_db;
     Options options_copy(options);
     const bool use_seq_per_batch =
         txn_db_options.write_policy == WRITE_PREPARED ||
@@ -206,11 +210,9 @@ class TransactionTestBase : public ::testing::Test {
                             &root_db, use_seq_per_batch, use_batch_per_txn,
                             /*is_retry=*/false, /*can_retry=*/nullptr);
     if (!s.ok()) {
-      delete root_db;
       return s;
     }
-    StackableDB* stackable_db = new StackableDB(root_db);
-    assert(root_db != nullptr);
+    StackableDB* stackable_db = new StackableDB(std::move(root_db));
     assert(handles.size() == 1);
     s = TransactionDB::WrapStackableDB(stackable_db, txn_db_options,
                                        compaction_enabled_cf_indices, handles,
@@ -484,30 +486,35 @@ class TransactionTestBase : public ::testing::Test {
 
 class TransactionTest
     : public TransactionTestBase,
-      virtual public ::testing::WithParamInterface<
-          std::tuple<bool, bool, TxnDBWritePolicy, WriteOrdering>> {
+      virtual public ::testing::WithParamInterface<std::tuple<
+          bool, bool, TxnDBWritePolicy, WriteOrdering, bool, int64_t>> {
  public:
   TransactionTest()
       : TransactionTestBase(std::get<0>(GetParam()), std::get<1>(GetParam()),
-                            std::get<2>(GetParam()), std::get<3>(GetParam())){};
+                            std::get<2>(GetParam()), std::get<3>(GetParam()),
+                            std::get<4>(GetParam()), std::get<5>(GetParam())) {}
 };
 
-class TransactionDBTest : public TransactionTestBase {
+class TransactionDBTest
+    : public TransactionTestBase,
+      virtual public ::testing::WithParamInterface<std::tuple<bool, int64_t>> {
  public:
   TransactionDBTest()
-      : TransactionTestBase(false, false, WRITE_COMMITTED, kOrderedWrite) {}
+      : TransactionTestBase(false, false, WRITE_COMMITTED, kOrderedWrite,
+                            std::get<0>(GetParam()), std::get<1>(GetParam())) {}
 };
 
 class TransactionStressTest : public TransactionTest {};
 
 class MySQLStyleTransactionTest
     : public TransactionTestBase,
-      virtual public ::testing::WithParamInterface<
-          std::tuple<bool, bool, TxnDBWritePolicy, WriteOrdering, bool>> {
+      virtual public ::testing::WithParamInterface<std::tuple<
+          bool, bool, TxnDBWritePolicy, WriteOrdering, bool, bool, int64_t>> {
  public:
   MySQLStyleTransactionTest()
       : TransactionTestBase(std::get<0>(GetParam()), std::get<1>(GetParam()),
-                            std::get<2>(GetParam()), std::get<3>(GetParam())),
+                            std::get<2>(GetParam()), std::get<3>(GetParam()),
+                            std::get<5>(GetParam()), std::get<6>(GetParam())),
         with_slow_threads_(std::get<4>(GetParam())) {
     if (with_slow_threads_ &&
         (txn_db_options.write_policy == WRITE_PREPARED ||
@@ -530,11 +537,13 @@ class MySQLStyleTransactionTest
 
 class WriteCommittedTxnWithTsTest
     : public TransactionTestBase,
-      public ::testing::WithParamInterface<std::tuple<bool, bool, bool>> {
+      public ::testing::WithParamInterface<
+          std::tuple<bool, bool, bool, bool, int64_t>> {
  public:
   WriteCommittedTxnWithTsTest()
       : TransactionTestBase(std::get<0>(GetParam()), std::get<1>(GetParam()),
-                            WRITE_COMMITTED, kOrderedWrite) {}
+                            WRITE_COMMITTED, kOrderedWrite,
+                            std::get<3>(GetParam()), std::get<4>(GetParam())) {}
   ~WriteCommittedTxnWithTsTest() override {
     for (auto* h : handles_) {
       delete h;
@@ -570,12 +579,13 @@ class WriteCommittedTxnWithTsTest
 
 class TimestampedSnapshotWithTsSanityCheck
     : public TransactionTestBase,
-      public ::testing::WithParamInterface<
-          std::tuple<bool, bool, TxnDBWritePolicy, WriteOrdering>> {
+      public ::testing::WithParamInterface<std::tuple<
+          bool, bool, TxnDBWritePolicy, WriteOrdering, bool, int64_t>> {
  public:
   explicit TimestampedSnapshotWithTsSanityCheck()
       : TransactionTestBase(std::get<0>(GetParam()), std::get<1>(GetParam()),
-                            std::get<2>(GetParam()), std::get<3>(GetParam())) {}
+                            std::get<2>(GetParam()), std::get<3>(GetParam()),
+                            std::get<4>(GetParam()), std::get<5>(GetParam())) {}
   ~TimestampedSnapshotWithTsSanityCheck() override {
     for (auto* h : handles_) {
       delete h;
@@ -585,5 +595,69 @@ class TimestampedSnapshotWithTsSanityCheck
  protected:
   std::vector<ColumnFamilyHandle*> handles_{};
 };
+
+// The following templates causes a bug in GCC 14, ignore the error for now
+#if defined(__GNUC__) && __GNUC__ == 14
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
+
+// Wrap existing params with per-key point lock manager parameters
+template <typename TargetParamType, typename SourceParamType, std::size_t... Is>
+std::vector<TargetParamType> WrapParamWithPerKeyPointLockManagerParamsImpl(
+    SourceParamType&& source_param, std::index_sequence<Is...>) {
+  std::vector<TargetParamType> wrapped_params;
+  // Use original PointLockManager
+  wrapped_params.push_back(TargetParamType(
+      std::get<Is>(std::forward<SourceParamType>(source_param))..., false,
+      INT64_C(0)));
+  // Use PerKeyPointLockManager with deadlock timeout 0
+  wrapped_params.push_back(TargetParamType(
+      std::get<Is>(std::forward<SourceParamType>(source_param))..., true,
+      INT64_C(0)));
+  // Use PerKeyPointLockManager with deadlock timeout 1000
+  wrapped_params.push_back(TargetParamType(
+      std::get<Is>(std::forward<SourceParamType>(source_param))..., true,
+      INT64_C(1000)));
+
+  return wrapped_params;
+}
+
+template <typename TargetParamType, typename SourceParamType>
+std::vector<TargetParamType> WrapParamWithPerKeyPointLockManagerParams(
+    SourceParamType&& source_param) {
+  // Get the size of the source param
+  constexpr std::size_t N = std::tuple_size_v<std::decay_t<SourceParamType>>;
+  // Create an index sequence from 0 to N-1
+  return WrapParamWithPerKeyPointLockManagerParamsImpl<TargetParamType>(
+      std::forward<SourceParamType>(source_param),
+      std::make_index_sequence<N>{});
+}
+
+template <typename TargetParamType, typename SourceParamType, size_t M>
+std::vector<TargetParamType> WrapParamsWithPerKeyPointLockManagerParams(
+    std::array<SourceParamType, M> source_param) {
+  std::vector<TargetParamType> wrapped_params;
+  for (auto& param : source_param) {
+    // Create an index sequence from 0 to N-1
+    auto new_params =
+        WrapParamWithPerKeyPointLockManagerParams<TargetParamType>(
+            std::forward<SourceParamType>(param));
+    wrapped_params.insert(wrapped_params.end(), new_params.begin(),
+                          new_params.end());
+  }
+  return wrapped_params;
+}
+
+#if defined(__GNUC__) && __GNUC__ == 14
+#pragma GCC diagnostic pop
+#endif
+
+#define WRAP_PARAM(...) __VA_ARGS__
+
+#define WRAP_PARAM_WITH_PER_KEY_POINT_LOCK_MANAGER_PARAMS(SOURCE_PARAM_TYPES, \
+                                                          PARAMS)             \
+  WrapParamsWithPerKeyPointLockManagerParams<                                 \
+      std::tuple<SOURCE_PARAM_TYPES, bool, int64_t>>(PARAMS)
 
 }  // namespace ROCKSDB_NAMESPACE

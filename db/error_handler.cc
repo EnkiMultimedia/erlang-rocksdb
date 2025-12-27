@@ -227,7 +227,7 @@ std::map<std::tuple<BackgroundErrorReason, bool>, Status::Severity>
          Status::Severity::kFatalError},
 };
 
-void ErrorHandler::CancelErrorRecovery() {
+void ErrorHandler::CancelErrorRecoveryForShutDown() {
   db_mutex_->AssertHeld();
 
   // We'll release the lock before calling sfm, so make sure no new
@@ -274,9 +274,6 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
   if (bg_err.ok()) {
     return;
   }
-
-  ROCKS_LOG_INFO(db_options_.info_log,
-                 "ErrorHandler: Set regular background error\n");
 
   bool paranoid = db_options_.paranoid_checks;
   Status::Severity sev = Status::Severity::kFatalError;
@@ -335,11 +332,20 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
     if (!s.ok() && (s.severity() > bg_error_.severity())) {
       bg_error_ = s;
     } else {
+      ROCKS_LOG_INFO(db_options_.info_log,
+                     "ErrorHandler: Hit less severe background error\n");
+
       // This error is less severe than previously encountered error. Don't
       // take any further action
       return;
     }
   }
+
+  bool stop = bg_error_.severity() >= Status::Severity::kHardError;
+  ROCKS_LOG_INFO(
+      db_options_.info_log,
+      "ErrorHandler: Set regular background error, auto_recovery=%d, stop=%d\n",
+      int{auto_recovery}, int{stop});
 
   recover_context_ = context;
   if (auto_recovery) {
@@ -351,7 +357,7 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
       RecoverFromNoSpace();
     }
   }
-  if (bg_error_.severity() >= Status::Severity::kHardError) {
+  if (stop) {
     is_db_stopped_.store(true, std::memory_order_release);
   }
 }
@@ -573,6 +579,8 @@ Status ErrorHandler::ClearBGError() {
 
   // Signal that recovery succeeded
   if (recovery_error_.ok()) {
+    // If this assertion fails, it means likely bg error is not set after a
+    // file is quarantined during MANIFEST write.
     assert(files_to_quarantine_.empty());
     Status old_bg_error = bg_error_;
     // old_bg_error is only for notifying listeners, so may not be checked
@@ -585,8 +593,15 @@ Status ErrorHandler::ClearBGError() {
     recovery_error_.PermitUncheckedError();
     recovery_in_prog_ = false;
     soft_error_no_bg_work_ = false;
-    EventHelpers::NotifyOnErrorRecoveryEnd(db_options_.listeners, old_bg_error,
-                                           bg_error_, db_mutex_);
+    if (!db_->shutdown_initiated_) {
+      // NotifyOnErrorRecoveryEnd() may release and re-acquire db_mutex_.
+      // Prevent DB from being closed while we notify listeners. DB close will
+      // wait until allow_db_shutdown_ = true, see ReadyForShutdown().
+      allow_db_shutdown_ = false;
+      EventHelpers::NotifyOnErrorRecoveryEnd(
+          db_options_.listeners, old_bg_error, bg_error_, db_mutex_);
+      allow_db_shutdown_ = true;
+    }
   }
   return recovery_error_;
 }

@@ -14,10 +14,9 @@
 #include "rocksdb/utilities/transaction_db.h"
 #include "test_util/sync_point.h"
 #include "test_util/testutil.h"
-#include "utilities/fault_injection_env.h"
+#include "utilities/merge_operators/string_append/stringappend2.h"
 
 namespace ROCKSDB_NAMESPACE {
-
 class DBSecondaryTestBase : public DBBasicTestWithTimestampBase {
  public:
   explicit DBSecondaryTestBase(const std::string& dbname)
@@ -161,6 +160,7 @@ TEST_F(DBSecondaryTest, NonExistingDb) {
 TEST_F(DBSecondaryTest, ReopenAsSecondary) {
   Options options;
   options.env = env_;
+  options.preserve_internal_time_seconds = 300;
   Reopen(options);
   ASSERT_OK(Put("foo", "foo_value"));
   ASSERT_OK(Put("bar", "bar_value"));
@@ -331,6 +331,43 @@ TEST_F(DBSecondaryTest, InternalCompactionMultiLevels) {
   //  cfh, input1, &result));
 }
 
+TEST_F(DBSecondaryTest, GetMergeOperands) {
+  Options options;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  options.env = env_;
+  Reopen(options);
+
+  ASSERT_OK(Merge("k1", "v1"));
+  ASSERT_OK(Merge("k1", "v2"));
+  ASSERT_OK(Merge("k1", "v3"));
+  ASSERT_OK(Merge("k1", "v4"));
+
+  options.max_open_files = -1;
+  OpenSecondary(options);
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+
+  int num_records = 4;
+  int number_of_operands = 0;
+  std::vector<PinnableSlice> values(num_records);
+  GetMergeOperandsOptions merge_operands_info;
+  merge_operands_info.expected_max_number_of_operands = num_records;
+
+  auto cfh = db_secondary_->DefaultColumnFamily();
+
+  const Status s = db_secondary_->GetMergeOperands(
+      ReadOptions(), cfh, "k1", values.data(), &merge_operands_info,
+      &number_of_operands);
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsMergeInProgress());
+
+  ASSERT_EQ(number_of_operands, 4);
+  ASSERT_EQ(values[0].ToString(), "v1");
+  ASSERT_EQ(values[1].ToString(), "v2");
+  ASSERT_EQ(values[2].ToString(), "v3");
+  ASSERT_EQ(values[3].ToString(), "v4");
+}
+
 TEST_F(DBSecondaryTest, InternalCompactionCompactedFiles) {
   Options options;
   options.env = env_;
@@ -471,6 +508,81 @@ TEST_F(DBSecondaryTest, OpenAsSecondary) {
   verify_db_func("new_foo_value", "new_bar_value");
 }
 
+TEST_F(DBSecondaryTest, OptionsOverrideTest) {
+  Options options;
+  options.env = env_;
+  options.preserve_internal_time_seconds = 300;
+  options.compaction_readahead_size = 200;
+  options.blob_compaction_readahead_size = 100;
+  Reopen(options);
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("foo", "foo_value" + std::to_string(i)));
+    ASSERT_OK(Put("bar", "bar_value" + std::to_string(i)));
+    ASSERT_OK(Flush());
+  }
+
+  CompactionServiceInput input;
+
+  ColumnFamilyMetaData meta;
+  db_->GetColumnFamilyMetaData(&meta);
+  for (auto& file : meta.levels[0].files) {
+    ASSERT_EQ(0, meta.levels[0].level);
+    input.input_files.push_back(file.name);
+  }
+  ASSERT_EQ(input.input_files.size(), 3);
+
+  input.output_level = 1;
+  input.options_file_number = dbfull()->GetVersionSet()->options_file_number();
+  input.cf_name = kDefaultColumnFamilyName;
+  ASSERT_OK(db_->GetDbIdentity(input.db_id));
+
+  ASSERT_EQ(db_->GetOptions().compaction_readahead_size, 200);
+  ASSERT_EQ(db_->GetOptions().blob_compaction_readahead_size, 100);
+
+  Close();
+
+  std::string compaction_input_binary;
+  ASSERT_OK(input.Write(&compaction_input_binary));
+  std::string compaction_result_binary;
+
+  CompactionServiceOptionsOverride override_options;
+  override_options.env = env_;
+  override_options.table_factory.reset(
+      NewBlockBasedTableFactory(BlockBasedTableOptions()));
+
+  ASSERT_OK(
+      StringToMap("compaction_readahead_size=8388608;"
+                  "blob_compaction_readahead_size=4194304;"
+                  "some_invalid_option=ignore_me;"
+                  "env=this_should_not_fail;"
+                  "max_open_files=100;",  // this should be always overriden as
+                                          // -1 in remote compaction
+                  &override_options.options_map));
+
+  bool verified = false;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImplSecondary::OpenAndCompact::AfterOpenAsSecondary:0",
+      [&](void* arg) {
+        auto secondary_db = static_cast<DB*>(arg);
+        auto secondary_db_options = secondary_db->GetOptions();
+        // DBOption
+        ASSERT_EQ(secondary_db_options.compaction_readahead_size, 8388608);
+        ASSERT_EQ(secondary_db_options.max_open_files, -1);
+        // CFOption
+        ASSERT_EQ(secondary_db_options.blob_compaction_readahead_size, 4194304);
+        verified = true;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(DB::OpenAndCompact(OpenAndCompactOptions(), dbname_,
+                               secondary_path_, compaction_input_binary,
+                               &compaction_result_binary, override_options));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(verified);
+}
+
 namespace {
 class TraceFileEnv : public EnvWrapper {
  public:
@@ -492,6 +604,9 @@ class TraceFileEnv : public EnvWrapper {
       Status Read(uint64_t offset, size_t n, Slice* result,
                   char* scratch) const override {
         return target_->Read(offset, n, result, scratch);
+      }
+      Status GetFileSize(uint64_t* file_size) override {
+        return target_->GetFileSize(file_size);
       }
 
      private:
@@ -1177,46 +1292,6 @@ TEST_F(DBSecondaryTest, CatchUpAfterFlush) {
   iter3->Seek("key1");
   ASSERT_FALSE(iter3->Valid());
   ASSERT_OK(iter3->status());
-}
-
-TEST_F(DBSecondaryTest, CheckConsistencyWhenOpen) {
-  bool called = false;
-  Options options;
-  options.env = env_;
-  options.disable_auto_compactions = true;
-  Reopen(options);
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImplSecondary::CheckConsistency:AfterFirstAttempt", [&](void* arg) {
-        ASSERT_NE(nullptr, arg);
-        called = true;
-        auto* s = static_cast<Status*>(arg);
-        ASSERT_NOK(*s);
-      });
-  SyncPoint::GetInstance()->LoadDependency(
-      {{"DBImpl::CheckConsistency:AfterGetLiveFilesMetaData",
-        "BackgroundCallCompaction:0"},
-       {"DBImpl::BackgroundCallCompaction:PurgedObsoleteFiles",
-        "DBImpl::CheckConsistency:BeforeGetFileSize"}});
-  SyncPoint::GetInstance()->EnableProcessing();
-
-  ASSERT_OK(Put("a", "value0"));
-  ASSERT_OK(Put("c", "value0"));
-  ASSERT_OK(Flush());
-  ASSERT_OK(Put("b", "value1"));
-  ASSERT_OK(Put("d", "value1"));
-  ASSERT_OK(Flush());
-  port::Thread thread([this]() {
-    Options opts;
-    opts.env = env_;
-    opts.max_open_files = -1;
-    OpenSecondary(opts);
-  });
-  ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
-  ASSERT_OK(dbfull()->TEST_WaitForCompact());
-  thread.join();
-  ASSERT_TRUE(called);
 }
 
 TEST_F(DBSecondaryTest, StartFromInconsistent) {

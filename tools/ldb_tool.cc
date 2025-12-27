@@ -140,7 +140,7 @@ void LDBCommandRunner::PrintHelp(const LDBOptions& ldb_options,
 }
 
 int LDBCommandRunner::RunCommand(
-    int argc, char const* const* argv, Options options,
+    int argc, char const* const* argv, const Options& options,
     const LDBOptions& ldb_options,
     const std::vector<ColumnFamilyDescriptor>* column_families) {
   if (argc <= 2) {
@@ -185,8 +185,14 @@ int LDBCommandRunner::RunCommand(
 void LDBTool::Run(int argc, char** argv, Options options,
                   const LDBOptions& ldb_options,
                   const std::vector<ColumnFamilyDescriptor>* column_families) {
-  int error_code = LDBCommandRunner::RunCommand(argc, argv, options,
-                                                ldb_options, column_families);
-  exit(error_code);
+  exit(RunAndReturn(argc, argv, options, ldb_options, column_families));
+}
+
+int LDBTool::RunAndReturn(
+    int argc, char** argv, const Options& options,
+    const LDBOptions& ldb_options,
+    const std::vector<ColumnFamilyDescriptor>* column_families) {
+  return LDBCommandRunner::RunCommand(argc, argv, options, ldb_options,
+                                      column_families);
 }
 }  // namespace ROCKSDB_NAMESPACE
