@@ -106,6 +106,8 @@ parse_iterator_options(
             }
             else if (option[0] == erocksdb::ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT)
                 opts.auto_refresh_iterator_with_snapshot = (option[1] == erocksdb::ATOM_TRUE);
+            else if (option[0] == erocksdb::ATOM_AUTO_READAHEAD_SIZE)
+                opts.auto_readahead_size = (option[1] == erocksdb::ATOM_TRUE);
         }
     }
     return 1;
