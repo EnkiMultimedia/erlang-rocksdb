@@ -253,10 +253,6 @@ invalid_test() ->
   rocksdb:destroy("ltest", []),
   rocksdb_test_util:rm_rf("ltest").
 
-
-seek_iterator(Itr, Prefix, Suffix) ->
-  rocksdb:iterator_move(Itr, test_key(Prefix, Suffix)).
-
 test_key(Prefix, Suffix) when is_integer(Prefix), is_integer(Suffix) ->
   << Prefix:64, Suffix:64 >>.
 
