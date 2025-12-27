@@ -1564,16 +1564,6 @@ public class RocksDBTest {
   }
 
   @Test
-  public void maxMemCompactionLevel() throws RocksDBException {
-    try (final Options options = new Options().setCreateIfMissing(true)) {
-      final String dbPath = dbFolder.getRoot().getAbsolutePath();
-      try (final RocksDB db = RocksDB.open(options, dbPath)) {
-        assertThat(db.maxMemCompactionLevel()).isEqualTo(0);
-      }
-    }
-  }
-
-  @Test
   public void level0StopWriteTrigger() throws RocksDBException {
     try (final Options options = new Options().setCreateIfMissing(true)) {
       final String dbPath = dbFolder.getRoot().getAbsolutePath();
@@ -1661,16 +1651,6 @@ public class RocksDBTest {
         assertThat(logFiles.size()).isEqualTo(1);
         assertThat(logFiles.get(0).type())
             .isEqualTo(WalFileType.kAliveLogFile);
-      }
-    }
-  }
-
-  @Test
-  public void deleteFile() throws RocksDBException {
-    try (final Options options = new Options().setCreateIfMissing(true)) {
-      final String dbPath = dbFolder.getRoot().getAbsolutePath();
-      try (final RocksDB db = RocksDB.open(options, dbPath)) {
-        db.deleteFile("unknown");
       }
     }
   }

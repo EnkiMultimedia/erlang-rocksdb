@@ -27,6 +27,7 @@ struct ImmutableDBOptions {
   bool flush_verify_memtable_count;
   bool compaction_verify_record_count;
   bool track_and_verify_wals_in_manifest;
+  bool track_and_verify_wals;
   bool verify_sst_unique_id_in_manifest;
   Env* env;
   std::shared_ptr<RateLimiter> rate_limiter;
@@ -61,7 +62,6 @@ struct ImmutableDBOptions {
   bool advise_random_on_open;
   size_t db_write_buffer_size;
   std::shared_ptr<WriteBufferManager> write_buffer_manager;
-  size_t random_access_max_buffer_size;
   bool use_adaptive_mutex;
   std::vector<std::shared_ptr<EventListener>> listeners;
   bool enable_thread_tracking;
@@ -77,7 +77,6 @@ struct ImmutableDBOptions {
   bool allow_2pc;
   std::shared_ptr<Cache> row_cache;
   WalFilter* wal_filter;
-  bool fail_if_options_file_error;
   bool dump_malloc_stats;
   bool avoid_flush_during_recovery;
   bool allow_ingest_behind;
@@ -107,6 +106,7 @@ struct ImmutableDBOptions {
   uint64_t follower_catchup_retry_wait_ms;
   Temperature metadata_write_temperature;
   Temperature wal_write_temperature;
+  CompactionStyleSet calculate_sst_write_lifetime_hint_set;
 
   // Beginning convenience/helper objects that are not part of the base
   // DBOptions

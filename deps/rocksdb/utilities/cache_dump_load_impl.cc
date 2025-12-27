@@ -24,7 +24,7 @@ namespace ROCKSDB_NAMESPACE {
 // DBs and we may only want to dump out the blocks belonging to certain DB(s).
 // Therefore, a filter is need to decide if the key of the block satisfy the
 // requirement.
-Status CacheDumperImpl::SetDumpFilter(std::vector<DB*> db_list) {
+Status CacheDumperImpl::SetDumpFilter(const std::vector<DB*>& db_list) {
   Status s = Status::OK();
   dump_all_keys_ = false;
   for (size_t i = 0; i < db_list.size(); i++) {
@@ -230,8 +230,8 @@ IOStatus CacheDumperImpl::WriteHeader() {
   std::ostringstream s;
   s << kTraceMagic << "\t"
     << "Cache dump format version: " << kCacheDumpMajorVersion << "."
-    << kCacheDumpMinorVersion << "\t"
-    << "RocksDB Version: " << kMajorVersion << "." << kMinorVersion << "\t"
+    << kCacheDumpMinorVersion << "\t" << "RocksDB Version: " << kMajorVersion
+    << "." << kMinorVersion << "\t"
     << "Format: dump_unit_metadata <sequence_number, dump_unit_checksum, "
        "dump_unit_size>, dump_unit <timestamp, key, block_type, "
        "block_size, block_data, block_checksum> cache_value\n";

@@ -27,6 +27,10 @@ class StackableDB : public DB {
   explicit StackableDB(std::shared_ptr<DB> db)
       : db_(db.get()), shared_db_ptr_(db) {}
 
+  // StackableDB take sole ownership of the underlying db.
+  explicit StackableDB(std::unique_ptr<DB>&& db)
+      : db_(db.get()), shared_db_ptr_(std::move(db)) {}
+
   ~StackableDB() override {
     if (shared_db_ptr_ == nullptr) {
       delete db_;
@@ -285,6 +289,13 @@ class StackableDB : public DB {
     return db_->NewAttributeGroupIterator(options, column_families);
   }
 
+  using DB::NewMultiScan;
+  std::unique_ptr<MultiScan> NewMultiScan(
+      const ReadOptions& opts, ColumnFamilyHandle* column_family,
+      const MultiScanArgs& scan_opts) override {
+    return db_->NewMultiScan(opts, column_family, scan_opts);
+  }
+
   const Snapshot* GetSnapshot() override { return db_->GetSnapshot(); }
 
   void ReleaseSnapshot(const Snapshot* snapshot) override {
@@ -501,27 +512,23 @@ class StackableDB : public DB {
     return db_->GetFullHistoryTsLow(column_family, ts_low);
   }
 
+  Status GetNewestUserDefinedTimestamp(ColumnFamilyHandle* column_family,
+                                       std::string* newest_timestamp) override {
+    return db_->GetNewestUserDefinedTimestamp(column_family, newest_timestamp);
+  }
+
   Status GetSortedWalFiles(VectorWalPtr& files) override {
     return db_->GetSortedWalFiles(files);
   }
 
   Status GetCurrentWalFile(
-      std::unique_ptr<WalFile>* current_log_file) override {
-    return db_->GetCurrentWalFile(current_log_file);
+      std::unique_ptr<WalFile>* current_wal_file) override {
+    return db_->GetCurrentWalFile(current_wal_file);
   }
 
   Status GetCreationTimeOfOldestFile(uint64_t* creation_time) override {
     return db_->GetCreationTimeOfOldestFile(creation_time);
   }
-
-  // WARNING: This API is planned for removal in RocksDB 7.0 since it does not
-  // operate at the proper level of abstraction for a key-value store, and its
-  // contract/restrictions are poorly documented. For example, it returns non-OK
-  // `Status` for non-bottommost files and files undergoing compaction. Since we
-  // do not plan to maintain it, the contract will likely remain underspecified
-  // until its removal. Any user is encouraged to read the implementation
-  // carefully and migrate away from it when possible.
-  Status DeleteFile(std::string name) override { return db_->DeleteFile(name); }
 
   Status GetDbIdentity(std::string& identity) const override {
     return db_->GetDbIdentity(identity);
@@ -557,6 +564,14 @@ class StackableDB : public DB {
       ColumnFamilyHandle* column_family, const Range* range, std::size_t n,
       TablePropertiesCollection* props) override {
     return db_->GetPropertiesOfTablesInRange(column_family, range, n, props);
+  }
+
+  using DB::GetPropertiesOfTablesByLevel;
+  Status GetPropertiesOfTablesByLevel(
+      ColumnFamilyHandle* column_family,
+      std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level)
+      override {
+    return db_->GetPropertiesOfTablesByLevel(column_family, props_by_level);
   }
 
   Status GetUpdatesSince(

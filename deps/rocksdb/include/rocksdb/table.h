@@ -44,6 +44,7 @@ class TableReader;
 class WritableFileWriter;
 struct ConfigOptions;
 struct EnvOptions;
+class UserDefinedIndexFactory;
 
 // Types of checksums to use for checking integrity of logical blocks within
 // files. All checksums currently use 32 bits of checking power (1 in 4B
@@ -126,7 +127,15 @@ struct CacheUsageOptions {
 };
 
 // Configures how SST files using the block-based table format (standard)
-// are written and read.
+// are written and read. With few exceptions, each option only affects either
+// (a) how new SST files are written, or (b) how SST files are read. If an
+// option seems to affect how the SST file is constructed, e.g. format_version,
+// that option *ONLY* has an effect at construction time. Contrast this with
+// options like the various `cache` and `pin` options, that only affect
+// in-memory and IO behavior at read time. In general, any version of RocksDB
+// able to read the full key-value and indexing data in the SST file will read
+// it as written regardless of current options for writing new files. See
+// filter_policy regarding filters.
 //
 // Except as specifically noted, all options here are "mutable" using
 // SetOptions(), with the caveat that only new table builders and new table
@@ -431,10 +440,13 @@ struct BlockBasedTableOptions {
   // versions of RocksDB able to read partitioned filters are able to read
   // decoupled partitioned filters.)
   //
-  // decouple_partitioned_filters = false is the original behavior, because of
-  // limitations in the initial implementation, and the new behavior
-  // decouple_partitioned_filters = true is expected to become the new default.
-  bool decouple_partitioned_filters = false;
+  // decouple_partitioned_filters = true is the new default. This option is now
+  // DEPRECATED and might be ignored and/or removed in a future release.
+  //
+  // NOTE: decouple_partitioned_filters = false with partition_filters = true
+  // disables parallel compression (CompressionOptions::parallel_threads
+  // sanitized to 1).
+  bool decouple_partitioned_filters = true;
 
   // Option to generate Bloom/Ribbon filters that minimize memory
   // internal fragmentation.
@@ -480,7 +492,28 @@ struct BlockBasedTableOptions {
   // If non-nullptr, use the specified filter policy to reduce disk reads.
   // Many applications will benefit from passing the result of
   // NewBloomFilterPolicy() here.
+  //
+  // Because filters only impact performance and are not data-critical, an
+  // SST file can be opened and used without filters if (a) the filter
+  // policy name or schema is unrecognized, or (b) filter_policy is nullptr.
+  // See filter_policy regarding filters.
   std::shared_ptr<const FilterPolicy> filter_policy = nullptr;
+
+  // EXPERIMENTAL
+  //
+  // If non-nullptr, use the specified factory to build user-defined index.
+  // This allows users to define their own index format and build the index
+  // during table building.
+  //
+  // NOTE: UserDefinedIndexFactory currently disables parallel compression
+  // (CompressionOptions::parallel_threads sanitized to 1).
+  std::shared_ptr<UserDefinedIndexFactory> user_defined_index_factory = nullptr;
+
+  // EXPERIMENTAL
+  //
+  // Return an error Status if a user_defined_index_factory is configured,
+  // but there's no corresponding UDI block in the SST file being opened.
+  bool fail_if_no_udi_on_open = false;
 
   // If true, place whole keys in the filter (not just prefixes).
   // This must generally be true for gets to be efficient.
@@ -524,13 +557,9 @@ struct BlockBasedTableOptions {
   // Default: 0 (disabled)
   uint32_t read_amp_bytes_per_bit = 0;
 
-  // We currently have these versions:
-  // 0 -- This version can be read by really old RocksDB's. Doesn't support
-  // changing checksum type (default is CRC32).
-  // 1 -- Can be read by RocksDB's versions since 3.0. Supports non-default
-  // checksum, like xxHash. It is written by RocksDB when
-  // BlockBasedTableOptions::checksum is something other than kCRC32c. (version
-  // 0 is silently upconverted)
+  // We currently have these format versions:
+  // 0 - 1 -- Unsupported for writing new files and quietly sanitized to 2.
+  // Read support is deprecated and could be removed in the future.
   // 2 -- Can be read by RocksDB's versions since 3.10. Changes the way we
   // encode compressed blocks with LZ4, BZip2 and Zlib compression. If you
   // don't plan to run RocksDB before version 3.10, you should probably use
@@ -553,6 +582,10 @@ struct BlockBasedTableOptions {
   // misplaced within or between files is as likely to fail checksum
   // verification as random corruption. Also checksum-protects SST footer.
   // Can be read by RocksDB versions >= 8.6.0.
+  // 7 -- Support for custom compression algorithms with a CompressionManager
+  // using a non-built-in CompatibilityName(). See `compression_manager` in
+  // ColumnFamilyOptions. Also changes the format of TableProperties field
+  // `compression_name`. Can be read by RocksDB versions >= 10.4.0.
   //
   // Using the default setting of format_version is strongly recommended, so
   // that available enhancements are adopted eventually and automatically. The

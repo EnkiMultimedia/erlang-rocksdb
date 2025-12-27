@@ -88,6 +88,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/memtable_list.cc",
         "db/merge_helper.cc",
         "db/merge_operator.cc",
+        "db/multi_scan.cc",
         "db/output_validator.cc",
         "db/periodic_task_scheduler.cc",
         "db/range_del_aggregator.cc",
@@ -113,6 +114,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/write_controller.cc",
         "db/write_stall_stats.cc",
         "db/write_thread.cc",
+        "db_stress_tool/db_stress_compression_manager.cc",
         "env/composite_env.cc",
         "env/env.cc",
         "env/env_chroot.cc",
@@ -214,6 +216,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "table/cuckoo/cuckoo_table_builder.cc",
         "table/cuckoo/cuckoo_table_factory.cc",
         "table/cuckoo/cuckoo_table_reader.cc",
+        "table/external_table.cc",
         "table/format.cc",
         "table/get_context.cc",
         "table/iterator.cc",
@@ -248,6 +251,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "trace_replay/trace_record_result.cc",
         "trace_replay/trace_replay.cc",
         "util/async_file_reader.cc",
+        "util/auto_tune_compressor.cc",
         "util/build_version.cc",
         "util/cleanable.cc",
         "util/coding.cc",
@@ -266,6 +270,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "util/random.cc",
         "util/rate_limiter.cc",
         "util/ribbon_config.cc",
+        "util/simple_mixed_compressor.cc",
         "util/slice.cc",
         "util/status.cc",
         "util/stderr_logger.cc",
@@ -317,6 +322,8 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "utilities/persistent_cache/block_cache_tier_metadata.cc",
         "utilities/persistent_cache/persistent_cache_tier.cc",
         "utilities/persistent_cache/volatile_tier_impl.cc",
+        "utilities/secondary_index/secondary_index_iterator.cc",
+        "utilities/secondary_index/simple_secondary_index.cc",
         "utilities/simulator_cache/cache_simulator.cc",
         "utilities/simulator_cache/sim_cache.cc",
         "utilities/table_properties_collectors/compact_for_tiering_collector.cc",
@@ -406,21 +413,24 @@ cpp_library_wrapper(name="rocksdb_tools_lib", srcs=[
         "tools/block_cache_analyzer/block_cache_trace_analyzer.cc",
         "tools/db_bench_tool.cc",
         "tools/simulated_hybrid_file_system.cc",
+        "tools/tool_hooks.cc",
         "tools/trace_analyzer_tool.cc",
     ], deps=[":rocksdb_lib"], headers=[], link_whole=False, extra_test_libs=False)
 
 cpp_library_wrapper(name="rocksdb_cache_bench_tools_lib", srcs=["cache/cache_bench_tool.cc"], deps=[":rocksdb_lib"], headers=[], link_whole=False, extra_test_libs=False)
 
+cpp_library_wrapper(name="rocksdb_point_lock_bench_tools_lib", srcs=["utilities/transactions/lock/point/point_lock_bench_tool.cc"], deps=[":rocksdb_lib"], headers=[], link_whole=False, extra_test_libs=False)
+
 rocks_cpp_library_wrapper(name="rocksdb_stress_lib", srcs=[
         "db_stress_tool/batched_ops_stress.cc",
         "db_stress_tool/cf_consistency_stress.cc",
         "db_stress_tool/db_stress_common.cc",
+        "db_stress_tool/db_stress_compression_manager.cc",
         "db_stress_tool/db_stress_driver.cc",
         "db_stress_tool/db_stress_filters.cc",
         "db_stress_tool/db_stress_gflags.cc",
         "db_stress_tool/db_stress_listener.cc",
         "db_stress_tool/db_stress_shared_state.cc",
-        "db_stress_tool/db_stress_stat.cc",
         "db_stress_tool/db_stress_test_base.cc",
         "db_stress_tool/db_stress_tool.cc",
         "db_stress_tool/db_stress_wide_merge_operator.cc",
@@ -441,6 +451,8 @@ cpp_binary_wrapper(name="db_stress", srcs=["db_stress_tool/db_stress.cc"], deps=
 cpp_binary_wrapper(name="db_bench", srcs=["tools/db_bench.cc"], deps=[":rocksdb_tools_lib"], extra_preprocessor_flags=[], extra_bench_libs=False)
 
 cpp_binary_wrapper(name="cache_bench", srcs=["cache/cache_bench.cc"], deps=[":rocksdb_cache_bench_tools_lib"], extra_preprocessor_flags=[], extra_bench_libs=False)
+
+cpp_binary_wrapper(name="point_lock_bench", srcs=["utilities/transactions/lock/point/point_lock_bench.cc"], deps=[":rocksdb_point_lock_bench_tools_lib"], extra_preprocessor_flags=[], extra_bench_libs=False)
 
 cpp_binary_wrapper(name="ribbon_bench", srcs=["microbench/ribbon_bench.cc"], deps=[], extra_preprocessor_flags=[], extra_bench_libs=True)
 
@@ -4705,6 +4717,12 @@ cpp_unittest_wrapper(name="compressed_secondary_cache_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="compression_test",
+            srcs=["util/compression_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="configurable_test",
             srcs=["options/configurable_test.cc"],
             deps=[":rocksdb_test_lib"],
@@ -5181,6 +5199,12 @@ cpp_unittest_wrapper(name="inlineskiplist_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="interval_test",
+            srcs=["util/interval_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="io_posix_test",
             srcs=["env/io_posix_test.cc"],
             deps=[":rocksdb_test_lib"],
@@ -5357,6 +5381,12 @@ cpp_unittest_wrapper(name="persistent_cache_test",
 
 cpp_unittest_wrapper(name="plain_table_db_test",
             srcs=["db/plain_table_db_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="point_lock_manager_stress_test",
+            srcs=["utilities/transactions/lock/point/point_lock_manager_stress_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

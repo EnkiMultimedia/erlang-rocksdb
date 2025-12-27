@@ -97,8 +97,7 @@ class MemTableListTest : public testing::Test {
   // Calls MemTableList::TryInstallMemtableFlushResults() and sets up all
   // structures needed to call this function.
   Status Mock_InstallMemtableFlushResults(
-      MemTableList* list, const MutableCFOptions& mutable_cf_options,
-      const autovector<ReadOnlyMemTable*>& m,
+      MemTableList* list, const autovector<ReadOnlyMemTable*>& m,
       autovector<ReadOnlyMemTable*>* to_delete) {
     // Create a mock Logger
     test::NullLogger logger;
@@ -138,8 +137,8 @@ class MemTableListTest : public testing::Test {
     InstrumentedMutexLock l(&mutex);
     std::list<std::unique_ptr<FlushJobInfo>> flush_jobs_info;
     Status s = list->TryInstallMemtableFlushResults(
-        cfd, mutable_cf_options, m, &dummy_prep_tracker, &versions, &mutex,
-        file_num, to_delete, nullptr, &log_buffer, &flush_jobs_info);
+        cfd, m, &dummy_prep_tracker, &versions, &mutex, file_num, to_delete,
+        nullptr, &log_buffer, &flush_jobs_info);
     EXPECT_OK(io_s);
     return s;
   }
@@ -148,7 +147,6 @@ class MemTableListTest : public testing::Test {
   // structures needed to call this function.
   Status Mock_InstallMemtableAtomicFlushResults(
       autovector<MemTableList*>& lists, const autovector<uint32_t>& cf_ids,
-      const autovector<const MutableCFOptions*>& mutable_cf_options_list,
       const autovector<const autovector<ReadOnlyMemTable*>*>& mems_list,
       autovector<ReadOnlyMemTable*>* to_delete) {
     // Create a mock Logger
@@ -211,9 +209,9 @@ class MemTableListTest : public testing::Test {
     InstrumentedMutex mutex;
     InstrumentedMutexLock l(&mutex);
     return InstallMemtableAtomicFlushResults(
-        &lists, cfds, mutable_cf_options_list, mems_list, &versions,
-        nullptr /* prep_tracker */, &mutex, file_meta_ptrs,
-        committed_flush_jobs_info, to_delete, nullptr, &log_buffer);
+        &lists, cfds, mems_list, &versions, nullptr /* prep_tracker */, &mutex,
+        file_meta_ptrs, committed_flush_jobs_info, to_delete, nullptr,
+        &log_buffer);
   }
 
  protected:
@@ -222,7 +220,7 @@ class MemTableListTest : public testing::Test {
 
 TEST_F(MemTableListTest, Empty) {
   // Create an empty MemTableList and validate basic functions.
-  MemTableList list(1, 0, 0);
+  MemTableList list(1, 0);
 
   ASSERT_EQ(0, list.NumNotFlushed());
   ASSERT_FALSE(list.imm_flush_needed.load(std::memory_order_acquire));
@@ -241,10 +239,8 @@ TEST_F(MemTableListTest, Empty) {
 TEST_F(MemTableListTest, GetTest) {
   // Create MemTableList
   int min_write_buffer_number_to_merge = 2;
-  int max_write_buffer_number_to_maintain = 0;
   int64_t max_write_buffer_size_to_maintain = 0;
   MemTableList list(min_write_buffer_number_to_merge,
-                    max_write_buffer_number_to_maintain,
                     max_write_buffer_size_to_maintain);
 
   SequenceNumber seq = 1;
@@ -409,10 +405,8 @@ TEST_F(MemTableListTest, GetTest) {
 TEST_F(MemTableListTest, GetFromHistoryTest) {
   // Create MemTableList
   int min_write_buffer_number_to_merge = 2;
-  int max_write_buffer_number_to_maintain = 2;
   int64_t max_write_buffer_size_to_maintain = 2 * Arena::kInlineSize;
   MemTableList list(min_write_buffer_number_to_merge,
-                    max_write_buffer_number_to_maintain,
                     max_write_buffer_size_to_maintain);
 
   SequenceNumber seq = 1;
@@ -499,9 +493,7 @@ TEST_F(MemTableListTest, GetFromHistoryTest) {
       std::numeric_limits<uint64_t>::max() /* memtable_id */, &to_flush);
   ASSERT_EQ(1, to_flush.size());
 
-  MutableCFOptions mutable_cf_options(options);
-  s = Mock_InstallMemtableFlushResults(&list, mutable_cf_options, to_flush,
-                                       &to_delete);
+  s = Mock_InstallMemtableFlushResults(&list, to_flush, &to_delete);
   ASSERT_OK(s);
   ASSERT_EQ(0, list.NumNotFlushed());
   ASSERT_EQ(1, list.NumFlushed());
@@ -564,8 +556,7 @@ TEST_F(MemTableListTest, GetFromHistoryTest) {
   ASSERT_EQ(1, to_flush.size());
 
   // Flush second memtable
-  s = Mock_InstallMemtableFlushResults(&list, mutable_cf_options, to_flush,
-                                       &to_delete);
+  s = Mock_InstallMemtableFlushResults(&list, to_flush, &to_delete);
   ASSERT_OK(s);
   ASSERT_EQ(0, list.NumNotFlushed());
   ASSERT_EQ(2, list.NumFlushed());
@@ -658,11 +649,9 @@ TEST_F(MemTableListTest, FlushPendingTest) {
 
   // Create MemTableList
   int min_write_buffer_number_to_merge = 3;
-  int max_write_buffer_number_to_maintain = 7;
   int64_t max_write_buffer_size_to_maintain =
       7 * static_cast<int>(options.write_buffer_size);
   MemTableList list(min_write_buffer_number_to_merge,
-                    max_write_buffer_number_to_maintain,
                     max_write_buffer_size_to_maintain);
 
   // Create some MemTables
@@ -833,8 +822,7 @@ TEST_F(MemTableListTest, FlushPendingTest) {
   ASSERT_FALSE(list.imm_flush_needed.load(std::memory_order_acquire));
 
   // Flush the 3 memtables that were picked in to_flush
-  s = Mock_InstallMemtableFlushResults(&list, mutable_cf_options, to_flush,
-                                       &to_delete);
+  s = Mock_InstallMemtableFlushResults(&list, to_flush, &to_delete);
   ASSERT_OK(s);
 
   // Note:  now to_flush contains tables[0,1,2].  to_flush2 contains
@@ -855,8 +843,8 @@ TEST_F(MemTableListTest, FlushPendingTest) {
   ASSERT_FALSE(list.imm_flush_needed.load(std::memory_order_acquire));
 
   // Flush the 1 memtable (tables[4]) that was picked in to_flush3
-  s = MemTableListTest::Mock_InstallMemtableFlushResults(
-      &list, mutable_cf_options, to_flush3, &to_delete);
+  s = MemTableListTest::Mock_InstallMemtableFlushResults(&list, to_flush3,
+                                                         &to_delete);
   ASSERT_OK(s);
 
   // This will install 0 tables since tables[4] flushed while tables[3] has not
@@ -865,8 +853,8 @@ TEST_F(MemTableListTest, FlushPendingTest) {
   ASSERT_EQ(0, to_delete.size());
 
   // Flush the 1 memtable (tables[3]) that was picked in to_flush2
-  s = MemTableListTest::Mock_InstallMemtableFlushResults(
-      &list, mutable_cf_options, to_flush2, &to_delete);
+  s = MemTableListTest::Mock_InstallMemtableFlushResults(&list, to_flush2,
+                                                         &to_delete);
   ASSERT_OK(s);
 
   // This will actually install 2 tables.  The 1 we told it to flush, and also
@@ -934,11 +922,10 @@ TEST_F(MemTableListTest, FlushPendingTest) {
 TEST_F(MemTableListTest, EmptyAtomicFlushTest) {
   autovector<MemTableList*> lists;
   autovector<uint32_t> cf_ids;
-  autovector<const MutableCFOptions*> options_list;
   autovector<const autovector<ReadOnlyMemTable*>*> to_flush;
   autovector<ReadOnlyMemTable*> to_delete;
-  Status s = Mock_InstallMemtableAtomicFlushResults(lists, cf_ids, options_list,
-                                                    to_flush, &to_delete);
+  Status s = Mock_InstallMemtableAtomicFlushResults(lists, cf_ids, to_flush,
+                                                    &to_delete);
   ASSERT_OK(s);
   ASSERT_TRUE(to_delete.empty());
 }
@@ -956,13 +943,11 @@ TEST_F(MemTableListTest, AtomicFlushTest) {
 
   // Create MemTableLists
   int min_write_buffer_number_to_merge = 3;
-  int max_write_buffer_number_to_maintain = 7;
   int64_t max_write_buffer_size_to_maintain =
       7 * static_cast<int64_t>(options.write_buffer_size);
   autovector<MemTableList*> lists;
   for (int i = 0; i != num_cfs; ++i) {
     lists.emplace_back(new MemTableList(min_write_buffer_number_to_merge,
-                                        max_write_buffer_number_to_maintain,
                                         max_write_buffer_size_to_maintain));
   }
 
@@ -1043,18 +1028,16 @@ TEST_F(MemTableListTest, AtomicFlushTest) {
   }
   autovector<MemTableList*> tmp_lists;
   autovector<uint32_t> tmp_cf_ids;
-  autovector<const MutableCFOptions*> tmp_options_list;
   autovector<const autovector<ReadOnlyMemTable*>*> to_flush;
   for (auto i = 0; i != num_cfs; ++i) {
     if (!flush_candidates[i].empty()) {
       to_flush.push_back(&flush_candidates[i]);
       tmp_lists.push_back(lists[i]);
       tmp_cf_ids.push_back(i);
-      tmp_options_list.push_back(mutable_cf_options_list[i]);
     }
   }
-  Status s = Mock_InstallMemtableAtomicFlushResults(
-      tmp_lists, tmp_cf_ids, tmp_options_list, to_flush, &to_delete);
+  Status s = Mock_InstallMemtableAtomicFlushResults(tmp_lists, tmp_cf_ids,
+                                                    to_flush, &to_delete);
   ASSERT_OK(s);
 
   for (auto i = 0; i != num_cfs; ++i) {
@@ -1113,11 +1096,9 @@ TEST_F(MemTableListWithTimestampTest, GetTableNewestUDT) {
 
   // Create MemTableList
   int min_write_buffer_number_to_merge = 1;
-  int max_write_buffer_number_to_maintain = 4;
   int64_t max_write_buffer_size_to_maintain =
       4 * static_cast<int>(options.write_buffer_size);
   MemTableList list(min_write_buffer_number_to_merge,
-                    max_write_buffer_number_to_maintain,
                     max_write_buffer_size_to_maintain);
 
   // Create some MemTables

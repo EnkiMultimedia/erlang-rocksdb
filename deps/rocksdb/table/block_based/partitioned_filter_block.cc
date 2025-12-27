@@ -240,7 +240,7 @@ Status PartitionedFilterBlockBuilder::Finish(
 
     index_on_filter_block_builder_.Add(e.ikey, handle_encoding,
                                        &handle_delta_encoding_slice);
-    if (!p_index_builder_->seperator_is_key_plus_seq()) {
+    if (!p_index_builder_->separator_is_key_plus_seq()) {
       index_on_filter_block_builder_without_seq_.Add(
           ExtractUserKey(e.ikey), handle_encoding,
           &handle_delta_encoding_slice);
@@ -267,7 +267,7 @@ Status PartitionedFilterBlockBuilder::Finish(
     if (UNLIKELY(filters_.empty())) {
       if (!index_on_filter_block_builder_.empty()) {
         // Simplest to just add them all at the end
-        if (p_index_builder_->seperator_is_key_plus_seq()) {
+        if (p_index_builder_->separator_is_key_plus_seq()) {
           *filter = index_on_filter_block_builder_.Finish();
         } else {
           *filter = index_on_filter_block_builder_without_seq_.Finish();
@@ -413,8 +413,7 @@ Status PartitionedFilterBlockReader::GetFilterPartitionBlock(
 
   const Status s = table()->RetrieveBlock(
       prefetch_buffer, read_options, fltr_blk_handle,
-      UncompressionDict::GetEmptyDict(), filter_block, get_context,
-      lookup_context,
+      /* decomp */ nullptr, filter_block, get_context, lookup_context,
       /* for_compaction */ false, /* use_cache */ true,
       /* async_read */ false, /* use_block_cache_for_lookup */ true);
 
@@ -592,7 +591,8 @@ Status PartitionedFilterBlockReader::CacheDependencies(
                                   /*usage=*/FilePrefetchBufferUsage::kUnknown);
 
     IOOptions opts;
-    s = rep->file->PrepareIOOptions(ro, opts);
+    IODebugContext dbg;
+    s = rep->file->PrepareIOOptions(ro, opts, &dbg);
     if (s.ok()) {
       s = prefetch_buffer->Prefetch(opts, rep->file.get(), prefetch_off,
                                     static_cast<size_t>(prefetch_len));
@@ -610,7 +610,7 @@ Status PartitionedFilterBlockReader::CacheDependencies(
     // filter blocks
     s = table()->MaybeReadBlockAndLoadToCache(
         prefetch_buffer ? prefetch_buffer.get() : tail_prefetch_buffer, ro,
-        handle, UncompressionDict::GetEmptyDict(),
+        handle, /* dict */ nullptr,
         /* for_compaction */ false, &block, nullptr /* get_context */,
         &lookup_context, nullptr /* contents */, false,
         /* use_block_cache_for_lookup */ true);

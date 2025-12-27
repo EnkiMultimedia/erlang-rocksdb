@@ -134,6 +134,7 @@ struct BufferInfo {
 enum class FilePrefetchBufferUsage {
   kTableOpenPrefetchTail,
   kUserScanPrefetch,
+  kCompactionPrefetch,
   kUnknown,
 };
 
@@ -300,6 +301,14 @@ class FilePrefetchBuffer {
   // offset                : the file offset to start reading from.
   // n                     : the number of bytes to read.
   //
+  // Note: Why do we pass in the RandomAccessFileReader* for every single call
+  // to Prefetch/PrefetchAsync/TryReadFromCache? Why can't we just pass it in at
+  // construction time?
+  // Although the RandomAccessFileReader* is often available when creating
+  // the FilePrefetchBuffer, this is not true for BlobDB (see
+  // BlobSource::GetBlob). The file reader gets retrieved or created inside
+  // BlobFileCache::GetBlobFileReader, after we have already allocated a new
+  // FilePrefetchBuffer.
   Status Prefetch(const IOOptions& opts, RandomAccessFileReader* reader,
                   uint64_t offset, size_t n);
 
@@ -489,6 +498,10 @@ class FilePrefetchBuffer {
   // Whether we reuse the file system provided buffer
   // Until we also handle the async read case, only enable this optimization
   // for the synchronous case when num_buffers_ = 1.
+  // Note: Although it would be more convenient if we could determine
+  // whether we want to reuse the file system buffer at construction time,
+  // this would not work in all cases, because not all clients (BlobDB in
+  // particular) have a RandomAccessFileReader* available at construction time.
   bool UseFSBuffer(RandomAccessFileReader* reader) {
     return reader->file() != nullptr && !reader->use_direct_io() &&
            fs_ != nullptr &&
@@ -562,6 +575,9 @@ class FilePrefetchBuffer {
                            size_t& read_len, uint64_t& aligned_useful_len);
 
   void UpdateStats(bool found_in_buffer, size_t length_found) {
+    if (usage_ != FilePrefetchBufferUsage::kUserScanPrefetch) {
+      return;
+    }
     if (found_in_buffer) {
       RecordTick(stats_, PREFETCH_HITS);
     }

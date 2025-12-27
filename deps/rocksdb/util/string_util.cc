@@ -20,20 +20,6 @@
 #include "port/sys_time.h"
 #include "rocksdb/slice.h"
 
-#ifndef __has_cpp_attribute
-#define ROCKSDB_HAS_CPP_ATTRIBUTE(x) 0
-#else
-#define ROCKSDB_HAS_CPP_ATTRIBUTE(x) __has_cpp_attribute(x)
-#endif
-
-#if ROCKSDB_HAS_CPP_ATTRIBUTE(maybe_unused) && __cplusplus >= 201703L
-#define ROCKSDB_MAYBE_UNUSED [[maybe_unused]]
-#elif ROCKSDB_HAS_CPP_ATTRIBUTE(gnu::unused) || __GNUC__
-#define ROCKSDB_MAYBE_UNUSED [[gnu::unused]]
-#else
-#define ROCKSDB_MAYBE_UNUSED
-#endif
-
 namespace ROCKSDB_NAMESPACE {
 
 const std::string kNullptrString = "nullptr";
@@ -296,7 +282,6 @@ bool StartsWith(const std::string& string, const std::string& pattern) {
   return string.compare(0, pattern.size(), pattern) == 0;
 }
 
-
 bool ParseBoolean(const std::string& type, const std::string& value) {
   if (value == "true" || value == "1") {
     return true;
@@ -333,7 +318,6 @@ int32_t ParseInt32(const std::string& value) {
     throw std::out_of_range(value);
   }
 }
-
 
 uint64_t ParseUint64(const std::string& value) {
   size_t endchar;
@@ -503,7 +487,7 @@ bool TryParseTimeRangeString(const std::string& value, int& start_time,
 // selects proper function.
 
 #if !(defined(_WIN32) && (defined(__MINGW32__) || defined(_MSC_VER)))
-ROCKSDB_MAYBE_UNUSED
+[[maybe_unused]]
 static std::string invoke_strerror_r(int (*strerror_r)(int, char*, size_t),
                                      int err, char* buf, size_t buflen) {
   // Using XSI-compatible strerror_r
@@ -517,7 +501,7 @@ static std::string invoke_strerror_r(int (*strerror_r)(int, char*, size_t),
   return buf;
 }
 
-ROCKSDB_MAYBE_UNUSED
+[[maybe_unused]]
 static std::string invoke_strerror_r(char* (*strerror_r)(int, char*, size_t),
                                      int err, char* buf, size_t buflen) {
   // Using GNU strerror_r

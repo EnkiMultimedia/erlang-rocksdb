@@ -3,7 +3,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-
 #include <map>
 #include <memory>
 
@@ -618,7 +617,6 @@ TEST_F(TtlTest, UnregisteredMergeOperator) {
    public:
     const char* Name() const override { return "UnregisteredMergeOperator"; }
   };
-  options_.fail_if_options_file_error = true;
   options_.merge_operator = std::make_shared<UnregisteredMergeOperator>();
   OpenTtl();
   CloseTtl();
@@ -722,6 +720,9 @@ TEST_F(TtlTest, ChangeTtlOnOpenDb) {
 
   OpenTtl(1);  // T=0:Open the db with ttl = 2
   SetTtl(3);
+  int32_t ttl = 0;
+  ASSERT_OK(db_ttl_->GetTtl(db_ttl_->DefaultColumnFamily(), &ttl));
+  ASSERT_EQ(ttl, 3);
   PutValues(0, kSampleSize_);  // T=0:Insert Set1. Delete at t=2
   SleepCompactCheck(2, 0, kSampleSize_, true);  // T=2:Set1 should be there
   CloseTtl();
@@ -931,4 +932,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-

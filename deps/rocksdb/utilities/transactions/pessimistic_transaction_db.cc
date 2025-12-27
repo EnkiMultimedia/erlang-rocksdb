@@ -230,7 +230,7 @@ Status TransactionDB::Open(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::vector<ColumnFamilyHandle*>* handles, TransactionDB** dbptr) {
   Status s;
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   if (txn_db_options.write_policy == WRITE_COMMITTED &&
       db_options.unordered_write) {
     return Status::NotSupported(
@@ -269,8 +269,8 @@ Status TransactionDB::Open(
                    static_cast<int>(txn_db_options.write_policy));
     // if WrapDB return non-ok, db will be deleted in WrapDB() via
     // ~StackableDB().
-    s = WrapDB(db, txn_db_options, compaction_enabled_cf_indices, *handles,
-               dbptr);
+    s = WrapDB(db.release(), txn_db_options, compaction_enabled_cf_indices,
+               *handles, dbptr);
   }
   return s;
 }
@@ -284,8 +284,7 @@ void TransactionDB::PrepareWrap(
   for (size_t i = 0; i < column_families->size(); i++) {
     ColumnFamilyOptions* cf_options = &(*column_families)[i].options;
 
-    if (cf_options->max_write_buffer_size_to_maintain == 0 &&
-        cf_options->max_write_buffer_number_to_maintain == 0) {
+    if (cf_options->max_write_buffer_size_to_maintain == 0) {
       // Setting to -1 will set the History size to
       // max_write_buffer_number * write_buffer_size.
       cf_options->max_write_buffer_size_to_maintain = -1;

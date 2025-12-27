@@ -848,16 +848,16 @@ public class Options extends RocksObject
   }
 
   @Override
-  public Options setRandomAccessMaxBufferSize(final long randomAccessMaxBufferSize) {
-    assert(isOwningHandle());
-    setRandomAccessMaxBufferSize(nativeHandle_, randomAccessMaxBufferSize);
+  public Options setDailyOffpeakTimeUTC(String offpeakTimeUTC) {
+    assert (isOwningHandle());
+    setDailyOffpeakTimeUTC(nativeHandle_, offpeakTimeUTC);
     return this;
   }
 
   @Override
-  public long randomAccessMaxBufferSize() {
-    assert(isOwningHandle());
-    return randomAccessMaxBufferSize(nativeHandle_);
+  public String dailyOffpeakTimeUTC() {
+    assert (isOwningHandle());
+    return dailyOffpeakTimeUTC(nativeHandle_);
   }
 
   @Override
@@ -1763,19 +1763,6 @@ public class Options extends RocksObject
   }
 
   @Override
-  public Options setMaxWriteBufferNumberToMaintain(
-      final int maxWriteBufferNumberToMaintain) {
-    setMaxWriteBufferNumberToMaintain(
-        nativeHandle_, maxWriteBufferNumberToMaintain);
-    return this;
-  }
-
-  @Override
-  public int maxWriteBufferNumberToMaintain() {
-    return maxWriteBufferNumberToMaintain(nativeHandle_);
-  }
-
-  @Override
   public Options setCompactionPriority(
       final CompactionPriority compactionPriority) {
     setCompactionPriority(nativeHandle_, compactionPriority.getValue());
@@ -2256,9 +2243,8 @@ public class Options extends RocksObject
   private static native void setCompactionReadaheadSize(
       final long handle, final long compactionReadaheadSize);
   private static native long compactionReadaheadSize(final long handle);
-  private static native void setRandomAccessMaxBufferSize(
-      final long handle, final long randomAccessMaxBufferSize);
-  private static native long randomAccessMaxBufferSize(final long handle);
+  private static native void setDailyOffpeakTimeUTC(final long handle, final String offpeakTimeUTC);
+  private static native String dailyOffpeakTimeUTC(final long handle);
   private static native void setWritableFileMaxBufferSize(
       final long handle, final long writableFileMaxBufferSize);
   private static native long writableFileMaxBufferSize(final long handle);
@@ -2444,9 +2430,6 @@ public class Options extends RocksObject
   private static native int[] maxBytesForLevelMultiplierAdditional(long handle);
   private static native void setParanoidFileChecks(long handle, boolean paranoidFileChecks);
   private static native boolean paranoidFileChecks(long handle);
-  private static native void setMaxWriteBufferNumberToMaintain(
-      final long handle, final int maxWriteBufferNumberToMaintain);
-  private static native int maxWriteBufferNumberToMaintain(final long handle);
   private static native void setCompactionPriority(
       final long handle, final byte compactionPriority);
   private static native byte compactionPriority(final long handle);

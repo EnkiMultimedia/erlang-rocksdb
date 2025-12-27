@@ -45,7 +45,6 @@ class MemTableListVersion {
   explicit MemTableListVersion(size_t* parent_memtable_list_memory_usage,
                                const MemTableListVersion& old);
   explicit MemTableListVersion(size_t* parent_memtable_list_memory_usage,
-                               int max_write_buffer_number_to_maintain,
                                int64_t max_write_buffer_size_to_maintain);
 
   void Ref();
@@ -150,13 +149,18 @@ class MemTableListVersion {
 
   int NumFlushed() const { return static_cast<int>(memlist_history_.size()); }
 
+  // Gets the newest user defined timestamps from the immutable memtables.
+  // This returns the newest user defined timestamp found in the most recent
+  // immutable memtable. This should only be called when user defined timestamp
+  // is enabled.
+  const Slice& GetNewestUDT() const;
+
  private:
   friend class MemTableList;
 
   friend Status InstallMemtableAtomicFlushResults(
       const autovector<MemTableList*>* imm_lists,
       const autovector<ColumnFamilyData*>& cfds,
-      const autovector<const MutableCFOptions*>& mutable_cf_options_list,
       const autovector<const autovector<ReadOnlyMemTable*>*>& mems_list,
       VersionSet* vset, LogsWithPrepTracker* prep_tracker,
       InstrumentedMutex* mu, const autovector<FileMetaData*>& file_meta,
@@ -210,8 +214,6 @@ class MemTableListVersion {
   // (used during Transaction validation)
   std::list<ReadOnlyMemTable*> memlist_history_;
 
-  // Maximum number of MemTables to keep in memory (including both flushed
-  const int max_write_buffer_number_to_maintain_;
   // Maximum size of MemTables to keep in memory (including both flushed
   // and not-yet-flushed tables).
   const int64_t max_write_buffer_size_to_maintain_;
@@ -239,13 +241,11 @@ class MemTableList {
  public:
   // A list of memtables.
   explicit MemTableList(int min_write_buffer_number_to_merge,
-                        int max_write_buffer_number_to_maintain,
                         int64_t max_write_buffer_size_to_maintain)
       : imm_flush_needed(false),
         imm_trim_needed(false),
         min_write_buffer_number_to_merge_(min_write_buffer_number_to_merge),
         current_(new MemTableListVersion(&current_memory_usage_,
-                                         max_write_buffer_number_to_maintain,
                                          max_write_buffer_size_to_maintain)),
         num_flush_not_started_(0),
         commit_in_progress_(false),
@@ -311,9 +311,9 @@ class MemTableList {
   // Try commit a successful flush in the manifest file. It might just return
   // Status::OK letting a concurrent flush to do the actual the recording.
   Status TryInstallMemtableFlushResults(
-      ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
-      const autovector<ReadOnlyMemTable*>& m, LogsWithPrepTracker* prep_tracker,
-      VersionSet* vset, InstrumentedMutex* mu, uint64_t file_number,
+      ColumnFamilyData* cfd, const autovector<ReadOnlyMemTable*>& m,
+      LogsWithPrepTracker* prep_tracker, VersionSet* vset,
+      InstrumentedMutex* mu, uint64_t file_number,
       autovector<ReadOnlyMemTable*>* to_delete, FSDirectory* db_directory,
       LogBuffer* log_buffer,
       std::list<std::unique_ptr<FlushJobInfo>>* committed_flush_jobs_info,
@@ -480,7 +480,6 @@ class MemTableList {
   friend Status InstallMemtableAtomicFlushResults(
       const autovector<MemTableList*>* imm_lists,
       const autovector<ColumnFamilyData*>& cfds,
-      const autovector<const MutableCFOptions*>& mutable_cf_options_list,
       const autovector<const autovector<ReadOnlyMemTable*>*>& mems_list,
       VersionSet* vset, LogsWithPrepTracker* prep_tracker,
       InstrumentedMutex* mu, const autovector<FileMetaData*>& file_meta,
@@ -536,7 +535,6 @@ class MemTableList {
 Status InstallMemtableAtomicFlushResults(
     const autovector<MemTableList*>* imm_lists,
     const autovector<ColumnFamilyData*>& cfds,
-    const autovector<const MutableCFOptions*>& mutable_cf_options_list,
     const autovector<const autovector<ReadOnlyMemTable*>*>& mems_list,
     VersionSet* vset, LogsWithPrepTracker* prep_tracker, InstrumentedMutex* mu,
     const autovector<FileMetaData*>& file_meta,

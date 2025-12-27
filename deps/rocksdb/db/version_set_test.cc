@@ -26,6 +26,7 @@
 #include "test_util/mock_time_env.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -1408,8 +1409,8 @@ class VersionSetTestBase {
   Status LogAndApplyToDefaultCF(VersionEdit& edit) {
     mutex_.Lock();
     Status s = versions_->LogAndApply(
-        versions_->GetColumnFamilySet()->GetDefault(), mutable_cf_options_,
-        read_options_, write_options_, &edit, &mutex_, nullptr);
+        versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+        write_options_, &edit, &mutex_, nullptr);
     mutex_.Unlock();
     return s;
   }
@@ -1422,8 +1423,8 @@ class VersionSetTestBase {
     }
     mutex_.Lock();
     Status s = versions_->LogAndApply(
-        versions_->GetColumnFamilySet()->GetDefault(), mutable_cf_options_,
-        read_options_, write_options_, vedits, &mutex_, nullptr);
+        versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+        write_options_, vedits, &mutex_, nullptr);
     mutex_.Unlock();
     return s;
   }
@@ -1434,9 +1435,8 @@ class VersionSetTestBase {
     mutex_.Lock();
     VersionEdit dummy;
     ASSERT_OK(versions_->LogAndApply(
-        versions_->GetColumnFamilySet()->GetDefault(), mutable_cf_options_,
-        read_options_, write_options_, &dummy, &mutex_, db_directory,
-        new_descriptor_log));
+        versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+        write_options_, &dummy, &mutex_, db_directory, new_descriptor_log));
     mutex_.Unlock();
   }
 
@@ -1452,8 +1452,7 @@ class VersionSetTestBase {
         cf_options.persist_user_defined_timestamps);
     Status s;
     mutex_.Lock();
-    s = versions_->LogAndApply(/*column_family_data=*/nullptr,
-                               MutableCFOptions(cf_options), read_options_,
+    s = versions_->LogAndApply(/*column_family_data=*/nullptr, read_options_,
                                write_options_, &new_cf, &mutex_,
                                /*db_directory=*/nullptr,
                                /*new_descriptor_log=*/false, &cf_options);
@@ -1510,11 +1509,9 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
     edits.emplace_back(VersionEdit());
   }
   autovector<ColumnFamilyData*> cfds;
-  autovector<const MutableCFOptions*> all_mutable_cf_options;
   autovector<autovector<VersionEdit*>> edit_lists;
   for (int i = 0; i != kGroupSize; ++i) {
     cfds.emplace_back(versions_->GetColumnFamilySet()->GetDefault());
-    all_mutable_cf_options.emplace_back(&mutable_cf_options_);
     autovector<VersionEdit*> edit_list;
     edit_list.emplace_back(&edits[i]);
     edit_lists.emplace_back(edit_list);
@@ -1531,9 +1528,8 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
       });
   SyncPoint::GetInstance()->EnableProcessing();
   mutex_.Lock();
-  Status s =
-      versions_->LogAndApply(cfds, all_mutable_cf_options, read_options,
-                             write_options, edit_lists, &mutex_, nullptr);
+  Status s = versions_->LogAndApply(cfds, read_options, write_options,
+                                    edit_lists, &mutex_, nullptr);
   mutex_.Unlock();
   EXPECT_OK(s);
   EXPECT_EQ(kGroupSize - 1, count);
@@ -1734,8 +1730,8 @@ TEST_F(VersionSetTest, ObsoleteBlobFile) {
 
   mutex_.Lock();
   Status s = versions_->LogAndApply(
-      versions_->GetColumnFamilySet()->GetDefault(), mutable_cf_options_,
-      read_options_, write_options_, &edit, &mutex_, nullptr);
+      versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+      write_options_, &edit, &mutex_, nullptr);
   mutex_.Unlock();
 
   ASSERT_OK(s);
@@ -1910,7 +1906,7 @@ TEST_F(VersionSetTest, WalAddition) {
         &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, /*read_only=*/false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 1);
@@ -1978,7 +1974,7 @@ TEST_F(VersionSetTest, WalCloseWithoutSync) {
         &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 2);
@@ -2032,7 +2028,7 @@ TEST_F(VersionSetTest, WalDeletion) {
         &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 1);
@@ -2071,7 +2067,7 @@ TEST_F(VersionSetTest, WalDeletion) {
         &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 1);
@@ -2192,7 +2188,7 @@ TEST_F(VersionSetTest, DeleteWalsBeforeNonExistingWalNumber) {
         &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 1);
@@ -2229,7 +2225,7 @@ TEST_F(VersionSetTest, DeleteAllWals) {
         &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 0);
@@ -2272,7 +2268,7 @@ TEST_F(VersionSetTest, AtomicGroupWithWalEdits) {
         &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     std::string db_id;
     ASSERT_OK(
         new_versions->Recover(column_families_, /*read_only=*/false, &db_id));
@@ -2425,7 +2421,6 @@ class VersionSetWithTimestampTest : public VersionSetTest {
     options.comparator = test::BytewiseComparatorWithU64TsWrapper();
     cfd_ = CreateColumnFamily(kNewCfName, options);
     EXPECT_NE(nullptr, cfd_);
-    EXPECT_NE(nullptr, cfd_->GetLatestMutableCFOptions());
     column_families_.emplace_back(kNewCfName, options);
   }
 
@@ -2453,7 +2448,7 @@ class VersionSetWithTimestampTest : public VersionSetTest {
         &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(vset->Recover(column_families_, /*read_only=*/false,
                             /*db_id=*/nullptr));
     for (auto* cfd : *(vset->GetColumnFamilySet())) {
@@ -2475,9 +2470,8 @@ class VersionSetWithTimestampTest : public VersionSetTest {
 
     Status s;
     mutex_.Lock();
-    s = versions_->LogAndApply(cfd_, *(cfd_->GetLatestMutableCFOptions()),
-                               read_options_, write_options_, edits_, &mutex_,
-                               nullptr);
+    s = versions_->LogAndApply(cfd_, read_options_, write_options_, edits_,
+                               &mutex_, nullptr);
     mutex_.Unlock();
     ASSERT_OK(s);
     VerifyFullHistoryTsLow(*std::max_element(ts_lbs.begin(), ts_lbs.end()));
@@ -3370,9 +3364,8 @@ TEST_P(VersionSetTestDropOneCF, HandleDroppedColumnFamilyInAtomicGroup) {
   cfd_to_drop->Ref();
   drop_cf_edit.SetColumnFamily(cfd_to_drop->GetID());
   mutex_.Lock();
-  Status s = versions_->LogAndApply(
-      cfd_to_drop, *cfd_to_drop->GetLatestMutableCFOptions(), read_options,
-      write_options, &drop_cf_edit, &mutex_, nullptr);
+  Status s = versions_->LogAndApply(cfd_to_drop, read_options, write_options,
+                                    &drop_cf_edit, &mutex_, nullptr);
   mutex_.Unlock();
   ASSERT_OK(s);
 
@@ -3380,7 +3373,6 @@ TEST_P(VersionSetTestDropOneCF, HandleDroppedColumnFamilyInAtomicGroup) {
   uint32_t remaining = kAtomicGroupSize;
   size_t i = 0;
   autovector<ColumnFamilyData*> cfds;
-  autovector<const MutableCFOptions*> mutable_cf_options_list;
   autovector<autovector<VersionEdit*>> edit_lists;
   for (const auto& cf_name : non_default_cf_names) {
     auto cfd = (cf_name != cf_to_drop_name)
@@ -3388,7 +3380,6 @@ TEST_P(VersionSetTestDropOneCF, HandleDroppedColumnFamilyInAtomicGroup) {
                    : cfd_to_drop;
     ASSERT_NE(nullptr, cfd);
     cfds.push_back(cfd);
-    mutable_cf_options_list.emplace_back(cfd->GetLatestMutableCFOptions());
     edits[i].SetColumnFamily(cfd->GetID());
     edits[i].SetLogNumber(0);
     edits[i].SetNextFile(2);
@@ -3421,8 +3412,8 @@ TEST_P(VersionSetTestDropOneCF, HandleDroppedColumnFamilyInAtomicGroup) {
       });
   SyncPoint::GetInstance()->EnableProcessing();
   mutex_.Lock();
-  s = versions_->LogAndApply(cfds, mutable_cf_options_list, read_options,
-                             write_options, edit_lists, &mutex_, nullptr);
+  s = versions_->LogAndApply(cfds, read_options, write_options, edit_lists,
+                             &mutex_, nullptr);
   mutex_.Unlock();
   ASSERT_OK(s);
   ASSERT_EQ(1, called);
@@ -3759,6 +3750,8 @@ TEST_P(VersionSetTestEmptyDb, OpenCompleteManifest) {
   }
   std::string db_id;
   bool has_missing_table_file = false;
+  SaveAndRestore<bool> override_unchanging(&versions_->TEST_unchanging(),
+                                           read_only);
   s = versions_->TryRecoverFromOneManifest(manifest_path, column_families,
                                            read_only, &db_id,
                                            &has_missing_table_file);

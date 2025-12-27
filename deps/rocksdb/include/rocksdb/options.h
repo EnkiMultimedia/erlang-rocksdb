@@ -57,11 +57,14 @@ class Statistics;
 class InternalKeyComparator;
 class WalFilter;
 class FileSystem;
+class UserDefinedIndexFactory;
 
 struct Options;
 struct DbPath;
 
 using FileTypeSet = SmallEnumSet<FileType, FileType::kBlobFile>;
+using CompactionStyleSet =
+    SmallEnumSet<CompactionStyle, CompactionStyle::kCompactionStyleNone>;
 
 struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // The function recovers options to a previous version. Only 4.6 or later
@@ -230,6 +233,14 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
 
   // different options for compression algorithms
   CompressionOptions compression_opts;
+
+  // EXPERIMENTAL
+  // Customized compression through a callback interface. When non-nullptr,
+  // supersedes the above compression options, except that the above options are
+  // still processed as they historically would be and passed to
+  // CompressionManager::GetCompressorForSST as hints or suggestions. See
+  // advanced_compression.h
+  std::shared_ptr<CompressionManager> compression_manager;
 
   // Number of files to trigger level-0 compaction. A value <0 means that
   // level-0 compaction will not be triggered by number of files at all.
@@ -454,6 +465,7 @@ extern const char* kHostnameForDbHostId;
 enum class CompactionServiceJobStatus : char {
   kSuccess,
   kFailure,
+  kAborted,
   kUseLocal,
 };
 
@@ -461,6 +473,12 @@ struct CompactionServiceJobInfo {
   std::string db_name;
   std::string db_id;
   std::string db_session_id;
+
+  // the id of the column family where the compaction happened.
+  uint32_t cf_id;
+  // the name of the column family where the compaction happened.
+  std::string cf_name;
+
   uint64_t job_id;  // job_id is only unique within the current DB and session,
                     // restart DB will reset the job_id. `db_id` and
                     // `db_session_id` could help you build unique id across
@@ -474,21 +492,34 @@ struct CompactionServiceJobInfo {
   bool is_manual_compaction;
   bool bottommost_level;
 
+  // the smallest input level of the compaction.
+  // (same as Compaction::start_level and CompactionJobInfo::base_input_level)
+  int base_input_level;
+  // the output level of the compaction.
+  int output_level;
+
+  CompactionServiceJobInfo() {}
   CompactionServiceJobInfo(std::string db_name_, std::string db_id_,
-                           std::string db_session_id_, uint64_t job_id_,
+                           std::string db_session_id_, uint32_t cf_id_,
+                           std::string cf_name_, uint64_t job_id_,
                            Env::Priority priority_,
                            CompactionReason compaction_reason_,
                            bool is_full_compaction_, bool is_manual_compaction_,
-                           bool bottommost_level_)
+                           bool bottommost_level_, int base_input_level_,
+                           int output_level_)
       : db_name(std::move(db_name_)),
         db_id(std::move(db_id_)),
         db_session_id(std::move(db_session_id_)),
+        cf_id(cf_id_),
+        cf_name(std::move(cf_name_)),
         job_id(job_id_),
         priority(priority_),
         compaction_reason(compaction_reason_),
         is_full_compaction(is_full_compaction_),
         is_manual_compaction(is_manual_compaction_),
-        bottommost_level(bottommost_level_) {}
+        bottommost_level(bottommost_level_),
+        base_input_level(base_input_level_),
+        output_level(output_level_) {}
 };
 
 struct CompactionServiceScheduleResponse {
@@ -526,6 +557,9 @@ class CompactionService : public Customizable {
       const std::string& /*scheduled_job_id*/, std::string* /*result*/) {
     return CompactionServiceJobStatus::kUseLocal;
   }
+
+  // Cancel awaiting jobs. Called by CancelAllBackgroundWork()
+  virtual void CancelAwaitingJobs() {}
 
   // Optional callback function upon Installation.
   virtual void OnInstallation(const std::string& /*scheduled_job_id*/,
@@ -576,12 +610,20 @@ struct DBOptions {
   // checksums. True also enters a read-only mode when a DB write fails;
   // see DB::Resume().
   //
+  // When set to true, the DB will fail to open if any SST files fail to open
+  // e.g. due to incorrect file size or corrupted footer.
+  //
+  // When set to false, when there are files corrupted, the DB will still be
+  // opened, and the healthy ones could still be accessed, while corrupted one
+  // will not
+  //
   // As most workloads value data correctness over availability, this option
   // is on by default. Note that the name of this old option is potentially
   // misleading, and other options and operations go further in proactive
   // checking for corruption, including
   // * paranoid_file_checks
   // * paranoid_memory_checks
+  // * memtable_veirfy_per_key_checksum_on_seek
   // * DB::VerifyChecksum()
   //
   // Default: true
@@ -590,7 +632,8 @@ struct DBOptions {
   // DEPRECATED: This option might be removed in a future release.
   //
   // If true, during memtable flush, RocksDB will validate total entries
-  // read in flush, and compare with counter inserted into it.
+  // read in flush, total entries written in the SST and compare them with
+  // counter of keys added.
   //
   // The option is here to turn the feature off in case this new validation
   // feature has a bug. The option may be removed in the future once the
@@ -631,6 +674,26 @@ struct DBOptions {
   //
   // Default: false
   bool track_and_verify_wals_in_manifest = false;
+
+  // EXPERIMENTAL
+  //
+  // If true, each new WAL will record various information about its predecessor
+  // WAL for verification on the predecessor WAL during WAL recovery.
+  //
+  // It verifies the following:
+  // 1. There exists at least some WAL in the DB
+  // - It's not compatible with `RepairDB()` since this option imposes a
+  // stricter requirement on WAL than the DB went through `RepariDB()` can
+  // normally meet
+  // 2. There exists no WAL hole where new WAL data presents while some old WAL
+  // data not yet obsolete is missing. The DB manifest indicates which WALs are
+  // obsolete.
+  //
+  // This is intended to be a better replacement to
+  // `track_and_verify_wals_in_manifest`.
+  //
+  // Default: false
+  bool track_and_verify_wals = false;
 
   // If true, verifies the SST unique id between MANIFEST and actual file
   // each time an SST file is opened. This check ensures an SST file is not
@@ -789,6 +852,7 @@ struct DBOptions {
   // If it is non empty, the log files will be in the specified dir,
   // and the db data dir's absolute path will be used as the log file
   // name's prefix.
+  // NOTE: not for WALs
   std::string db_log_dir = "";
 
   // This specifies the absolute dir path for write-ahead logs (WAL).
@@ -869,21 +933,24 @@ struct DBOptions {
   // be created.
   // If max_log_file_size == 0, all logs will be written to one
   // log file.
+  // NOTE: not for WALs
   size_t max_log_file_size = 0;
 
   // Time for the info log file to roll (in seconds).
   // If specified with non-zero value, log file will be rolled
   // if it has been active longer than `log_file_time_to_roll`.
   // Default: 0 (disabled)
+  // NOTE: not for WALs
   size_t log_file_time_to_roll = 0;
 
   // Maximal info log files to be kept.
   // Default: 1000
+  // NOTE: not for WALs
   size_t keep_log_file_num = 1000;
 
-  // Recycle log files.
-  // If non-zero, we will reuse previously written log files for new
-  // logs, overwriting the old data.  The value indicates how many
+  // Recycle WAL files.
+  // If non-zero, we will reuse previously written WAL files for new
+  // WALs, overwriting the old data.  The value indicates how many
   // such files we will keep around at any point in time for later
   // use.  This is more efficient because the blocks are already
   // allocated and fdatasync does not need to update the inode after
@@ -1044,23 +1111,6 @@ struct DBOptions {
   //
   // Dynamically changeable through SetDBOptions() API.
   size_t compaction_readahead_size = 2 * 1024 * 1024;
-
-  // This is a maximum buffer size that is used by WinMmapReadableFile in
-  // unbuffered disk I/O mode. We need to maintain an aligned buffer for
-  // reads. We allow the buffer to grow until the specified value and then
-  // for bigger requests allocate one shot buffers. In unbuffered mode we
-  // always bypass read-ahead buffer at ReadaheadRandomAccessFile
-  // When read-ahead is required we then make use of compaction_readahead_size
-  // value and always try to read ahead. With read-ahead we always
-  // pre-allocate buffer to the size instead of growing it up to a limit.
-  //
-  // This option is currently honored only on Windows
-  //
-  // Default: 1 Mb
-  //
-  // Special value: 0 - means do not maintain per instance buffer. Allocate
-  //                per request buffer and avoid locking.
-  size_t random_access_max_buffer_size = 1024 * 1024;
 
   // This is the maximum buffer size that is used by WritableFileWriter.
   // With direct IO, we need to maintain an aligned buffer for writes.
@@ -1257,12 +1307,13 @@ struct DBOptions {
   // Default: false
   bool skip_stats_update_on_db_open = false;
 
-  // If true, then DB::Open() will not fetch and check sizes of all sst files.
-  // This may significantly speed up startup if there are many sst files,
-  // especially when using non-default Env with expensive GetFileSize().
-  // We'll still check that all required sst files exist.
-  // If paranoid_checks is false, this option is ignored, and sst files are
-  // not checked at all.
+  // This option is deprecated and marked as no-op. Kept for backward
+  // compatibility until usage is fully removed.
+  // File size check will be performed through a thread
+  // pool during DB Open, when max_open_files is set to -1.
+  // Therefore, the concern of DB Open slowness is eliminated.
+  // Note that when max_open_files is not set to -1, only a subset of files will
+  // be opened and checked during DB Open.
   //
   // Default: false
   bool skip_checking_sst_file_sizes_on_db_open = false;
@@ -1288,14 +1339,6 @@ struct DBOptions {
   // currently.
   WalFilter* wal_filter = nullptr;
 
-  // DEPRECATED: This option might be removed in a future release.
-  //
-  // If true, then DB::Open, CreateColumnFamily, DropColumnFamily, and
-  // SetOptions will fail if options file is not properly persisted.
-  //
-  // DEFAULT: true
-  bool fail_if_options_file_error = true;
-
   // If true, then print malloc stats together with rocksdb.stats
   // when printing to LOG.
   // DEFAULT: false
@@ -1319,16 +1362,11 @@ struct DBOptions {
   // Dynamically changeable through SetDBOptions() API.
   bool avoid_flush_during_shutdown = false;
 
-  // Set this option to true during creation of database if you want
-  // to be able to ingest behind (call IngestExternalFile() skipping keys
-  // that already exist, rather than overwriting matching keys).
-  // Setting this option to true has the following effects:
-  // 1) Disable some internal optimizations around SST file compression.
-  // 2) Reserve the last level for ingested files only.
-  // 3) Compaction will not include any file from the last level.
-  // Note that only Universal Compaction supports allow_ingest_behind.
-  // `num_levels` should be >= 3 if this option is turned on.
+  // DEPRECATED: use ColumnFamilyOptions::cf_allow_ingest_behind instead.
+  // This option might be removed in a future release.
   //
+  // See comment for `ColumnFamilyOptions::cf_allow_ingest_behind` for
+  // detail about the option's functionality and use cases.
   //
   // DEFAULT: false
   // Immutable.
@@ -1414,9 +1452,10 @@ struct DBOptions {
   // prefix_same_as_start=true can take advantage of prefix seek optimizations.
   bool prefix_seek_opt_in_only = false;
 
-  // The number of bytes to prefetch when reading the log. This is mostly useful
-  // for reading a remotely located log, as it can save the number of
-  // round-trips. If 0, then the prefetching is disabled.
+  // The number of bytes to prefetch when reading the DB manifest and WAL files
+  // during DB::Open (and variants). This is mostly useful for reading a
+  // remotely located log, as it can save the number of round-trips. If 0, then
+  // the prefetching is disabled.
   //
   // Default: 0
   size_t log_readahead_size = 0;
@@ -1613,6 +1652,24 @@ struct DBOptions {
   // `kUnknown`, this overrides any temperature set by OptimizeForLogWrite
   // functions.
   Temperature wal_write_temperature = Temperature::kUnknown;
+
+  // Enum set indicative of which compaction styles SST write lifetime hint
+  // calculation is allowed on. Today, RocksDB provides native support for
+  // kCompactionStyleLevel and kCompactionStyleUniversal (experimental version).
+  // Other compaction styles, even when enabled in the set, won't have any
+  // effect in the default PosixWritableFile file implementation. There are
+  // numerous benefits coming from employing the hints including reduction in
+  // write amplification caused by OS file movement during garbage collection,
+  // and reduction in wear-leveling (SSDs). However, as currently implemented,
+  // SST write lifetime hints are calculated in a static way and solely based on
+  // the level, which might not be suitable for non-uniform workloads with
+  // dynamic / high-variance lifespan of data within the same level. In those
+  // cases (or when the performance is not satisfactory), it's recommended to
+  // disable the hints by assigning the setting to the empty set (= {});
+  //
+  // Default: Enabled in kCompactionStyleLevel mode.
+  CompactionStyleSet calculate_sst_write_lifetime_hint_set = {
+      CompactionStyle::kCompactionStyleLevel};
   // End EXPERIMENTAL
 };
 
@@ -1674,6 +1731,163 @@ enum ReadTier {
                           // Note that this ReadTier currently only supports
                           // Get and MultiGet and does not support iterators.
   kMemtableTier = 0x3     // data in memtable. used for memtable-only iterators.
+};
+
+// A range of keys. In case of user_defined timestamp, if enabled, `start` and
+// `limit` should point to key without timestamp part.
+struct Range {
+  Slice start;
+  Slice limit;
+
+  Range() {}
+  Range(const Slice& s, const Slice& l) : start(s), limit(l) {}
+};
+
+// A key range with optional endpoints. In case of user_defined timestamp, if
+// enabled, `start` and `limit` should point to key without timestamp part.
+struct RangeOpt {
+  // When start.has_value() == false, refers to starting before every key
+  OptSlice start;
+  // When limit.has_value() == false, refers to ending after every key
+  OptSlice limit;
+
+  RangeOpt() {}
+  RangeOpt(const OptSlice& s, const OptSlice& l) : start(s), limit(l) {}
+};
+
+// EXPERIMENTAL
+//
+// Options for a RocksDB scan request. Only forward scans for now.
+// We may add other options such as prefix scan in the future.
+struct ScanOptions {
+  // The scan range. Mandatory for start to be set, limit is optional
+  RangeOpt range;
+
+  // A map of name,value pairs that can be passed by the user to an
+  // external table reader. This is completely opaque to RocksDB and is
+  // ignored by the natively supported table readers like block based and plain
+  // table. This is only useful for Iterator.
+  std::optional<std::unordered_map<std::string, std::string>> property_bag;
+
+  // An unbounded scan with a start key
+  explicit ScanOptions(const Slice& _start) : range(_start, OptSlice()) {}
+
+  // A bounded scan with a start key and upper bound
+  ScanOptions(const Slice& _start, const Slice& _upper_bound)
+      : range(_start, _upper_bound) {}
+};
+
+// Container for multiple scan ranges that can be used with MultiScan.
+// This replaces std::vector<ScanOptions> with a more efficient implementation
+// that can merge overlapping ranges.
+class MultiScanArgs {
+ public:
+  // Constructor that takes a comparator
+  explicit MultiScanArgs(const Comparator* comparator) : comp_(comparator) {}
+
+  // Copy Constructor
+  MultiScanArgs(const MultiScanArgs& other) {
+    comp_ = other.comp_;
+    original_ranges_ = other.original_ranges_;
+    io_coalesce_threshold = other.io_coalesce_threshold;
+    max_prefetch_size = other.max_prefetch_size;
+    use_async_io = other.use_async_io;
+  }
+  MultiScanArgs(MultiScanArgs&& other) noexcept
+      : io_coalesce_threshold(other.io_coalesce_threshold),
+        max_prefetch_size(other.max_prefetch_size),
+        use_async_io(other.use_async_io),
+        comp_(other.comp_),
+        original_ranges_(std::move(other.original_ranges_)) {}
+
+  MultiScanArgs& operator=(const MultiScanArgs& other) {
+    comp_ = other.comp_;
+    original_ranges_ = other.original_ranges_;
+    io_coalesce_threshold = other.io_coalesce_threshold;
+    max_prefetch_size = other.max_prefetch_size;
+    use_async_io = other.use_async_io;
+    return *this;
+  }
+
+  MultiScanArgs& operator=(MultiScanArgs&& other) noexcept {
+    if (this != &other) {
+      comp_ = other.comp_;
+      original_ranges_ = std::move(other.original_ranges_);
+      io_coalesce_threshold = other.io_coalesce_threshold;
+      max_prefetch_size = other.max_prefetch_size;
+      use_async_io = other.use_async_io;
+    }
+    return *this;
+  }
+
+  void insert(const Slice& s, const Slice& b) {
+    original_ranges_.emplace_back(s, b);
+  }
+
+  void insert(const Slice& s, const Slice& b,
+              const std::optional<std::unordered_map<std::string, std::string>>&
+                  property_bag) {
+    original_ranges_.emplace_back(s, b);
+    original_ranges_.back().property_bag = property_bag;
+  }
+
+  void insert(const Slice& s) { original_ranges_.emplace_back(s); }
+
+  void insert(const Slice& s,
+              const std::optional<std::unordered_map<std::string, std::string>>&
+                  property_bag) {
+    original_ranges_.emplace_back(s);
+    original_ranges_.back().property_bag = property_bag;
+  }
+
+  size_t size() const { return original_ranges_.size(); }
+  bool empty() const { return original_ranges_.empty(); }
+
+  void reserve(size_t size) { original_ranges_.reserve(size); }
+
+  operator std::vector<ScanOptions>*() { return &original_ranges_; }
+
+  operator const std::vector<ScanOptions>*() const { return &original_ranges_; }
+
+  ~MultiScanArgs() {}
+
+  const std::vector<ScanOptions>& GetScanRanges() const {
+    return original_ranges_;
+  }
+
+  const Comparator* GetComparator() const { return comp_; }
+
+  // Copies the configurations (excluding actual scan ranges) from another
+  // MultiScanArgs.
+  void CopyConfigFrom(const MultiScanArgs& other) {
+    io_coalesce_threshold = other.io_coalesce_threshold;
+    max_prefetch_size = other.max_prefetch_size;
+    use_async_io = other.use_async_io;
+  }
+
+  uint64_t io_coalesce_threshold = 16 << 10;  // 16KB by default
+
+  // Maximum size (in bytes) for the data blocks loaded by a MultiScan.
+  // This limits the amount of I/O and memory usage by pinned data blocks.
+  //
+  // When set to 0 (the default), there is no limit. When the limit is reached,
+  // the iterator will start returning Status::PrefetchLimitReached().
+  //
+  // Note that prefetching happens only once in Prepare(), which is different
+  // from ReadOptions::readahead_size, which applies any time the iterator does
+  // I/O.
+  // Note that this limit is per file and applies to compressed block size.
+  uint64_t max_prefetch_size = 0;
+
+  // Enable async I/O for multi-scan operations
+  // When true, BlockBasedTableIterator will use ReadAsync() for reading blocks
+  // When false, it will use synchronous MultiRead().
+  bool use_async_io = false;
+
+ private:
+  // The comparator used for ordering ranges
+  const Comparator* comp_;
+  std::vector<ScanOptions> original_ranges_;
 };
 
 // Options that control read operations
@@ -1757,6 +1971,10 @@ struct ReadOptions {
   // block cache.
   bool fill_cache = true;
 
+  // DEPRECATED: This option might be removed in a future release.
+  // There should be no noticeable performance difference whether this option
+  // is turned on or off when a DB does not use DeleteRange().
+  //
   // If true, range tombstones handling will be skipped in key lookup paths.
   // For DB instances that don't use DeleteRange() calls, this setting can
   // be used to optimize the read performance.
@@ -1940,6 +2158,39 @@ struct ReadOptions {
   // Default: false
   bool allow_unprepared_value = false;
 
+  // EXPERIMENTAL
+  //
+  // Long-running iterators are holding onto memory and storage resources long
+  // after they are obsolete. This setting (when enabled) will fix that problem
+  // for as long as iterator periodically makes some progress and its supplied
+  // `read_options` was configured with non-nullptr `snapshot` value.
+  // The feature is engineered so that the performance impact should be
+  // negligible. We expect the default value to be true some time in the future.
+  //
+  // NOTE 1: Does not have effect on TransactionDB with WRITE_PREPARED or
+  //         WRITE_UNPREPARED policies (currently incompatible).
+  //
+  // NOTE 2: True is not recommended if using user-defined timestamp with
+  //         persist_user_defined_timestamps=false and non-nullptr
+  //         ReadOptions::timestamp or ReadOptions::iter_start_ts, because
+  //         auto-refreshing iterator will not prevent user timestamp
+  //         information from being dropped during iteration. Auto-refresh might
+  //         be disabled for this combination in the future.
+  //
+  // Default: false
+  bool auto_refresh_iterator_with_snapshot = false;
+
+  // EXPERIMENTAL
+  //
+  // Specify an alternate index to use in the SST files instead of the native
+  // block based table index. The table_factory used for the column family
+  // must support building/reading this index.
+  //
+  // Currently, only forward scans are supported. For forward scans, only Seek()
+  // is supported. SeekToFirst() is not supported. If the caller wishes to scan
+  // from start to end, the native index must be used.
+  const UserDefinedIndexFactory* table_index_factory = nullptr;
+
   // *** END options only relevant to iterators or scans ***
 
   // *** BEGIN options for RocksDB internal use only ***
@@ -1948,6 +2199,19 @@ struct ReadOptions {
   Env::IOActivity io_activity = Env::IOActivity::kUnknown;
 
   // *** END options for RocksDB internal use only ***
+
+  // *** BEGIN per-request settings for internal team use only ***
+
+  // TODO: create a new struct for per-request options, potentially including
+  // timestamps in point lookups/scans
+
+  // request_id is a unique id assigned by the application. It is used to allow
+  // us to link file system metrics/logs to rocksDB and application logs. This
+  // request_id may not be unique to each RocksDB api call - it could refer to
+  // an application level request that results in multiple RocksDB api calls
+  const std::string* request_id = nullptr;
+
+  // *** END per-request settings for internal team use only ***
 
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);
@@ -2088,10 +2352,20 @@ struct CompactionOptions {
   // If > 0, it will replace the option in the DBOptions for this compaction.
   uint32_t max_subcompactions;
 
+  // Allows cancellation of an in-progress manual compaction.
+  //
+  // Cancellation can be delayed waiting on automatic compactions when used
+  // together with `exclusive_manual_compaction == true`.
+  std::atomic<bool>* canceled;
+  // NOTE: Calling DisableManualCompaction() will not override the
+  // canceled variable in CompactionOptions, as it does for CompactRangeOptions
+  // - this is because ManualCompactionState is not used
+
   CompactionOptions()
       : compression(kDisableCompressionOption),
         output_file_size_limit(std::numeric_limits<uint64_t>::max()),
-        max_subcompactions(0) {}
+        max_subcompactions(0),
+        canceled(nullptr) {}
 };
 
 // For level based compaction, we can configure if we want to skip/force
@@ -2158,7 +2432,7 @@ struct CompactRangeOptions {
   // Cancellation can be delayed waiting on automatic compactions when used
   // together with `exclusive_manual_compaction == true`.
   std::atomic<bool>* canceled = nullptr;
-  // NOTE: Calling DisableManualCompaction() overwrites the uer-provided
+  // NOTE: Calling DisableManualCompaction() overwrites the user-provided
   // canceled variable in CompactRangeOptions.
   // Typically, when CompactRange is being called in one thread (t1) with
   // canceled = false, and DisableManualCompaction is being called in the
@@ -2180,7 +2454,47 @@ struct CompactRangeOptions {
   double blob_garbage_collection_age_cutoff = -1;
 };
 
-// IngestExternalFileOptions is used by IngestExternalFile()
+// IngestExternalFileOptions setting guide:
+//
+// The options in IngestExternalFileOptions interact in complex ways depending
+// on the source and overlap of SST files. Below is a summary of recommended
+// non-default settings for common use cases:
+//
+// 1. Ingesting only SST writer generated non-overlapping SSTs that are not
+// expected to overlap with existing data:
+//    - Optionally set fail_if_not_bottommost_level = true to enforce placement
+//    in the last level. This is better paird with SST partitioner to guarantee
+//    that there are no existing file with keys across the ingesting key range.
+//    - Set allow_blocking_flush to false: Not expecting to overlap with
+//    memtable and cause a flush.
+//    - If snapshot consistency is not expected, set snapshot_consistency to
+//    false and allow_global_seqno to false. allow_global_seqno = false will
+//    fail ingestion if any input file overlap with each other.
+//
+// 2. Ingesting SST writer generated overlapping SSTs:
+//    - order files with older updates first, newer overwrites later.
+//    - Set allow_global_seqno = true since newer files need to be assigned
+//    larger sequence numbers.
+//
+// 3. Ingesting DB generated SSTs: overlapping with target CF data is not
+// allowed. Input files are allowed to contain both DB generated files and SST
+// file writer generated files. They will all be treated as DB generated.
+//    - Set allow_db_generated_files = true.
+//    - Set snapshot_consistency = false: snapshot consistency requires
+// assigning higher sequence number to ingested files. DB generated files
+// don't support global seqno assignment yet.
+//    - Set allow_blocking_flush to false: Not expecting to overlap with
+//    memtable and cause a flush.
+//    - If the source live DB is running, set link_files = true instead of
+//    move_files.
+// 3a) SST files are non-overlapping and all keys have seqno 0: e.g., a
+// temporary RocksDB instance used to sort some data, and compacts all
+// data into the last level before ingestion.
+//    - Optionally set fail_if_not_bottommost_level = true to enforce placement
+//    in the last level.
+// 3b) SST files are overlapping, e.g. ingesting files from one CF to another.
+//    - Ensure older updates are ordered first and newer updates are ordered
+//    later. See more in option comment for allow_db_generated_files.
 struct IngestExternalFileOptions {
   // Can be set to true to move the files instead of copying them.
   // The input files will be unlinked after successful ingestion.
@@ -2197,20 +2511,33 @@ struct IngestExternalFileOptions {
   // If set to false, an ingested file keys could appear in existing snapshots
   // that where created before the file was ingested.
   bool snapshot_consistency = true;
-  // If set to false, IngestExternalFile() will fail if the file key range
+  // Enables assiging a global sequence number to each ingested file, i.e.,
+  // all keys in the ingested file will be treated as having this seqno.
+  // If set to false, we will use the sequence numbers in the ingested file
+  // as is, and IngestExternalFile() will fail if the ingested key range
   // overlaps with existing keys or tombstones or output of ongoing compaction
-  // during file ingestion in the DB (the conditions under which a global_seqno
-  // must be assigned to the ingested file).
+  // in the CF (the conditions under which a global seqno must be assigned to
+  // the ingested file).
+  // If the ingested files overlap with each other, we need to assign global
+  // sequence to the ingested files and this option needs to be enabled. One
+  // exception to this is when ingesting DB generated SST files (see option
+  // allow_db_generated_files below). DB generated files do not support
+  // global seqno assignment and can be ingested even if they overlap with
+  // each other. This option has no effect when allow_db_generated_files is
+  // enabled.
   bool allow_global_seqno = true;
-  // If set to false and the file key range overlaps with the memtable key range
-  // (memtable flush required), IngestExternalFile will fail.
+  // Normally (true), IngestExternalFile() will trigger and block for flushing
+  // memtable(s) if there is overlap between ingested files and memtable(s). If
+  // allow_blocking_flush is set to false, IngestExternalFile() will fail if the
+  // file key range overlaps with the memtable key range (memtable flush
+  // required).
   bool allow_blocking_flush = true;
   // Set to true if you would like duplicate keys in the file being ingested
   // to be skipped rather than overwriting existing data under that key.
   // Use case: back-fill of some historical data in the database without
   // over-writing existing newer version of data.
-  // This option could only be used if the DB has been running
-  // with allow_ingest_behind=true since the dawn of time.
+  // This option could only be used if the CF has been running
+  // with cf_allow_ingest_behind=true since CF creation (or before any write).
   // All files will be ingested at the bottommost level with seqno=0.
   bool ingest_behind = false;
   // DEPRECATED - Set to true if you would like to write global_seqno to
@@ -2263,18 +2590,53 @@ struct IngestExternalFileOptions {
   //
   // XXX: "bottommost" is obsolete/confusing terminology to refer to last level
   bool fail_if_not_bottommost_level = false;
-  // EXPERIMENTAL
-  // Enables ingestion of files not generated by SstFileWriter. When true:
+  // EXPERIMENTAL, SUBJECT TO CHANGE
+  //
+  // Enables special mode of ingestion that allows files generated by a live DB,
+  // instead of SstFileWriter. When true:
   // - Allows files to be ingested when their cf_id doesn't match the CF they
   //   are being ingested into.
+  // - Allows files with any sequence numbers to be ingested.
+  // - Original sequence numbers are preserved (no reassignment).
+  //
   // REQUIREMENTS:
-  // - Ingested files must not overlap with existing keys.
-  // - `write_global_seqno` must be false.
-  // - All keys in ingested files should have sequence number 0. We fail
-  // ingestion if any sequence numbers is non-zero.
-  // WARNING: If a DB contains ingested files generated by another DB/CF,
-  // RepairDB() may not recover these files correctly, potentially leading to
-  // data loss.
+  // - Ingested files must NOT overlap with any existing data in the DB. Since
+  //   no sequence number reassignment is performed on db generated files.
+  //   Ingestion will fail if any overlap is detected. However, input files
+  //   are allowed to overlap with each other when this option is enabled. This
+  //   is useful when ingesting multiple levels of files from a CF, where
+  //   levels naturally overlap with each other.
+  // - CAUTION: If input files overlap with each other, then for any given user
+  //   key appearing in multiple files, earlier files MUST have smaller sequence
+  //   numbers than later files. Later files will be placed at a higher level
+  //   (smaller level number). This is to ensure the LSM invariant where for
+  //   the same key, recent updates are in higher levels. This means that
+  //   if you are ingesting files from multiple levels of a CF, you should
+  //   put files from lower levels first, and files from higher levels later.
+  //   Example for getting files from a CF for ingestion:
+  //
+  // ColumnFamilyMetaData cf_meta;
+  // from_db->GetColumnFamilyMetaData(from_cf, &cf_meta);
+  // // iterate in reverse to start from lowest level
+  // for (auto level_meta = cf_meta.levels.rbegin();
+  //      level_meta != cf_meta.levels.rend(); ++level_meta) {
+  //   // L0 files need to be added in reverse order so we iterate in reverse
+  //   // within a level too
+  //   for (auto file_meta = level_meta->files.rbegin();
+  //        file_meta != level_meta->files.rend(); ++file_meta) {
+  //     // Add file for ingestion
+  //   }
+  // }
+  //
+  //   WARNING: Violating the sequence number ordering requirement will cause
+  //   LSM invariant violations and may lead to incorrect reads or data
+  //   corruption.
+  // - If you would like to enforce that the ingested files do not overlap
+  //   with each other, you can set `fail_if_not_bottommost_level` to true.
+  //   If ingested files overlap with each other, some file will be placed
+  //   above Lmax, failing the ingestion if the option is set.
+  // - `write_global_seqno` must be false (sequence numbers cannot be
+  //    reassigned).
   bool allow_db_generated_files = false;
 
   // Controls whether data and metadata blocks (e.g. index, filter) read during
@@ -2284,6 +2646,44 @@ struct IngestExternalFileOptions {
   // When ingesting to multiple families, this option should be the same across
   // ingestion options.
   bool fill_cache = true;
+};
+
+// It is valid that files_checksums and files_checksum_func_names are both
+// empty (no checksum information is provided for ingestion). Otherwise,
+// their sizes should be the same as external_files. The file order should
+// be the same in three vectors and guaranteed by the caller.
+// Note that, we assume the temperatures of this batch of files to be
+// ingested are the same.
+struct IngestExternalFileArg {
+  ColumnFamilyHandle* column_family = nullptr;
+  std::vector<std::string> external_files;
+  IngestExternalFileOptions options;
+  std::vector<std::string> files_checksums;
+  std::vector<std::string> files_checksum_func_names;
+  // A hint as to the temperature for *reading* the files to be ingested.
+  Temperature file_temperature = Temperature::kUnknown;
+  // EXPERIMENTAL: When specified, existing keys in the given range will be
+  // cleared atomically as part of the ingestion, where the ingested files are
+  // logically applied on top of the cleared key range.
+  // * If both `start` and `limit` are nullptr, the entire column family is
+  // cleared; however, setting just one bound to nullptr is not yet supported.
+  // * When a range is specified, all the external files in this batch must
+  //   be contained in that key range.
+  // * Checks for memtable overlap and possible blocking flush will apply
+  //   to this range (not just the file ranges).
+  // * Not compatible with ingest_behind=true.
+  // * When options.snapshot_consistency = false, the range is cleared
+  // similarly to DeleteFilesInRange, but fails if any files overlap the range
+  // only partially.
+  //   * It is recommended to use fail_if_not_bottommost_level=true to ensure
+  //     data in the key range is ingested to a single compacted level (the
+  //     last level). (fail_if_not_bottommost_level=false allows overlap between
+  //     the ingested files.)
+  // * options.snapshot_consistency = true is not yet supported.
+  // BUG: the upper bound of the range may be interpreted as inclusive or
+  // exclusive, so it is best not to depend on one or the other until it is
+  // sorted out.
+  std::optional<RangeOpt> atomic_replace_range;
 };
 
 enum TraceFilterType : uint64_t {
@@ -2371,10 +2771,16 @@ struct CompactionServiceOptionsOverride {
   // to set it here.
   std::shared_ptr<Statistics> statistics = nullptr;
 
+  // Info Log. If not overriden, default one will be used.
+  std::shared_ptr<Logger> info_log = nullptr;
+
   // Only compaction generated SST files use this user defined table properties
   // collector.
   std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>
       table_properties_collector_factories;
+
+  // All other options to override. Unknown options will be ignored.
+  std::unordered_map<std::string, std::string> options_map;
 };
 
 struct OpenAndCompactOptions {

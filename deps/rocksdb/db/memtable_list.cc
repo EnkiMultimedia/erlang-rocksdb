@@ -51,9 +51,7 @@ void MemTableListVersion::UnrefMemTable(
 
 MemTableListVersion::MemTableListVersion(
     size_t* parent_memtable_list_memory_usage, const MemTableListVersion& old)
-    : max_write_buffer_number_to_maintain_(
-          old.max_write_buffer_number_to_maintain_),
-      max_write_buffer_size_to_maintain_(
+    : max_write_buffer_size_to_maintain_(
           old.max_write_buffer_size_to_maintain_),
       parent_memtable_list_memory_usage_(parent_memtable_list_memory_usage) {
   memlist_ = old.memlist_;
@@ -69,10 +67,8 @@ MemTableListVersion::MemTableListVersion(
 
 MemTableListVersion::MemTableListVersion(
     size_t* parent_memtable_list_memory_usage,
-    int max_write_buffer_number_to_maintain,
     int64_t max_write_buffer_size_to_maintain)
-    : max_write_buffer_number_to_maintain_(max_write_buffer_number_to_maintain),
-      max_write_buffer_size_to_maintain_(max_write_buffer_size_to_maintain),
+    : max_write_buffer_size_to_maintain_(max_write_buffer_size_to_maintain),
       parent_memtable_list_memory_usage_(parent_memtable_list_memory_usage) {}
 
 void MemTableListVersion::Ref() { ++refs_; }
@@ -323,8 +319,7 @@ void MemTableListVersion::Remove(ReadOnlyMemTable* m,
   memlist_.remove(m);
 
   m->MarkFlushed();
-  if (max_write_buffer_size_to_maintain_ > 0 ||
-      max_write_buffer_number_to_maintain_ > 0) {
+  if (max_write_buffer_size_to_maintain_ > 0) {
     memlist_history_.push_front(m);
     // Unable to get size of mutable memtable at this point, pass 0 to
     // TrimHistory as a best effort.
@@ -356,9 +351,6 @@ bool MemTableListVersion::MemtableLimitExceeded(size_t usage) {
     // whether to trim history
     return MemoryAllocatedBytesExcludingLast() + usage >=
            static_cast<size_t>(max_write_buffer_size_to_maintain_);
-  } else if (max_write_buffer_number_to_maintain_ > 0) {
-    return memlist_.size() + memlist_history_.size() >
-           static_cast<size_t>(max_write_buffer_number_to_maintain_);
   } else {
     return false;
   }
@@ -380,6 +372,19 @@ bool MemTableListVersion::TrimHistory(autovector<ReadOnlyMemTable*>* to_delete,
     ret = true;
   }
   return ret;
+}
+
+const Slice& MemTableListVersion::GetNewestUDT() const {
+  static Slice kEmptySlice;
+  for (auto it = memlist_.begin(); it != memlist_.end(); ++it) {
+    ReadOnlyMemTable* m = *it;
+    Slice timestamp = m->GetNewestUDT();
+    assert(!timestamp.empty() || m->IsEmpty());
+    if (!timestamp.empty()) {
+      return m->GetNewestUDT();
+    }
+  }
+  return kEmptySlice;
 }
 
 // Returns true if there is at least one memtable on which flush has
@@ -515,8 +520,7 @@ void MemTableList::RollbackMemtableFlush(
 // Try record a successful flush in the manifest file. It might just return
 // Status::OK letting a concurrent flush to do actual the recording..
 Status MemTableList::TryInstallMemtableFlushResults(
-    ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
-    const autovector<ReadOnlyMemTable*>& mems,
+    ColumnFamilyData* cfd, const autovector<ReadOnlyMemTable*>& mems,
     LogsWithPrepTracker* prep_tracker, VersionSet* vset, InstrumentedMutex* mu,
     uint64_t file_number, autovector<ReadOnlyMemTable*>* to_delete,
     FSDirectory* db_directory, LogBuffer* log_buffer,
@@ -632,10 +636,10 @@ Status MemTableList::TryInstallMemtableFlushResults(
       };
       if (write_edits) {
         // this can release and reacquire the mutex.
-        s = vset->LogAndApply(
-            cfd, mutable_cf_options, read_options, write_options, edit_list, mu,
-            db_directory, /*new_descriptor_log=*/false,
-            /*column_family_options=*/nullptr, manifest_write_cb);
+        s = vset->LogAndApply(cfd, read_options, write_options, edit_list, mu,
+                              db_directory, /*new_descriptor_log=*/false,
+                              /*column_family_options=*/nullptr,
+                              manifest_write_cb);
       } else {
         // If write_edit is false (e.g: successful mempurge),
         // then remove old memtables, wake up manifest write queue threads,
@@ -854,7 +858,6 @@ uint64_t MemTableList::PrecomputeMinLogContainingPrepSection(
 Status InstallMemtableAtomicFlushResults(
     const autovector<MemTableList*>* imm_lists,
     const autovector<ColumnFamilyData*>& cfds,
-    const autovector<const MutableCFOptions*>& mutable_cf_options_list,
     const autovector<const autovector<ReadOnlyMemTable*>*>& mems_list,
     VersionSet* vset, LogsWithPrepTracker* prep_tracker, InstrumentedMutex* mu,
     const autovector<FileMetaData*>& file_metas,
@@ -946,8 +949,8 @@ Status InstallMemtableAtomicFlushResults(
   }
 
   // this can release and reacquire the mutex.
-  s = vset->LogAndApply(cfds, mutable_cf_options_list, read_options,
-                        write_options, edit_lists, mu, db_directory);
+  s = vset->LogAndApply(cfds, read_options, write_options, edit_lists, mu,
+                        db_directory);
 
   for (size_t k = 0; k != cfds.size(); ++k) {
     auto* imm = (imm_lists == nullptr) ? cfds[k]->imm() : imm_lists->at(k);

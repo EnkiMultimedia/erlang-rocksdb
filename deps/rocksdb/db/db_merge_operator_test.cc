@@ -120,6 +120,10 @@ TEST_F(DBMergeOperatorTest, LimitMergeOperands) {
   ASSERT_OK(Merge("k3", "de"));
   ASSERT_OK(db_->Get(ReadOptions(), "k3", &value));
   ASSERT_EQ(value, "cd,de");
+  // Tests that merge operands reach exact limit at memtable.
+  ASSERT_OK(Merge("k3", "fg"));
+  ASSERT_OK(db_->Get(ReadOptions(), "k3", &value));
+  ASSERT_EQ(value, "de,fg");
 
   // All K4 values are in different levels
   ASSERT_OK(Merge("k4", "ab"));
@@ -967,7 +971,7 @@ TEST_F(DBMergeOperatorTest, MaxSuccessiveMergesBaseValues) {
 
   // No base value
   {
-    constexpr char key[] = "key1";
+    const std::string key = "key1";
 
     ASSERT_OK(db_->Merge(WriteOptions(), db_->DefaultColumnFamily(), key, foo));
     ASSERT_OK(db_->Merge(WriteOptions(), db_->DefaultColumnFamily(), key, bar));
@@ -990,7 +994,7 @@ TEST_F(DBMergeOperatorTest, MaxSuccessiveMergesBaseValues) {
 
   // Plain base value
   {
-    constexpr char key[] = "key2";
+    const std::string key = "key2";
 
     ASSERT_OK(db_->Put(WriteOptions(), db_->DefaultColumnFamily(), key, foo));
     ASSERT_OK(db_->Merge(WriteOptions(), db_->DefaultColumnFamily(), key, bar));
@@ -1015,7 +1019,7 @@ TEST_F(DBMergeOperatorTest, MaxSuccessiveMergesBaseValues) {
 
   // Wide-column base value
   {
-    constexpr char key[] = "key3";
+    const std::string key = "key3";
     const WideColumns columns{{kDefaultWideColumnName, foo}, {bar, baz}};
 
     ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), key,

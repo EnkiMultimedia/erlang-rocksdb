@@ -29,9 +29,6 @@
 #include "rocksdb/iterator.h"
 #include "rocksdb/utilities/stackable_db.h"
 #include "rocksdb/utilities/transaction.h"
-#include "table/block_based/block.h"
-#include "table/block_based/block_based_table_builder.h"
-#include "table/block_based/block_builder.h"
 #include "table/meta_blocks.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
@@ -232,12 +229,9 @@ Status BlobDBImpl::Open(std::vector<ColumnFamilyHandle*>* handles) {
       static_cast<ColumnFamilyHandleImpl*>(DefaultColumnFamily())->cfd();
   assert(cfd);
 
-  const ImmutableCFOptions* const ioptions = cfd->ioptions();
-  assert(ioptions);
-
   assert(env_);
 
-  for (const auto& cf_path : ioptions->cf_paths) {
+  for (const auto& cf_path : cfd->ioptions().cf_paths) {
     bool blob_dir_same_as_cf_dir = false;
     s = env_->AreFilesSame(blob_dir_, cf_path.path, &blob_dir_same_as_cf_dir);
     if (!s.ok()) {
@@ -1165,11 +1159,19 @@ Slice BlobDBImpl::GetCompressedSlice(const Slice& raw,
   CompressionType type = bdb_options_.compression;
   CompressionOptions opts;
   CompressionContext context(type, opts);
-  CompressionInfo info(opts, context, CompressionDict::GetEmptyDict(), type,
-                       0 /* sample_for_compression */);
-  CompressBlock(raw, info, &type, kBlockBasedTableVersionFormat, false,
-                compression_output, nullptr, nullptr);
+  CompressionInfo info(opts, context, CompressionDict::GetEmptyDict(), type);
+  OLD_CompressData(raw, info,
+                   GetCompressFormatForVersion(kBlockBasedTableVersionFormat),
+                   compression_output);
   return *compression_output;
+}
+
+Decompressor& BlobDecompressor() {
+  static auto mgr = GetBuiltinCompressionManager(
+      GetCompressFormatForVersion(kBlockBasedTableVersionFormat));
+  static auto decompressor = mgr->GetDecompressor();
+
+  return *decompressor;
 }
 
 Status BlobDBImpl::DecompressSlice(const Slice& compressed_value,
@@ -1183,12 +1185,9 @@ Status BlobDBImpl::DecompressSlice(const Slice& compressed_value,
   {
     StopWatch decompression_sw(clock_, statistics_,
                                BLOB_DB_DECOMPRESSION_MICROS);
-    UncompressionContext context(compression_type);
-    UncompressionInfo info(context, UncompressionDict::GetEmptyDict(),
-                           compression_type);
-    Status s = UncompressBlockData(
-        info, compressed_value.data(), compressed_value.size(), &contents,
-        kBlockBasedTableVersionFormat, *(cfh->cfd()->ioptions()));
+    Status s = DecompressBlockData(
+        compressed_value.data(), compressed_value.size(), compression_type,
+        BlobDecompressor(), &contents, cfh->cfd()->ioptions());
     if (!s.ok()) {
       return Status::Corruption("Unable to decompress blob.");
     }

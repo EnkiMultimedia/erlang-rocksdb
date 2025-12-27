@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/transactions/write_unprepared_txn.h"
 
 #include "db/db_impl/db_impl.h"
@@ -375,7 +374,7 @@ Status WriteUnpreparedTxn::FlushWriteBatchToDBInternal(bool prepared) {
   uint64_t seq_used = kMaxSequenceNumber;
   // log_number_ should refer to the oldest log containing uncommitted data
   // from the current transaction. This means that if log_number_ is set,
-  // WriteImpl should not overwrite that value, so set log_used to nullptr if
+  // WriteImpl should not overwrite that value, so set wal_used to nullptr if
   // log_number_ is already set.
   s = db_impl_->WriteImpl(write_options, GetWriteBatch()->GetWriteBatch(),
                           /*callback*/ nullptr, /*user_write_cb=*/nullptr,

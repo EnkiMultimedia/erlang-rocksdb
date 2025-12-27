@@ -6,20 +6,21 @@
 
 #pragma once
 
-#include <memory>
 #include <string>
 
-#include "faiss/IndexIVF.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/utilities/secondary_index.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-// A SecondaryIndex implementation that wraps a FAISS inverted file index.
-class FaissIVFIndex : public SecondaryIndex {
+// EXPERIMENTAL
+//
+// A simple secondary index implementation that indexes the specified column
+// as-is.
+
+class SimpleSecondaryIndex : public SecondaryIndex {
  public:
-  explicit FaissIVFIndex(std::unique_ptr<faiss::IndexIVF>&& index,
-                         std::string primary_column_name);
-  ~FaissIVFIndex() override;
+  explicit SimpleSecondaryIndex(std::string primary_column_name);
 
   void SetPrimaryColumnFamily(ColumnFamilyHandle* column_family) override;
   void SetSecondaryColumnFamily(ColumnFamilyHandle* column_family) override;
@@ -38,6 +39,9 @@ class FaissIVFIndex : public SecondaryIndex {
       const Slice& primary_key, const Slice& primary_column_value,
       std::variant<Slice, std::string>* secondary_key_prefix) const override;
 
+  Status FinalizeSecondaryKeyPrefix(
+      std::variant<Slice, std::string>* secondary_key_prefix) const override;
+
   Status GetSecondaryValue(const Slice& primary_key,
                            const Slice& primary_column_value,
                            const Slice& original_column_value,
@@ -45,13 +49,6 @@ class FaissIVFIndex : public SecondaryIndex {
                                secondary_value) const override;
 
  private:
-  class Adapter;
-
-  static std::string SerializeLabel(faiss::idx_t label);
-  static faiss::idx_t DeserializeLabel(Slice label_slice);
-
-  std::unique_ptr<Adapter> adapter_;
-  std::unique_ptr<faiss::IndexIVF> index_;
   std::string primary_column_name_;
   ColumnFamilyHandle* primary_column_family_{};
   ColumnFamilyHandle* secondary_column_family_{};

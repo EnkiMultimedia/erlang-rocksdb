@@ -246,7 +246,6 @@ Status Configurable::ParseOption(const ConfigOptions& config_options,
   }
 }
 
-
 Status ConfigurableHelper::ConfigureOptions(
     const ConfigOptions& config_options, Configurable& configurable,
     const std::unordered_map<std::string, std::string>& opts_map,
@@ -273,7 +272,8 @@ Status ConfigurableHelper::ConfigureOptions(
   if (config_options.ignore_unknown_options) {
     s = Status::OK();
   } else if (s.ok() && unused == nullptr && !remaining.empty()) {
-    s = Status::NotFound("Could not find option: ", remaining.begin()->first);
+    s = Status::NotFound("Extra option not recognized",
+                         remaining.begin()->first);
   }
   return s;
 }
@@ -329,7 +329,7 @@ Status ConfigurableHelper::ConfigureSomeOptions(
         }
       }
     }  // End for all remaining options
-  }    // End while found one or options remain
+  }  // End while found one or options remain
 
   // Now that we have been through the list, remove any unsupported
   for (const auto& u : unsupported) {
@@ -370,7 +370,7 @@ Status ConfigurableHelper::ConfigureSingleOption(
   const auto opt_info =
       FindOption(configurable, opt_name, &elem_name, &opt_ptr);
   if (opt_info == nullptr) {
-    return Status::NotFound("Could not find option: ", name);
+    return Status::NotFound("Could not find option", name);
   } else {
     return ConfigureOption(config_options, configurable, *opt_info, opt_name,
                            elem_name, value, opt_ptr);
@@ -466,7 +466,7 @@ Status ConfigurableHelper::ConfigureOption(
     return configurable.ParseOption(config_options, opt_info, name, value,
                                     opt_ptr);
   } else {
-    return Status::NotFound("Could not find option: ", name);
+    return Status::NotFound("Unknown how to configure option", name);
   }
 }
 

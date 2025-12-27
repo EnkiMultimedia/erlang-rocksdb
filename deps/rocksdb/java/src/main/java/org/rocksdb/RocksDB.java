@@ -84,13 +84,7 @@ public class RocksDB extends RocksObject {
       return;
     }
 
-    while (libraryLoaded.get() == LibraryState.LOADING) {
-      try {
-        Thread.sleep(10);
-      } catch(final InterruptedException e) {
-        //ignore
-      }
-    }
+    waitForLibraryToBeLoaded();
   }
 
   /**
@@ -146,12 +140,28 @@ public class RocksDB extends RocksObject {
       return;
     }
 
-    while (libraryLoaded.get() == LibraryState.LOADING) {
-      try {
-        Thread.sleep(10);
-      } catch(final InterruptedException e) {
-        //ignore
+    waitForLibraryToBeLoaded();
+  }
+
+  private static void waitForLibraryToBeLoaded() {
+    final long wait = 10; // Time to wait before re-checking if another thread loaded the library
+    final long timeout =
+        10 * 1000; // Maximum time to wait for another thread to load the library (10 seconds)
+    long waited = 0;
+    try {
+      while (libraryLoaded.get() == LibraryState.LOADING) {
+        Thread.sleep(wait);
+        waited += wait;
+
+        if (waited >= timeout) {
+          throw new RuntimeException(
+              "Exceeded timeout whilst trying to load the RocksDB shared library");
+        }
       }
+    } catch (final InterruptedException e) {
+      // restore interrupted status
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted whilst trying to load the RocksDB shared library", e);
     }
   }
 
@@ -4126,6 +4136,7 @@ public class RocksDB extends RocksObject {
    *
    * @return the maximum level
    */
+  @Deprecated
   public int maxMemCompactionLevel() {
     return maxMemCompactionLevel(null);
   }
@@ -4420,19 +4431,6 @@ public class RocksDB extends RocksObject {
   }
 
   /**
-   * Delete the file name from the db directory and update the internal state to
-   * reflect that. Supports deletion of sst and log files only. 'name' must be
-   * path relative to the db directory. eg. 000001.sst, /archive/000003.log
-   *
-   * @param name the file name
-   *
-   * @throws RocksDBException if an error occurs whilst deleting the file
-   */
-  public void deleteFile(final String name) throws RocksDBException {
-    deleteFile(nativeHandle_, name);
-  }
-
-  /**
    * Gets a list of all table files metadata.
    *
    * @return table files metadata.
@@ -4646,10 +4644,13 @@ public class RocksDB extends RocksObject {
    * @param targetLevel the target level for L0
    *
    * @throws RocksDBException if an error occurs whilst promoting L0
+   *
+   * @deprecated this API may be removed in a future release.
    */
+  @Deprecated
   public void promoteL0(
-      /* @Nullable */final ColumnFamilyHandle columnFamilyHandle,
-      final int targetLevel) throws RocksDBException {
+      /* @Nullable */ final ColumnFamilyHandle columnFamilyHandle, final int targetLevel)
+      throws RocksDBException {
     promoteL0(nativeHandle_,
         columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_,
         targetLevel);
@@ -4661,9 +4662,11 @@ public class RocksDB extends RocksObject {
    * @param targetLevel the target level for L0
    *
    * @throws RocksDBException if an error occurs whilst promoting L0
+   *
+   * @deprecated this API may be removed in a future release.
    */
-  public void promoteL0(final int targetLevel)
-      throws RocksDBException {
+  @Deprecated
+  public void promoteL0(final int targetLevel) throws RocksDBException {
     promoteL0(null, targetLevel);
   }
 
@@ -5053,8 +5056,6 @@ public class RocksDB extends RocksObject {
       throws RocksDBException;
   private static native LogFile[] getSortedWalFiles(final long handle) throws RocksDBException;
   private static native long getUpdatesSince(final long handle, final long sequenceNumber)
-      throws RocksDBException;
-  private static native void deleteFile(final long handle, final String name)
       throws RocksDBException;
   private static native LiveFileMetaData[] getLiveFilesMetaData(final long handle);
   private static native ColumnFamilyMetaData getColumnFamilyMetaData(

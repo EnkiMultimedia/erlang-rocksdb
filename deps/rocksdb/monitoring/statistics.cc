@@ -226,10 +226,14 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {REMOTE_COMPACT_WRITE_BYTES, "rocksdb.remote.compact.write.bytes"},
     {HOT_FILE_READ_BYTES, "rocksdb.hot.file.read.bytes"},
     {WARM_FILE_READ_BYTES, "rocksdb.warm.file.read.bytes"},
+    {COOL_FILE_READ_BYTES, "rocksdb.cool.file.read.bytes"},
     {COLD_FILE_READ_BYTES, "rocksdb.cold.file.read.bytes"},
+    {ICE_FILE_READ_BYTES, "rocksdb.ice.file.read.bytes"},
     {HOT_FILE_READ_COUNT, "rocksdb.hot.file.read.count"},
     {WARM_FILE_READ_COUNT, "rocksdb.warm.file.read.count"},
+    {COOL_FILE_READ_COUNT, "rocksdb.cool.file.read.count"},
     {COLD_FILE_READ_COUNT, "rocksdb.cold.file.read.count"},
+    {ICE_FILE_READ_COUNT, "rocksdb.ice.file.read.count"},
     {LAST_LEVEL_READ_BYTES, "rocksdb.last.level.read.bytes"},
     {LAST_LEVEL_READ_COUNT, "rocksdb.last.level.read.count"},
     {NON_LAST_LEVEL_READ_BYTES, "rocksdb.non.last.level.read.bytes"},
@@ -262,6 +266,8 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {READAHEAD_TRIMMED, "rocksdb.readahead.trimmed"},
     {FIFO_MAX_SIZE_COMPACTIONS, "rocksdb.fifo.max.size.compactions"},
     {FIFO_TTL_COMPACTIONS, "rocksdb.fifo.ttl.compactions"},
+    {FIFO_CHANGE_TEMPERATURE_COMPACTIONS,
+     "rocksdb.fifo.change_temperature.compactions"},
     {PREFETCH_BYTES, "rocksdb.prefetch.bytes"},
     {PREFETCH_BYTES_USEFUL, "rocksdb.prefetch.bytes.useful"},
     {PREFETCH_HITS, "rocksdb.prefetch.hits"},
@@ -270,6 +276,9 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
      "rocksdb.file.read.corruption.retry.count"},
     {FILE_READ_CORRUPTION_RETRY_SUCCESS_COUNT,
      "rocksdb.file.read.corruption.retry.success.count"},
+    {NUMBER_WBWI_INGEST, "rocksdb.number.wbwi.ingest"},
+    {SST_USER_DEFINED_INDEX_LOAD_FAIL_COUNT,
+     "rocksdb.sst.user.defined.index.load.fail.count"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
@@ -336,10 +345,12 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
      "rocksdb.error.handler.autoresume.retry.count"},
     {ASYNC_READ_BYTES, "rocksdb.async.read.bytes"},
     {POLL_WAIT_MICROS, "rocksdb.poll.wait.micros"},
+    {COMPACTION_PREFETCH_BYTES, "rocksdb.compaction.prefetch.bytes"},
     {PREFETCHED_BYTES_DISCARDED, "rocksdb.prefetched.bytes.discarded"},
     {ASYNC_PREFETCH_ABORT_MICROS, "rocksdb.async.prefetch.abort.micros"},
     {TABLE_OPEN_PREFETCH_TAIL_READ_BYTES,
      "rocksdb.table.open.prefetch.tail.read.bytes"},
+    {NUM_OP_PER_TRANSACTION, "rocksdb.num.op.per.transaction"},
 };
 
 std::shared_ptr<Statistics> CreateDBStatistics() {

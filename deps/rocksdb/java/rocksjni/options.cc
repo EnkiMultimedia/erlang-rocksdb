@@ -1579,29 +1579,6 @@ jlong Java_org_rocksdb_Options_compactionReadaheadSize(JNIEnv*, jclass,
 
 /*
  * Class:     org_rocksdb_Options
- * Method:    setRandomAccessMaxBufferSize
- * Signature: (JJ)V
- */
-void Java_org_rocksdb_Options_setRandomAccessMaxBufferSize(
-    JNIEnv*, jclass, jlong jhandle, jlong jrandom_access_max_buffer_size) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
-  opt->random_access_max_buffer_size =
-      static_cast<size_t>(jrandom_access_max_buffer_size);
-}
-
-/*
- * Class:     org_rocksdb_Options
- * Method:    randomAccessMaxBufferSize
- * Signature: (J)J
- */
-jlong Java_org_rocksdb_Options_randomAccessMaxBufferSize(JNIEnv*, jclass,
-                                                         jlong jhandle) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
-  return static_cast<jlong>(opt->random_access_max_buffer_size);
-}
-
-/*
- * Class:     org_rocksdb_Options
  * Method:    setWritableFileMaxBufferSize
  * Signature: (JJ)V
  */
@@ -2080,29 +2057,6 @@ void Java_org_rocksdb_Options_setWalFilter(JNIEnv*, jclass, jlong jhandle,
 
 /*
  * Class:     org_rocksdb_Options
- * Method:    setFailIfOptionsFileError
- * Signature: (JZ)V
- */
-void Java_org_rocksdb_Options_setFailIfOptionsFileError(
-    JNIEnv*, jclass, jlong jhandle, jboolean jfail_if_options_file_error) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
-  opt->fail_if_options_file_error =
-      static_cast<bool>(jfail_if_options_file_error);
-}
-
-/*
- * Class:     org_rocksdb_Options
- * Method:    failIfOptionsFileError
- * Signature: (J)Z
- */
-jboolean Java_org_rocksdb_Options_failIfOptionsFileError(JNIEnv*, jclass,
-                                                         jlong jhandle) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
-  return static_cast<jboolean>(opt->fail_if_options_file_error);
-}
-
-/*
- * Class:     org_rocksdb_Options
  * Method:    setDumpMallocStats
  * Signature: (JZ)V
  */
@@ -2304,6 +2258,35 @@ jlong Java_org_rocksdb_Options_bgerrorResumeRetryInterval(JNIEnv*, jclass,
 
 /*
  * Class:     org_rocksdb_Options
+ * Method:    setDailyOffpeakTimeUTC
+ * Signature: (JLjava/lang/String;)V
+ */
+void Java_org_rocksdb_Options_setDailyOffpeakTimeUTC(JNIEnv* env, jclass,
+                                                     jlong jhandle,
+                                                     jstring jtimeutc) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
+  jboolean has_exception;
+  auto timeutc =
+      ROCKSDB_NAMESPACE::JniUtil::copyStdString(env, jtimeutc, &has_exception);
+  if (has_exception == JNI_TRUE) {
+    return;
+  }
+  opt->daily_offpeak_time_utc = timeutc;
+}
+
+/*
+ * Class:     org_rocksdb_Options
+ * Method:    dailyOffpeakTimeUTC
+ * Signature: (J)Ljava/lang/String;
+ */
+jstring Java_org_rocksdb_Options_dailyOffpeakTimeUTC(JNIEnv* env, jclass,
+                                                     jlong jhandle) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
+  return env->NewStringUTF(opt->daily_offpeak_time_utc.c_str());
+}
+
+/*
+ * Class:     org_rocksdb_Options
  * Method:    setAvoidFlushDuringShutdown
  * Signature: (JZ)V
  */
@@ -2449,28 +2432,6 @@ void Java_org_rocksdb_Options_setMinWriteBufferNumberToMerge(
   reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle)
       ->min_write_buffer_number_to_merge =
       static_cast<int>(jmin_write_buffer_number_to_merge);
-}
-/*
- * Class:     org_rocksdb_Options
- * Method:    maxWriteBufferNumberToMaintain
- * Signature: (J)I
- */
-jint Java_org_rocksdb_Options_maxWriteBufferNumberToMaintain(JNIEnv*, jclass,
-                                                             jlong jhandle) {
-  return reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle)
-      ->max_write_buffer_number_to_maintain;
-}
-
-/*
- * Class:     org_rocksdb_Options
- * Method:    setMaxWriteBufferNumberToMaintain
- * Signature: (JI)V
- */
-void Java_org_rocksdb_Options_setMaxWriteBufferNumberToMaintain(
-    JNIEnv*, jclass, jlong jhandle, jint jmax_write_buffer_number_to_maintain) {
-  reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle)
-      ->max_write_buffer_number_to_maintain =
-      static_cast<int>(jmax_write_buffer_number_to_maintain);
 }
 
 /*
@@ -4488,29 +4449,6 @@ void Java_org_rocksdb_ColumnFamilyOptions_setMinWriteBufferNumberToMerge(
   reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyOptions*>(jhandle)
       ->min_write_buffer_number_to_merge =
       static_cast<int>(jmin_write_buffer_number_to_merge);
-}
-
-/*
- * Class:     org_rocksdb_ColumnFamilyOptions
- * Method:    maxWriteBufferNumberToMaintain
- * Signature: (J)I
- */
-jint Java_org_rocksdb_ColumnFamilyOptions_maxWriteBufferNumberToMaintain(
-    JNIEnv*, jclass, jlong jhandle) {
-  return reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyOptions*>(jhandle)
-      ->max_write_buffer_number_to_maintain;
-}
-
-/*
- * Class:     org_rocksdb_ColumnFamilyOptions
- * Method:    setMaxWriteBufferNumberToMaintain
- * Signature: (JI)V
- */
-void Java_org_rocksdb_ColumnFamilyOptions_setMaxWriteBufferNumberToMaintain(
-    JNIEnv*, jclass, jlong jhandle, jint jmax_write_buffer_number_to_maintain) {
-  reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyOptions*>(jhandle)
-      ->max_write_buffer_number_to_maintain =
-      static_cast<int>(jmax_write_buffer_number_to_maintain);
 }
 
 /*
@@ -7085,29 +7023,6 @@ jlong Java_org_rocksdb_DBOptions_compactionReadaheadSize(JNIEnv*, jclass,
 
 /*
  * Class:     org_rocksdb_DBOptions
- * Method:    setRandomAccessMaxBufferSize
- * Signature: (JJ)V
- */
-void Java_org_rocksdb_DBOptions_setRandomAccessMaxBufferSize(
-    JNIEnv*, jclass, jlong jhandle, jlong jrandom_access_max_buffer_size) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
-  opt->random_access_max_buffer_size =
-      static_cast<size_t>(jrandom_access_max_buffer_size);
-}
-
-/*
- * Class:     org_rocksdb_DBOptions
- * Method:    randomAccessMaxBufferSize
- * Signature: (J)J
- */
-jlong Java_org_rocksdb_DBOptions_randomAccessMaxBufferSize(JNIEnv*, jclass,
-                                                           jlong jhandle) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
-  return static_cast<jlong>(opt->random_access_max_buffer_size);
-}
-
-/*
- * Class:     org_rocksdb_DBOptions
  * Method:    setWritableFileMaxBufferSize
  * Signature: (JJ)V
  */
@@ -7543,29 +7458,6 @@ void Java_org_rocksdb_DBOptions_setWalFilter(JNIEnv*, jclass, jlong jhandle,
 
 /*
  * Class:     org_rocksdb_DBOptions
- * Method:    setFailIfOptionsFileError
- * Signature: (JZ)V
- */
-void Java_org_rocksdb_DBOptions_setFailIfOptionsFileError(
-    JNIEnv*, jclass, jlong jhandle, jboolean jfail_if_options_file_error) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
-  opt->fail_if_options_file_error =
-      static_cast<bool>(jfail_if_options_file_error);
-}
-
-/*
- * Class:     org_rocksdb_DBOptions
- * Method:    failIfOptionsFileError
- * Signature: (J)Z
- */
-jboolean Java_org_rocksdb_DBOptions_failIfOptionsFileError(JNIEnv*, jclass,
-                                                           jlong jhandle) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
-  return static_cast<jboolean>(opt->fail_if_options_file_error);
-}
-
-/*
- * Class:     org_rocksdb_DBOptions
  * Method:    setDumpMallocStats
  * Signature: (JZ)V
  */
@@ -7876,6 +7768,35 @@ jlong Java_org_rocksdb_DBOptions_bgerrorResumeRetryInterval(JNIEnv*, jclass,
                                                             jlong jhandle) {
   auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
   return static_cast<jlong>(opt->bgerror_resume_retry_interval);
+}
+
+/*
+ * Class:     org_rocksdb_DBOptions
+ * Method:    setDailyOffpeakTimeUTC
+ * Signature: (JLjava/lang/String;)V
+ */
+void Java_org_rocksdb_DBOptions_setDailyOffpeakTimeUTC(JNIEnv* env, jclass,
+                                                       jlong jhandle,
+                                                       jstring jtimeutc) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
+  const jsize jtimesz = env->GetStringUTFLength(jtimeutc);
+  const char* timeutc = env->GetStringUTFChars(jtimeutc, nullptr);
+  if (env->ExceptionCheck()) {
+    return;
+  }
+  opt->daily_offpeak_time_utc = std::string(timeutc, jtimesz);
+  env->ReleaseStringUTFChars(jtimeutc, timeutc);
+}
+
+/*
+ * Class:     org_rocksdb_DBOptions
+ * Method:    dailyOffpeakTimeUTC
+ * Signature: (J)Ljava/lang/String;
+ */
+jstring Java_org_rocksdb_DBOptions_dailyOffpeakTimeUTC(JNIEnv* env, jclass,
+                                                       jlong jhandle) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
+  return env->NewStringUTF(opt->daily_offpeak_time_utc.c_str());
 }
 
 //////////////////////////////////////////////////////////////////////////////

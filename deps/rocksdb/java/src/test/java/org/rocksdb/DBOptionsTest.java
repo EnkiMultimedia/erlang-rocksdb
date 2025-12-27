@@ -463,15 +463,6 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void randomAccessMaxBufferSize() {
-    try(final DBOptions opt = new DBOptions()) {
-      final long longValue = rand.nextLong();
-      opt.setRandomAccessMaxBufferSize(longValue);
-      assertThat(opt.randomAccessMaxBufferSize()).isEqualTo(longValue);
-    }
-  }
-
-  @Test
   public void writableFileMaxBufferSize() {
     try(final DBOptions opt = new DBOptions()) {
       final long longValue = rand.nextLong();
@@ -662,15 +653,6 @@ public class DBOptionsTest {
         opt.setWalFilter(walFilter);
         assertThat(opt.walFilter()).isEqualTo(walFilter);
       }
-    }
-  }
-
-  @Test
-  public void failIfOptionsFileError() {
-    try (final DBOptions opt = new DBOptions()) {
-      final boolean boolValue = rand.nextBoolean();
-      opt.setFailIfOptionsFileError(boolValue);
-      assertThat(opt.failIfOptionsFileError()).isEqualTo(boolValue);
     }
   }
 

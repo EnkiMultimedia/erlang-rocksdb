@@ -4,13 +4,12 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
-#include "rocksdb/comparator.h"
-
 #include <queue>
 #include <string>
 #include <vector>
 
 #include "memory/arena.h"
+#include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
@@ -43,6 +42,7 @@ using MinIterHeap =
     std::priority_queue<InternalIterator*, std::vector<InternalIterator*>,
                         MinIterComparator>;
 
+// TODO: name to TailingIterator
 /**
  * ForwardIterator is a special type of iterator that only supports Seek()
  * and Next(). It is expected to perform better than TailingIterator by

@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/transactions/optimistic_transaction_db_impl.h"
 
 #include <string>
@@ -82,8 +81,7 @@ Status OptimisticTransactionDB::Open(
   for (auto& column_family : column_families_copy) {
     ColumnFamilyOptions* options = &column_family.options;
 
-    if (options->max_write_buffer_size_to_maintain == 0 &&
-        options->max_write_buffer_number_to_maintain == 0) {
+    if (options->max_write_buffer_size_to_maintain == 0) {
       // Setting to -1 will set the History size to
       // max_write_buffer_number * write_buffer_size.
       options->max_write_buffer_size_to_maintain = -1;

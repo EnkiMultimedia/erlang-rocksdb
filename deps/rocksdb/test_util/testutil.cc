@@ -91,9 +91,9 @@ bool ShouldPersistUDT(const UserDefinedTimestampTestMode& test_mode) {
   return test_mode != UserDefinedTimestampTestMode::kStripUserDefinedTimestamp;
 }
 
-Slice CompressibleString(Random* rnd, double compressed_fraction, int len,
+Slice CompressibleString(Random* rnd, double compressed_to_fraction, int len,
                          std::string* dst) {
-  int raw = static_cast<int>(len * compressed_fraction);
+  int raw = static_cast<int>(len * compressed_to_fraction);
   if (raw < 1) {
     raw = 1;
   }
@@ -308,9 +308,9 @@ void RandomInitDBOptions(DBOptions* db_opt, Random* rnd) {
   db_opt->is_fd_close_on_exec = rnd->Uniform(2);
   db_opt->paranoid_checks = rnd->Uniform(2);
   db_opt->track_and_verify_wals_in_manifest = rnd->Uniform(2);
+  db_opt->track_and_verify_wals = rnd->Uniform(2);
   db_opt->verify_sst_unique_id_in_manifest = rnd->Uniform(2);
   db_opt->skip_stats_update_on_db_open = rnd->Uniform(2);
-  db_opt->skip_checking_sst_file_sizes_on_db_open = rnd->Uniform(2);
   db_opt->use_adaptive_mutex = rnd->Uniform(2);
   db_opt->use_fsync = rnd->Uniform(2);
   db_opt->recycle_log_file_num = rnd->Uniform(2);
@@ -385,7 +385,6 @@ void RandomInitCFOptions(ColumnFamilyOptions* cf_opt, DBOptions& db_options,
   cf_opt->level0_stop_writes_trigger = rnd->Uniform(100);
   cf_opt->max_bytes_for_level_multiplier = rnd->Uniform(100);
   cf_opt->max_write_buffer_number = rnd->Uniform(100);
-  cf_opt->max_write_buffer_number_to_maintain = rnd->Uniform(100);
   cf_opt->max_write_buffer_size_to_maintain = rnd->Uniform(10000);
   cf_opt->min_write_buffer_number_to_merge = rnd->Uniform(100);
   cf_opt->num_levels = rnd->Uniform(100);
@@ -764,7 +763,6 @@ int RegisterTestObjects(ObjectLibrary& library, const std::string& arg) {
       });
   return static_cast<int>(library.GetFactoryCount(&num_types));
 }
-
 
 void RegisterTestLibrary(const std::string& arg) {
   static bool registered = false;

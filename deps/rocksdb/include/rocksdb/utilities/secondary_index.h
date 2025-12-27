@@ -6,10 +6,12 @@
 
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <variant>
 
+#include "rocksdb/iterator.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
@@ -18,10 +20,8 @@ namespace ROCKSDB_NAMESPACE {
 
 class ColumnFamilyHandle;
 
-//       / \     UNDER CONSTRUCTION
-//      / ! \    UNDER CONSTRUCTION
-//     /-----\   UNDER CONSTRUCTION
-
+// EXPERIMENTAL
+//
 // A secondary index is an additional data structure built over a set of primary
 // key-values that enables efficiently querying key-values by value instead of
 // key. Both plain and wide-column key-values can be indexed, the latter on a
@@ -49,6 +49,7 @@ class ColumnFamilyHandle;
 // Note: the methods of SecondaryIndex implementations are expected to be
 // thread-safe with the exception of Set{Primary,Secondary}ColumnFamily (which
 // are not expected to be called after initialization).
+
 class SecondaryIndex {
  public:
   virtual ~SecondaryIndex() = default;
@@ -77,12 +78,22 @@ class SecondaryIndex {
   // called by the transaction layer when adding or removing secondary index
   // entries (which have the form <secondary_key_prefix><primary_key> ->
   // <secondary_value>) and should be deterministic. The output parameter
-  // secondary_key_prefix is expected to be based on primary_column_value,
-  // potentially with some additional metadata to prevent ambiguities (e.g.
-  // index id or length indicator). Returning a non-OK status rolls back all
-  // operations in the transaction related to this primary key-value.
+  // secondary_key_prefix is expected to be based on primary_key and/or
+  // primary_column_value. Returning a non-OK status rolls back all operations
+  // in the transaction related to this primary key-value.
   virtual Status GetSecondaryKeyPrefix(
       const Slice& primary_key, const Slice& primary_column_value,
+      std::variant<Slice, std::string>* secondary_key_prefix) const = 0;
+
+  // Finalize the secondary key prefix, for instance by adding some metadata to
+  // prevent ambiguities (e.g. index id or length indicator). This method is
+  // called by the transaction layer when adding or removing secondary index
+  // entries (which have the form <secondary_key_prefix><primary_key> ->
+  // <secondary_value>) and also when querying the index (in which case it is
+  // called with the search target). The method should be deterministic.
+  // Returning a non-OK status rolls back all operations in the transaction
+  // related to this primary key-value.
+  virtual Status FinalizeSecondaryKeyPrefix(
       std::variant<Slice, std::string>* secondary_key_prefix) const = 0;
 
   // Get the optional secondary value for a given primary key-value. This method
@@ -97,6 +108,83 @@ class SecondaryIndex {
       const Slice& previous_column_value,
       std::optional<std::variant<Slice, std::string>>* secondary_value)
       const = 0;
+};
+
+// SecondaryIndexIterator can be used to find the primary keys for a given
+// search target. It can be used as-is or as a building block. Its interface
+// mirrors most of the Iterator API, with the exception of SeekToFirst,
+// SeekToLast, and SeekForPrev, which are not applicable to secondary indices
+// and thus not present. Querying the index can be performed by calling the
+// returned iterator's Seek API with a search target, and then using Next (and
+// potentially Prev) to iterate through the matching index entries. The iterator
+// exposes primary keys, that is, the secondary key prefix is stripped from the
+// index entries.
+
+class SecondaryIndexIterator {
+ public:
+  // Constructs a SecondaryIndexIterator. The SecondaryIndexIterator takes
+  // ownership of the underlying iterator.
+  // PRE: index is not nullptr
+  // PRE: underlying_it is not nullptr and points to an iterator over the
+  // index's secondary column family
+  SecondaryIndexIterator(const SecondaryIndex* index,
+                         std::unique_ptr<Iterator>&& underlying_it);
+
+  // Returns whether the iterator is valid, i.e. whether it is positioned on a
+  // secondary index entry matching the search target.
+  bool Valid() const;
+
+  // Returns the status of the iterator, which is guaranteed to be OK if the
+  // iterator is valid. Otherwise, it might be non-OK, which indicates an error,
+  // or OK, which means that the iterator has reached the end of the applicable
+  // secondary index entries.
+  Status status() const;
+
+  // Query the index with the given search target.
+  void Seek(const Slice& target);
+
+  // Move the iterator to the next entry.
+  // PRE: Valid()
+  void Next();
+
+  // Move the iterator back to the previous entry.
+  // PRE: Valid()
+  void Prev();
+
+  // Prepare the value of the current entry. Should be called before calling
+  // value() or columns() if the underlying iterator was constructed with the
+  // read option allow_unprepared_value set to true. Returns true upon success.
+  // Returns false and sets the status to non-OK upon failure.
+  // PRE: Valid()
+  bool PrepareValue();
+
+  // Returns the primary key from the current secondary index entry.
+  // PRE: Valid()
+  Slice key() const;
+
+  // Returns the value of the current secondary index entry.
+  // PRE: Valid()
+  Slice value() const;
+
+  // Returns the value of the current secondary index entry as a wide-column
+  // structure.
+  // PRE: Valid()
+  const WideColumns& columns() const;
+
+  // Returns the timestamp of the current secondary index entry.
+  // PRE: Valid()
+  Slice timestamp() const;
+
+  // Queries the given property of the underlying iterator. Returns OK on
+  // success, non-OK on failure.
+  // PRE: Valid()
+  Status GetProperty(std::string prop_name, std::string* prop) const;
+
+ private:
+  const SecondaryIndex* index_;
+  std::unique_ptr<Iterator> underlying_it_;
+  Status status_;
+  std::string prefix_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

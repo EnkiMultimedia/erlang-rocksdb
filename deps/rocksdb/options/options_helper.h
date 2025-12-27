@@ -25,11 +25,11 @@ struct MutableDBOptions;
 struct MutableCFOptions;
 struct Options;
 
-std::vector<CompressionType> GetSupportedCompressions();
+const std::vector<CompressionType>& GetSupportedCompressions();
 
-std::vector<CompressionType> GetSupportedDictCompressions();
+const std::vector<CompressionType>& GetSupportedDictCompressions();
 
-std::vector<ChecksumType> GetSupportedChecksums();
+const std::vector<ChecksumType>& GetSupportedChecksums();
 
 inline bool IsSupportedChecksumType(ChecksumType type) {
   // Avoid annoying compiler warning-as-error (-Werror=type-limits)
@@ -71,6 +71,9 @@ std::unique_ptr<Configurable> CFOptionsAsConfigurable(
 
 Status StringToMap(const std::string& opts_str,
                    std::unordered_map<std::string, std::string>* opts_map);
+
+Status GetStringFromCompressionType(std::string* compression_str,
+                                    CompressionType compression_type);
 
 struct OptionsHelper {
   static const std::string kCFOptionsName /*= "ColumnFamilyOptions"*/;
