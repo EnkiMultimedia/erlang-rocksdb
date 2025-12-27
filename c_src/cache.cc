@@ -98,7 +98,9 @@ NewCache(
     if (argv[0] == erocksdb::ATOM_LRU) {
         cache = rocksdb::NewLRUCache(capacity);
     } else if (argv[0] == erocksdb::ATOM_CLOCK) {
-        cache = rocksdb::NewClockCache(capacity);
+        // RocksDB 10.x: NewClockCache is deprecated, use HyperClockCache
+        rocksdb::HyperClockCacheOptions opts(capacity, 0 /* auto entry charge */);
+        cache = opts.MakeSharedCache();
     } else {
         return enif_make_badarg(env);
     }
