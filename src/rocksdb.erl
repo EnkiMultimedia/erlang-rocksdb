@@ -405,7 +405,8 @@
                          {tailing, boolean()} |
                          {total_order_seek, boolean()} |
                          {prefix_same_as_start, boolean()} |
-                         {snapshot, snapshot_handle()}].
+                         {snapshot, snapshot_handle()} |
+                         {auto_refresh_iterator_with_snapshot, boolean()}].
 
 -type write_options() :: [{sync, boolean()} |
                           {disable_wal, boolean()} |

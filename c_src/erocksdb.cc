@@ -357,6 +357,7 @@ ERL_NIF_TERM ATOM_TOTAL_ORDER_SEEK;
 ERL_NIF_TERM ATOM_PREFIX_SAME_AS_START;
 ERL_NIF_TERM ATOM_SNAPSHOT;
 ERL_NIF_TERM ATOM_BAD_SNAPSHOT;
+ERL_NIF_TERM ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT;
 
 // Related to Write Options
 ERL_NIF_TERM ATOM_SYNC;
@@ -710,6 +711,7 @@ try
   ATOM(erocksdb::ATOM_PREFIX_SAME_AS_START,"prefix_same_as_start");
   ATOM(erocksdb::ATOM_SNAPSHOT, "snapshot");
   ATOM(erocksdb::ATOM_BAD_SNAPSHOT, "bad_snapshot");
+  ATOM(erocksdb::ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT, "auto_refresh_iterator_with_snapshot");
 
   // Related to Write Options
   ATOM(erocksdb::ATOM_SYNC, "sync");
