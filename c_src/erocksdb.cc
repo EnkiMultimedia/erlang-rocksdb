@@ -129,6 +129,8 @@ static ErlNifFunc nif_funcs[] =
         {"batch_delete", 3, erocksdb::DeleteBatch, ERL_NIF_REGULAR_BOUND},
         {"batch_single_delete", 2, erocksdb::SingleDeleteBatch, ERL_NIF_REGULAR_BOUND},
         {"batch_single_delete", 3, erocksdb::SingleDeleteBatch, ERL_NIF_REGULAR_BOUND},
+        {"batch_delete_range", 3, erocksdb::DeleteRangeBatch, ERL_NIF_REGULAR_BOUND},
+        {"batch_delete_range", 4, erocksdb::DeleteRangeBatch, ERL_NIF_REGULAR_BOUND},
         {"batch_clear", 1, erocksdb::ClearBatch, ERL_NIF_REGULAR_BOUND},
         {"batch_savepoint", 1, erocksdb::BatchSetSavePoint, ERL_NIF_REGULAR_BOUND},
         {"batch_rollback", 1, erocksdb::BatchRollbackToSavePoint, ERL_NIF_REGULAR_BOUND},
@@ -375,7 +377,6 @@ ERL_NIF_TERM ATOM_EXCLUSIVE_MANUAL_COMPACTION;
 ERL_NIF_TERM ATOM_CHANGE_LEVEL;
 ERL_NIF_TERM ATOM_TARGET_LEVEL;
 ERL_NIF_TERM ATOM_ALLOW_WRITE_STALL;
-
 
 // Related to CompactionOptionsFIFO
 ERL_NIF_TERM ATOM_COMPACTION_OPTIONS_FIFO;

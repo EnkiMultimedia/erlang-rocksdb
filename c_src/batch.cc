@@ -299,6 +299,55 @@ SingleDeleteBatch(
     return ATOM_OK;
 }
 
+ERL_NIF_TERM
+DeleteRangeBatch(
+        ErlNifEnv* env,
+        int argc,
+        const ERL_NIF_TERM argv[])
+{
+    rocksdb::WriteBatch* wb = nullptr;
+    Batch* batch_ptr = nullptr;
+    ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
+    rocksdb::Slice begin;
+    rocksdb::Slice end;
+
+    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+        return enif_make_badarg(env);
+    wb = batch_ptr->wb;
+
+    if (argc > 3)
+    {
+        if(!enif_get_cf(env, argv[1], &cf_ptr))
+            return enif_make_badarg(env);
+
+        if (!binary_to_slice(env, argv[2], &begin))
+            return enif_make_badarg(env);
+
+        if (!binary_to_slice(env, argv[3], &end))
+            return enif_make_badarg(env);
+
+        enif_make_copy(batch_ptr->env, argv[2]);
+        enif_make_copy(batch_ptr->env, argv[3]);
+
+        erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
+        wb->DeleteRange(cf->m_ColumnFamily, begin, end);
+    }
+    else
+    {
+        if (!binary_to_slice(env, argv[1], &begin))
+            return enif_make_badarg(env);
+
+        if (!binary_to_slice(env, argv[2], &end))
+            return enif_make_badarg(env);
+
+        enif_make_copy(batch_ptr->env, argv[1]);
+        enif_make_copy(batch_ptr->env, argv[2]);
+
+        wb->DeleteRange(begin, end);
+    }
+
+    return ATOM_OK;
+}
 
 
 ERL_NIF_TERM

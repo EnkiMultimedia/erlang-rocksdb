@@ -151,6 +151,7 @@
          batch_merge/3, batch_merge/4,
          batch_delete/2, batch_delete/3,
          batch_single_delete/2, batch_single_delete/3,
+         batch_delete_range/3, batch_delete_range/4,
          batch_clear/1,
          batch_savepoint/1,
          batch_rollback/1,
@@ -271,7 +272,7 @@
 
 -type compaction_options_fifo() :: [{max_table_file_size, pos_integer()} |
                                     {allow_compaction, boolean()}].
-                            
+
 
 -type block_based_table_options() :: [{no_block_cache, boolean()} |
                                       {block_size, pos_integer()} |
@@ -1236,6 +1237,16 @@ batch_single_delete(_Batch, _Key) ->
 %% @doc like `batch_single_delete/2' but apply the operation to a column family
 -spec batch_single_delete(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Key :: binary()) -> ok.
 batch_single_delete(_Batch, _ColumnFamily, _Key) ->
+  ?nif_stub.
+
+%% @doc batch implementation of `delete_range/5`
+-spec batch_delete_range(Batch :: batch_handle(), Begin :: binary(), End :: binary()) -> ok.
+batch_delete_range(_Batch, _Begin, _End) ->
+  ?nif_stub.
+
+%% @doc batch implementation of `delete_range/5, but apply the operation to a column family`
+-spec batch_delete_range(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Begin :: binary(), End :: binary()) -> ok.
+batch_delete_range(_Batch, _ColumnFamily, _Begin, _End) ->
   ?nif_stub.
 
 %% @doc return the number of operations in the batch

@@ -72,6 +72,30 @@ single_delete_test() ->
   close_destroy(Db, "test.db"),
   ok.
 
+delete_range_test() ->
+  Db = destroy_reopen("test.db", [{create_if_missing, true}]),
+  {ok, Batch} = rocksdb:batch(),
+  ok = rocksdb:batch_put(Batch, <<"a">>, <<"v1">>),
+  ok = rocksdb:batch_put(Batch, <<"b">>, <<"v2">>),
+  ok = rocksdb:batch_put(Batch, <<"c">>, <<"v3">>),
+  ok = rocksdb:batch_put(Batch, <<"d">>, <<"v4">>),
+  ok = rocksdb:write_batch(Db, Batch, []),
+  ?assertEqual({ok, <<"v1">>}, rocksdb:get(Db, <<"a">>, [])),
+  ?assertEqual({ok, <<"v2">>}, rocksdb:get(Db, <<"b">>, [])),
+  ?assertEqual({ok, <<"v3">>}, rocksdb:get(Db, <<"c">>, [])),
+  ?assertEqual({ok, <<"v4">>}, rocksdb:get(Db, <<"d">>, [])),
+  ok = rocksdb:release_batch(Batch),
+  {ok, Batch1} = rocksdb:batch(),
+  ok = rocksdb:batch_delete_range(Batch1, <<"a">>, <<"c">>),
+  ok = rocksdb:write_batch(Db, Batch1, []),
+  ok = rocksdb:release_batch(Batch1),
+  ?assertEqual(not_found, rocksdb:get(Db, <<"a">>, [])),
+  ?assertEqual(not_found, rocksdb:get(Db, <<"b">>, [])),
+  ?assertEqual({ok, <<"v3">>}, rocksdb:get(Db, <<"c">>, [])),
+  ?assertEqual({ok, <<"v4">>}, rocksdb:get(Db, <<"d">>, [])),
+  close_destroy(Db, "test.db"),
+  ok.
+
 delete_with_notfound_test() ->
   Db = destroy_reopen("test.db", [{create_if_missing, true}]),
 
