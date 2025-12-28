@@ -80,6 +80,10 @@ static ErlNifFunc nif_funcs[] =
         {"delete", 4, erocksdb::Delete, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"single_delete", 3, erocksdb::SingleDelete, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"single_delete", 4, erocksdb::SingleDelete, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"put_entity", 4, erocksdb::PutEntity, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"put_entity", 5, erocksdb::PutEntity, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"get_entity", 3, erocksdb::GetEntity, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"get_entity", 4, erocksdb::GetEntity, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
         {"snapshot", 1, erocksdb::Snapshot, ERL_NIF_REGULAR_BOUND},
         {"release_snapshot", 1, erocksdb::ReleaseSnapshot, ERL_NIF_REGULAR_BOUND},
@@ -93,6 +97,7 @@ static ErlNifFunc nif_funcs[] =
         {"iterator_move", 2, erocksdb::IteratorMove, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_refresh", 1, erocksdb::IteratorRefresh, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_close", 1, erocksdb::IteratorClose, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"iterator_columns", 1, erocksdb::IteratorColumns, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
         {"get_latest_sequence_number", 1, erocksdb::GetLatestSequenceNumber, ERL_NIF_REGULAR_BOUND},
 

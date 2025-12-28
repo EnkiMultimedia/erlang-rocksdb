@@ -26,6 +26,7 @@
 #include "rocksdb/comparator.h"
 #include "rocksdb/write_batch.h"
 #include "rocksdb/slice_transform.h"
+#include "rocksdb/wide_columns.h"
 
 #include "atoms.h"
 #include "erl_nif.h"
@@ -436,5 +437,55 @@ IteratorClose(
     }   // else
 
 }   // erocksdb:IteratorClose
+
+ERL_NIF_TERM
+IteratorColumns(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM argv[])
+{
+    const ERL_NIF_TERM& itr_handle_ref = argv[0];
+
+    ReferencePtr<ItrObject> itr_ptr;
+    itr_ptr.assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
+
+    if(NULL==itr_ptr.get())
+    {
+        return enif_make_badarg(env);
+    }
+
+    rocksdb::Iterator* itr = itr_ptr->m_Iterator;
+
+    if(!itr->Valid())
+    {
+        return enif_make_tuple2(env, ATOM_ERROR, ATOM_INVALID_ITERATOR);
+    }
+
+    rocksdb::Status status = itr->status();
+    if(!status.ok())
+    {
+        return error_tuple(env, ATOM_ERROR, status);
+    }
+
+    // Get columns from iterator
+    const rocksdb::WideColumns& cols = itr->columns();
+
+    // Build result list: [{Name, Value}, ...]
+    ERL_NIF_TERM result_list = enif_make_list(env, 0);
+
+    // Build in reverse order (since we prepend)
+    for (auto it = cols.rbegin(); it != cols.rend(); ++it)
+    {
+        ERL_NIF_TERM name_bin, value_bin;
+        memcpy(enif_make_new_binary(env, it->name().size(), &name_bin),
+               it->name().data(), it->name().size());
+        memcpy(enif_make_new_binary(env, it->value().size(), &value_bin),
+               it->value().data(), it->value().size());
+        ERL_NIF_TERM tuple = enif_make_tuple2(env, name_bin, value_bin);
+        result_list = enif_make_list_cell(env, tuple, result_list);
+    }
+
+    return enif_make_tuple2(env, ATOM_OK, result_list);
+}   // erocksdb::IteratorColumns
 
 }
