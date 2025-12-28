@@ -278,7 +278,7 @@ ERL_NIF_TERM ATOM_BLOB_GC_FORCE_THRESHOLD;
 ERL_NIF_TERM ATOM_BLOB_COMPACTION_READAHEAD_SIZE;
 ERL_NIF_TERM ATOM_BLOB_FILE_STARTING_LEVEL;
 ERL_NIF_TERM ATOM_BLOB_CACHE;
-ERL_NIF_TERM ATOM_PREPOLUATE_BLOB_CACHE;
+ERL_NIF_TERM ATOM_PREPOPULATE_BLOB_CACHE;
 
 // Related to CFOpCompressionOptions
 ERL_NIF_TERM ATOM_BOTTOMMOST_COMPRESSION;
@@ -651,7 +651,7 @@ try
   ATOM(erocksdb::ATOM_BLOB_COMPACTION_READAHEAD_SIZE, "blob_compaction_readahead_size");
   ATOM(erocksdb::ATOM_BLOB_FILE_STARTING_LEVEL, "blob_file_starting_level");
   ATOM(erocksdb::ATOM_BLOB_CACHE, "blob_cache");
-  ATOM(erocksdb::ATOM_PREPOLUATE_BLOB_CACHE, "prepopulate_blob_cache");
+  ATOM(erocksdb::ATOM_PREPOPULATE_BLOB_CACHE, "prepopulate_blob_cache");
   ATOM(erocksdb::ATOM_BOTTOMMOST_COMPRESSION, "bottommost_compression");
   ATOM(erocksdb::ATOM_BOTTOMMOST_COMPRESSION_OPTS, "bottommost_compression_opts");
   ATOM(erocksdb::ATOM_COMPRESSION_OPTS, "compression_opts");

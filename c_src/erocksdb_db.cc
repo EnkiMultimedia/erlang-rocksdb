@@ -817,7 +817,7 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
             opts.blob_cache = cache;
           }
         }
-        if(option[0] == erocksdb::ATOM_PREPOLUATE_BLOB_CACHE)
+        if(option[0] == erocksdb::ATOM_PREPOPULATE_BLOB_CACHE)
         {
           if (option[1] == erocksdb::ATOM_DISABLE)
           {
