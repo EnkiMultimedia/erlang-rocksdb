@@ -121,6 +121,34 @@ count(DBH, CFH) ->
   {ok, C} = rocksdb:get_property(DBH, CFH, <<"rocksdb.estimate-num-keys">>),
   binary_to_integer(C).
 
+%% Test coalescing iterator across multiple column families
+coalescing_iterator_test() ->
+  destroy_and_rm(?DB, []),
+  ColumnFamilies = [{"default", []}, {"cf1", []}, {"cf2", []}],
+  {ok, Db, [DefaultH, Cf1H, Cf2H]} = rocksdb:open(?DB, [{create_if_missing, true}, {create_missing_column_families, true}], ColumnFamilies),
+
+  %% Write different keys to different column families
+  ok = rocksdb:put(Db, DefaultH, <<"a">>, <<"default_a">>, []),
+  ok = rocksdb:put(Db, Cf1H, <<"b">>, <<"cf1_b">>, []),
+  ok = rocksdb:put(Db, Cf2H, <<"c">>, <<"cf2_c">>, []),
+  %% Write same key to multiple CFs - coalescing should only return first value
+  ok = rocksdb:put(Db, DefaultH, <<"d">>, <<"default_d">>, []),
+  ok = rocksdb:put(Db, Cf1H, <<"d">>, <<"cf1_d">>, []),
+
+  %% Create coalescing iterator over all three column families
+  {ok, Itr} = rocksdb:coalescing_iterator(Db, [DefaultH, Cf1H, Cf2H], []),
+
+  %% Iterate and collect all keys (should be sorted: a, b, c, d)
+  {ok, <<"a">>, <<"default_a">>} = rocksdb:iterator_move(Itr, first),
+  {ok, <<"b">>, <<"cf1_b">>} = rocksdb:iterator_move(Itr, next),
+  {ok, <<"c">>, <<"cf2_c">>} = rocksdb:iterator_move(Itr, next),
+  {ok, <<"d">>, _} = rocksdb:iterator_move(Itr, next),  % first value from either CF
+  {error, invalid_iterator} = rocksdb:iterator_move(Itr, next),
+
+  ok = rocksdb:iterator_close(Itr),
+  rocksdb:close(Db),
+  destroy_and_rm(?DB, []),
+  ok.
 
 destroy_and_rm(Dir, Options) ->
   rocksdb:destroy(Dir, Options),

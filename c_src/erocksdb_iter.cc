@@ -244,6 +244,63 @@ Iterators(
 }
 
 ERL_NIF_TERM
+CoalescingIterator(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    if(!enif_is_list(env, argv[1]) || !enif_is_list(env, argv[2]))
+       return enif_make_badarg(env);
+
+    rocksdb::ReadOptions opts;
+    ItrBounds bounds;
+    auto itr_env = std::make_shared<ErlEnvCtr>();
+    if (!parse_iterator_options(env, itr_env->env, argv[2], opts, bounds))
+    {
+        return enif_make_badarg(env);
+    }
+
+    std::vector<rocksdb::ColumnFamilyHandle*> column_families;
+    ERL_NIF_TERM head, tail = argv[1];
+    while(enif_get_list_cell(env, tail, &head, &tail))
+    {
+        ReferencePtr<ColumnFamilyObject> cf_ptr;
+        cf_ptr.assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
+        if(NULL == cf_ptr.get())
+            return enif_make_badarg(env);
+        column_families.push_back(cf_ptr->m_ColumnFamily);
+    }
+
+    std::unique_ptr<rocksdb::Iterator> iterator =
+        db_ptr->m_Db->NewCoalescingIterator(opts, column_families);
+
+    if (!iterator) {
+        rocksdb::Status status = rocksdb::Status::NotSupported("CoalescingIterator not available");
+        return error_tuple(env, ATOM_ERROR, status);
+    }
+
+    ItrObject* itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterator.release());
+
+    if(bounds.upper_bound_slice != nullptr)
+    {
+        itr_ptr->SetUpperBoundSlice(bounds.upper_bound_slice);
+    }
+
+    if(bounds.lower_bound_slice != nullptr)
+    {
+        itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
+    }
+
+    ERL_NIF_TERM result = enif_make_resource(env, itr_ptr);
+    enif_release_resource(itr_ptr);
+    return enif_make_tuple2(env, ATOM_OK, result);
+}
+
+ERL_NIF_TERM
 IteratorMove(
     ErlNifEnv* env,
     int /*argc*/,

@@ -66,6 +66,7 @@
   compact_range/4, compact_range/5,
   iterator/2, iterator/3,
   iterators/3,
+  coalescing_iterator/3,
   iterator_move/2,
   iterator_refresh/1,
   iterator_close/1
@@ -940,6 +941,17 @@ iterator(_DBHandle, _CfHandle, _ReadOpts) ->
 iterators(_DBHandle, _CFHandle, _ReadOpts) ->
   ?nif_stub.
 
+%% @doc
+%% Return a coalescing iterator over multiple column families.
+%% The iterator merges results from all column families and returns
+%% keys in sorted order. When the same key exists in multiple column
+%% families, only one value is returned (from the first CF in the list).
+-spec(coalescing_iterator(DBHandle, CFHandles, ReadOpts) ->
+             {ok, itr_handle()} | {error, any()} when DBHandle::db_handle(),
+                                                      CFHandles::[cf_handle()],
+                                                      ReadOpts::read_options()).
+coalescing_iterator(_DBHandle, _CFHandles, _ReadOpts) ->
+  ?nif_stub.
 
 %% @doc
 %% Move to the specified place
