@@ -222,6 +222,7 @@ static ErlNifFunc nif_funcs[] =
         {"new_statistics", 0, erocksdb::NewStatistics, ERL_NIF_REGULAR_BOUND},
         {"set_stats_level", 2, erocksdb::SetStatsLevel, ERL_NIF_REGULAR_BOUND},
         {"statistics_info", 1, erocksdb::StatisticsInfo, ERL_NIF_REGULAR_BOUND},
+        {"statistics_ticker", 2, erocksdb::StatisticsTicker, ERL_NIF_REGULAR_BOUND},
         {"release_statistics", 1, erocksdb::ReleaseStatistics, ERL_NIF_REGULAR_BOUND},
         };
 
@@ -548,6 +549,44 @@ ERL_NIF_TERM ATOM_STATS_EXCEPT_DETAILED_TIMERS;
 ERL_NIF_TERM ATOM_STATS_EXCEPT_TIME_FOR_MUTEX;
 ERL_NIF_TERM ATOM_STATS_ALL;
 ERL_NIF_TERM ATOM_STATS_LEVEL;
+
+// BlobDB Statistics Tickers
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_PUT;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_WRITE;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_GET;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_MULTIGET;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_SEEK;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_NEXT;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_PREV;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_KEYS_WRITTEN;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_KEYS_READ;
+ERL_NIF_TERM ATOM_BLOB_DB_BYTES_WRITTEN;
+ERL_NIF_TERM ATOM_BLOB_DB_BYTES_READ;
+ERL_NIF_TERM ATOM_BLOB_DB_WRITE_INLINED;
+ERL_NIF_TERM ATOM_BLOB_DB_WRITE_INLINED_TTL;
+ERL_NIF_TERM ATOM_BLOB_DB_WRITE_BLOB;
+ERL_NIF_TERM ATOM_BLOB_DB_WRITE_BLOB_TTL;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_BYTES_WRITTEN;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_BYTES_READ;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_SYNCED;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_INDEX_EXPIRED_COUNT;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_INDEX_EXPIRED_SIZE;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_INDEX_EVICTED_COUNT;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_INDEX_EVICTED_SIZE;
+ERL_NIF_TERM ATOM_BLOB_DB_GC_NUM_FILES;
+ERL_NIF_TERM ATOM_BLOB_DB_GC_NUM_NEW_FILES;
+ERL_NIF_TERM ATOM_BLOB_DB_GC_FAILURES;
+ERL_NIF_TERM ATOM_BLOB_DB_GC_NUM_KEYS_RELOCATED;
+ERL_NIF_TERM ATOM_BLOB_DB_GC_BYTES_RELOCATED;
+ERL_NIF_TERM ATOM_BLOB_DB_FIFO_NUM_FILES_EVICTED;
+ERL_NIF_TERM ATOM_BLOB_DB_FIFO_NUM_KEYS_EVICTED;
+ERL_NIF_TERM ATOM_BLOB_DB_FIFO_BYTES_EVICTED;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_MISS;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_HIT;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_ADD;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_ADD_FAILURES;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_BYTES_READ;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_BYTES_WRITE;
 
 // Pessimistic Transaction DB Options
 ERL_NIF_TERM ATOM_MAX_NUM_LOCKS;
@@ -919,6 +958,44 @@ try
   ATOM(erocksdb::ATOM_STATS_EXCEPT_TIME_FOR_MUTEX, "stats_except_time_for_mutex");
   ATOM(erocksdb::ATOM_STATS_ALL, "stats_all");
   ATOM(erocksdb::ATOM_STATS_LEVEL, "stats_level");
+
+  // BlobDB Statistics Tickers
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_PUT, "blob_db_num_put");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_WRITE, "blob_db_num_write");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_GET, "blob_db_num_get");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_MULTIGET, "blob_db_num_multiget");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_SEEK, "blob_db_num_seek");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_NEXT, "blob_db_num_next");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_PREV, "blob_db_num_prev");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_KEYS_WRITTEN, "blob_db_num_keys_written");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_KEYS_READ, "blob_db_num_keys_read");
+  ATOM(erocksdb::ATOM_BLOB_DB_BYTES_WRITTEN, "blob_db_bytes_written");
+  ATOM(erocksdb::ATOM_BLOB_DB_BYTES_READ, "blob_db_bytes_read");
+  ATOM(erocksdb::ATOM_BLOB_DB_WRITE_INLINED, "blob_db_write_inlined");
+  ATOM(erocksdb::ATOM_BLOB_DB_WRITE_INLINED_TTL, "blob_db_write_inlined_ttl");
+  ATOM(erocksdb::ATOM_BLOB_DB_WRITE_BLOB, "blob_db_write_blob");
+  ATOM(erocksdb::ATOM_BLOB_DB_WRITE_BLOB_TTL, "blob_db_write_blob_ttl");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_BYTES_WRITTEN, "blob_db_blob_file_bytes_written");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_BYTES_READ, "blob_db_blob_file_bytes_read");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_SYNCED, "blob_db_blob_file_synced");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_INDEX_EXPIRED_COUNT, "blob_db_blob_index_expired_count");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_INDEX_EXPIRED_SIZE, "blob_db_blob_index_expired_size");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_INDEX_EVICTED_COUNT, "blob_db_blob_index_evicted_count");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_INDEX_EVICTED_SIZE, "blob_db_blob_index_evicted_size");
+  ATOM(erocksdb::ATOM_BLOB_DB_GC_NUM_FILES, "blob_db_gc_num_files");
+  ATOM(erocksdb::ATOM_BLOB_DB_GC_NUM_NEW_FILES, "blob_db_gc_num_new_files");
+  ATOM(erocksdb::ATOM_BLOB_DB_GC_FAILURES, "blob_db_gc_failures");
+  ATOM(erocksdb::ATOM_BLOB_DB_GC_NUM_KEYS_RELOCATED, "blob_db_gc_num_keys_relocated");
+  ATOM(erocksdb::ATOM_BLOB_DB_GC_BYTES_RELOCATED, "blob_db_gc_bytes_relocated");
+  ATOM(erocksdb::ATOM_BLOB_DB_FIFO_NUM_FILES_EVICTED, "blob_db_fifo_num_files_evicted");
+  ATOM(erocksdb::ATOM_BLOB_DB_FIFO_NUM_KEYS_EVICTED, "blob_db_fifo_num_keys_evicted");
+  ATOM(erocksdb::ATOM_BLOB_DB_FIFO_BYTES_EVICTED, "blob_db_fifo_bytes_evicted");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_MISS, "blob_db_cache_miss");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_HIT, "blob_db_cache_hit");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_ADD, "blob_db_cache_add");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_ADD_FAILURES, "blob_db_cache_add_failures");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_BYTES_READ, "blob_db_cache_bytes_read");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_BYTES_WRITE, "blob_db_cache_bytes_write");
 
   // Pessimistic Transaction DB Options
   ATOM(erocksdb::ATOM_MAX_NUM_LOCKS, "max_num_locks");

@@ -124,6 +124,7 @@
   new_statistics/0,
   set_stats_level/2,
   statistics_info/1,
+  statistics_ticker/2,
   release_statistics/1
 ]).
 
@@ -482,6 +483,43 @@
       stats_except_detailed_timers |
       stats_except_time_for_mutex |
       stats_all.
+
+-type blob_db_ticker() :: blob_db_num_put |
+      blob_db_num_write |
+      blob_db_num_get |
+      blob_db_num_multiget |
+      blob_db_num_seek |
+      blob_db_num_next |
+      blob_db_num_prev |
+      blob_db_num_keys_written |
+      blob_db_num_keys_read |
+      blob_db_bytes_written |
+      blob_db_bytes_read |
+      blob_db_write_inlined |
+      blob_db_write_inlined_ttl |
+      blob_db_write_blob |
+      blob_db_write_blob_ttl |
+      blob_db_blob_file_bytes_written |
+      blob_db_blob_file_bytes_read |
+      blob_db_blob_file_synced |
+      blob_db_blob_index_expired_count |
+      blob_db_blob_index_expired_size |
+      blob_db_blob_index_evicted_count |
+      blob_db_blob_index_evicted_size |
+      blob_db_gc_num_files |
+      blob_db_gc_num_new_files |
+      blob_db_gc_failures |
+      blob_db_gc_num_keys_relocated |
+      blob_db_gc_bytes_relocated |
+      blob_db_fifo_num_files_evicted |
+      blob_db_fifo_num_keys_evicted |
+      blob_db_fifo_bytes_evicted |
+      blob_db_cache_miss |
+      blob_db_cache_hit |
+      blob_db_cache_add |
+      blob_db_cache_add_failures |
+      blob_db_cache_bytes_read |
+      blob_db_cache_bytes_write.
 
 -compile(no_native).
 -on_load(on_load/0).
@@ -2055,6 +2093,13 @@ set_stats_level(_StatisticsHandle, _StatsLevel) ->
   InfoList :: [InfoTuple],
   InfoTuple :: {stats_level, stats_level()}.
 statistics_info(_Statistics) ->
+  ?nif_stub.
+
+%% @doc Get the count for a specific statistics ticker.
+%% Returns the count for BlobDB related tickers such as blob_db_num_put,
+%% blob_db_cache_hit, blob_db_gc_num_files, etc.
+-spec statistics_ticker(statistics_handle(), blob_db_ticker()) -> {ok, non_neg_integer()}.
+statistics_ticker(_Statistics, _Ticker) ->
   ?nif_stub.
 
 

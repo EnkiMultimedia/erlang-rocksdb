@@ -213,4 +213,208 @@ StatisticsInfo(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
                                info);
 }
 
+bool TickerAtomToEnum(ERL_NIF_TERM atom, rocksdb::Tickers* ticker)
+{
+    // BlobDB Tickers
+    if (atom == ATOM_BLOB_DB_NUM_PUT)
+    {
+        *ticker = rocksdb::BLOB_DB_NUM_PUT;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_NUM_WRITE)
+    {
+        *ticker = rocksdb::BLOB_DB_NUM_WRITE;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_NUM_GET)
+    {
+        *ticker = rocksdb::BLOB_DB_NUM_GET;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_NUM_MULTIGET)
+    {
+        *ticker = rocksdb::BLOB_DB_NUM_MULTIGET;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_NUM_SEEK)
+    {
+        *ticker = rocksdb::BLOB_DB_NUM_SEEK;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_NUM_NEXT)
+    {
+        *ticker = rocksdb::BLOB_DB_NUM_NEXT;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_NUM_PREV)
+    {
+        *ticker = rocksdb::BLOB_DB_NUM_PREV;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_NUM_KEYS_WRITTEN)
+    {
+        *ticker = rocksdb::BLOB_DB_NUM_KEYS_WRITTEN;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_NUM_KEYS_READ)
+    {
+        *ticker = rocksdb::BLOB_DB_NUM_KEYS_READ;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BYTES_WRITTEN)
+    {
+        *ticker = rocksdb::BLOB_DB_BYTES_WRITTEN;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BYTES_READ)
+    {
+        *ticker = rocksdb::BLOB_DB_BYTES_READ;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_WRITE_INLINED)
+    {
+        *ticker = rocksdb::BLOB_DB_WRITE_INLINED;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_WRITE_INLINED_TTL)
+    {
+        *ticker = rocksdb::BLOB_DB_WRITE_INLINED_TTL;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_WRITE_BLOB)
+    {
+        *ticker = rocksdb::BLOB_DB_WRITE_BLOB;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_WRITE_BLOB_TTL)
+    {
+        *ticker = rocksdb::BLOB_DB_WRITE_BLOB_TTL;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BLOB_FILE_BYTES_WRITTEN)
+    {
+        *ticker = rocksdb::BLOB_DB_BLOB_FILE_BYTES_WRITTEN;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BLOB_FILE_BYTES_READ)
+    {
+        *ticker = rocksdb::BLOB_DB_BLOB_FILE_BYTES_READ;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BLOB_FILE_SYNCED)
+    {
+        *ticker = rocksdb::BLOB_DB_BLOB_FILE_SYNCED;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BLOB_INDEX_EXPIRED_COUNT)
+    {
+        *ticker = rocksdb::BLOB_DB_BLOB_INDEX_EXPIRED_COUNT;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BLOB_INDEX_EXPIRED_SIZE)
+    {
+        *ticker = rocksdb::BLOB_DB_BLOB_INDEX_EXPIRED_SIZE;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BLOB_INDEX_EVICTED_COUNT)
+    {
+        *ticker = rocksdb::BLOB_DB_BLOB_INDEX_EVICTED_COUNT;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BLOB_INDEX_EVICTED_SIZE)
+    {
+        *ticker = rocksdb::BLOB_DB_BLOB_INDEX_EVICTED_SIZE;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_GC_NUM_FILES)
+    {
+        *ticker = rocksdb::BLOB_DB_GC_NUM_FILES;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_GC_NUM_NEW_FILES)
+    {
+        *ticker = rocksdb::BLOB_DB_GC_NUM_NEW_FILES;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_GC_FAILURES)
+    {
+        *ticker = rocksdb::BLOB_DB_GC_FAILURES;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_GC_NUM_KEYS_RELOCATED)
+    {
+        *ticker = rocksdb::BLOB_DB_GC_NUM_KEYS_RELOCATED;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_GC_BYTES_RELOCATED)
+    {
+        *ticker = rocksdb::BLOB_DB_GC_BYTES_RELOCATED;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_FIFO_NUM_FILES_EVICTED)
+    {
+        *ticker = rocksdb::BLOB_DB_FIFO_NUM_FILES_EVICTED;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_FIFO_NUM_KEYS_EVICTED)
+    {
+        *ticker = rocksdb::BLOB_DB_FIFO_NUM_KEYS_EVICTED;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_FIFO_BYTES_EVICTED)
+    {
+        *ticker = rocksdb::BLOB_DB_FIFO_BYTES_EVICTED;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_CACHE_MISS)
+    {
+        *ticker = rocksdb::BLOB_DB_CACHE_MISS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_CACHE_HIT)
+    {
+        *ticker = rocksdb::BLOB_DB_CACHE_HIT;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_CACHE_ADD)
+    {
+        *ticker = rocksdb::BLOB_DB_CACHE_ADD;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_CACHE_ADD_FAILURES)
+    {
+        *ticker = rocksdb::BLOB_DB_CACHE_ADD_FAILURES;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_CACHE_BYTES_READ)
+    {
+        *ticker = rocksdb::BLOB_DB_CACHE_BYTES_READ;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_CACHE_BYTES_WRITE)
+    {
+        *ticker = rocksdb::BLOB_DB_CACHE_BYTES_WRITE;
+        return true;
+    }
+    return false;
+}
+
+ERL_NIF_TERM
+StatisticsTicker(ErlNifEnv *env, int /*argc*/, const ERL_NIF_TERM argv[])
+{
+    Statistics* statistics_ptr = erocksdb::Statistics::RetrieveStatisticsResource(env, argv[0]);
+    if (statistics_ptr == nullptr)
+        return enif_make_badarg(env);
+
+    rocksdb::Tickers ticker;
+    if (!TickerAtomToEnum(argv[1], &ticker))
+        return enif_make_badarg(env);
+
+    std::lock_guard<std::mutex> guard(statistics_ptr->mu);
+    std::shared_ptr<rocksdb::Statistics> statistics = statistics_ptr->statistics();
+
+    uint64_t count = statistics->getTickerCount(ticker);
+    return enif_make_tuple2(env, ATOM_OK, enif_make_uint64(env, count));
+}
+
 }
