@@ -31,6 +31,7 @@
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb/utilities/optimistic_transaction_db.h"
+#include "rocksdb/utilities/transaction_db.h"
 
 #include "atoms.h"
 #include "refobjects.h"
@@ -2134,6 +2135,133 @@ GetEntity(
 
     return enif_make_tuple2(env, ATOM_OK, result_list);
 }   // erocksdb::GetEntity
+
+
+ERL_NIF_TERM
+parse_txn_db_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::TransactionDBOptions& opts)
+{
+    int arity;
+    const ERL_NIF_TERM* option;
+    if (enif_get_tuple(env, item, &arity, &option) && 2==arity)
+    {
+        if (option[0] == ATOM_MAX_NUM_LOCKS)
+        {
+            ErlNifSInt64 max_num_locks;
+            if (enif_get_int64(env, option[1], &max_num_locks))
+                opts.max_num_locks = max_num_locks;
+        }
+        else if (option[0] == ATOM_NUM_STRIPES)
+        {
+            ErlNifUInt64 num_stripes;
+            if (enif_get_uint64(env, option[1], &num_stripes))
+                opts.num_stripes = static_cast<size_t>(num_stripes);
+        }
+        else if (option[0] == ATOM_TRANSACTION_LOCK_TIMEOUT)
+        {
+            ErlNifSInt64 lock_timeout;
+            if (enif_get_int64(env, option[1], &lock_timeout))
+                opts.transaction_lock_timeout = lock_timeout;
+        }
+        else if (option[0] == ATOM_DEFAULT_LOCK_TIMEOUT)
+        {
+            ErlNifSInt64 lock_timeout;
+            if (enif_get_int64(env, option[1], &lock_timeout))
+                opts.default_lock_timeout = lock_timeout;
+        }
+    }
+    return ATOM_OK;
+}
+
+ERL_NIF_TERM
+OpenPessimisticTransactionDB(
+    ErlNifEnv* env,
+    int argc,
+    const ERL_NIF_TERM argv[])
+{
+    char db_name[4096];
+    DbObject * db_ptr;
+    rocksdb::TransactionDB *db;
+
+    // argv[0] = db_name
+    // argv[1] = db_options (merged with txn_db_options)
+    // argv[2] = column_family_descriptors (optional for 2-arity version)
+
+    if(!enif_get_string(env, argv[0], db_name, sizeof(db_name), ERL_NIF_LATIN1) ||
+       !enif_is_list(env, argv[1]))
+    {
+        return enif_make_badarg(env);
+    }
+
+    // Read DB options
+    rocksdb::DBOptions db_opts;
+    fold(env, argv[1], parse_db_option, db_opts);
+
+    // Read TransactionDB options from the same list
+    rocksdb::TransactionDBOptions txn_db_opts;
+    fold(env, argv[1], parse_txn_db_option, txn_db_opts);
+
+    std::vector<rocksdb::ColumnFamilyDescriptor> column_families;
+
+    if (argc == 3)
+    {
+        // With column families
+        if (!enif_is_list(env, argv[2]))
+            return enif_make_badarg(env);
+
+        ERL_NIF_TERM head, tail = argv[2];
+        while(enif_get_list_cell(env, tail, &head, &tail))
+        {
+            ERL_NIF_TERM result = parse_cf_descriptor(env, head, column_families);
+            if (result != ATOM_OK)
+            {
+                return result;
+            }
+        }
+    }
+    else
+    {
+        // Default column family only
+        column_families.push_back(rocksdb::ColumnFamilyDescriptor(
+            rocksdb::kDefaultColumnFamilyName, rocksdb::ColumnFamilyOptions()));
+    }
+
+    std::vector<rocksdb::ColumnFamilyHandle*> handles;
+    rocksdb::Status status = rocksdb::TransactionDB::Open(
+        db_opts, txn_db_opts, db_name, column_families, &handles, &db);
+
+    if(!status.ok())
+        return error_tuple(env, ATOM_ERROR_DB_OPEN, status);
+
+    // Create DbObject with IsPessimistic = true
+    db_ptr = DbObject::CreateDbObject(db, true);
+
+    ERL_NIF_TERM result = enif_make_resource(env, db_ptr);
+
+    unsigned int num_cols = column_families.size();
+
+    ERL_NIF_TERM cf_list = enif_make_list(env, 0);
+    try {
+        for (unsigned int i = 0; i < num_cols; ++i)
+        {
+            ColumnFamilyObject * handle_ptr;
+            handle_ptr = ColumnFamilyObject::CreateColumnFamilyObject(db_ptr, handles[i]);
+            ERL_NIF_TERM cf = enif_make_resource(env, handle_ptr);
+            enif_release_resource(handle_ptr);
+            handle_ptr = NULL;
+            cf_list = enif_make_list_cell(env, cf, cf_list);
+        }
+    } catch (const std::exception&) {
+        // pass through
+    }
+
+    // Clear the automatic reference from enif_alloc_resource in CreateDbObject
+    enif_release_resource(db_ptr);
+
+    ERL_NIF_TERM cf_list_out;
+    enif_make_reverse_list(env, cf_list, &cf_list_out);
+
+    return enif_make_tuple3(env, ATOM_OK, result, cf_list_out);
+}   // OpenPessimisticTransactionDB
 
 
 }

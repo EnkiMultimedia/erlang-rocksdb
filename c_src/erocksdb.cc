@@ -17,6 +17,7 @@
 
 #include "atoms.h"
 #include "erocksdb.h"
+#include "erocksdb_db.h"
 #include "refobjects.h"
 #include "cache.h"
 #include "statistics.h"
@@ -24,6 +25,7 @@
 #include "env.h"
 #include "sst_file_manager.h"
 #include "write_buffer_manager.h"
+#include "pessimistic_transaction.h"
 
 // See erl_nif(3) Data Types sections for ErlNifFunc for more deails
 #define ERL_NIF_REGULAR_BOUND 0
@@ -122,6 +124,26 @@ static ErlNifFunc nif_funcs[] =
         {"transaction_commit", 1, erocksdb::CommitTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"transaction_rollback", 1, erocksdb::RollbackTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"release_transaction", 1, erocksdb::ReleaseTransaction, ERL_NIF_REGULAR_BOUND},
+
+        // pessimistic transaction db
+
+        {"open_pessimistic_transaction_db", 2, erocksdb::OpenPessimisticTransactionDB, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"open_pessimistic_transaction_db", 3, erocksdb::OpenPessimisticTransactionDB, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction", 2, erocksdb::NewPessimisticTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction", 3, erocksdb::NewPessimisticTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_put", 3, erocksdb::PessimisticTransactionPut, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_put", 4, erocksdb::PessimisticTransactionPut, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_get", 3, erocksdb::PessimisticTransactionGet, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_get", 4, erocksdb::PessimisticTransactionGet, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_get_for_update", 3, erocksdb::PessimisticTransactionGetForUpdate, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_get_for_update", 4, erocksdb::PessimisticTransactionGetForUpdate, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_delete", 2, erocksdb::PessimisticTransactionDelete, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_delete", 3, erocksdb::PessimisticTransactionDelete, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_iterator", 2, erocksdb::PessimisticTransactionIterator, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_iterator", 3, erocksdb::PessimisticTransactionIterator, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_commit", 1, erocksdb::PessimisticTransactionCommit, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_rollback", 1, erocksdb::PessimisticTransactionRollback, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"release_pessimistic_transaction", 1, erocksdb::ReleasePessimisticTransaction, ERL_NIF_REGULAR_BOUND},
 
         // Batch
         {"batch", 0, erocksdb::NewBatch, ERL_NIF_REGULAR_BOUND},
@@ -522,6 +544,23 @@ ERL_NIF_TERM ATOM_STATS_EXCEPT_TIME_FOR_MUTEX;
 ERL_NIF_TERM ATOM_STATS_ALL;
 ERL_NIF_TERM ATOM_STATS_LEVEL;
 
+// Pessimistic Transaction DB Options
+ERL_NIF_TERM ATOM_MAX_NUM_LOCKS;
+ERL_NIF_TERM ATOM_NUM_STRIPES;
+ERL_NIF_TERM ATOM_TRANSACTION_LOCK_TIMEOUT;
+ERL_NIF_TERM ATOM_DEFAULT_LOCK_TIMEOUT;
+
+// Pessimistic Transaction Options
+ERL_NIF_TERM ATOM_SET_SNAPSHOT;
+ERL_NIF_TERM ATOM_DEADLOCK_DETECT;
+ERL_NIF_TERM ATOM_LOCK_TIMEOUT;
+
+// Pessimistic Transaction Error Codes
+ERL_NIF_TERM ATOM_BUSY;
+ERL_NIF_TERM ATOM_TIMED_OUT;
+ERL_NIF_TERM ATOM_EXPIRED;
+ERL_NIF_TERM ATOM_TRY_AGAIN;
+
 }   // namespace erocksdb
 
 
@@ -875,6 +914,23 @@ try
   ATOM(erocksdb::ATOM_STATS_EXCEPT_TIME_FOR_MUTEX, "stats_except_time_for_mutex");
   ATOM(erocksdb::ATOM_STATS_ALL, "stats_all");
   ATOM(erocksdb::ATOM_STATS_LEVEL, "stats_level");
+
+  // Pessimistic Transaction DB Options
+  ATOM(erocksdb::ATOM_MAX_NUM_LOCKS, "max_num_locks");
+  ATOM(erocksdb::ATOM_NUM_STRIPES, "num_stripes");
+  ATOM(erocksdb::ATOM_TRANSACTION_LOCK_TIMEOUT, "transaction_lock_timeout");
+  ATOM(erocksdb::ATOM_DEFAULT_LOCK_TIMEOUT, "default_lock_timeout");
+
+  // Pessimistic Transaction Options
+  ATOM(erocksdb::ATOM_SET_SNAPSHOT, "set_snapshot");
+  ATOM(erocksdb::ATOM_DEADLOCK_DETECT, "deadlock_detect");
+  ATOM(erocksdb::ATOM_LOCK_TIMEOUT, "lock_timeout");
+
+  // Pessimistic Transaction Error Codes
+  ATOM(erocksdb::ATOM_BUSY, "busy");
+  ATOM(erocksdb::ATOM_TIMED_OUT, "timed_out");
+  ATOM(erocksdb::ATOM_EXPIRED, "expired");
+  ATOM(erocksdb::ATOM_TRY_AGAIN, "try_again");
 
 #undef ATOM
 

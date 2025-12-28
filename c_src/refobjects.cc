@@ -192,14 +192,14 @@ DbObject::CreateDbObjectType(
 
 
 DbObject *
-DbObject::CreateDbObject(rocksdb::DB * Db)
+DbObject::CreateDbObject(rocksdb::DB * Db, bool IsPessimistic)
 {
     DbObject * ret_ptr;
     void * alloc_ptr;
 
     // the alloc call initializes the reference count to "one"
     alloc_ptr=enif_alloc_resource(m_Db_RESOURCE, sizeof(DbObject));
-    ret_ptr=new (alloc_ptr) DbObject(Db);
+    ret_ptr=new (alloc_ptr) DbObject(Db, IsPessimistic);
 
     // manual reference increase to keep active until "close" called
     //  only inc local counter, leave erl ref count alone ... will force
@@ -256,8 +256,8 @@ DbObject::DbObjectResourceCleanup(
 }   // DbObject::DbObjectResourceCleanup
 
 
-DbObject::DbObject(rocksdb::DB * DbPtr)
-    : m_Db(DbPtr)
+DbObject::DbObject(rocksdb::DB * DbPtr, bool IsPessimistic)
+    : m_Db(DbPtr), m_IsPessimistic(IsPessimistic)
     {}   // DbObject::DbObject
 
 

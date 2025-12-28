@@ -164,7 +164,7 @@
          batch_data_size/1,
          batch_tolist/1]).
 
-%% Transaction API
+%% Transaction API (Optimistic)
 -export([
          transaction/2,
          release_transaction/1,
@@ -176,6 +176,20 @@
          transaction_iterator/2, transaction_iterator/3,
          transaction_commit/1,
          transaction_rollback/1
+        ]).
+
+%% Pessimistic Transaction API
+-export([
+         open_pessimistic_transaction_db/2, open_pessimistic_transaction_db/3,
+         pessimistic_transaction/2, pessimistic_transaction/3,
+         release_pessimistic_transaction/1,
+         pessimistic_transaction_put/3, pessimistic_transaction_put/4,
+         pessimistic_transaction_get/3, pessimistic_transaction_get/4,
+         pessimistic_transaction_get_for_update/3, pessimistic_transaction_get_for_update/4,
+         pessimistic_transaction_delete/2, pessimistic_transaction_delete/3,
+         pessimistic_transaction_iterator/2, pessimistic_transaction_iterator/3,
+         pessimistic_transaction_commit/1,
+         pessimistic_transaction_rollback/1
         ]).
 
 %% Backup Engine
@@ -1473,6 +1487,143 @@ transaction_commit(_Transaction) ->
 %% @doc rollback a transaction to disk atomically (?)
 -spec transaction_rollback(Transaction :: transaction_handle()) -> ok | {error, term()}.
 transaction_rollback(_Transaction) ->
+  ?nif_stub.
+
+%% ===================================================================
+%% Pessimistic Transaction API
+
+%% @doc open a database with pessimistic transaction support.
+%% Pessimistic transactions acquire locks on keys when they are accessed,
+%% providing strict serializability at the cost of potential lock contention.
+-spec open_pessimistic_transaction_db(Name :: file:filename_all(), DbOpts :: db_options()) ->
+    {ok, db_handle(), [cf_handle()]} | {error, any()}.
+open_pessimistic_transaction_db(_Name, _DbOpts) ->
+  open_pessimistic_transaction_db(_Name, _DbOpts, [{"default", []}]).
+
+%% @doc open a database with pessimistic transaction support and column families.
+-spec open_pessimistic_transaction_db(Name :: file:filename_all(),
+                                       DbOpts :: db_options(),
+                                       CfDescriptors :: [cf_descriptor()]) ->
+    {ok, db_handle(), [cf_handle()]} | {error, any()}.
+open_pessimistic_transaction_db(_Name, _DbOpts, _CFDescriptors) ->
+  ?nif_stub.
+
+%% @doc create a new pessimistic transaction.
+%% Pessimistic transactions use row-level locking with deadlock detection.
+-spec pessimistic_transaction(TransactionDB :: db_handle(), WriteOptions :: write_options()) ->
+    {ok, transaction_handle()} | {error, any()}.
+pessimistic_transaction(_TransactionDB, _WriteOptions) ->
+  ?nif_stub.
+
+%% @doc create a new pessimistic transaction with transaction options.
+%% Transaction options include:
+%%   {set_snapshot, boolean()} - acquire a snapshot at start
+%%   {deadlock_detect, boolean()} - enable deadlock detection
+%%   {lock_timeout, integer()} - lock wait timeout in ms
+-spec pessimistic_transaction(TransactionDB :: db_handle(),
+                               WriteOptions :: write_options(),
+                               TxnOptions :: list()) ->
+    {ok, transaction_handle()} | {error, any()}.
+pessimistic_transaction(_TransactionDB, _WriteOptions, _TxnOptions) ->
+  ?nif_stub.
+
+%% @doc release a pessimistic transaction.
+-spec release_pessimistic_transaction(TransactionHandle :: transaction_handle()) -> ok.
+release_pessimistic_transaction(_TransactionHandle) ->
+  ?nif_stub.
+
+%% @doc put a key-value pair in the transaction.
+-spec pessimistic_transaction_put(Transaction :: transaction_handle(),
+                                   Key :: binary(),
+                                   Value :: binary()) ->
+    ok | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_put(_Transaction, _Key, _Value) ->
+  ?nif_stub.
+
+%% @doc put a key-value pair in a column family within the transaction.
+-spec pessimistic_transaction_put(Transaction :: transaction_handle(),
+                                   ColumnFamily :: cf_handle(),
+                                   Key :: binary(),
+                                   Value :: binary()) ->
+    ok | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_put(_Transaction, _ColumnFamily, _Key, _Value) ->
+  ?nif_stub.
+
+%% @doc get a value from the transaction (read without acquiring lock).
+-spec pessimistic_transaction_get(Transaction :: transaction_handle(),
+                                   Key :: binary(),
+                                   Opts :: read_options()) ->
+    {ok, binary()} | not_found | {error, any()}.
+pessimistic_transaction_get(_Transaction, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc get a value from a column family within the transaction.
+-spec pessimistic_transaction_get(Transaction :: transaction_handle(),
+                                   ColumnFamily :: cf_handle(),
+                                   Key :: binary(),
+                                   Opts :: read_options()) ->
+    {ok, binary()} | not_found | {error, any()}.
+pessimistic_transaction_get(_Transaction, _ColumnFamily, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc get a value and acquire an exclusive lock on the key.
+%% This is useful for read-modify-write patterns.
+-spec pessimistic_transaction_get_for_update(Transaction :: transaction_handle(),
+                                              Key :: binary(),
+                                              Opts :: read_options()) ->
+    {ok, binary()} | not_found | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_get_for_update(_Transaction, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc get a value from a column family and acquire an exclusive lock.
+-spec pessimistic_transaction_get_for_update(Transaction :: transaction_handle(),
+                                              ColumnFamily :: cf_handle(),
+                                              Key :: binary(),
+                                              Opts :: read_options()) ->
+    {ok, binary()} | not_found | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_get_for_update(_Transaction, _ColumnFamily, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc delete a key from the transaction.
+-spec pessimistic_transaction_delete(Transaction :: transaction_handle(),
+                                      Key :: binary()) ->
+    ok | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_delete(_Transaction, _Key) ->
+  ?nif_stub.
+
+%% @doc delete a key from a column family within the transaction.
+-spec pessimistic_transaction_delete(Transaction :: transaction_handle(),
+                                      ColumnFamily :: cf_handle(),
+                                      Key :: binary()) ->
+    ok | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_delete(_Transaction, _ColumnFamily, _Key) ->
+  ?nif_stub.
+
+%% @doc create an iterator over the transaction's view of the database.
+-spec pessimistic_transaction_iterator(TransactionHandle :: transaction_handle(),
+                                        ReadOpts :: read_options()) ->
+    {ok, itr_handle()} | {error, any()}.
+pessimistic_transaction_iterator(_TransactionHandle, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc create an iterator over a column family within the transaction.
+-spec pessimistic_transaction_iterator(TransactionHandle :: transaction_handle(),
+                                        CFHandle :: cf_handle(),
+                                        ReadOpts :: read_options()) ->
+    {ok, itr_handle()} | {error, any()}.
+pessimistic_transaction_iterator(_TransactionHandle, _CfHandle, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc commit the transaction atomically.
+-spec pessimistic_transaction_commit(Transaction :: transaction_handle()) ->
+    ok | {error, busy} | {error, expired} | {error, any()}.
+pessimistic_transaction_commit(_Transaction) ->
+  ?nif_stub.
+
+%% @doc rollback the transaction, discarding all changes.
+-spec pessimistic_transaction_rollback(Transaction :: transaction_handle()) ->
+    ok | {error, any()}.
+pessimistic_transaction_rollback(_Transaction) ->
   ?nif_stub.
 
 %% ===================================================================
