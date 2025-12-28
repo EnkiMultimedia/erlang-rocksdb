@@ -189,7 +189,10 @@
          pessimistic_transaction_delete/2, pessimistic_transaction_delete/3,
          pessimistic_transaction_iterator/2, pessimistic_transaction_iterator/3,
          pessimistic_transaction_commit/1,
-         pessimistic_transaction_rollback/1
+         pessimistic_transaction_rollback/1,
+         pessimistic_transaction_set_savepoint/1,
+         pessimistic_transaction_rollback_to_savepoint/1,
+         pessimistic_transaction_pop_savepoint/1
         ]).
 
 %% Backup Engine
@@ -1624,6 +1627,27 @@ pessimistic_transaction_commit(_Transaction) ->
 -spec pessimistic_transaction_rollback(Transaction :: transaction_handle()) ->
     ok | {error, any()}.
 pessimistic_transaction_rollback(_Transaction) ->
+  ?nif_stub.
+
+%% @doc set a savepoint in a pessimistic transaction.
+%% Use {@link pessimistic_transaction_rollback_to_savepoint/1} to rollback to this point.
+-spec pessimistic_transaction_set_savepoint(Transaction :: transaction_handle()) -> ok.
+pessimistic_transaction_set_savepoint(_Transaction) ->
+  ?nif_stub.
+
+%% @doc rollback a pessimistic transaction to the most recent savepoint.
+%% All operations since the last call to {@link pessimistic_transaction_set_savepoint/1}
+%% are undone and the savepoint is removed.
+-spec pessimistic_transaction_rollback_to_savepoint(Transaction :: transaction_handle()) ->
+    ok | {error, any()}.
+pessimistic_transaction_rollback_to_savepoint(_Transaction) ->
+  ?nif_stub.
+
+%% @doc pop the most recent savepoint without rolling back.
+%% The savepoint is simply discarded.
+-spec pessimistic_transaction_pop_savepoint(Transaction :: transaction_handle()) ->
+    ok | {error, any()}.
+pessimistic_transaction_pop_savepoint(_Transaction) ->
   ?nif_stub.
 
 %% ===================================================================

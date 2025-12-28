@@ -437,4 +437,62 @@ PessimisticTransactionIterator(ErlNifEnv* env,
     return enif_make_tuple2(env, ATOM_OK, result);
 }
 
+// Savepoint operations
+
+ERL_NIF_TERM
+PessimisticTransactionSetSavepoint(ErlNifEnv* env,
+                                   int /*argc*/,
+                                   const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<TransactionObject> tx_ptr;
+    if(!enif_get_transaction(env, argv[0], &tx_ptr))
+        return enif_make_badarg(env);
+
+    tx_ptr->m_Tx->SetSavePoint();
+
+    return ATOM_OK;
+}
+
+ERL_NIF_TERM
+PessimisticTransactionRollbackToSavepoint(ErlNifEnv* env,
+                                          int /*argc*/,
+                                          const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<TransactionObject> tx_ptr;
+    if(!enif_get_transaction(env, argv[0], &tx_ptr))
+        return enif_make_badarg(env);
+
+    rocksdb::Status status = tx_ptr->m_Tx->RollbackToSavePoint();
+
+    if(!status.ok())
+    {
+        if(status.IsNotFound())
+            return error_tuple(env, ATOM_ERROR, "no savepoint set");
+        return error_tuple(env, ATOM_ERROR, status);
+    }
+
+    return ATOM_OK;
+}
+
+ERL_NIF_TERM
+PessimisticTransactionPopSavepoint(ErlNifEnv* env,
+                                   int /*argc*/,
+                                   const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<TransactionObject> tx_ptr;
+    if(!enif_get_transaction(env, argv[0], &tx_ptr))
+        return enif_make_badarg(env);
+
+    rocksdb::Status status = tx_ptr->m_Tx->PopSavePoint();
+
+    if(!status.ok())
+    {
+        if(status.IsNotFound())
+            return error_tuple(env, ATOM_ERROR, "no savepoint set");
+        return error_tuple(env, ATOM_ERROR, status);
+    }
+
+    return ATOM_OK;
+}
+
 }  // namespace erocksdb

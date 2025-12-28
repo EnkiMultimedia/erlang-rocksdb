@@ -291,3 +291,147 @@ txn_options_test() ->
 
     close_destroy(Db, "pessimistic_tx_testdb"),
     ok.
+
+%% Basic savepoint test - set and rollback to savepoint
+savepoint_basic_test() ->
+    Db = destroy_reopen("pessimistic_tx_testdb", [{create_if_missing, true}]),
+
+    {ok, Txn} = rocksdb:pessimistic_transaction(Db, []),
+
+    %% Put initial data
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"a">>, <<"v1">>),
+
+    %% Set savepoint
+    ok = rocksdb:pessimistic_transaction_set_savepoint(Txn),
+
+    %% Put more data after savepoint
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"b">>, <<"v2">>),
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"a">>, <<"v1_modified">>),
+
+    %% Verify both values are visible in transaction
+    ?assertEqual({ok, <<"v1_modified">>}, rocksdb:pessimistic_transaction_get(Txn, <<"a">>, [])),
+    ?assertEqual({ok, <<"v2">>}, rocksdb:pessimistic_transaction_get(Txn, <<"b">>, [])),
+
+    %% Rollback to savepoint
+    ok = rocksdb:pessimistic_transaction_rollback_to_savepoint(Txn),
+
+    %% After rollback: 'a' has original value, 'b' is gone
+    ?assertEqual({ok, <<"v1">>}, rocksdb:pessimistic_transaction_get(Txn, <<"a">>, [])),
+    ?assertEqual(not_found, rocksdb:pessimistic_transaction_get(Txn, <<"b">>, [])),
+
+    %% Commit and verify
+    ok = rocksdb:pessimistic_transaction_commit(Txn),
+    ok = rocksdb:release_pessimistic_transaction(Txn),
+
+    ?assertEqual({ok, <<"v1">>}, rocksdb:get(Db, <<"a">>, [])),
+    ?assertEqual(not_found, rocksdb:get(Db, <<"b">>, [])),
+
+    close_destroy(Db, "pessimistic_tx_testdb"),
+    ok.
+
+%% Multiple savepoints test
+multiple_savepoints_test() ->
+    Db = destroy_reopen("pessimistic_tx_testdb", [{create_if_missing, true}]),
+
+    {ok, Txn} = rocksdb:pessimistic_transaction(Db, []),
+
+    %% First operation
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"a">>, <<"v1">>),
+
+    %% First savepoint
+    ok = rocksdb:pessimistic_transaction_set_savepoint(Txn),
+
+    %% Second operation
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"b">>, <<"v2">>),
+
+    %% Second savepoint
+    ok = rocksdb:pessimistic_transaction_set_savepoint(Txn),
+
+    %% Third operation
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"c">>, <<"v3">>),
+
+    %% All three should be visible
+    ?assertEqual({ok, <<"v1">>}, rocksdb:pessimistic_transaction_get(Txn, <<"a">>, [])),
+    ?assertEqual({ok, <<"v2">>}, rocksdb:pessimistic_transaction_get(Txn, <<"b">>, [])),
+    ?assertEqual({ok, <<"v3">>}, rocksdb:pessimistic_transaction_get(Txn, <<"c">>, [])),
+
+    %% Rollback to second savepoint - removes 'c'
+    ok = rocksdb:pessimistic_transaction_rollback_to_savepoint(Txn),
+
+    ?assertEqual({ok, <<"v1">>}, rocksdb:pessimistic_transaction_get(Txn, <<"a">>, [])),
+    ?assertEqual({ok, <<"v2">>}, rocksdb:pessimistic_transaction_get(Txn, <<"b">>, [])),
+    ?assertEqual(not_found, rocksdb:pessimistic_transaction_get(Txn, <<"c">>, [])),
+
+    %% Rollback to first savepoint - removes 'b'
+    ok = rocksdb:pessimistic_transaction_rollback_to_savepoint(Txn),
+
+    ?assertEqual({ok, <<"v1">>}, rocksdb:pessimistic_transaction_get(Txn, <<"a">>, [])),
+    ?assertEqual(not_found, rocksdb:pessimistic_transaction_get(Txn, <<"b">>, [])),
+    ?assertEqual(not_found, rocksdb:pessimistic_transaction_get(Txn, <<"c">>, [])),
+
+    %% Commit and verify only 'a' is saved
+    ok = rocksdb:pessimistic_transaction_commit(Txn),
+    ok = rocksdb:release_pessimistic_transaction(Txn),
+
+    ?assertEqual({ok, <<"v1">>}, rocksdb:get(Db, <<"a">>, [])),
+    ?assertEqual(not_found, rocksdb:get(Db, <<"b">>, [])),
+    ?assertEqual(not_found, rocksdb:get(Db, <<"c">>, [])),
+
+    close_destroy(Db, "pessimistic_tx_testdb"),
+    ok.
+
+%% Pop savepoint test - discard savepoint without rollback
+pop_savepoint_test() ->
+    Db = destroy_reopen("pessimistic_tx_testdb", [{create_if_missing, true}]),
+
+    {ok, Txn} = rocksdb:pessimistic_transaction(Db, []),
+
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"a">>, <<"v1">>),
+
+    %% Set savepoint
+    ok = rocksdb:pessimistic_transaction_set_savepoint(Txn),
+
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"b">>, <<"v2">>),
+
+    %% Pop savepoint (discard it without rolling back)
+    ok = rocksdb:pessimistic_transaction_pop_savepoint(Txn),
+
+    %% Both values should still be visible
+    ?assertEqual({ok, <<"v1">>}, rocksdb:pessimistic_transaction_get(Txn, <<"a">>, [])),
+    ?assertEqual({ok, <<"v2">>}, rocksdb:pessimistic_transaction_get(Txn, <<"b">>, [])),
+
+    %% Now rollback_to_savepoint should fail (no savepoint exists)
+    ?assertMatch({error, _}, rocksdb:pessimistic_transaction_rollback_to_savepoint(Txn)),
+
+    %% Commit - both values should be saved
+    ok = rocksdb:pessimistic_transaction_commit(Txn),
+    ok = rocksdb:release_pessimistic_transaction(Txn),
+
+    ?assertEqual({ok, <<"v1">>}, rocksdb:get(Db, <<"a">>, [])),
+    ?assertEqual({ok, <<"v2">>}, rocksdb:get(Db, <<"b">>, [])),
+
+    close_destroy(Db, "pessimistic_tx_testdb"),
+    ok.
+
+%% Error case: rollback_to_savepoint without setting one
+no_savepoint_error_test() ->
+    Db = destroy_reopen("pessimistic_tx_testdb", [{create_if_missing, true}]),
+
+    {ok, Txn} = rocksdb:pessimistic_transaction(Db, []),
+
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"a">>, <<"v1">>),
+
+    %% Try to rollback without a savepoint
+    ?assertMatch({error, _}, rocksdb:pessimistic_transaction_rollback_to_savepoint(Txn)),
+
+    %% Try to pop without a savepoint
+    ?assertMatch({error, _}, rocksdb:pessimistic_transaction_pop_savepoint(Txn)),
+
+    %% Data should still be there
+    ?assertEqual({ok, <<"v1">>}, rocksdb:pessimistic_transaction_get(Txn, <<"a">>, [])),
+
+    ok = rocksdb:pessimistic_transaction_rollback(Txn),
+    ok = rocksdb:release_pessimistic_transaction(Txn),
+
+    close_destroy(Db, "pessimistic_tx_testdb"),
+    ok.
