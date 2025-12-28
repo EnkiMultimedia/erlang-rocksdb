@@ -1329,12 +1329,12 @@ batch_single_delete(_Batch, _Key) ->
 batch_single_delete(_Batch, _ColumnFamily, _Key) ->
   ?nif_stub.
 
-%% @doc batch implementation of `delete_range/5`
+%% @doc Batch implementation of `delete_range/5'
 -spec batch_delete_range(Batch :: batch_handle(), Begin :: binary(), End :: binary()) -> ok.
 batch_delete_range(_Batch, _Begin, _End) ->
   ?nif_stub.
 
-%% @doc batch implementation of `delete_range/5, but apply the operation to a column family`
+%% @doc Like `batch_delete_range/3' but apply the operation to a column family
 -spec batch_delete_range(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Begin :: binary(), End :: binary()) -> ok.
 batch_delete_range(_Batch, _ColumnFamily, _Begin, _End) ->
   ?nif_stub.
