@@ -192,7 +192,9 @@
          pessimistic_transaction_rollback/1,
          pessimistic_transaction_set_savepoint/1,
          pessimistic_transaction_rollback_to_savepoint/1,
-         pessimistic_transaction_pop_savepoint/1
+         pessimistic_transaction_pop_savepoint/1,
+         pessimistic_transaction_get_id/1,
+         pessimistic_transaction_get_waiting_txns/1
         ]).
 
 %% Backup Engine
@@ -1648,6 +1650,28 @@ pessimistic_transaction_rollback_to_savepoint(_Transaction) ->
 -spec pessimistic_transaction_pop_savepoint(Transaction :: transaction_handle()) ->
     ok | {error, any()}.
 pessimistic_transaction_pop_savepoint(_Transaction) ->
+  ?nif_stub.
+
+%% @doc get the unique ID of a pessimistic transaction.
+%% This ID can be used to identify the transaction in deadlock detection
+%% and waiting transaction lists.
+-spec pessimistic_transaction_get_id(Transaction :: transaction_handle()) ->
+    {ok, non_neg_integer()}.
+pessimistic_transaction_get_id(_Transaction) ->
+  ?nif_stub.
+
+%% @doc get information about transactions this transaction is waiting on.
+%% Returns a map with:
+%% - `column_family_id': The column family ID of the key being waited on
+%% - `key': The key being waited on (binary)
+%% - `waiting_txns': List of transaction IDs that hold locks this transaction needs
+%%
+%% If the transaction is not currently waiting, returns an empty waiting_txns list.
+-spec pessimistic_transaction_get_waiting_txns(Transaction :: transaction_handle()) ->
+    {ok, #{column_family_id := non_neg_integer(),
+           key := binary(),
+           waiting_txns := [non_neg_integer()]}}.
+pessimistic_transaction_get_waiting_txns(_Transaction) ->
   ?nif_stub.
 
 %% ===================================================================

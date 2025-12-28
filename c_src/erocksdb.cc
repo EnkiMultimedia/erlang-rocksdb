@@ -147,6 +147,8 @@ static ErlNifFunc nif_funcs[] =
         {"pessimistic_transaction_set_savepoint", 1, erocksdb::PessimisticTransactionSetSavepoint, ERL_NIF_REGULAR_BOUND},
         {"pessimistic_transaction_rollback_to_savepoint", 1, erocksdb::PessimisticTransactionRollbackToSavepoint, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"pessimistic_transaction_pop_savepoint", 1, erocksdb::PessimisticTransactionPopSavepoint, ERL_NIF_REGULAR_BOUND},
+        {"pessimistic_transaction_get_id", 1, erocksdb::PessimisticTransactionGetId, ERL_NIF_REGULAR_BOUND},
+        {"pessimistic_transaction_get_waiting_txns", 1, erocksdb::PessimisticTransactionGetWaitingTxns, ERL_NIF_REGULAR_BOUND},
 
         // Batch
         {"batch", 0, erocksdb::NewBatch, ERL_NIF_REGULAR_BOUND},

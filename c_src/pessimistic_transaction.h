@@ -47,6 +47,10 @@ ERL_NIF_TERM PessimisticTransactionSetSavepoint(ErlNifEnv* env, int argc, const 
 ERL_NIF_TERM PessimisticTransactionRollbackToSavepoint(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PessimisticTransactionPopSavepoint(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
+// Transaction information
+ERL_NIF_TERM PessimisticTransactionGetId(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PessimisticTransactionGetWaitingTxns(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
 }  // namespace erocksdb
 
 #endif  // INCL_PESSIMISTIC_TRANSACTION_H

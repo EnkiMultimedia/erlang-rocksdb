@@ -495,4 +495,65 @@ PessimisticTransactionPopSavepoint(ErlNifEnv* env,
     return ATOM_OK;
 }
 
+// Transaction information
+
+ERL_NIF_TERM
+PessimisticTransactionGetId(ErlNifEnv* env,
+                            int /*argc*/,
+                            const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<TransactionObject> tx_ptr;
+    if(!enif_get_transaction(env, argv[0], &tx_ptr))
+        return enif_make_badarg(env);
+
+    uint64_t id = tx_ptr->m_Tx->GetID();
+
+    return enif_make_tuple2(env, ATOM_OK, enif_make_uint64(env, id));
+}
+
+ERL_NIF_TERM
+PessimisticTransactionGetWaitingTxns(ErlNifEnv* env,
+                                     int /*argc*/,
+                                     const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<TransactionObject> tx_ptr;
+    if(!enif_get_transaction(env, argv[0], &tx_ptr))
+        return enif_make_badarg(env);
+
+    uint32_t column_family_id;
+    std::string key;
+
+    std::vector<rocksdb::TransactionID> waiting_txns =
+        tx_ptr->m_Tx->GetWaitingTxns(&column_family_id, &key);
+
+    // Build list of waiting transaction IDs
+    ERL_NIF_TERM txn_list = enif_make_list(env, 0);
+    for (auto it = waiting_txns.rbegin(); it != waiting_txns.rend(); ++it)
+    {
+        txn_list = enif_make_list_cell(env, enif_make_uint64(env, *it), txn_list);
+    }
+
+    // Build key binary
+    ERL_NIF_TERM key_bin;
+    memcpy(enif_make_new_binary(env, key.size(), &key_bin), key.data(), key.size());
+
+    // Return {ok, #{column_family_id => CfId, key => Key, waiting_txns => TxnList}}
+    ERL_NIF_TERM keys[3];
+    ERL_NIF_TERM values[3];
+
+    keys[0] = enif_make_atom(env, "column_family_id");
+    values[0] = enif_make_uint(env, column_family_id);
+
+    keys[1] = enif_make_atom(env, "key");
+    values[1] = key_bin;
+
+    keys[2] = enif_make_atom(env, "waiting_txns");
+    values[2] = txn_list;
+
+    ERL_NIF_TERM result_map;
+    enif_make_map_from_arrays(env, keys, values, 3, &result_map);
+
+    return enif_make_tuple2(env, ATOM_OK, result_map);
+}
+
 }  // namespace erocksdb

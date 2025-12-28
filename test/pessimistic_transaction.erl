@@ -435,3 +435,107 @@ no_savepoint_error_test() ->
 
     close_destroy(Db, "pessimistic_tx_testdb"),
     ok.
+
+%% Test transaction ID
+get_id_test() ->
+    Db = destroy_reopen("pessimistic_tx_testdb", [{create_if_missing, true}]),
+
+    {ok, Txn1} = rocksdb:pessimistic_transaction(Db, []),
+    {ok, Txn2} = rocksdb:pessimistic_transaction(Db, []),
+
+    %% Each transaction should have a unique ID
+    {ok, Id1} = rocksdb:pessimistic_transaction_get_id(Txn1),
+    {ok, Id2} = rocksdb:pessimistic_transaction_get_id(Txn2),
+
+    ?assert(is_integer(Id1)),
+    ?assert(is_integer(Id2)),
+    ?assertNotEqual(Id1, Id2),
+
+    ok = rocksdb:pessimistic_transaction_rollback(Txn1),
+    ok = rocksdb:pessimistic_transaction_rollback(Txn2),
+    ok = rocksdb:release_pessimistic_transaction(Txn1),
+    ok = rocksdb:release_pessimistic_transaction(Txn2),
+
+    close_destroy(Db, "pessimistic_tx_testdb"),
+    ok.
+
+%% Test get_waiting_txns - not waiting case
+get_waiting_txns_not_waiting_test() ->
+    Db = destroy_reopen("pessimistic_tx_testdb", [{create_if_missing, true}]),
+
+    {ok, Txn} = rocksdb:pessimistic_transaction(Db, []),
+
+    %% When not waiting on anything, should return empty list
+    {ok, Result} = rocksdb:pessimistic_transaction_get_waiting_txns(Txn),
+
+    ?assert(is_map(Result)),
+    ?assertMatch(#{waiting_txns := []}, Result),
+
+    ok = rocksdb:pessimistic_transaction_rollback(Txn),
+    ok = rocksdb:release_pessimistic_transaction(Txn),
+
+    close_destroy(Db, "pessimistic_tx_testdb"),
+    ok.
+
+%% Test get_waiting_txns - with lock contention
+%% This test spawns a process that will block trying to acquire a lock
+get_waiting_txns_contention_test() ->
+    Db = destroy_reopen("pessimistic_tx_testdb", [{create_if_missing, true}]),
+
+    %% Put initial data
+    ok = rocksdb:put(Db, <<"key">>, <<"v1">>, []),
+
+    %% Transaction 1 acquires lock
+    {ok, Txn1} = rocksdb:pessimistic_transaction(Db, []),
+    {ok, Id1} = rocksdb:pessimistic_transaction_get_id(Txn1),
+    {ok, <<"v1">>} = rocksdb:pessimistic_transaction_get_for_update(Txn1, <<"key">>, []),
+
+    %% Spawn a process that will try to get the same lock with a long timeout
+    Self = self(),
+    Pid = spawn(fun() ->
+        {ok, Txn2} = rocksdb:pessimistic_transaction(Db, [{lock_timeout, 10000}]),
+        Self ! {txn2_started, Txn2},
+        %% This will block waiting for Txn1's lock
+        Result = rocksdb:pessimistic_transaction_get_for_update(Txn2, <<"key">>, []),
+        Self ! {txn2_result, Result, Txn2}
+    end),
+
+    %% Wait for Txn2 to start
+    Txn2 = receive
+        {txn2_started, T2} -> T2
+    after 1000 ->
+        error(timeout_waiting_for_txn2)
+    end,
+
+    %% Give some time for Txn2 to start waiting
+    timer:sleep(100),
+
+    %% Check waiting txns for Txn2 - should be waiting on Txn1
+    {ok, WaitInfo} = rocksdb:pessimistic_transaction_get_waiting_txns(Txn2),
+
+    ?assert(is_map(WaitInfo)),
+    #{waiting_txns := WaitingTxns, key := WaitingKey} = WaitInfo,
+
+    %% Should be waiting on Txn1
+    ?assertEqual([Id1], WaitingTxns),
+    ?assertEqual(<<"key">>, WaitingKey),
+
+    %% Release Txn1's lock
+    ok = rocksdb:pessimistic_transaction_commit(Txn1),
+    ok = rocksdb:release_pessimistic_transaction(Txn1),
+
+    %% Txn2 should now succeed
+    receive
+        {txn2_result, {ok, <<"v1">>}, _} -> ok;
+        {txn2_result, Other, _} -> error({unexpected_result, Other})
+    after 5000 ->
+        exit(Pid, kill),
+        error(timeout_waiting_for_txn2_result)
+    end,
+
+    %% Cleanup Txn2
+    ok = rocksdb:pessimistic_transaction_rollback(Txn2),
+    ok = rocksdb:release_pessimistic_transaction(Txn2),
+
+    close_destroy(Db, "pessimistic_tx_testdb"),
+    ok.
