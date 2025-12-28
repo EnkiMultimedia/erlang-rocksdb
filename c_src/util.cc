@@ -45,6 +45,13 @@ rocksdb::Status& status)
                             enif_make_tuple2(env, error, reason));
 }
 
+ERL_NIF_TERM error_tuple(ErlNifEnv* env, ERL_NIF_TERM error, const char* msg)
+{
+    ERL_NIF_TERM reason = enif_make_string(env, msg, ERL_NIF_LATIN1);
+    return enif_make_tuple2(env, erocksdb::ATOM_ERROR,
+                            enif_make_tuple2(env, error, reason));
+}
+
 ERL_NIF_TERM slice_to_binary(ErlNifEnv* env, rocksdb::Slice s)
 {
     ERL_NIF_TERM result;

@@ -30,11 +30,18 @@ namespace rocksdb {
     struct ColumnFamilyOptions;
     struct ReadOptions;
     struct WriteOptions;
+    struct TransactionDBOptions;
+    struct TransactionOptions;
 }
 
 ERL_NIF_TERM parse_db_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::DBOptions& opts);
 ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnFamilyOptions& opts);
 ERL_NIF_TERM parse_read_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ReadOptions& opts);
 ERL_NIF_TERM parse_write_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::WriteOptions& opts);
+ERL_NIF_TERM parse_txn_db_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::TransactionDBOptions& opts);
+
+namespace erocksdb {
+    ERL_NIF_TERM OpenPessimisticTransactionDB(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+}
 
 #endif
