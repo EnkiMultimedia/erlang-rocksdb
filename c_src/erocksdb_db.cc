@@ -22,6 +22,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/utilities/db_ttl.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/wide_columns.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/rate_limiter.h"
 #include "rocksdb/sst_file_manager.h"
@@ -1991,6 +1992,148 @@ SetDBBackgroundThreads(
     return ATOM_OK;
 }   // erocksdb::SetDBBackgroundThreads
 
+ERL_NIF_TERM
+PutEntity(
+  ErlNifEnv* env,
+  int argc,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
+    ErlNifBinary key;
+    ERL_NIF_TERM columns_list, arg_opts;
+
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    rocksdb::ColumnFamilyHandle* cfh;
+    int columns_idx, opts_idx;
+
+    if (argc > 4)
+    {
+        // With column family: db, cf, key, columns, opts
+        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+                !enif_inspect_binary(env, argv[2], &key) ||
+                !enif_is_list(env, argv[3]))
+            return enif_make_badarg(env);
+        cfh = cf_ptr->m_ColumnFamily;
+        columns_idx = 3;
+        opts_idx = 4;
+    }
+    else
+    {
+        // Without column family: db, key, columns, opts
+        if(!enif_inspect_binary(env, argv[1], &key) ||
+                !enif_is_list(env, argv[2]))
+            return enif_make_badarg(env);
+        cfh = db_ptr->m_Db->DefaultColumnFamily();
+        columns_idx = 2;
+        opts_idx = 3;
+    }
+
+    columns_list = argv[columns_idx];
+    arg_opts = argv[opts_idx];
+
+    // Parse columns list: [{Name, Value}, ...]
+    rocksdb::WideColumns columns;
+    ERL_NIF_TERM head, tail = columns_list;
+    while(enif_get_list_cell(env, tail, &head, &tail))
+    {
+        const ERL_NIF_TERM* tuple;
+        int arity;
+        if(!enif_get_tuple(env, head, &arity, &tuple) || arity != 2)
+            return enif_make_badarg(env);
+
+        ErlNifBinary col_name, col_value;
+        if(!enif_inspect_binary(env, tuple[0], &col_name) ||
+           !enif_inspect_binary(env, tuple[1], &col_value))
+            return enif_make_badarg(env);
+
+        columns.emplace_back(
+            rocksdb::Slice(reinterpret_cast<char*>(col_name.data), col_name.size),
+            rocksdb::Slice(reinterpret_cast<char*>(col_value.data), col_value.size));
+    }
+
+    rocksdb::WriteOptions opts;
+    fold(env, arg_opts, parse_write_option, opts);
+
+    rocksdb::Slice key_slice(reinterpret_cast<char*>(key.data), key.size);
+    rocksdb::Status status = db_ptr->m_Db->PutEntity(opts, cfh, key_slice, columns);
+
+    if(!status.ok())
+        return error_tuple(env, ATOM_ERROR, status);
+    return ATOM_OK;
+}   // erocksdb::PutEntity
+
+ERL_NIF_TERM
+GetEntity(
+  ErlNifEnv* env,
+  int argc,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    int key_idx = 1;
+    int opts_idx = 2;
+    if(argc == 4)
+    {
+        key_idx = 2;
+        opts_idx = 3;
+    }
+
+    rocksdb::Slice key;
+    if(!binary_to_slice(env, argv[key_idx], &key))
+        return enif_make_badarg(env);
+
+    rocksdb::ReadOptions opts;
+    fold(env, argv[opts_idx], parse_read_option, opts);
+
+    rocksdb::PinnableWideColumns columns;
+    rocksdb::Status status;
+
+    if(argc == 4)
+    {
+        ReferencePtr<ColumnFamilyObject> cf_ptr;
+        if(!enif_get_cf(env, argv[1], &cf_ptr))
+            return enif_make_badarg(env);
+        status = db_ptr->m_Db->GetEntity(opts, cf_ptr->m_ColumnFamily, key, &columns);
+    }
+    else
+    {
+        status = db_ptr->m_Db->GetEntity(opts, db_ptr->m_Db->DefaultColumnFamily(), key, &columns);
+    }
+
+    if (!status.ok())
+    {
+        if (status.IsNotFound())
+            return ATOM_NOT_FOUND;
+
+        if (status.IsCorruption())
+            return error_tuple(env, ATOM_CORRUPTION, status);
+
+        return error_tuple(env, ATOM_UNKNOWN_STATUS_ERROR, status);
+    }
+
+    // Build result list: [{Name, Value}, ...]
+    const rocksdb::WideColumns& cols = columns.columns();
+    ERL_NIF_TERM result_list = enif_make_list(env, 0);
+
+    // Build in reverse order, then reverse
+    for (auto it = cols.rbegin(); it != cols.rend(); ++it)
+    {
+        ERL_NIF_TERM name_bin, value_bin;
+        memcpy(enif_make_new_binary(env, it->name().size(), &name_bin),
+               it->name().data(), it->name().size());
+        memcpy(enif_make_new_binary(env, it->value().size(), &value_bin),
+               it->value().data(), it->value().size());
+        ERL_NIF_TERM tuple = enif_make_tuple2(env, name_bin, value_bin);
+        result_list = enif_make_list_cell(env, tuple, result_list);
+    }
+
+    return enif_make_tuple2(env, ATOM_OK, result_list);
+}   // erocksdb::GetEntity
 
 
 }

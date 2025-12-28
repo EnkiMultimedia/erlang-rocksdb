@@ -62,13 +62,18 @@
   delete/3, delete/4,
   single_delete/3, single_delete/4,
   get/3, get/4,
+  put_entity/4, put_entity/5,
+  get_entity/3, get_entity/4,
   delete_range/4, delete_range/5,
   compact_range/4, compact_range/5,
   iterator/2, iterator/3,
   iterators/3,
+  coalescing_iterator/3,
   iterator_move/2,
   iterator_refresh/1,
-  iterator_close/1
+  iterator_close/1,
+  iterator_columns/1,
+  delete_entity/3, delete_entity/4
 ]).
 
 %% deprecated API
@@ -789,6 +794,48 @@ get(_DBHandle, _Key, _ReadOpts) ->
 get(_DBHandle, _CFHandle, _Key, _ReadOpts) ->
   ?nif_stub.
 
+%% @doc Put an entity (wide-column key) in the default column family.
+%% An entity is a key with multiple named columns stored as a proplist.
+-spec put_entity(DBHandle, Key, Columns, WriteOpts) -> Res when
+  DBHandle::db_handle(),
+  Key::binary(),
+  Columns::[{binary(), binary()}],
+  WriteOpts::write_options(),
+  Res :: ok | {error, any()}.
+put_entity(_DBHandle, _Key, _Columns, _WriteOpts) ->
+  ?nif_stub.
+
+%% @doc Put an entity (wide-column key) in the specified column family.
+-spec put_entity(DBHandle, CFHandle, Key, Columns, WriteOpts) -> Res when
+  DBHandle::db_handle(),
+  CFHandle::cf_handle(),
+  Key::binary(),
+  Columns::[{binary(), binary()}],
+  WriteOpts::write_options(),
+  Res :: ok | {error, any()}.
+put_entity(_DBHandle, _CFHandle, _Key, _Columns, _WriteOpts) ->
+  ?nif_stub.
+
+%% @doc Retrieve an entity (wide-column key) from the default column family.
+%% Returns the columns as a proplist of {Name, Value} tuples.
+-spec get_entity(DBHandle, Key, ReadOpts) -> Res when
+  DBHandle::db_handle(),
+  Key::binary(),
+  ReadOpts::read_options(),
+  Res :: {ok, [{binary(), binary()}]} | not_found | {error, any()}.
+get_entity(_DBHandle, _Key, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc Retrieve an entity (wide-column key) from the specified column family.
+-spec get_entity(DBHandle, CFHandle, Key, ReadOpts) -> Res when
+  DBHandle::db_handle(),
+  CFHandle::cf_handle(),
+  Key::binary(),
+  ReadOpts::read_options(),
+  Res :: {ok, [{binary(), binary()}]} | not_found | {error, any()}.
+get_entity(_DBHandle, _CFHandle, _Key, _ReadOpts) ->
+  ?nif_stub.
+
 
 %% @doc For each i in [0,n-1], store in "Sizes[i]", the approximate
 %% file system space used by keys in "[range[i].start .. range[i].limit)".
@@ -940,6 +987,17 @@ iterator(_DBHandle, _CfHandle, _ReadOpts) ->
 iterators(_DBHandle, _CFHandle, _ReadOpts) ->
   ?nif_stub.
 
+%% @doc
+%% Return a coalescing iterator over multiple column families.
+%% The iterator merges results from all column families and returns
+%% keys in sorted order. When the same key exists in multiple column
+%% families, only one value is returned (from the first CF in the list).
+-spec(coalescing_iterator(DBHandle, CFHandles, ReadOpts) ->
+             {ok, itr_handle()} | {error, any()} when DBHandle::db_handle(),
+                                                      CFHandles::[cf_handle()],
+                                                      ReadOpts::read_options()).
+coalescing_iterator(_DBHandle, _CFHandles, _ReadOpts) ->
+  ?nif_stub.
 
 %% @doc
 %% Move to the specified place
@@ -963,6 +1021,37 @@ iterator_refresh(_ITRHandle) ->
 -spec(iterator_close(ITRHandle) -> ok | {error, _} when ITRHandle::itr_handle()).
 iterator_close(_ITRHandle) ->
     ?nif_stub.
+
+%% @doc Get the columns of the current iterator entry.
+%% Returns the wide columns for the current entry. For entities, returns
+%% all columns. For regular key-values, returns a single column with an
+%% empty name (the default column) containing the value.
+-spec iterator_columns(ITRHandle) -> Res when
+    ITRHandle::itr_handle(),
+    Res :: {ok, [{binary(), binary()}]} | {error, any()}.
+iterator_columns(_ITRHandle) ->
+    ?nif_stub.
+
+%% @doc Delete an entity (same as regular delete).
+%% Entities are deleted using the normal delete operation - all columns
+%% are removed when the key is deleted.
+-spec delete_entity(DBHandle, Key, WriteOpts) -> Res when
+    DBHandle::db_handle(),
+    Key::binary(),
+    WriteOpts::write_options(),
+    Res :: ok | {error, any()}.
+delete_entity(DBHandle, Key, WriteOpts) ->
+    delete(DBHandle, Key, WriteOpts).
+
+%% @doc Delete an entity from a column family (same as regular delete).
+-spec delete_entity(DBHandle, CFHandle, Key, WriteOpts) -> Res when
+    DBHandle::db_handle(),
+    CFHandle::cf_handle(),
+    Key::binary(),
+    WriteOpts::write_options(),
+    Res :: ok | {error, any()}.
+delete_entity(DBHandle, CFHandle, Key, WriteOpts) ->
+    delete(DBHandle, CFHandle, Key, WriteOpts).
 
 -type fold_fun() :: fun(({Key::binary(), Value::binary()}, any()) -> any()).
 

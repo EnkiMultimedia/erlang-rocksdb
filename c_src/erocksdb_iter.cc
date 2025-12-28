@@ -26,6 +26,7 @@
 #include "rocksdb/comparator.h"
 #include "rocksdb/write_batch.h"
 #include "rocksdb/slice_transform.h"
+#include "rocksdb/wide_columns.h"
 
 #include "atoms.h"
 #include "erl_nif.h"
@@ -106,6 +107,8 @@ parse_iterator_options(
             }
             else if (option[0] == erocksdb::ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT)
                 opts.auto_refresh_iterator_with_snapshot = (option[1] == erocksdb::ATOM_TRUE);
+            else if (option[0] == erocksdb::ATOM_AUTO_READAHEAD_SIZE)
+                opts.auto_readahead_size = (option[1] == erocksdb::ATOM_TRUE);
         }
     }
     return 1;
@@ -239,6 +242,63 @@ Iterators(
     enif_make_reverse_list(env, result, &result_out);
 
     return enif_make_tuple2(env, erocksdb::ATOM_OK, result_out);
+}
+
+ERL_NIF_TERM
+CoalescingIterator(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    if(!enif_is_list(env, argv[1]) || !enif_is_list(env, argv[2]))
+       return enif_make_badarg(env);
+
+    rocksdb::ReadOptions opts;
+    ItrBounds bounds;
+    auto itr_env = std::make_shared<ErlEnvCtr>();
+    if (!parse_iterator_options(env, itr_env->env, argv[2], opts, bounds))
+    {
+        return enif_make_badarg(env);
+    }
+
+    std::vector<rocksdb::ColumnFamilyHandle*> column_families;
+    ERL_NIF_TERM head, tail = argv[1];
+    while(enif_get_list_cell(env, tail, &head, &tail))
+    {
+        ReferencePtr<ColumnFamilyObject> cf_ptr;
+        cf_ptr.assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
+        if(NULL == cf_ptr.get())
+            return enif_make_badarg(env);
+        column_families.push_back(cf_ptr->m_ColumnFamily);
+    }
+
+    std::unique_ptr<rocksdb::Iterator> iterator =
+        db_ptr->m_Db->NewCoalescingIterator(opts, column_families);
+
+    if (!iterator) {
+        rocksdb::Status status = rocksdb::Status::NotSupported("CoalescingIterator not available");
+        return error_tuple(env, ATOM_ERROR, status);
+    }
+
+    ItrObject* itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterator.release());
+
+    if(bounds.upper_bound_slice != nullptr)
+    {
+        itr_ptr->SetUpperBoundSlice(bounds.upper_bound_slice);
+    }
+
+    if(bounds.lower_bound_slice != nullptr)
+    {
+        itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
+    }
+
+    ERL_NIF_TERM result = enif_make_resource(env, itr_ptr);
+    enif_release_resource(itr_ptr);
+    return enif_make_tuple2(env, ATOM_OK, result);
 }
 
 ERL_NIF_TERM
@@ -377,5 +437,55 @@ IteratorClose(
     }   // else
 
 }   // erocksdb:IteratorClose
+
+ERL_NIF_TERM
+IteratorColumns(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM argv[])
+{
+    const ERL_NIF_TERM& itr_handle_ref = argv[0];
+
+    ReferencePtr<ItrObject> itr_ptr;
+    itr_ptr.assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
+
+    if(NULL==itr_ptr.get())
+    {
+        return enif_make_badarg(env);
+    }
+
+    rocksdb::Iterator* itr = itr_ptr->m_Iterator;
+
+    if(!itr->Valid())
+    {
+        return enif_make_tuple2(env, ATOM_ERROR, ATOM_INVALID_ITERATOR);
+    }
+
+    rocksdb::Status status = itr->status();
+    if(!status.ok())
+    {
+        return error_tuple(env, ATOM_ERROR, status);
+    }
+
+    // Get columns from iterator
+    const rocksdb::WideColumns& cols = itr->columns();
+
+    // Build result list: [{Name, Value}, ...]
+    ERL_NIF_TERM result_list = enif_make_list(env, 0);
+
+    // Build in reverse order (since we prepend)
+    for (auto it = cols.rbegin(); it != cols.rend(); ++it)
+    {
+        ERL_NIF_TERM name_bin, value_bin;
+        memcpy(enif_make_new_binary(env, it->name().size(), &name_bin),
+               it->name().data(), it->name().size());
+        memcpy(enif_make_new_binary(env, it->value().size(), &value_bin),
+               it->value().data(), it->value().size());
+        ERL_NIF_TERM tuple = enif_make_tuple2(env, name_bin, value_bin);
+        result_list = enif_make_list_cell(env, tuple, result_list);
+    }
+
+    return enif_make_tuple2(env, ATOM_OK, result_list);
+}   // erocksdb::IteratorColumns
 
 }

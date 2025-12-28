@@ -253,6 +253,32 @@ invalid_test() ->
   rocksdb:destroy("ltest", []),
   rocksdb_test_util:rm_rf("ltest").
 
+%% Test auto_readahead_size option for iterators
+auto_readahead_size_test() ->
+  rocksdb_test_util:rm_rf("ltest"),
+  {ok, Ref} = rocksdb:open("ltest", [{create_if_missing, true}]),
+  try
+    rocksdb:put(Ref, <<"key1">>, <<"val1">>, []),
+    rocksdb:put(Ref, <<"key2">>, <<"val2">>, []),
+    rocksdb:put(Ref, <<"key3">>, <<"val3">>, []),
+
+    %% Test with auto_readahead_size enabled (default is true in RocksDB 8.10+)
+    {ok, I1} = rocksdb:iterator(Ref, [{auto_readahead_size, true}]),
+    ?assertEqual({ok, <<"key1">>, <<"val1">>}, rocksdb:iterator_move(I1, first)),
+    ?assertEqual({ok, <<"key2">>, <<"val2">>}, rocksdb:iterator_move(I1, next)),
+    ?assertEqual(ok, rocksdb:iterator_close(I1)),
+
+    %% Test with auto_readahead_size disabled
+    {ok, I2} = rocksdb:iterator(Ref, [{auto_readahead_size, false}]),
+    ?assertEqual({ok, <<"key1">>, <<"val1">>}, rocksdb:iterator_move(I2, first)),
+    ?assertEqual({ok, <<"key2">>, <<"val2">>}, rocksdb:iterator_move(I2, next)),
+    ?assertEqual(ok, rocksdb:iterator_close(I2))
+  after
+    rocksdb:close(Ref)
+  end,
+  rocksdb:destroy("ltest", []),
+  rocksdb_test_util:rm_rf("ltest").
+
 test_key(Prefix, Suffix) when is_integer(Prefix), is_integer(Suffix) ->
   << Prefix:64, Suffix:64 >>.
 

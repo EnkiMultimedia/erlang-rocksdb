@@ -53,3 +53,4 @@ deps/snappy/WORKSPACE
 erocksdb.close.test
 rebar3.crashdump
 test_cacheblobdb
+erl_crash.dump

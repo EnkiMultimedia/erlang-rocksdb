@@ -80,6 +80,10 @@ static ErlNifFunc nif_funcs[] =
         {"delete", 4, erocksdb::Delete, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"single_delete", 3, erocksdb::SingleDelete, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"single_delete", 4, erocksdb::SingleDelete, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"put_entity", 4, erocksdb::PutEntity, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"put_entity", 5, erocksdb::PutEntity, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"get_entity", 3, erocksdb::GetEntity, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"get_entity", 4, erocksdb::GetEntity, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
         {"snapshot", 1, erocksdb::Snapshot, ERL_NIF_REGULAR_BOUND},
         {"release_snapshot", 1, erocksdb::ReleaseSnapshot, ERL_NIF_REGULAR_BOUND},
@@ -89,9 +93,11 @@ static ErlNifFunc nif_funcs[] =
         {"iterator", 2, erocksdb::Iterator, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator", 3, erocksdb::Iterator, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterators", 3, erocksdb::Iterators, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"coalescing_iterator", 3, erocksdb::CoalescingIterator, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_move", 2, erocksdb::IteratorMove, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_refresh", 1, erocksdb::IteratorRefresh, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_close", 1, erocksdb::IteratorClose, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"iterator_columns", 1, erocksdb::IteratorColumns, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
         {"get_latest_sequence_number", 1, erocksdb::GetLatestSequenceNumber, ERL_NIF_REGULAR_BOUND},
 
@@ -358,6 +364,7 @@ ERL_NIF_TERM ATOM_PREFIX_SAME_AS_START;
 ERL_NIF_TERM ATOM_SNAPSHOT;
 ERL_NIF_TERM ATOM_BAD_SNAPSHOT;
 ERL_NIF_TERM ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT;
+ERL_NIF_TERM ATOM_AUTO_READAHEAD_SIZE;
 
 // Related to Write Options
 ERL_NIF_TERM ATOM_SYNC;
@@ -712,6 +719,7 @@ try
   ATOM(erocksdb::ATOM_SNAPSHOT, "snapshot");
   ATOM(erocksdb::ATOM_BAD_SNAPSHOT, "bad_snapshot");
   ATOM(erocksdb::ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT, "auto_refresh_iterator_with_snapshot");
+  ATOM(erocksdb::ATOM_AUTO_READAHEAD_SIZE, "auto_readahead_size");
 
   // Related to Write Options
   ATOM(erocksdb::ATOM_SYNC, "sync");
