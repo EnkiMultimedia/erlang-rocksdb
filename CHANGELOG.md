@@ -1,3 +1,27 @@
+## erlang-rocksdb 2.1.0, released on 2025/12/28
+
+- add Pessimistic Transaction support for high-contention workloads:
+  - `open_pessimistic_transaction_db/2,3`: open a TransactionDB with row-level locking
+  - `pessimistic_transaction/2,3`: begin a new transaction
+  - `pessimistic_transaction_put/3,4`: put with lock acquisition
+  - `pessimistic_transaction_get/3,4`: read without lock
+  - `pessimistic_transaction_get_for_update/3,4`: read with exclusive lock
+  - `pessimistic_transaction_delete/2,3`: delete with lock
+  - `pessimistic_transaction_iterator/2,3`: create transaction iterator
+  - `pessimistic_transaction_commit/1`: commit transaction
+  - `pessimistic_transaction_rollback/1`: rollback transaction
+  - `release_pessimistic_transaction/1`: release resources
+- add Pessimistic Transaction savepoint support:
+  - `pessimistic_transaction_set_savepoint/1`: mark a savepoint
+  - `pessimistic_transaction_rollback_to_savepoint/1`: rollback to last savepoint
+  - `pessimistic_transaction_pop_savepoint/1`: discard savepoint without rollback
+- add Pessimistic Transaction introspection:
+  - `pessimistic_transaction_get_id/1`: get unique transaction ID
+  - `pessimistic_transaction_get_waiting_txns/1`: get lock contention info
+- TransactionDB options: lock_timeout, deadlock_detect, max_num_locks, num_stripes
+- Transaction options: set_snapshot, deadlock_detect, lock_timeout
+- all pessimistic transaction operations use dirty NIFs to prevent blocking the Erlang scheduler
+
 ## erlang-rocksdb 2.0.0, released on 2025/12/28
 
 - bump to rocksdb version [10.7.5](https://github.com/facebook/rocksdb/releases/tag/v10.7.5)
