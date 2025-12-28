@@ -16,7 +16,7 @@ Or add it to your rebar config
 ```erlang
 {deps, [
     ....
-    {rocksdb, {rocksdb, "1.9.0"}}
+    {rocksdb, "2.0.0"}
 ]}.
 ```
 
@@ -114,6 +114,41 @@ then you can move to the previous or next data using the function `iterator:move
 > An iterator doesn't support parallel operations, so make sure to use it accordingly.
 
 Prefix seek can be optimized by putting your database in "prefix seek" mode using  the option `prefix_extractor` for your DB or column family is specified. See the [Prefix Seek](prefix-seek.html) API for more information.
+
+### Wide-Column Entities
+
+Starting in version 2.0.0, Erlang RocksDB supports RocksDB's Wide-Column Entity API. Entities allow storing structured data with multiple named columns per key, providing a more flexible schema than simple key-value pairs.
+
+```erlang
+%% Store an entity with multiple columns
+Key = <<"user:123">>,
+Columns = [
+    {<<"name">>, <<"Alice">>},
+    {<<"email">>, <<"alice@example.com">>},
+    {<<"age">>, <<"30">>}
+],
+ok = rocksdb:put_entity(Db, Key, Columns, []),
+
+%% Retrieve entity columns as a proplist
+{ok, Result} = rocksdb:get_entity(Db, Key, []),
+Name = proplists:get_value(<<"name">>, Result),  %% <<"Alice">>
+
+%% Delete entity (same as regular delete)
+ok = rocksdb:delete_entity(Db, Key, []).
+```
+
+When iterating, you can access columns for any entry:
+
+```erlang
+{ok, Itr} = rocksdb:iterator(Db, []),
+{ok, Key, _Value} = rocksdb:iterator_move(Itr, first),
+{ok, Columns} = rocksdb:iterator_columns(Itr),
+%% For regular key-values, returns [{<<>>, Value}] (single default column)
+%% For entities, returns all stored columns
+rocksdb:iterator_close(Itr).
+```
+
+See [Wide-Column Entities](wide_column_entities.html) for more details.
 
 ### Snapshots
 

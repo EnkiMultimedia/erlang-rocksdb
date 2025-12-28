@@ -1,4 +1,19 @@
-## erlang-rockksdb 1.9.0, released on 2025/02/01
+## erlang-rocksdb 2.0.0, released on 2025/12/28
+
+- bump to rocksdb version [10.7.5](https://github.com/facebook/rocksdb/releases/tag/v10.7.5)
+- add Wide-Column Entity API for structured data storage:
+  - `put_entity/4,5`: store key with multiple named columns
+  - `get_entity/3,4`: retrieve entity columns as proplist
+  - `iterator_columns/1`: get columns from current iterator position
+  - `delete_entity/3,4`: convenience wrapper for delete
+- add `coalescing_iterator/3` for efficient multi-column-family iteration
+- add `auto_readahead_size` iterator option for automatic prefetch tuning
+- add `auto_refresh_iterator_with_snapshot` iterator option
+- fix CMake 3.31 compatibility
+- fix bundled snappy linking on Linux (RTTI mismatch)
+- fix compiler warnings
+
+## erlang-rocksdb 1.9.0, released on 2025/02/01
 
 - bump to rocksdb version [9.10.0]((https://github.com/facebook/rocksdb/releases/tag/v9.10.0)
 - bump to snappy 1.2.1

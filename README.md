@@ -11,18 +11,19 @@ Feedback and pull requests welcome! If a particular feature of RocksDB is import
 
 ## Features
 
-- rocksdb 9.10.0 with snappy 1.12.1, lz4 1.8.3
-- Erlang 22 and sup with dirty-nifs enabled
-- all basics db operations
-- batchs support
-- snapshots support
-- checkpoint support
-- column families support
-- transaction logs
-- backup support
-- erlang merge operator
-- customized build support
-- Tested on macosx, freebsd, solaris and linux
+- RocksDB 10.7.5 with snappy 1.2.1, lz4 1.10.0
+- Erlang 22+ with dirty-nifs enabled
+- All basic db operations (get, put, delete, merge)
+- Wide-column entity API (put_entity, get_entity, iterator_columns)
+- Batch operations support
+- Snapshots support
+- Checkpoint support
+- Column families support with coalescing iterator
+- Transaction logs
+- Backup support
+- Erlang merge operator
+- Customized build support
+- Tested on macOS, FreeBSD, Solaris and Linux
 
 ## Usage
 
