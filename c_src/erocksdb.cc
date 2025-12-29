@@ -608,6 +608,18 @@ ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS;
 ERL_NIF_TERM ATOM_BLOB_DB_COMPRESSION_MICROS;
 ERL_NIF_TERM ATOM_BLOB_DB_DECOMPRESSION_MICROS;
 
+// Compaction Statistics Tickers
+ERL_NIF_TERM ATOM_COMPACT_READ_BYTES;
+ERL_NIF_TERM ATOM_COMPACT_WRITE_BYTES;
+ERL_NIF_TERM ATOM_FLUSH_WRITE_BYTES;
+ERL_NIF_TERM ATOM_COMPACTION_KEY_DROP_NEWER_ENTRY;
+ERL_NIF_TERM ATOM_COMPACTION_KEY_DROP_OBSOLETE;
+ERL_NIF_TERM ATOM_COMPACTION_KEY_DROP_RANGE_DEL;
+ERL_NIF_TERM ATOM_COMPACTION_KEY_DROP_USER;
+ERL_NIF_TERM ATOM_COMPACTION_CANCELLED;
+ERL_NIF_TERM ATOM_NUMBER_SUPERVERSION_ACQUIRES;
+ERL_NIF_TERM ATOM_NUMBER_SUPERVERSION_RELEASES;
+
 // Read/Write Operation Tickers
 ERL_NIF_TERM ATOM_NUMBER_KEYS_WRITTEN;
 ERL_NIF_TERM ATOM_NUMBER_KEYS_READ;
@@ -1084,6 +1096,18 @@ try
   ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS, "blob_db_blob_file_sync_micros");
   ATOM(erocksdb::ATOM_BLOB_DB_COMPRESSION_MICROS, "blob_db_compression_micros");
   ATOM(erocksdb::ATOM_BLOB_DB_DECOMPRESSION_MICROS, "blob_db_decompression_micros");
+
+  // Compaction Statistics Tickers
+  ATOM(erocksdb::ATOM_COMPACT_READ_BYTES, "compact_read_bytes");
+  ATOM(erocksdb::ATOM_COMPACT_WRITE_BYTES, "compact_write_bytes");
+  ATOM(erocksdb::ATOM_FLUSH_WRITE_BYTES, "flush_write_bytes");
+  ATOM(erocksdb::ATOM_COMPACTION_KEY_DROP_NEWER_ENTRY, "compaction_key_drop_newer_entry");
+  ATOM(erocksdb::ATOM_COMPACTION_KEY_DROP_OBSOLETE, "compaction_key_drop_obsolete");
+  ATOM(erocksdb::ATOM_COMPACTION_KEY_DROP_RANGE_DEL, "compaction_key_drop_range_del");
+  ATOM(erocksdb::ATOM_COMPACTION_KEY_DROP_USER, "compaction_key_drop_user");
+  ATOM(erocksdb::ATOM_COMPACTION_CANCELLED, "compaction_cancelled");
+  ATOM(erocksdb::ATOM_NUMBER_SUPERVERSION_ACQUIRES, "number_superversion_acquires");
+  ATOM(erocksdb::ATOM_NUMBER_SUPERVERSION_RELEASES, "number_superversion_releases");
 
   // Read/Write Operation Tickers
   ATOM(erocksdb::ATOM_NUMBER_KEYS_WRITTEN, "number_keys_written");

@@ -540,6 +540,17 @@
       blob_db_compression_micros |
       blob_db_decompression_micros.
 
+-type compaction_ticker() :: compact_read_bytes |
+      compact_write_bytes |
+      flush_write_bytes |
+      compaction_key_drop_newer_entry |
+      compaction_key_drop_obsolete |
+      compaction_key_drop_range_del |
+      compaction_key_drop_user |
+      compaction_cancelled |
+      number_superversion_acquires |
+      number_superversion_releases.
+
 -type db_operation_ticker() :: number_keys_written |
       number_keys_read |
       number_keys_updated |
@@ -2184,8 +2195,8 @@ statistics_info(_Statistics) ->
 
 %% @doc Get the count for a specific statistics ticker.
 %% Returns the count for tickers such as blob_db_num_put, block_cache_hit,
-%% number_keys_written, bytes_read, etc.
--spec statistics_ticker(statistics_handle(), blob_db_ticker() | db_operation_ticker() | block_cache_ticker()) -> {ok, non_neg_integer()}.
+%% number_keys_written, compact_read_bytes, etc.
+-spec statistics_ticker(statistics_handle(), blob_db_ticker() | compaction_ticker() | db_operation_ticker() | block_cache_ticker()) -> {ok, non_neg_integer()}.
 statistics_ticker(_Statistics, _Ticker) ->
   ?nif_stub.
 

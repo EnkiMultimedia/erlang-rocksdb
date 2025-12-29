@@ -396,6 +396,57 @@ bool TickerAtomToEnum(ERL_NIF_TERM atom, rocksdb::Tickers* ticker)
         *ticker = rocksdb::BLOB_DB_CACHE_BYTES_WRITE;
         return true;
     }
+    // Compaction Statistics Tickers
+    else if (atom == ATOM_COMPACT_READ_BYTES)
+    {
+        *ticker = rocksdb::COMPACT_READ_BYTES;
+        return true;
+    }
+    else if (atom == ATOM_COMPACT_WRITE_BYTES)
+    {
+        *ticker = rocksdb::COMPACT_WRITE_BYTES;
+        return true;
+    }
+    else if (atom == ATOM_FLUSH_WRITE_BYTES)
+    {
+        *ticker = rocksdb::FLUSH_WRITE_BYTES;
+        return true;
+    }
+    else if (atom == ATOM_COMPACTION_KEY_DROP_NEWER_ENTRY)
+    {
+        *ticker = rocksdb::COMPACTION_KEY_DROP_NEWER_ENTRY;
+        return true;
+    }
+    else if (atom == ATOM_COMPACTION_KEY_DROP_OBSOLETE)
+    {
+        *ticker = rocksdb::COMPACTION_KEY_DROP_OBSOLETE;
+        return true;
+    }
+    else if (atom == ATOM_COMPACTION_KEY_DROP_RANGE_DEL)
+    {
+        *ticker = rocksdb::COMPACTION_KEY_DROP_RANGE_DEL;
+        return true;
+    }
+    else if (atom == ATOM_COMPACTION_KEY_DROP_USER)
+    {
+        *ticker = rocksdb::COMPACTION_KEY_DROP_USER;
+        return true;
+    }
+    else if (atom == ATOM_COMPACTION_CANCELLED)
+    {
+        *ticker = rocksdb::COMPACTION_CANCELLED;
+        return true;
+    }
+    else if (atom == ATOM_NUMBER_SUPERVERSION_ACQUIRES)
+    {
+        *ticker = rocksdb::NUMBER_SUPERVERSION_ACQUIRES;
+        return true;
+    }
+    else if (atom == ATOM_NUMBER_SUPERVERSION_RELEASES)
+    {
+        *ticker = rocksdb::NUMBER_SUPERVERSION_RELEASES;
+        return true;
+    }
     // Read/Write Operation Tickers
     else if (atom == ATOM_NUMBER_KEYS_WRITTEN)
     {
