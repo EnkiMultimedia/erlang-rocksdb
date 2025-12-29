@@ -577,6 +577,13 @@
       block_cache_bytes_read |
       block_cache_bytes_write.
 
+-type memtable_stall_ticker() :: memtable_hit |
+      memtable_miss |
+      stall_micros |
+      write_done_by_self |
+      write_done_by_other |
+      wal_file_synced.
+
 -type histogram_info() :: #{median => float(),
                             percentile95 => float(),
                             percentile99 => float(),
@@ -2196,7 +2203,7 @@ statistics_info(_Statistics) ->
 %% @doc Get the count for a specific statistics ticker.
 %% Returns the count for tickers such as blob_db_num_put, block_cache_hit,
 %% number_keys_written, compact_read_bytes, etc.
--spec statistics_ticker(statistics_handle(), blob_db_ticker() | compaction_ticker() | db_operation_ticker() | block_cache_ticker()) -> {ok, non_neg_integer()}.
+-spec statistics_ticker(statistics_handle(), blob_db_ticker() | compaction_ticker() | db_operation_ticker() | block_cache_ticker() | memtable_stall_ticker()) -> {ok, non_neg_integer()}.
 statistics_ticker(_Statistics, _Ticker) ->
   ?nif_stub.
 

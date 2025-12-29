@@ -648,6 +648,14 @@ ERL_NIF_TERM ATOM_BLOCK_CACHE_DATA_HIT;
 ERL_NIF_TERM ATOM_BLOCK_CACHE_BYTES_READ;
 ERL_NIF_TERM ATOM_BLOCK_CACHE_BYTES_WRITE;
 
+// Memtable and Stall Statistics Tickers
+ERL_NIF_TERM ATOM_MEMTABLE_HIT;
+ERL_NIF_TERM ATOM_MEMTABLE_MISS;
+ERL_NIF_TERM ATOM_STALL_MICROS;
+ERL_NIF_TERM ATOM_WRITE_DONE_BY_SELF;
+ERL_NIF_TERM ATOM_WRITE_DONE_BY_OTHER;
+ERL_NIF_TERM ATOM_WAL_FILE_SYNCED;
+
 // Histogram result keys
 ERL_NIF_TERM ATOM_MEDIAN;
 ERL_NIF_TERM ATOM_PERCENTILE95;
@@ -1136,6 +1144,14 @@ try
   ATOM(erocksdb::ATOM_BLOCK_CACHE_DATA_HIT, "block_cache_data_hit");
   ATOM(erocksdb::ATOM_BLOCK_CACHE_BYTES_READ, "block_cache_bytes_read");
   ATOM(erocksdb::ATOM_BLOCK_CACHE_BYTES_WRITE, "block_cache_bytes_write");
+
+  // Memtable and Stall Statistics Tickers
+  ATOM(erocksdb::ATOM_MEMTABLE_HIT, "memtable_hit");
+  ATOM(erocksdb::ATOM_MEMTABLE_MISS, "memtable_miss");
+  ATOM(erocksdb::ATOM_STALL_MICROS, "stall_micros");
+  ATOM(erocksdb::ATOM_WRITE_DONE_BY_SELF, "write_done_by_self");
+  ATOM(erocksdb::ATOM_WRITE_DONE_BY_OTHER, "write_done_by_other");
+  ATOM(erocksdb::ATOM_WAL_FILE_SYNCED, "wal_file_synced");
 
   // Histogram result keys
   ATOM(erocksdb::ATOM_MEDIAN, "median");

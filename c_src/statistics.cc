@@ -569,6 +569,37 @@ bool TickerAtomToEnum(ERL_NIF_TERM atom, rocksdb::Tickers* ticker)
         *ticker = rocksdb::BLOCK_CACHE_BYTES_WRITE;
         return true;
     }
+    // Memtable and Stall Tickers
+    else if (atom == ATOM_MEMTABLE_HIT)
+    {
+        *ticker = rocksdb::MEMTABLE_HIT;
+        return true;
+    }
+    else if (atom == ATOM_MEMTABLE_MISS)
+    {
+        *ticker = rocksdb::MEMTABLE_MISS;
+        return true;
+    }
+    else if (atom == ATOM_STALL_MICROS)
+    {
+        *ticker = rocksdb::STALL_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_WRITE_DONE_BY_SELF)
+    {
+        *ticker = rocksdb::WRITE_DONE_BY_SELF;
+        return true;
+    }
+    else if (atom == ATOM_WRITE_DONE_BY_OTHER)
+    {
+        *ticker = rocksdb::WRITE_DONE_BY_OTHER;
+        return true;
+    }
+    else if (atom == ATOM_WAL_FILE_SYNCED)
+    {
+        *ticker = rocksdb::WAL_FILE_SYNCED;
+        return true;
+    }
     return false;
 }
 
