@@ -109,6 +109,8 @@ parse_iterator_options(
                 opts.auto_refresh_iterator_with_snapshot = (option[1] == erocksdb::ATOM_TRUE);
             else if (option[0] == erocksdb::ATOM_AUTO_READAHEAD_SIZE)
                 opts.auto_readahead_size = (option[1] == erocksdb::ATOM_TRUE);
+            else if (option[0] == erocksdb::ATOM_ALLOW_UNPREPARED_VALUE)
+                opts.allow_unprepared_value = (option[1] == erocksdb::ATOM_TRUE);
         }
     }
     return 1;

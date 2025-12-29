@@ -394,6 +394,7 @@ ERL_NIF_TERM ATOM_SNAPSHOT;
 ERL_NIF_TERM ATOM_BAD_SNAPSHOT;
 ERL_NIF_TERM ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT;
 ERL_NIF_TERM ATOM_AUTO_READAHEAD_SIZE;
+ERL_NIF_TERM ATOM_ALLOW_UNPREPARED_VALUE;
 
 // Related to Write Options
 ERL_NIF_TERM ATOM_SYNC;
@@ -829,6 +830,7 @@ try
   ATOM(erocksdb::ATOM_BAD_SNAPSHOT, "bad_snapshot");
   ATOM(erocksdb::ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT, "auto_refresh_iterator_with_snapshot");
   ATOM(erocksdb::ATOM_AUTO_READAHEAD_SIZE, "auto_readahead_size");
+  ATOM(erocksdb::ATOM_ALLOW_UNPREPARED_VALUE, "allow_unprepared_value");
 
   // Related to Write Options
   ATOM(erocksdb::ATOM_SYNC, "sync");

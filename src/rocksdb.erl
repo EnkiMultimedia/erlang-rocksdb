@@ -432,7 +432,9 @@
                          {total_order_seek, boolean()} |
                          {prefix_same_as_start, boolean()} |
                          {snapshot, snapshot_handle()} |
-                         {auto_refresh_iterator_with_snapshot, boolean()}].
+                         {auto_refresh_iterator_with_snapshot, boolean()} |
+                         {auto_readahead_size, boolean()} |
+                         {allow_unprepared_value, boolean()}].
 
 -type write_options() :: [{sync, boolean()} |
                           {disable_wal, boolean()} |

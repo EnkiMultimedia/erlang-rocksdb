@@ -279,6 +279,41 @@ auto_readahead_size_test() ->
   rocksdb:destroy("ltest", []),
   rocksdb_test_util:rm_rf("ltest").
 
+%% Test allow_unprepared_value option for lazy blob loading in BlobDB
+%% When allow_unprepared_value=true, blob values are not loaded until
+%% PrepareValue() is called (see iterator_prepare_value_test for full test)
+allow_unprepared_value_test() ->
+  rocksdb_test_util:rm_rf("test_unprepared"),
+  {ok, Ref} = rocksdb:open("test_unprepared",
+    [{create_if_missing, true}
+    ,{enable_blob_files, true}
+    ,{min_blob_size, 0}]),  %% All values go to blob files
+  try
+    Value = list_to_binary(lists:duplicate(100, $a)),
+    rocksdb:put(Ref, <<"key1">>, Value, []),
+    rocksdb:put(Ref, <<"key2">>, Value, []),
+    rocksdb:flush(Ref, []),
+
+    %% Test with allow_unprepared_value enabled
+    %% Values will be empty until PrepareValue() is called
+    {ok, I} = rocksdb:iterator(Ref, [{allow_unprepared_value, true}]),
+    %% Keys are returned, but blob values are empty (not yet loaded)
+    {ok, <<"key1">>, _} = rocksdb:iterator_move(I, first),
+    {ok, <<"key2">>, _} = rocksdb:iterator_move(I, next),
+    ?assertEqual(ok, rocksdb:iterator_close(I)),
+
+    %% Test with allow_unprepared_value disabled (default)
+    %% Values are loaded automatically
+    {ok, I2} = rocksdb:iterator(Ref, [{allow_unprepared_value, false}]),
+    ?assertEqual({ok, <<"key1">>, Value}, rocksdb:iterator_move(I2, first)),
+    ?assertEqual({ok, <<"key2">>, Value}, rocksdb:iterator_move(I2, next)),
+    ?assertEqual(ok, rocksdb:iterator_close(I2))
+  after
+    rocksdb:close(Ref)
+  end,
+  rocksdb:destroy("test_unprepared", []),
+  rocksdb_test_util:rm_rf("test_unprepared").
+
 test_key(Prefix, Suffix) when is_integer(Prefix), is_integer(Suffix) ->
   << Prefix:64, Suffix:64 >>.
 
