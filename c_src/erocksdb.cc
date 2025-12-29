@@ -70,6 +70,8 @@ static ErlNifFunc nif_funcs[] =
         {"drop_column_family", 2, erocksdb::DropColumnFamily, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"destroy_column_family", 1, erocksdb::DestroyColumnFamily, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"destroy_column_family", 2, erocksdb::DestroyColumnFamily, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"get_column_family_metadata", 1, erocksdb::GetColumnFamilyMetaData, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"get_column_family_metadata", 2, erocksdb::GetColumnFamilyMetaData, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
         // kv operations
         {"get", 3, erocksdb::Get, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -633,6 +635,20 @@ ERL_NIF_TERM ATOM_TIMED_OUT;
 ERL_NIF_TERM ATOM_EXPIRED;
 ERL_NIF_TERM ATOM_TRY_AGAIN;
 
+// Column Family/Blob Metadata
+ERL_NIF_TERM ATOM_SIZE;
+ERL_NIF_TERM ATOM_FILE_COUNT;
+ERL_NIF_TERM ATOM_NAME;
+// ATOM_BLOB_FILE_SIZE already defined above in CFOptions blob section
+ERL_NIF_TERM ATOM_BLOB_FILES;
+ERL_NIF_TERM ATOM_BLOB_FILE_NUMBER;
+ERL_NIF_TERM ATOM_BLOB_FILE_NAME;
+ERL_NIF_TERM ATOM_BLOB_FILE_PATH;
+ERL_NIF_TERM ATOM_TOTAL_BLOB_COUNT;
+ERL_NIF_TERM ATOM_TOTAL_BLOB_BYTES;
+ERL_NIF_TERM ATOM_GARBAGE_BLOB_COUNT;
+ERL_NIF_TERM ATOM_GARBAGE_BLOB_BYTES;
+
 }   // namespace erocksdb
 
 
@@ -1067,6 +1083,20 @@ try
   ATOM(erocksdb::ATOM_TIMED_OUT, "timed_out");
   ATOM(erocksdb::ATOM_EXPIRED, "expired");
   ATOM(erocksdb::ATOM_TRY_AGAIN, "try_again");
+
+  // Column Family/Blob Metadata
+  ATOM(erocksdb::ATOM_SIZE, "size");
+  ATOM(erocksdb::ATOM_FILE_COUNT, "file_count");
+  ATOM(erocksdb::ATOM_NAME, "name");
+  // ATOM_BLOB_FILE_SIZE already initialized above
+  ATOM(erocksdb::ATOM_BLOB_FILES, "blob_files");
+  ATOM(erocksdb::ATOM_BLOB_FILE_NUMBER, "blob_file_number");
+  ATOM(erocksdb::ATOM_BLOB_FILE_NAME, "blob_file_name");
+  ATOM(erocksdb::ATOM_BLOB_FILE_PATH, "blob_file_path");
+  ATOM(erocksdb::ATOM_TOTAL_BLOB_COUNT, "total_blob_count");
+  ATOM(erocksdb::ATOM_TOTAL_BLOB_BYTES, "total_blob_bytes");
+  ATOM(erocksdb::ATOM_GARBAGE_BLOB_COUNT, "garbage_blob_count");
+  ATOM(erocksdb::ATOM_GARBAGE_BLOB_BYTES, "garbage_blob_bytes");
 
 #undef ATOM
 

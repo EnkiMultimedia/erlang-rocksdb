@@ -32,6 +32,7 @@
 #include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb/utilities/optimistic_transaction_db.h"
 #include "rocksdb/utilities/transaction_db.h"
+#include "rocksdb/metadata.h"
 
 #include "atoms.h"
 #include "refobjects.h"
@@ -2262,6 +2263,115 @@ OpenPessimisticTransactionDB(
 
     return enif_make_tuple3(env, ATOM_OK, result, cf_list_out);
 }   // OpenPessimisticTransactionDB
+
+ERL_NIF_TERM
+GetColumnFamilyMetaData(
+    ErlNifEnv* env,
+    int argc,
+    const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    rocksdb::ColumnFamilyMetaData cf_meta;
+
+    if (argc == 2)
+    {
+        // With column family handle
+        ReferencePtr<ColumnFamilyObject> cf_ptr;
+        if(!enif_get_cf(env, argv[1], &cf_ptr))
+            return enif_make_badarg(env);
+        db_ptr->m_Db->GetColumnFamilyMetaData(cf_ptr->m_ColumnFamily, &cf_meta);
+    }
+    else
+    {
+        // Default column family
+        db_ptr->m_Db->GetColumnFamilyMetaData(&cf_meta);
+    }
+
+    // Build blob_files list
+    ERL_NIF_TERM blob_files_list = enif_make_list(env, 0);
+    for (auto it = cf_meta.blob_files.rbegin(); it != cf_meta.blob_files.rend(); ++it)
+    {
+        const rocksdb::BlobMetaData& blob = *it;
+
+        // Create binary for file_name and file_path
+        ERL_NIF_TERM file_name_bin;
+        unsigned char* name_data = enif_make_new_binary(env, blob.blob_file_name.size(), &file_name_bin);
+        memcpy(name_data, blob.blob_file_name.data(), blob.blob_file_name.size());
+
+        ERL_NIF_TERM file_path_bin;
+        unsigned char* path_data = enif_make_new_binary(env, blob.blob_file_path.size(), &file_path_bin);
+        memcpy(path_data, blob.blob_file_path.data(), blob.blob_file_path.size());
+
+        // Build blob metadata map
+        ERL_NIF_TERM blob_keys[8];
+        ERL_NIF_TERM blob_values[8];
+
+        blob_keys[0] = ATOM_BLOB_FILE_NUMBER;
+        blob_values[0] = enif_make_uint64(env, blob.blob_file_number);
+
+        blob_keys[1] = ATOM_BLOB_FILE_NAME;
+        blob_values[1] = file_name_bin;
+
+        blob_keys[2] = ATOM_BLOB_FILE_PATH;
+        blob_values[2] = file_path_bin;
+
+        blob_keys[3] = ATOM_SIZE;
+        blob_values[3] = enif_make_uint64(env, blob.blob_file_size);
+
+        blob_keys[4] = ATOM_TOTAL_BLOB_COUNT;
+        blob_values[4] = enif_make_uint64(env, blob.total_blob_count);
+
+        blob_keys[5] = ATOM_TOTAL_BLOB_BYTES;
+        blob_values[5] = enif_make_uint64(env, blob.total_blob_bytes);
+
+        blob_keys[6] = ATOM_GARBAGE_BLOB_COUNT;
+        blob_values[6] = enif_make_uint64(env, blob.garbage_blob_count);
+
+        blob_keys[7] = ATOM_GARBAGE_BLOB_BYTES;
+        blob_values[7] = enif_make_uint64(env, blob.garbage_blob_bytes);
+
+        ERL_NIF_TERM blob_map;
+        enif_make_map_from_arrays(env, blob_keys, blob_values, 8, &blob_map);
+
+        blob_files_list = enif_make_list_cell(env, blob_map, blob_files_list);
+    }
+
+    // Reverse to get correct order
+    ERL_NIF_TERM blob_files_out;
+    enif_make_reverse_list(env, blob_files_list, &blob_files_out);
+
+    // Create binary for name
+    ERL_NIF_TERM name_bin;
+    unsigned char* cf_name_data = enif_make_new_binary(env, cf_meta.name.size(), &name_bin);
+    memcpy(cf_name_data, cf_meta.name.data(), cf_meta.name.size());
+
+    // Build result map
+    ERL_NIF_TERM keys[5];
+    ERL_NIF_TERM values[5];
+
+    keys[0] = ATOM_SIZE;
+    values[0] = enif_make_uint64(env, cf_meta.size);
+
+    keys[1] = ATOM_FILE_COUNT;
+    values[1] = enif_make_uint64(env, cf_meta.file_count);
+
+    keys[2] = ATOM_NAME;
+    values[2] = name_bin;
+
+    keys[3] = ATOM_BLOB_FILE_SIZE;
+    values[3] = enif_make_uint64(env, cf_meta.blob_file_size);
+
+    keys[4] = ATOM_BLOB_FILES;
+    values[4] = blob_files_out;
+
+    ERL_NIF_TERM result_map;
+    enif_make_map_from_arrays(env, keys, values, 5, &result_map);
+
+    return enif_make_tuple2(env, ATOM_OK, result_map);
+}   // GetColumnFamilyMetaData
 
 
 }

@@ -45,6 +45,7 @@
 -export([open_with_cf/3, open_with_cf_readonly/3]).
 -export([drop_column_family/1]).
 -export([destroy_column_family/1]).
+-export([get_column_family_metadata/1, get_column_family_metadata/2]).
 
 -export([get_latest_sequence_number/1]).
 
@@ -548,6 +549,21 @@
                             count => non_neg_integer(),
                             sum => non_neg_integer()}.
 
+-type blob_metadata() :: #{blob_file_number => non_neg_integer(),
+                           blob_file_name => binary(),
+                           blob_file_path => binary(),
+                           size => non_neg_integer(),
+                           total_blob_count => non_neg_integer(),
+                           total_blob_bytes => non_neg_integer(),
+                           garbage_blob_count => non_neg_integer(),
+                           garbage_blob_bytes => non_neg_integer()}.
+
+-type cf_metadata() :: #{size => non_neg_integer(),
+                         file_count => non_neg_integer(),
+                         name => binary(),
+                         blob_file_size => non_neg_integer(),
+                         blob_files => [blob_metadata()]}.
+
 -compile(no_native).
 -on_load(on_load/0).
 
@@ -705,7 +721,18 @@ drop_column_family(_CFHandle) ->
 destroy_column_family(_CFHandle) ->
   ?nif_stub.
 
+%% @doc Get column family metadata including blob file information.
+-spec get_column_family_metadata(DBHandle) -> {ok, cf_metadata()} when
+  DBHandle :: db_handle().
+get_column_family_metadata(_DBHandle) ->
+  ?nif_stub.
 
+%% @doc Get column family metadata for a specific column family.
+-spec get_column_family_metadata(DBHandle, CFHandle) -> {ok, cf_metadata()} when
+  DBHandle :: db_handle(),
+  CFHandle :: cf_handle().
+get_column_family_metadata(_DBHandle, _CFHandle) ->
+  ?nif_stub.
 
 %% @doc return a database snapshot
 %% Snapshots provide consistent read-only views over the entire state of the key-value store
