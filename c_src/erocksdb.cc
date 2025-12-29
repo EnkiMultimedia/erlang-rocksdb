@@ -608,6 +608,20 @@ ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS;
 ERL_NIF_TERM ATOM_BLOB_DB_COMPRESSION_MICROS;
 ERL_NIF_TERM ATOM_BLOB_DB_DECOMPRESSION_MICROS;
 
+// Block Cache Statistics Tickers
+ERL_NIF_TERM ATOM_BLOCK_CACHE_MISS;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_HIT;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_ADD;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_ADD_FAILURES;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_INDEX_MISS;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_INDEX_HIT;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_FILTER_MISS;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_FILTER_HIT;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_DATA_MISS;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_DATA_HIT;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_BYTES_READ;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_BYTES_WRITE;
+
 // Histogram result keys
 ERL_NIF_TERM ATOM_MEDIAN;
 ERL_NIF_TERM ATOM_PERCENTILE95;
@@ -1056,6 +1070,20 @@ try
   ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS, "blob_db_blob_file_sync_micros");
   ATOM(erocksdb::ATOM_BLOB_DB_COMPRESSION_MICROS, "blob_db_compression_micros");
   ATOM(erocksdb::ATOM_BLOB_DB_DECOMPRESSION_MICROS, "blob_db_decompression_micros");
+
+  // Block Cache Statistics Tickers
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_MISS, "block_cache_miss");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_HIT, "block_cache_hit");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_ADD, "block_cache_add");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_ADD_FAILURES, "block_cache_add_failures");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_INDEX_MISS, "block_cache_index_miss");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_INDEX_HIT, "block_cache_index_hit");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_FILTER_MISS, "block_cache_filter_miss");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_FILTER_HIT, "block_cache_filter_hit");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_DATA_MISS, "block_cache_data_miss");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_DATA_HIT, "block_cache_data_hit");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_BYTES_READ, "block_cache_bytes_read");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_BYTES_WRITE, "block_cache_bytes_write");
 
   // Histogram result keys
   ATOM(erocksdb::ATOM_MEDIAN, "median");

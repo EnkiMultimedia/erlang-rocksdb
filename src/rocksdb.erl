@@ -540,6 +540,19 @@
       blob_db_compression_micros |
       blob_db_decompression_micros.
 
+-type block_cache_ticker() :: block_cache_miss |
+      block_cache_hit |
+      block_cache_add |
+      block_cache_add_failures |
+      block_cache_index_miss |
+      block_cache_index_hit |
+      block_cache_filter_miss |
+      block_cache_filter_hit |
+      block_cache_data_miss |
+      block_cache_data_hit |
+      block_cache_bytes_read |
+      block_cache_bytes_write.
+
 -type histogram_info() :: #{median => float(),
                             percentile95 => float(),
                             percentile99 => float(),
@@ -2157,9 +2170,9 @@ statistics_info(_Statistics) ->
   ?nif_stub.
 
 %% @doc Get the count for a specific statistics ticker.
-%% Returns the count for BlobDB related tickers such as blob_db_num_put,
-%% blob_db_cache_hit, blob_db_gc_num_files, etc.
--spec statistics_ticker(statistics_handle(), blob_db_ticker()) -> {ok, non_neg_integer()}.
+%% Returns the count for tickers such as blob_db_num_put, block_cache_hit,
+%% blob_db_gc_num_files, etc.
+-spec statistics_ticker(statistics_handle(), blob_db_ticker() | block_cache_ticker()) -> {ok, non_neg_integer()}.
 statistics_ticker(_Statistics, _Ticker) ->
   ?nif_stub.
 
