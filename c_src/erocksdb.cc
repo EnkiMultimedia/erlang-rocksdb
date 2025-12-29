@@ -98,6 +98,7 @@ static ErlNifFunc nif_funcs[] =
         {"coalescing_iterator", 3, erocksdb::CoalescingIterator, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_move", 2, erocksdb::IteratorMove, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_refresh", 1, erocksdb::IteratorRefresh, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"iterator_prepare_value", 1, erocksdb::IteratorPrepareValue, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_close", 1, erocksdb::IteratorClose, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_columns", 1, erocksdb::IteratorColumns, ERL_NIF_DIRTY_JOB_IO_BOUND},
 

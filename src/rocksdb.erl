@@ -71,6 +71,7 @@
   coalescing_iterator/3,
   iterator_move/2,
   iterator_refresh/1,
+  iterator_prepare_value/1,
   iterator_close/1,
   iterator_columns/1,
   delete_entity/3, delete_entity/4
@@ -1097,6 +1098,13 @@ iterator_move(_ITRHandle, _ITRAction) ->
 %% Refresh iterator
 -spec(iterator_refresh(ITRHandle) -> ok when ITRHandle::itr_handle()).
 iterator_refresh(_ITRHandle) ->
+    ?nif_stub.
+
+%% @doc Load the blob value for the current iterator position.
+%% Use with `{allow_unprepared_value, true}' to enable efficient key-only
+%% scanning with selective value loading.
+-spec(iterator_prepare_value(ITRHandle) -> ok | {error, any()} when ITRHandle::itr_handle()).
+iterator_prepare_value(_ITRHandle) ->
     ?nif_stub.
 
 %% @doc
