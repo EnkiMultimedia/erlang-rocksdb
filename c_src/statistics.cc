@@ -396,6 +396,67 @@ bool TickerAtomToEnum(ERL_NIF_TERM atom, rocksdb::Tickers* ticker)
         *ticker = rocksdb::BLOB_DB_CACHE_BYTES_WRITE;
         return true;
     }
+    // Read/Write Operation Tickers
+    else if (atom == ATOM_NUMBER_KEYS_WRITTEN)
+    {
+        *ticker = rocksdb::NUMBER_KEYS_WRITTEN;
+        return true;
+    }
+    else if (atom == ATOM_NUMBER_KEYS_READ)
+    {
+        *ticker = rocksdb::NUMBER_KEYS_READ;
+        return true;
+    }
+    else if (atom == ATOM_NUMBER_KEYS_UPDATED)
+    {
+        *ticker = rocksdb::NUMBER_KEYS_UPDATED;
+        return true;
+    }
+    else if (atom == ATOM_BYTES_WRITTEN)
+    {
+        *ticker = rocksdb::BYTES_WRITTEN;
+        return true;
+    }
+    else if (atom == ATOM_BYTES_READ)
+    {
+        *ticker = rocksdb::BYTES_READ;
+        return true;
+    }
+    else if (atom == ATOM_ITER_BYTES_READ)
+    {
+        *ticker = rocksdb::ITER_BYTES_READ;
+        return true;
+    }
+    else if (atom == ATOM_NUMBER_DB_SEEK)
+    {
+        *ticker = rocksdb::NUMBER_DB_SEEK;
+        return true;
+    }
+    else if (atom == ATOM_NUMBER_DB_NEXT)
+    {
+        *ticker = rocksdb::NUMBER_DB_NEXT;
+        return true;
+    }
+    else if (atom == ATOM_NUMBER_DB_PREV)
+    {
+        *ticker = rocksdb::NUMBER_DB_PREV;
+        return true;
+    }
+    else if (atom == ATOM_NUMBER_DB_SEEK_FOUND)
+    {
+        *ticker = rocksdb::NUMBER_DB_SEEK_FOUND;
+        return true;
+    }
+    else if (atom == ATOM_NUMBER_DB_NEXT_FOUND)
+    {
+        *ticker = rocksdb::NUMBER_DB_NEXT_FOUND;
+        return true;
+    }
+    else if (atom == ATOM_NUMBER_DB_PREV_FOUND)
+    {
+        *ticker = rocksdb::NUMBER_DB_PREV_FOUND;
+        return true;
+    }
     // Block Cache Tickers
     else if (atom == ATOM_BLOCK_CACHE_MISS)
     {

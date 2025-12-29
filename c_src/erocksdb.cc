@@ -608,6 +608,20 @@ ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS;
 ERL_NIF_TERM ATOM_BLOB_DB_COMPRESSION_MICROS;
 ERL_NIF_TERM ATOM_BLOB_DB_DECOMPRESSION_MICROS;
 
+// Read/Write Operation Tickers
+ERL_NIF_TERM ATOM_NUMBER_KEYS_WRITTEN;
+ERL_NIF_TERM ATOM_NUMBER_KEYS_READ;
+ERL_NIF_TERM ATOM_NUMBER_KEYS_UPDATED;
+ERL_NIF_TERM ATOM_BYTES_WRITTEN;
+ERL_NIF_TERM ATOM_BYTES_READ;
+ERL_NIF_TERM ATOM_ITER_BYTES_READ;
+ERL_NIF_TERM ATOM_NUMBER_DB_SEEK;
+ERL_NIF_TERM ATOM_NUMBER_DB_NEXT;
+ERL_NIF_TERM ATOM_NUMBER_DB_PREV;
+ERL_NIF_TERM ATOM_NUMBER_DB_SEEK_FOUND;
+ERL_NIF_TERM ATOM_NUMBER_DB_NEXT_FOUND;
+ERL_NIF_TERM ATOM_NUMBER_DB_PREV_FOUND;
+
 // Block Cache Statistics Tickers
 ERL_NIF_TERM ATOM_BLOCK_CACHE_MISS;
 ERL_NIF_TERM ATOM_BLOCK_CACHE_HIT;
@@ -1070,6 +1084,20 @@ try
   ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS, "blob_db_blob_file_sync_micros");
   ATOM(erocksdb::ATOM_BLOB_DB_COMPRESSION_MICROS, "blob_db_compression_micros");
   ATOM(erocksdb::ATOM_BLOB_DB_DECOMPRESSION_MICROS, "blob_db_decompression_micros");
+
+  // Read/Write Operation Tickers
+  ATOM(erocksdb::ATOM_NUMBER_KEYS_WRITTEN, "number_keys_written");
+  ATOM(erocksdb::ATOM_NUMBER_KEYS_READ, "number_keys_read");
+  ATOM(erocksdb::ATOM_NUMBER_KEYS_UPDATED, "number_keys_updated");
+  ATOM(erocksdb::ATOM_BYTES_WRITTEN, "bytes_written");
+  ATOM(erocksdb::ATOM_BYTES_READ, "bytes_read");
+  ATOM(erocksdb::ATOM_ITER_BYTES_READ, "iter_bytes_read");
+  ATOM(erocksdb::ATOM_NUMBER_DB_SEEK, "number_db_seek");
+  ATOM(erocksdb::ATOM_NUMBER_DB_NEXT, "number_db_next");
+  ATOM(erocksdb::ATOM_NUMBER_DB_PREV, "number_db_prev");
+  ATOM(erocksdb::ATOM_NUMBER_DB_SEEK_FOUND, "number_db_seek_found");
+  ATOM(erocksdb::ATOM_NUMBER_DB_NEXT_FOUND, "number_db_next_found");
+  ATOM(erocksdb::ATOM_NUMBER_DB_PREV_FOUND, "number_db_prev_found");
 
   // Block Cache Statistics Tickers
   ATOM(erocksdb::ATOM_BLOCK_CACHE_MISS, "block_cache_miss");

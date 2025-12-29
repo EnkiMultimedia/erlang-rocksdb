@@ -540,6 +540,19 @@
       blob_db_compression_micros |
       blob_db_decompression_micros.
 
+-type db_operation_ticker() :: number_keys_written |
+      number_keys_read |
+      number_keys_updated |
+      bytes_written |
+      bytes_read |
+      iter_bytes_read |
+      number_db_seek |
+      number_db_next |
+      number_db_prev |
+      number_db_seek_found |
+      number_db_next_found |
+      number_db_prev_found.
+
 -type block_cache_ticker() :: block_cache_miss |
       block_cache_hit |
       block_cache_add |
@@ -2171,8 +2184,8 @@ statistics_info(_Statistics) ->
 
 %% @doc Get the count for a specific statistics ticker.
 %% Returns the count for tickers such as blob_db_num_put, block_cache_hit,
-%% blob_db_gc_num_files, etc.
--spec statistics_ticker(statistics_handle(), blob_db_ticker() | block_cache_ticker()) -> {ok, non_neg_integer()}.
+%% number_keys_written, bytes_read, etc.
+-spec statistics_ticker(statistics_handle(), blob_db_ticker() | db_operation_ticker() | block_cache_ticker()) -> {ok, non_neg_integer()}.
 statistics_ticker(_Statistics, _Ticker) ->
   ?nif_stub.
 
