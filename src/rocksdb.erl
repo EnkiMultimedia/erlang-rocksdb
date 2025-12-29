@@ -125,6 +125,7 @@
   set_stats_level/2,
   statistics_info/1,
   statistics_ticker/2,
+  statistics_histogram/2,
   release_statistics/1
 ]).
 
@@ -520,6 +521,29 @@
       blob_db_cache_add_failures |
       blob_db_cache_bytes_read |
       blob_db_cache_bytes_write.
+
+-type blob_db_histogram() :: blob_db_key_size |
+      blob_db_value_size |
+      blob_db_write_micros |
+      blob_db_get_micros |
+      blob_db_multiget_micros |
+      blob_db_seek_micros |
+      blob_db_next_micros |
+      blob_db_prev_micros |
+      blob_db_blob_file_write_micros |
+      blob_db_blob_file_read_micros |
+      blob_db_blob_file_sync_micros |
+      blob_db_compression_micros |
+      blob_db_decompression_micros.
+
+-type histogram_info() :: #{median => float(),
+                            percentile95 => float(),
+                            percentile99 => float(),
+                            average => float(),
+                            standard_deviation => float(),
+                            max => float(),
+                            count => non_neg_integer(),
+                            sum => non_neg_integer()}.
 
 -compile(no_native).
 -on_load(on_load/0).
@@ -2100,6 +2124,14 @@ statistics_info(_Statistics) ->
 %% blob_db_cache_hit, blob_db_gc_num_files, etc.
 -spec statistics_ticker(statistics_handle(), blob_db_ticker()) -> {ok, non_neg_integer()}.
 statistics_ticker(_Statistics, _Ticker) ->
+  ?nif_stub.
+
+%% @doc Get histogram data for a specific statistics histogram.
+%% Returns histogram information including median, percentiles, average, etc.
+%% For integrated BlobDB, relevant histograms are blob_db_blob_file_write_micros,
+%% blob_db_blob_file_read_micros, blob_db_compression_micros, etc.
+-spec statistics_histogram(statistics_handle(), blob_db_histogram()) -> {ok, histogram_info()}.
+statistics_histogram(_Statistics, _Histogram) ->
   ?nif_stub.
 
 

@@ -152,6 +152,7 @@ ERL_NIF_TERM NewStatistics(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM SetStatsLevel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM StatisticsInfo(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM StatisticsTicker(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM StatisticsHistogram(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM ReleaseStatistics(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 void CreateBatchType(ErlNifEnv* env);

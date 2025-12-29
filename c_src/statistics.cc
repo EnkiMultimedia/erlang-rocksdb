@@ -417,4 +417,126 @@ StatisticsTicker(ErlNifEnv *env, int /*argc*/, const ERL_NIF_TERM argv[])
     return enif_make_tuple2(env, ATOM_OK, enif_make_uint64(env, count));
 }
 
+bool HistogramAtomToEnum(ERL_NIF_TERM atom, rocksdb::Histograms* histogram)
+{
+    // BlobDB Histograms
+    if (atom == ATOM_BLOB_DB_KEY_SIZE)
+    {
+        *histogram = rocksdb::BLOB_DB_KEY_SIZE;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_VALUE_SIZE)
+    {
+        *histogram = rocksdb::BLOB_DB_VALUE_SIZE;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_WRITE_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_WRITE_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_GET_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_GET_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_MULTIGET_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_MULTIGET_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_SEEK_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_SEEK_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_NEXT_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_NEXT_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_PREV_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_PREV_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BLOB_FILE_WRITE_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_BLOB_FILE_WRITE_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BLOB_FILE_READ_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_BLOB_FILE_READ_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_BLOB_FILE_SYNC_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_COMPRESSION_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_COMPRESSION_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BLOB_DB_DECOMPRESSION_MICROS)
+    {
+        *histogram = rocksdb::BLOB_DB_DECOMPRESSION_MICROS;
+        return true;
+    }
+    return false;
+}
+
+ERL_NIF_TERM
+StatisticsHistogram(ErlNifEnv *env, int /*argc*/, const ERL_NIF_TERM argv[])
+{
+    Statistics* statistics_ptr = erocksdb::Statistics::RetrieveStatisticsResource(env, argv[0]);
+    if (statistics_ptr == nullptr)
+        return enif_make_badarg(env);
+
+    rocksdb::Histograms histogram;
+    if (!HistogramAtomToEnum(argv[1], &histogram))
+        return enif_make_badarg(env);
+
+    std::lock_guard<std::mutex> guard(statistics_ptr->mu);
+    std::shared_ptr<rocksdb::Statistics> statistics = statistics_ptr->statistics();
+
+    rocksdb::HistogramData data;
+    statistics->histogramData(histogram, &data);
+
+    // Build the result map
+    ERL_NIF_TERM keys[8];
+    ERL_NIF_TERM values[8];
+
+    keys[0] = ATOM_MEDIAN;
+    values[0] = enif_make_double(env, data.median);
+
+    keys[1] = ATOM_PERCENTILE95;
+    values[1] = enif_make_double(env, data.percentile95);
+
+    keys[2] = ATOM_PERCENTILE99;
+    values[2] = enif_make_double(env, data.percentile99);
+
+    keys[3] = ATOM_AVERAGE;
+    values[3] = enif_make_double(env, data.average);
+
+    keys[4] = ATOM_STANDARD_DEVIATION;
+    values[4] = enif_make_double(env, data.standard_deviation);
+
+    keys[5] = ATOM_MAX;
+    values[5] = enif_make_double(env, data.max);
+
+    keys[6] = ATOM_COUNT;
+    values[6] = enif_make_uint64(env, data.count);
+
+    keys[7] = ATOM_SUM;
+    values[7] = enif_make_uint64(env, data.sum);
+
+    ERL_NIF_TERM result_map;
+    enif_make_map_from_arrays(env, keys, values, 8, &result_map);
+
+    return enif_make_tuple2(env, ATOM_OK, result_map);
+}
+
 }

@@ -223,6 +223,7 @@ static ErlNifFunc nif_funcs[] =
         {"set_stats_level", 2, erocksdb::SetStatsLevel, ERL_NIF_REGULAR_BOUND},
         {"statistics_info", 1, erocksdb::StatisticsInfo, ERL_NIF_REGULAR_BOUND},
         {"statistics_ticker", 2, erocksdb::StatisticsTicker, ERL_NIF_REGULAR_BOUND},
+        {"statistics_histogram", 2, erocksdb::StatisticsHistogram, ERL_NIF_REGULAR_BOUND},
         {"release_statistics", 1, erocksdb::ReleaseStatistics, ERL_NIF_REGULAR_BOUND},
         };
 
@@ -587,6 +588,31 @@ ERL_NIF_TERM ATOM_BLOB_DB_CACHE_ADD;
 ERL_NIF_TERM ATOM_BLOB_DB_CACHE_ADD_FAILURES;
 ERL_NIF_TERM ATOM_BLOB_DB_CACHE_BYTES_READ;
 ERL_NIF_TERM ATOM_BLOB_DB_CACHE_BYTES_WRITE;
+
+// BlobDB Statistics Histograms
+ERL_NIF_TERM ATOM_BLOB_DB_KEY_SIZE;
+ERL_NIF_TERM ATOM_BLOB_DB_VALUE_SIZE;
+ERL_NIF_TERM ATOM_BLOB_DB_WRITE_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_GET_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_MULTIGET_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_SEEK_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_NEXT_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_PREV_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_WRITE_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_READ_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_COMPRESSION_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_DECOMPRESSION_MICROS;
+
+// Histogram result keys
+ERL_NIF_TERM ATOM_MEDIAN;
+ERL_NIF_TERM ATOM_PERCENTILE95;
+ERL_NIF_TERM ATOM_PERCENTILE99;
+ERL_NIF_TERM ATOM_AVERAGE;
+ERL_NIF_TERM ATOM_STANDARD_DEVIATION;
+ERL_NIF_TERM ATOM_MAX;
+ERL_NIF_TERM ATOM_COUNT;
+ERL_NIF_TERM ATOM_SUM;
 
 // Pessimistic Transaction DB Options
 ERL_NIF_TERM ATOM_MAX_NUM_LOCKS;
@@ -996,6 +1022,31 @@ try
   ATOM(erocksdb::ATOM_BLOB_DB_CACHE_ADD_FAILURES, "blob_db_cache_add_failures");
   ATOM(erocksdb::ATOM_BLOB_DB_CACHE_BYTES_READ, "blob_db_cache_bytes_read");
   ATOM(erocksdb::ATOM_BLOB_DB_CACHE_BYTES_WRITE, "blob_db_cache_bytes_write");
+
+  // BlobDB Statistics Histograms
+  ATOM(erocksdb::ATOM_BLOB_DB_KEY_SIZE, "blob_db_key_size");
+  ATOM(erocksdb::ATOM_BLOB_DB_VALUE_SIZE, "blob_db_value_size");
+  ATOM(erocksdb::ATOM_BLOB_DB_WRITE_MICROS, "blob_db_write_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_GET_MICROS, "blob_db_get_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_MULTIGET_MICROS, "blob_db_multiget_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_SEEK_MICROS, "blob_db_seek_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_NEXT_MICROS, "blob_db_next_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_PREV_MICROS, "blob_db_prev_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_WRITE_MICROS, "blob_db_blob_file_write_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_READ_MICROS, "blob_db_blob_file_read_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS, "blob_db_blob_file_sync_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_COMPRESSION_MICROS, "blob_db_compression_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_DECOMPRESSION_MICROS, "blob_db_decompression_micros");
+
+  // Histogram result keys
+  ATOM(erocksdb::ATOM_MEDIAN, "median");
+  ATOM(erocksdb::ATOM_PERCENTILE95, "percentile95");
+  ATOM(erocksdb::ATOM_PERCENTILE99, "percentile99");
+  ATOM(erocksdb::ATOM_AVERAGE, "average");
+  ATOM(erocksdb::ATOM_STANDARD_DEVIATION, "standard_deviation");
+  ATOM(erocksdb::ATOM_MAX, "max");
+  ATOM(erocksdb::ATOM_COUNT, "count");
+  ATOM(erocksdb::ATOM_SUM, "sum");
 
   // Pessimistic Transaction DB Options
   ATOM(erocksdb::ATOM_MAX_NUM_LOCKS, "max_num_locks");
