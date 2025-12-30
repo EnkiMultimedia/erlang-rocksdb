@@ -225,6 +225,12 @@ Iterators(
         ReferencePtr<ColumnFamilyObject> cf_ptr;
         cf_ptr.assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
         ColumnFamilyObject* cf = cf_ptr.get();
+        if(NULL == cf)
+        {
+            delete bounds.upper_bound_slice;
+            delete bounds.lower_bound_slice;
+            return enif_make_badarg(env);
+        }
         column_families.push_back(cf->m_ColumnFamily);
     }
 
