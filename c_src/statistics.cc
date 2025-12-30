@@ -777,6 +777,12 @@ bool HistogramAtomToEnum(ERL_NIF_TERM atom, rocksdb::Histograms* histogram)
         *histogram = rocksdb::BYTES_PER_WRITE;
         return true;
     }
+    // Transaction Histogram
+    else if (atom == ATOM_NUM_OP_PER_TRANSACTION)
+    {
+        *histogram = rocksdb::NUM_OP_PER_TRANSACTION;
+        return true;
+    }
     return false;
 }
 

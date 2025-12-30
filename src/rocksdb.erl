@@ -554,6 +554,8 @@
       bytes_per_read |
       bytes_per_write.
 
+-type transaction_histogram() :: num_op_per_transaction.
+
 -type compaction_ticker() :: compact_read_bytes |
       compact_write_bytes |
       flush_write_bytes |
@@ -2231,7 +2233,7 @@ statistics_ticker(_Statistics, _Ticker) ->
 %% Returns histogram information including median, percentiles, average, etc.
 %% For integrated BlobDB, relevant histograms are blob_db_blob_file_write_micros,
 %% blob_db_blob_file_read_micros, blob_db_compression_micros, etc.
--spec statistics_histogram(statistics_handle(), blob_db_histogram() | core_operation_histogram() | io_sync_histogram()) -> {ok, histogram_info()}.
+-spec statistics_histogram(statistics_handle(), blob_db_histogram() | core_operation_histogram() | io_sync_histogram() | transaction_histogram()) -> {ok, histogram_info()}.
 statistics_histogram(_Statistics, _Histogram) ->
   ?nif_stub.
 

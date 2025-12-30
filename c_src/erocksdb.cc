@@ -624,6 +624,9 @@ ERL_NIF_TERM ATOM_WAL_FILE_SYNC_MICROS;
 ERL_NIF_TERM ATOM_BYTES_PER_READ;
 ERL_NIF_TERM ATOM_BYTES_PER_WRITE;
 
+// Transaction Histogram
+ERL_NIF_TERM ATOM_NUM_OP_PER_TRANSACTION;
+
 // Compaction Statistics Tickers
 ERL_NIF_TERM ATOM_COMPACT_READ_BYTES;
 ERL_NIF_TERM ATOM_COMPACT_WRITE_BYTES;
@@ -1143,6 +1146,9 @@ try
   ATOM(erocksdb::ATOM_WAL_FILE_SYNC_MICROS, "wal_file_sync_micros");
   ATOM(erocksdb::ATOM_BYTES_PER_READ, "bytes_per_read");
   ATOM(erocksdb::ATOM_BYTES_PER_WRITE, "bytes_per_write");
+
+  // Transaction Histogram
+  ATOM(erocksdb::ATOM_NUM_OP_PER_TRANSACTION, "num_op_per_transaction");
 
   // Compaction Statistics Tickers
   ATOM(erocksdb::ATOM_COMPACT_READ_BYTES, "compact_read_bytes");

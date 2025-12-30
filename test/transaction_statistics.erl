@@ -184,3 +184,40 @@ all_transaction_tickers_readable_test() ->
   end,
   ok.
 
+num_op_per_transaction_histogram_test() ->
+  ?rm_rf("test_txn_ops_hist"),
+  {ok, Stats} = rocksdb:new_statistics(),
+  {ok, Db, _} = rocksdb:open_pessimistic_transaction_db(
+    "test_txn_ops_hist",
+    [{create_if_missing, true},
+     {statistics, Stats}],
+    [{"default", []}]),
+  try
+    %% Create a transaction with multiple operations
+    {ok, Txn} = rocksdb:pessimistic_transaction(Db, []),
+    lists:foreach(
+      fun(I) ->
+        Key = <<$k, (integer_to_binary(I))/binary>>,
+        Value = list_to_binary(lists:duplicate(50, $v)),
+        ok = rocksdb:pessimistic_transaction_put(Txn, Key, Value)
+      end,
+      lists:seq(1, 10)),
+    ok = rocksdb:pessimistic_transaction_commit(Txn),
+    ok = rocksdb:release_pessimistic_transaction(Txn),
+
+    %% Check num_op_per_transaction histogram is readable
+    {ok, OpHist} = rocksdb:statistics_histogram(Stats, num_op_per_transaction),
+    ?assert(is_map(OpHist)),
+    ?assert(is_float(maps:get(median, OpHist))),
+    ?assert(is_float(maps:get(percentile95, OpHist))),
+    ?assert(is_float(maps:get(percentile99, OpHist))),
+    ?assert(is_float(maps:get(average, OpHist))),
+    ?assert(is_integer(maps:get(count, OpHist))),
+    ?assert(is_integer(maps:get(sum, OpHist)))
+  after
+    ok = rocksdb:close(Db),
+    ok = rocksdb:release_statistics(Stats),
+    ?rm_rf("test_txn_ops_hist")
+  end,
+  ok.
+
