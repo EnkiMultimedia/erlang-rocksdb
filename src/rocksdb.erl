@@ -63,6 +63,7 @@
   delete/3, delete/4,
   single_delete/3, single_delete/4,
   get/3, get/4,
+  multi_get/3, multi_get/4,
   put_entity/4, put_entity/5,
   get_entity/3, get_entity/4,
   delete_range/4, delete_range/5,
@@ -969,6 +970,29 @@ get(_DBHandle, _Key, _ReadOpts) ->
   ReadOpts::read_options(),
   Res :: {ok, binary()} | not_found | {error, {corruption, string()}} | {error, any()}.
 get(_DBHandle, _CFHandle, _Key, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc Retrieve multiple key/value pairs in a single call.
+%% Returns a list of results in the same order as the input keys.
+%% Each result is either `{ok, Value}', `not_found', or `{error, Reason}'.
+%% This is more efficient than calling get/3 multiple times.
+-spec multi_get(DBHandle, Keys, ReadOpts) -> Results when
+  DBHandle :: db_handle(),
+  Keys :: [binary()],
+  ReadOpts :: read_options(),
+  Results :: [{ok, binary()} | not_found | {error, any()}].
+multi_get(_DBHandle, _Keys, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc Retrieve multiple key/value pairs from a specific column family.
+%% Returns a list of results in the same order as the input keys.
+-spec multi_get(DBHandle, CFHandle, Keys, ReadOpts) -> Results when
+  DBHandle :: db_handle(),
+  CFHandle :: cf_handle(),
+  Keys :: [binary()],
+  ReadOpts :: read_options(),
+  Results :: [{ok, binary()} | not_found | {error, any()}].
+multi_get(_DBHandle, _CFHandle, _Keys, _ReadOpts) ->
   ?nif_stub.
 
 %% @doc Put an entity (wide-column key) in the default column family.

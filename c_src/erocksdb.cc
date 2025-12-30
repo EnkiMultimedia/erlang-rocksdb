@@ -76,6 +76,8 @@ static ErlNifFunc nif_funcs[] =
         // kv operations
         {"get", 3, erocksdb::Get, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"get", 4, erocksdb::Get, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"multi_get", 3, erocksdb::MultiGet, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"multi_get", 4, erocksdb::MultiGet, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"put", 4, erocksdb::Put, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"put", 5, erocksdb::Put, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"merge", 4, erocksdb::Merge, ERL_NIF_DIRTY_JOB_IO_BOUND},
