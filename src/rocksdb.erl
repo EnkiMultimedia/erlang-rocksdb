@@ -45,6 +45,7 @@
 -export([open_with_cf/3, open_with_cf_readonly/3]).
 -export([drop_column_family/1]).
 -export([destroy_column_family/1]).
+-export([get_column_family_metadata/1, get_column_family_metadata/2]).
 
 -export([get_latest_sequence_number/1]).
 
@@ -71,6 +72,7 @@
   coalescing_iterator/3,
   iterator_move/2,
   iterator_refresh/1,
+  iterator_prepare_value/1,
   iterator_close/1,
   iterator_columns/1,
   delete_entity/3, delete_entity/4
@@ -124,6 +126,8 @@
   new_statistics/0,
   set_stats_level/2,
   statistics_info/1,
+  statistics_ticker/2,
+  statistics_histogram/2,
   release_statistics/1
 ]).
 
@@ -430,7 +434,9 @@
                          {total_order_seek, boolean()} |
                          {prefix_same_as_start, boolean()} |
                          {snapshot, snapshot_handle()} |
-                         {auto_refresh_iterator_with_snapshot, boolean()}].
+                         {auto_refresh_iterator_with_snapshot, boolean()} |
+                         {auto_readahead_size, boolean()} |
+                         {allow_unprepared_value, boolean()}].
 
 -type write_options() :: [{sync, boolean()} |
                           {disable_wal, boolean()} |
@@ -482,6 +488,147 @@
       stats_except_detailed_timers |
       stats_except_time_for_mutex |
       stats_all.
+
+-type blob_db_ticker() :: blob_db_num_put |
+      blob_db_num_write |
+      blob_db_num_get |
+      blob_db_num_multiget |
+      blob_db_num_seek |
+      blob_db_num_next |
+      blob_db_num_prev |
+      blob_db_num_keys_written |
+      blob_db_num_keys_read |
+      blob_db_bytes_written |
+      blob_db_bytes_read |
+      blob_db_write_inlined |
+      blob_db_write_inlined_ttl |
+      blob_db_write_blob |
+      blob_db_write_blob_ttl |
+      blob_db_blob_file_bytes_written |
+      blob_db_blob_file_bytes_read |
+      blob_db_blob_file_synced |
+      blob_db_blob_index_expired_count |
+      blob_db_blob_index_expired_size |
+      blob_db_blob_index_evicted_count |
+      blob_db_blob_index_evicted_size |
+      blob_db_gc_num_files |
+      blob_db_gc_num_new_files |
+      blob_db_gc_failures |
+      blob_db_gc_num_keys_relocated |
+      blob_db_gc_bytes_relocated |
+      blob_db_fifo_num_files_evicted |
+      blob_db_fifo_num_keys_evicted |
+      blob_db_fifo_bytes_evicted |
+      blob_db_cache_miss |
+      blob_db_cache_hit |
+      blob_db_cache_add |
+      blob_db_cache_add_failures |
+      blob_db_cache_bytes_read |
+      blob_db_cache_bytes_write.
+
+-type blob_db_histogram() :: blob_db_key_size |
+      blob_db_value_size |
+      blob_db_write_micros |
+      blob_db_get_micros |
+      blob_db_multiget_micros |
+      blob_db_seek_micros |
+      blob_db_next_micros |
+      blob_db_prev_micros |
+      blob_db_blob_file_write_micros |
+      blob_db_blob_file_read_micros |
+      blob_db_blob_file_sync_micros |
+      blob_db_compression_micros |
+      blob_db_decompression_micros.
+
+-type core_operation_histogram() :: db_get |
+      db_write |
+      db_multiget |
+      db_seek |
+      compaction_time |
+      flush_time.
+
+-type io_sync_histogram() :: sst_read_micros |
+      sst_write_micros |
+      table_sync_micros |
+      wal_file_sync_micros |
+      bytes_per_read |
+      bytes_per_write.
+
+-type transaction_histogram() :: num_op_per_transaction.
+
+-type compaction_ticker() :: compact_read_bytes |
+      compact_write_bytes |
+      flush_write_bytes |
+      compaction_key_drop_newer_entry |
+      compaction_key_drop_obsolete |
+      compaction_key_drop_range_del |
+      compaction_key_drop_user |
+      compaction_cancelled |
+      number_superversion_acquires |
+      number_superversion_releases.
+
+-type db_operation_ticker() :: number_keys_written |
+      number_keys_read |
+      number_keys_updated |
+      bytes_written |
+      bytes_read |
+      iter_bytes_read |
+      number_db_seek |
+      number_db_next |
+      number_db_prev |
+      number_db_seek_found |
+      number_db_next_found |
+      number_db_prev_found.
+
+-type block_cache_ticker() :: block_cache_miss |
+      block_cache_hit |
+      block_cache_add |
+      block_cache_add_failures |
+      block_cache_index_miss |
+      block_cache_index_hit |
+      block_cache_filter_miss |
+      block_cache_filter_hit |
+      block_cache_data_miss |
+      block_cache_data_hit |
+      block_cache_bytes_read |
+      block_cache_bytes_write.
+
+-type memtable_stall_ticker() :: memtable_hit |
+      memtable_miss |
+      stall_micros |
+      write_done_by_self |
+      write_done_by_other |
+      wal_file_synced.
+
+-type transaction_ticker() :: txn_prepare_mutex_overhead |
+      txn_old_commit_map_mutex_overhead |
+      txn_duplicate_key_overhead |
+      txn_snapshot_mutex_overhead |
+      txn_get_try_again.
+
+-type histogram_info() :: #{median => float(),
+                            percentile95 => float(),
+                            percentile99 => float(),
+                            average => float(),
+                            standard_deviation => float(),
+                            max => float(),
+                            count => non_neg_integer(),
+                            sum => non_neg_integer()}.
+
+-type blob_metadata() :: #{blob_file_number => non_neg_integer(),
+                           blob_file_name => binary(),
+                           blob_file_path => binary(),
+                           size => non_neg_integer(),
+                           total_blob_count => non_neg_integer(),
+                           total_blob_bytes => non_neg_integer(),
+                           garbage_blob_count => non_neg_integer(),
+                           garbage_blob_bytes => non_neg_integer()}.
+
+-type cf_metadata() :: #{size => non_neg_integer(),
+                         file_count => non_neg_integer(),
+                         name => binary(),
+                         blob_file_size => non_neg_integer(),
+                         blob_files => [blob_metadata()]}.
 
 -compile(no_native).
 -on_load(on_load/0).
@@ -640,7 +787,18 @@ drop_column_family(_CFHandle) ->
 destroy_column_family(_CFHandle) ->
   ?nif_stub.
 
+%% @doc Get column family metadata including blob file information.
+-spec get_column_family_metadata(DBHandle) -> {ok, cf_metadata()} when
+  DBHandle :: db_handle().
+get_column_family_metadata(_DBHandle) ->
+  ?nif_stub.
 
+%% @doc Get column family metadata for a specific column family.
+-spec get_column_family_metadata(DBHandle, CFHandle) -> {ok, cf_metadata()} when
+  DBHandle :: db_handle(),
+  CFHandle :: cf_handle().
+get_column_family_metadata(_DBHandle, _CFHandle) ->
+  ?nif_stub.
 
 %% @doc return a database snapshot
 %% Snapshots provide consistent read-only views over the entire state of the key-value store
@@ -1033,6 +1191,13 @@ iterator_move(_ITRHandle, _ITRAction) ->
 %% Refresh iterator
 -spec(iterator_refresh(ITRHandle) -> ok when ITRHandle::itr_handle()).
 iterator_refresh(_ITRHandle) ->
+    ?nif_stub.
+
+%% @doc Load the blob value for the current iterator position.
+%% Use with `{allow_unprepared_value, true}' to enable efficient key-only
+%% scanning with selective value loading.
+-spec(iterator_prepare_value(ITRHandle) -> ok | {error, any()} when ITRHandle::itr_handle()).
+iterator_prepare_value(_ITRHandle) ->
     ?nif_stub.
 
 %% @doc
@@ -2055,6 +2220,21 @@ set_stats_level(_StatisticsHandle, _StatsLevel) ->
   InfoList :: [InfoTuple],
   InfoTuple :: {stats_level, stats_level()}.
 statistics_info(_Statistics) ->
+  ?nif_stub.
+
+%% @doc Get the count for a specific statistics ticker.
+%% Returns the count for tickers such as blob_db_num_put, block_cache_hit,
+%% number_keys_written, compact_read_bytes, etc.
+-spec statistics_ticker(statistics_handle(), blob_db_ticker() | compaction_ticker() | db_operation_ticker() | block_cache_ticker() | memtable_stall_ticker() | transaction_ticker()) -> {ok, non_neg_integer()}.
+statistics_ticker(_Statistics, _Ticker) ->
+  ?nif_stub.
+
+%% @doc Get histogram data for a specific statistics histogram.
+%% Returns histogram information including median, percentiles, average, etc.
+%% For integrated BlobDB, relevant histograms are blob_db_blob_file_write_micros,
+%% blob_db_blob_file_read_micros, blob_db_compression_micros, etc.
+-spec statistics_histogram(statistics_handle(), blob_db_histogram() | core_operation_histogram() | io_sync_histogram() | transaction_histogram()) -> {ok, histogram_info()}.
+statistics_histogram(_Statistics, _Histogram) ->
   ?nif_stub.
 
 

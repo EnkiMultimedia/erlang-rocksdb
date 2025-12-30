@@ -70,6 +70,8 @@ static ErlNifFunc nif_funcs[] =
         {"drop_column_family", 2, erocksdb::DropColumnFamily, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"destroy_column_family", 1, erocksdb::DestroyColumnFamily, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"destroy_column_family", 2, erocksdb::DestroyColumnFamily, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"get_column_family_metadata", 1, erocksdb::GetColumnFamilyMetaData, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"get_column_family_metadata", 2, erocksdb::GetColumnFamilyMetaData, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
         // kv operations
         {"get", 3, erocksdb::Get, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -98,6 +100,7 @@ static ErlNifFunc nif_funcs[] =
         {"coalescing_iterator", 3, erocksdb::CoalescingIterator, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_move", 2, erocksdb::IteratorMove, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_refresh", 1, erocksdb::IteratorRefresh, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"iterator_prepare_value", 1, erocksdb::IteratorPrepareValue, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_close", 1, erocksdb::IteratorClose, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"iterator_columns", 1, erocksdb::IteratorColumns, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
@@ -222,6 +225,8 @@ static ErlNifFunc nif_funcs[] =
         {"new_statistics", 0, erocksdb::NewStatistics, ERL_NIF_REGULAR_BOUND},
         {"set_stats_level", 2, erocksdb::SetStatsLevel, ERL_NIF_REGULAR_BOUND},
         {"statistics_info", 1, erocksdb::StatisticsInfo, ERL_NIF_REGULAR_BOUND},
+        {"statistics_ticker", 2, erocksdb::StatisticsTicker, ERL_NIF_REGULAR_BOUND},
+        {"statistics_histogram", 2, erocksdb::StatisticsHistogram, ERL_NIF_REGULAR_BOUND},
         {"release_statistics", 1, erocksdb::ReleaseStatistics, ERL_NIF_REGULAR_BOUND},
         };
 
@@ -278,7 +283,7 @@ ERL_NIF_TERM ATOM_BLOB_GC_FORCE_THRESHOLD;
 ERL_NIF_TERM ATOM_BLOB_COMPACTION_READAHEAD_SIZE;
 ERL_NIF_TERM ATOM_BLOB_FILE_STARTING_LEVEL;
 ERL_NIF_TERM ATOM_BLOB_CACHE;
-ERL_NIF_TERM ATOM_PREPOLUATE_BLOB_CACHE;
+ERL_NIF_TERM ATOM_PREPOPULATE_BLOB_CACHE;
 
 // Related to CFOpCompressionOptions
 ERL_NIF_TERM ATOM_BOTTOMMOST_COMPRESSION;
@@ -392,6 +397,7 @@ ERL_NIF_TERM ATOM_SNAPSHOT;
 ERL_NIF_TERM ATOM_BAD_SNAPSHOT;
 ERL_NIF_TERM ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT;
 ERL_NIF_TERM ATOM_AUTO_READAHEAD_SIZE;
+ERL_NIF_TERM ATOM_ALLOW_UNPREPARED_VALUE;
 
 // Related to Write Options
 ERL_NIF_TERM ATOM_SYNC;
@@ -549,6 +555,143 @@ ERL_NIF_TERM ATOM_STATS_EXCEPT_TIME_FOR_MUTEX;
 ERL_NIF_TERM ATOM_STATS_ALL;
 ERL_NIF_TERM ATOM_STATS_LEVEL;
 
+// BlobDB Statistics Tickers
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_PUT;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_WRITE;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_GET;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_MULTIGET;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_SEEK;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_NEXT;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_PREV;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_KEYS_WRITTEN;
+ERL_NIF_TERM ATOM_BLOB_DB_NUM_KEYS_READ;
+ERL_NIF_TERM ATOM_BLOB_DB_BYTES_WRITTEN;
+ERL_NIF_TERM ATOM_BLOB_DB_BYTES_READ;
+ERL_NIF_TERM ATOM_BLOB_DB_WRITE_INLINED;
+ERL_NIF_TERM ATOM_BLOB_DB_WRITE_INLINED_TTL;
+ERL_NIF_TERM ATOM_BLOB_DB_WRITE_BLOB;
+ERL_NIF_TERM ATOM_BLOB_DB_WRITE_BLOB_TTL;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_BYTES_WRITTEN;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_BYTES_READ;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_SYNCED;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_INDEX_EXPIRED_COUNT;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_INDEX_EXPIRED_SIZE;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_INDEX_EVICTED_COUNT;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_INDEX_EVICTED_SIZE;
+ERL_NIF_TERM ATOM_BLOB_DB_GC_NUM_FILES;
+ERL_NIF_TERM ATOM_BLOB_DB_GC_NUM_NEW_FILES;
+ERL_NIF_TERM ATOM_BLOB_DB_GC_FAILURES;
+ERL_NIF_TERM ATOM_BLOB_DB_GC_NUM_KEYS_RELOCATED;
+ERL_NIF_TERM ATOM_BLOB_DB_GC_BYTES_RELOCATED;
+ERL_NIF_TERM ATOM_BLOB_DB_FIFO_NUM_FILES_EVICTED;
+ERL_NIF_TERM ATOM_BLOB_DB_FIFO_NUM_KEYS_EVICTED;
+ERL_NIF_TERM ATOM_BLOB_DB_FIFO_BYTES_EVICTED;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_MISS;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_HIT;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_ADD;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_ADD_FAILURES;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_BYTES_READ;
+ERL_NIF_TERM ATOM_BLOB_DB_CACHE_BYTES_WRITE;
+
+// BlobDB Statistics Histograms
+ERL_NIF_TERM ATOM_BLOB_DB_KEY_SIZE;
+ERL_NIF_TERM ATOM_BLOB_DB_VALUE_SIZE;
+ERL_NIF_TERM ATOM_BLOB_DB_WRITE_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_GET_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_MULTIGET_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_SEEK_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_NEXT_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_PREV_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_WRITE_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_READ_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_COMPRESSION_MICROS;
+ERL_NIF_TERM ATOM_BLOB_DB_DECOMPRESSION_MICROS;
+
+// Core Operation Histograms
+ERL_NIF_TERM ATOM_DB_GET;
+ERL_NIF_TERM ATOM_DB_WRITE;
+ERL_NIF_TERM ATOM_DB_MULTIGET;
+ERL_NIF_TERM ATOM_DB_SEEK;
+ERL_NIF_TERM ATOM_COMPACTION_TIME;
+ERL_NIF_TERM ATOM_FLUSH_TIME;
+
+// I/O and Sync Histograms
+ERL_NIF_TERM ATOM_SST_READ_MICROS;
+ERL_NIF_TERM ATOM_SST_WRITE_MICROS;
+ERL_NIF_TERM ATOM_TABLE_SYNC_MICROS;
+ERL_NIF_TERM ATOM_WAL_FILE_SYNC_MICROS;
+ERL_NIF_TERM ATOM_BYTES_PER_READ;
+ERL_NIF_TERM ATOM_BYTES_PER_WRITE;
+
+// Transaction Histogram
+ERL_NIF_TERM ATOM_NUM_OP_PER_TRANSACTION;
+
+// Compaction Statistics Tickers
+ERL_NIF_TERM ATOM_COMPACT_READ_BYTES;
+ERL_NIF_TERM ATOM_COMPACT_WRITE_BYTES;
+ERL_NIF_TERM ATOM_FLUSH_WRITE_BYTES;
+ERL_NIF_TERM ATOM_COMPACTION_KEY_DROP_NEWER_ENTRY;
+ERL_NIF_TERM ATOM_COMPACTION_KEY_DROP_OBSOLETE;
+ERL_NIF_TERM ATOM_COMPACTION_KEY_DROP_RANGE_DEL;
+ERL_NIF_TERM ATOM_COMPACTION_KEY_DROP_USER;
+ERL_NIF_TERM ATOM_COMPACTION_CANCELLED;
+ERL_NIF_TERM ATOM_NUMBER_SUPERVERSION_ACQUIRES;
+ERL_NIF_TERM ATOM_NUMBER_SUPERVERSION_RELEASES;
+
+// Read/Write Operation Tickers
+ERL_NIF_TERM ATOM_NUMBER_KEYS_WRITTEN;
+ERL_NIF_TERM ATOM_NUMBER_KEYS_READ;
+ERL_NIF_TERM ATOM_NUMBER_KEYS_UPDATED;
+ERL_NIF_TERM ATOM_BYTES_WRITTEN;
+ERL_NIF_TERM ATOM_BYTES_READ;
+ERL_NIF_TERM ATOM_ITER_BYTES_READ;
+ERL_NIF_TERM ATOM_NUMBER_DB_SEEK;
+ERL_NIF_TERM ATOM_NUMBER_DB_NEXT;
+ERL_NIF_TERM ATOM_NUMBER_DB_PREV;
+ERL_NIF_TERM ATOM_NUMBER_DB_SEEK_FOUND;
+ERL_NIF_TERM ATOM_NUMBER_DB_NEXT_FOUND;
+ERL_NIF_TERM ATOM_NUMBER_DB_PREV_FOUND;
+
+// Block Cache Statistics Tickers
+ERL_NIF_TERM ATOM_BLOCK_CACHE_MISS;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_HIT;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_ADD;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_ADD_FAILURES;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_INDEX_MISS;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_INDEX_HIT;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_FILTER_MISS;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_FILTER_HIT;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_DATA_MISS;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_DATA_HIT;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_BYTES_READ;
+ERL_NIF_TERM ATOM_BLOCK_CACHE_BYTES_WRITE;
+
+// Memtable and Stall Statistics Tickers
+ERL_NIF_TERM ATOM_MEMTABLE_HIT;
+ERL_NIF_TERM ATOM_MEMTABLE_MISS;
+ERL_NIF_TERM ATOM_STALL_MICROS;
+ERL_NIF_TERM ATOM_WRITE_DONE_BY_SELF;
+ERL_NIF_TERM ATOM_WRITE_DONE_BY_OTHER;
+ERL_NIF_TERM ATOM_WAL_FILE_SYNCED;
+
+// Transaction Statistics Tickers
+ERL_NIF_TERM ATOM_TXN_PREPARE_MUTEX_OVERHEAD;
+ERL_NIF_TERM ATOM_TXN_OLD_COMMIT_MAP_MUTEX_OVERHEAD;
+ERL_NIF_TERM ATOM_TXN_DUPLICATE_KEY_OVERHEAD;
+ERL_NIF_TERM ATOM_TXN_SNAPSHOT_MUTEX_OVERHEAD;
+ERL_NIF_TERM ATOM_TXN_GET_TRY_AGAIN;
+
+// Histogram result keys
+ERL_NIF_TERM ATOM_MEDIAN;
+ERL_NIF_TERM ATOM_PERCENTILE95;
+ERL_NIF_TERM ATOM_PERCENTILE99;
+ERL_NIF_TERM ATOM_AVERAGE;
+ERL_NIF_TERM ATOM_STANDARD_DEVIATION;
+ERL_NIF_TERM ATOM_MAX;
+ERL_NIF_TERM ATOM_COUNT;
+ERL_NIF_TERM ATOM_SUM;
+
 // Pessimistic Transaction DB Options
 ERL_NIF_TERM ATOM_MAX_NUM_LOCKS;
 ERL_NIF_TERM ATOM_NUM_STRIPES;
@@ -565,6 +708,20 @@ ERL_NIF_TERM ATOM_BUSY;
 ERL_NIF_TERM ATOM_TIMED_OUT;
 ERL_NIF_TERM ATOM_EXPIRED;
 ERL_NIF_TERM ATOM_TRY_AGAIN;
+
+// Column Family/Blob Metadata
+ERL_NIF_TERM ATOM_SIZE;
+ERL_NIF_TERM ATOM_FILE_COUNT;
+ERL_NIF_TERM ATOM_NAME;
+// ATOM_BLOB_FILE_SIZE already defined above in CFOptions blob section
+ERL_NIF_TERM ATOM_BLOB_FILES;
+ERL_NIF_TERM ATOM_BLOB_FILE_NUMBER;
+ERL_NIF_TERM ATOM_BLOB_FILE_NAME;
+ERL_NIF_TERM ATOM_BLOB_FILE_PATH;
+ERL_NIF_TERM ATOM_TOTAL_BLOB_COUNT;
+ERL_NIF_TERM ATOM_TOTAL_BLOB_BYTES;
+ERL_NIF_TERM ATOM_GARBAGE_BLOB_COUNT;
+ERL_NIF_TERM ATOM_GARBAGE_BLOB_BYTES;
 
 }   // namespace erocksdb
 
@@ -651,7 +808,7 @@ try
   ATOM(erocksdb::ATOM_BLOB_COMPACTION_READAHEAD_SIZE, "blob_compaction_readahead_size");
   ATOM(erocksdb::ATOM_BLOB_FILE_STARTING_LEVEL, "blob_file_starting_level");
   ATOM(erocksdb::ATOM_BLOB_CACHE, "blob_cache");
-  ATOM(erocksdb::ATOM_PREPOLUATE_BLOB_CACHE, "prepopulate_blob_cache");
+  ATOM(erocksdb::ATOM_PREPOPULATE_BLOB_CACHE, "prepopulate_blob_cache");
   ATOM(erocksdb::ATOM_BOTTOMMOST_COMPRESSION, "bottommost_compression");
   ATOM(erocksdb::ATOM_BOTTOMMOST_COMPRESSION_OPTS, "bottommost_compression_opts");
   ATOM(erocksdb::ATOM_COMPRESSION_OPTS, "compression_opts");
@@ -764,6 +921,7 @@ try
   ATOM(erocksdb::ATOM_BAD_SNAPSHOT, "bad_snapshot");
   ATOM(erocksdb::ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT, "auto_refresh_iterator_with_snapshot");
   ATOM(erocksdb::ATOM_AUTO_READAHEAD_SIZE, "auto_readahead_size");
+  ATOM(erocksdb::ATOM_ALLOW_UNPREPARED_VALUE, "allow_unprepared_value");
 
   // Related to Write Options
   ATOM(erocksdb::ATOM_SYNC, "sync");
@@ -920,6 +1078,143 @@ try
   ATOM(erocksdb::ATOM_STATS_ALL, "stats_all");
   ATOM(erocksdb::ATOM_STATS_LEVEL, "stats_level");
 
+  // BlobDB Statistics Tickers
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_PUT, "blob_db_num_put");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_WRITE, "blob_db_num_write");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_GET, "blob_db_num_get");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_MULTIGET, "blob_db_num_multiget");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_SEEK, "blob_db_num_seek");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_NEXT, "blob_db_num_next");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_PREV, "blob_db_num_prev");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_KEYS_WRITTEN, "blob_db_num_keys_written");
+  ATOM(erocksdb::ATOM_BLOB_DB_NUM_KEYS_READ, "blob_db_num_keys_read");
+  ATOM(erocksdb::ATOM_BLOB_DB_BYTES_WRITTEN, "blob_db_bytes_written");
+  ATOM(erocksdb::ATOM_BLOB_DB_BYTES_READ, "blob_db_bytes_read");
+  ATOM(erocksdb::ATOM_BLOB_DB_WRITE_INLINED, "blob_db_write_inlined");
+  ATOM(erocksdb::ATOM_BLOB_DB_WRITE_INLINED_TTL, "blob_db_write_inlined_ttl");
+  ATOM(erocksdb::ATOM_BLOB_DB_WRITE_BLOB, "blob_db_write_blob");
+  ATOM(erocksdb::ATOM_BLOB_DB_WRITE_BLOB_TTL, "blob_db_write_blob_ttl");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_BYTES_WRITTEN, "blob_db_blob_file_bytes_written");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_BYTES_READ, "blob_db_blob_file_bytes_read");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_SYNCED, "blob_db_blob_file_synced");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_INDEX_EXPIRED_COUNT, "blob_db_blob_index_expired_count");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_INDEX_EXPIRED_SIZE, "blob_db_blob_index_expired_size");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_INDEX_EVICTED_COUNT, "blob_db_blob_index_evicted_count");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_INDEX_EVICTED_SIZE, "blob_db_blob_index_evicted_size");
+  ATOM(erocksdb::ATOM_BLOB_DB_GC_NUM_FILES, "blob_db_gc_num_files");
+  ATOM(erocksdb::ATOM_BLOB_DB_GC_NUM_NEW_FILES, "blob_db_gc_num_new_files");
+  ATOM(erocksdb::ATOM_BLOB_DB_GC_FAILURES, "blob_db_gc_failures");
+  ATOM(erocksdb::ATOM_BLOB_DB_GC_NUM_KEYS_RELOCATED, "blob_db_gc_num_keys_relocated");
+  ATOM(erocksdb::ATOM_BLOB_DB_GC_BYTES_RELOCATED, "blob_db_gc_bytes_relocated");
+  ATOM(erocksdb::ATOM_BLOB_DB_FIFO_NUM_FILES_EVICTED, "blob_db_fifo_num_files_evicted");
+  ATOM(erocksdb::ATOM_BLOB_DB_FIFO_NUM_KEYS_EVICTED, "blob_db_fifo_num_keys_evicted");
+  ATOM(erocksdb::ATOM_BLOB_DB_FIFO_BYTES_EVICTED, "blob_db_fifo_bytes_evicted");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_MISS, "blob_db_cache_miss");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_HIT, "blob_db_cache_hit");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_ADD, "blob_db_cache_add");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_ADD_FAILURES, "blob_db_cache_add_failures");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_BYTES_READ, "blob_db_cache_bytes_read");
+  ATOM(erocksdb::ATOM_BLOB_DB_CACHE_BYTES_WRITE, "blob_db_cache_bytes_write");
+
+  // BlobDB Statistics Histograms
+  ATOM(erocksdb::ATOM_BLOB_DB_KEY_SIZE, "blob_db_key_size");
+  ATOM(erocksdb::ATOM_BLOB_DB_VALUE_SIZE, "blob_db_value_size");
+  ATOM(erocksdb::ATOM_BLOB_DB_WRITE_MICROS, "blob_db_write_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_GET_MICROS, "blob_db_get_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_MULTIGET_MICROS, "blob_db_multiget_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_SEEK_MICROS, "blob_db_seek_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_NEXT_MICROS, "blob_db_next_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_PREV_MICROS, "blob_db_prev_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_WRITE_MICROS, "blob_db_blob_file_write_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_READ_MICROS, "blob_db_blob_file_read_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS, "blob_db_blob_file_sync_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_COMPRESSION_MICROS, "blob_db_compression_micros");
+  ATOM(erocksdb::ATOM_BLOB_DB_DECOMPRESSION_MICROS, "blob_db_decompression_micros");
+
+  // Core Operation Histograms
+  ATOM(erocksdb::ATOM_DB_GET, "db_get");
+  ATOM(erocksdb::ATOM_DB_WRITE, "db_write");
+  ATOM(erocksdb::ATOM_DB_MULTIGET, "db_multiget");
+  ATOM(erocksdb::ATOM_DB_SEEK, "db_seek");
+  ATOM(erocksdb::ATOM_COMPACTION_TIME, "compaction_time");
+  ATOM(erocksdb::ATOM_FLUSH_TIME, "flush_time");
+
+  // I/O and Sync Histograms
+  ATOM(erocksdb::ATOM_SST_READ_MICROS, "sst_read_micros");
+  ATOM(erocksdb::ATOM_SST_WRITE_MICROS, "sst_write_micros");
+  ATOM(erocksdb::ATOM_TABLE_SYNC_MICROS, "table_sync_micros");
+  ATOM(erocksdb::ATOM_WAL_FILE_SYNC_MICROS, "wal_file_sync_micros");
+  ATOM(erocksdb::ATOM_BYTES_PER_READ, "bytes_per_read");
+  ATOM(erocksdb::ATOM_BYTES_PER_WRITE, "bytes_per_write");
+
+  // Transaction Histogram
+  ATOM(erocksdb::ATOM_NUM_OP_PER_TRANSACTION, "num_op_per_transaction");
+
+  // Compaction Statistics Tickers
+  ATOM(erocksdb::ATOM_COMPACT_READ_BYTES, "compact_read_bytes");
+  ATOM(erocksdb::ATOM_COMPACT_WRITE_BYTES, "compact_write_bytes");
+  ATOM(erocksdb::ATOM_FLUSH_WRITE_BYTES, "flush_write_bytes");
+  ATOM(erocksdb::ATOM_COMPACTION_KEY_DROP_NEWER_ENTRY, "compaction_key_drop_newer_entry");
+  ATOM(erocksdb::ATOM_COMPACTION_KEY_DROP_OBSOLETE, "compaction_key_drop_obsolete");
+  ATOM(erocksdb::ATOM_COMPACTION_KEY_DROP_RANGE_DEL, "compaction_key_drop_range_del");
+  ATOM(erocksdb::ATOM_COMPACTION_KEY_DROP_USER, "compaction_key_drop_user");
+  ATOM(erocksdb::ATOM_COMPACTION_CANCELLED, "compaction_cancelled");
+  ATOM(erocksdb::ATOM_NUMBER_SUPERVERSION_ACQUIRES, "number_superversion_acquires");
+  ATOM(erocksdb::ATOM_NUMBER_SUPERVERSION_RELEASES, "number_superversion_releases");
+
+  // Read/Write Operation Tickers
+  ATOM(erocksdb::ATOM_NUMBER_KEYS_WRITTEN, "number_keys_written");
+  ATOM(erocksdb::ATOM_NUMBER_KEYS_READ, "number_keys_read");
+  ATOM(erocksdb::ATOM_NUMBER_KEYS_UPDATED, "number_keys_updated");
+  ATOM(erocksdb::ATOM_BYTES_WRITTEN, "bytes_written");
+  ATOM(erocksdb::ATOM_BYTES_READ, "bytes_read");
+  ATOM(erocksdb::ATOM_ITER_BYTES_READ, "iter_bytes_read");
+  ATOM(erocksdb::ATOM_NUMBER_DB_SEEK, "number_db_seek");
+  ATOM(erocksdb::ATOM_NUMBER_DB_NEXT, "number_db_next");
+  ATOM(erocksdb::ATOM_NUMBER_DB_PREV, "number_db_prev");
+  ATOM(erocksdb::ATOM_NUMBER_DB_SEEK_FOUND, "number_db_seek_found");
+  ATOM(erocksdb::ATOM_NUMBER_DB_NEXT_FOUND, "number_db_next_found");
+  ATOM(erocksdb::ATOM_NUMBER_DB_PREV_FOUND, "number_db_prev_found");
+
+  // Block Cache Statistics Tickers
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_MISS, "block_cache_miss");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_HIT, "block_cache_hit");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_ADD, "block_cache_add");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_ADD_FAILURES, "block_cache_add_failures");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_INDEX_MISS, "block_cache_index_miss");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_INDEX_HIT, "block_cache_index_hit");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_FILTER_MISS, "block_cache_filter_miss");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_FILTER_HIT, "block_cache_filter_hit");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_DATA_MISS, "block_cache_data_miss");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_DATA_HIT, "block_cache_data_hit");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_BYTES_READ, "block_cache_bytes_read");
+  ATOM(erocksdb::ATOM_BLOCK_CACHE_BYTES_WRITE, "block_cache_bytes_write");
+
+  // Memtable and Stall Statistics Tickers
+  ATOM(erocksdb::ATOM_MEMTABLE_HIT, "memtable_hit");
+  ATOM(erocksdb::ATOM_MEMTABLE_MISS, "memtable_miss");
+  ATOM(erocksdb::ATOM_STALL_MICROS, "stall_micros");
+  ATOM(erocksdb::ATOM_WRITE_DONE_BY_SELF, "write_done_by_self");
+  ATOM(erocksdb::ATOM_WRITE_DONE_BY_OTHER, "write_done_by_other");
+  ATOM(erocksdb::ATOM_WAL_FILE_SYNCED, "wal_file_synced");
+
+  // Transaction Statistics Tickers
+  ATOM(erocksdb::ATOM_TXN_PREPARE_MUTEX_OVERHEAD, "txn_prepare_mutex_overhead");
+  ATOM(erocksdb::ATOM_TXN_OLD_COMMIT_MAP_MUTEX_OVERHEAD, "txn_old_commit_map_mutex_overhead");
+  ATOM(erocksdb::ATOM_TXN_DUPLICATE_KEY_OVERHEAD, "txn_duplicate_key_overhead");
+  ATOM(erocksdb::ATOM_TXN_SNAPSHOT_MUTEX_OVERHEAD, "txn_snapshot_mutex_overhead");
+  ATOM(erocksdb::ATOM_TXN_GET_TRY_AGAIN, "txn_get_try_again");
+
+  // Histogram result keys
+  ATOM(erocksdb::ATOM_MEDIAN, "median");
+  ATOM(erocksdb::ATOM_PERCENTILE95, "percentile95");
+  ATOM(erocksdb::ATOM_PERCENTILE99, "percentile99");
+  ATOM(erocksdb::ATOM_AVERAGE, "average");
+  ATOM(erocksdb::ATOM_STANDARD_DEVIATION, "standard_deviation");
+  ATOM(erocksdb::ATOM_MAX, "max");
+  ATOM(erocksdb::ATOM_COUNT, "count");
+  ATOM(erocksdb::ATOM_SUM, "sum");
+
   // Pessimistic Transaction DB Options
   ATOM(erocksdb::ATOM_MAX_NUM_LOCKS, "max_num_locks");
   ATOM(erocksdb::ATOM_NUM_STRIPES, "num_stripes");
@@ -936,6 +1231,20 @@ try
   ATOM(erocksdb::ATOM_TIMED_OUT, "timed_out");
   ATOM(erocksdb::ATOM_EXPIRED, "expired");
   ATOM(erocksdb::ATOM_TRY_AGAIN, "try_again");
+
+  // Column Family/Blob Metadata
+  ATOM(erocksdb::ATOM_SIZE, "size");
+  ATOM(erocksdb::ATOM_FILE_COUNT, "file_count");
+  ATOM(erocksdb::ATOM_NAME, "name");
+  // ATOM_BLOB_FILE_SIZE already initialized above
+  ATOM(erocksdb::ATOM_BLOB_FILES, "blob_files");
+  ATOM(erocksdb::ATOM_BLOB_FILE_NUMBER, "blob_file_number");
+  ATOM(erocksdb::ATOM_BLOB_FILE_NAME, "blob_file_name");
+  ATOM(erocksdb::ATOM_BLOB_FILE_PATH, "blob_file_path");
+  ATOM(erocksdb::ATOM_TOTAL_BLOB_COUNT, "total_blob_count");
+  ATOM(erocksdb::ATOM_TOTAL_BLOB_BYTES, "total_blob_bytes");
+  ATOM(erocksdb::ATOM_GARBAGE_BLOB_COUNT, "garbage_blob_count");
+  ATOM(erocksdb::ATOM_GARBAGE_BLOB_BYTES, "garbage_blob_bytes");
 
 #undef ATOM
 
