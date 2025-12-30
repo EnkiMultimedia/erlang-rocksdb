@@ -244,14 +244,19 @@ Iterators(
         for (size_t i = 0; i < iterators.size(); i++) {
             itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterators[i]);
 
+            // Clone slices for each iterator so each has independent ownership
             if(bounds.upper_bound_slice != nullptr)
             {
-                itr_ptr->SetUpperBoundSlice(bounds.upper_bound_slice);
+                rocksdb::Slice* upper_clone = new rocksdb::Slice(
+                    bounds.upper_bound_slice->data(), bounds.upper_bound_slice->size());
+                itr_ptr->SetUpperBoundSlice(upper_clone);
             }
 
             if(bounds.lower_bound_slice != nullptr)
             {
-                itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
+                rocksdb::Slice* lower_clone = new rocksdb::Slice(
+                    bounds.lower_bound_slice->data(), bounds.lower_bound_slice->size());
+                itr_ptr->SetLowerBoundSlice(lower_clone);
             }
             ERL_NIF_TERM itr_res = enif_make_resource(env, itr_ptr);
             result = enif_make_list_cell(env, itr_res, result);
@@ -260,6 +265,10 @@ Iterators(
     } catch (const std::exception&) {
         // pass through and return nullptr
     }
+
+    // Clean up original bounds after all iterators are created with clones
+    delete bounds.upper_bound_slice;
+    delete bounds.lower_bound_slice;
     ERL_NIF_TERM result_out;
     enif_make_reverse_list(env, result, &result_out);
 
