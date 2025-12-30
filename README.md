@@ -1,9 +1,9 @@
+# erlang-rocksdb - Erlang wrapper for RocksDB
 
-
-# erlang-rocksdb - Erlang wrapper for RocksDB. #
-
-:[![Build Status](https://github.com/EnkiMultimedia/erlang-rocksdb/workflows/build/badge.svg)](https://github.com/EnkiMultimedia/erlang-rocksdb/actions?query=workflow%3Abuild)
+[![Build Status](https://github.com/EnkiMultimedia/erlang-rocksdb/workflows/build/badge.svg)](https://github.com/EnkiMultimedia/erlang-rocksdb/actions?query=workflow%3Abuild)
 [![Hex pm](http://img.shields.io/hexpm/v/rocksdb.svg?style=flat)](https://hex.pm/packages/rocksdb)
+
+**Current version: 2.2.0**
 
 Copyright (c) 2016-2025 Benoît Chesneau
 
@@ -13,13 +13,16 @@ Feedback and pull requests welcome! If a particular feature of RocksDB is import
 
 - RocksDB 10.7.5 with snappy 1.2.1, lz4 1.10.0
 - Erlang 22+ with dirty-nifs enabled
-- All basic db operations (get, put, delete, merge)
+- All basic db operations (get, put, delete, merge, multi_get)
 - Wide-column entity API (put_entity, get_entity, iterator_columns)
+- Extended statistics API (45+ tickers, 13+ histograms)
+- BlobDB support with statistics and lazy loading
 - Batch operations support
 - Snapshots support
 - Checkpoint support
 - Column families support with coalescing iterator
 - Transaction logs
+- Pessimistic transactions with row-level locking
 - Backup support
 - Erlang merge operator
 - Customized build support
