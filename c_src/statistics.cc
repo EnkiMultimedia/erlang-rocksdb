@@ -715,6 +715,37 @@ bool HistogramAtomToEnum(ERL_NIF_TERM atom, rocksdb::Histograms* histogram)
         *histogram = rocksdb::BLOB_DB_DECOMPRESSION_MICROS;
         return true;
     }
+    // Core Operation Histograms
+    else if (atom == ATOM_DB_GET)
+    {
+        *histogram = rocksdb::DB_GET;
+        return true;
+    }
+    else if (atom == ATOM_DB_WRITE)
+    {
+        *histogram = rocksdb::DB_WRITE;
+        return true;
+    }
+    else if (atom == ATOM_DB_MULTIGET)
+    {
+        *histogram = rocksdb::DB_MULTIGET;
+        return true;
+    }
+    else if (atom == ATOM_DB_SEEK)
+    {
+        *histogram = rocksdb::DB_SEEK;
+        return true;
+    }
+    else if (atom == ATOM_COMPACTION_TIME)
+    {
+        *histogram = rocksdb::COMPACTION_TIME;
+        return true;
+    }
+    else if (atom == ATOM_FLUSH_TIME)
+    {
+        *histogram = rocksdb::FLUSH_TIME;
+        return true;
+    }
     return false;
 }
 

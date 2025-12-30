@@ -608,6 +608,14 @@ ERL_NIF_TERM ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS;
 ERL_NIF_TERM ATOM_BLOB_DB_COMPRESSION_MICROS;
 ERL_NIF_TERM ATOM_BLOB_DB_DECOMPRESSION_MICROS;
 
+// Core Operation Histograms
+ERL_NIF_TERM ATOM_DB_GET;
+ERL_NIF_TERM ATOM_DB_WRITE;
+ERL_NIF_TERM ATOM_DB_MULTIGET;
+ERL_NIF_TERM ATOM_DB_SEEK;
+ERL_NIF_TERM ATOM_COMPACTION_TIME;
+ERL_NIF_TERM ATOM_FLUSH_TIME;
+
 // Compaction Statistics Tickers
 ERL_NIF_TERM ATOM_COMPACT_READ_BYTES;
 ERL_NIF_TERM ATOM_COMPACT_WRITE_BYTES;
@@ -1111,6 +1119,14 @@ try
   ATOM(erocksdb::ATOM_BLOB_DB_BLOB_FILE_SYNC_MICROS, "blob_db_blob_file_sync_micros");
   ATOM(erocksdb::ATOM_BLOB_DB_COMPRESSION_MICROS, "blob_db_compression_micros");
   ATOM(erocksdb::ATOM_BLOB_DB_DECOMPRESSION_MICROS, "blob_db_decompression_micros");
+
+  // Core Operation Histograms
+  ATOM(erocksdb::ATOM_DB_GET, "db_get");
+  ATOM(erocksdb::ATOM_DB_WRITE, "db_write");
+  ATOM(erocksdb::ATOM_DB_MULTIGET, "db_multiget");
+  ATOM(erocksdb::ATOM_DB_SEEK, "db_seek");
+  ATOM(erocksdb::ATOM_COMPACTION_TIME, "compaction_time");
+  ATOM(erocksdb::ATOM_FLUSH_TIME, "flush_time");
 
   // Compaction Statistics Tickers
   ATOM(erocksdb::ATOM_COMPACT_READ_BYTES, "compact_read_bytes");
