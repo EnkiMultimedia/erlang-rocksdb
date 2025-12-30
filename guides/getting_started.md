@@ -68,6 +68,41 @@ end,
 rocksdb:delete(Db, <<"my key">>).
 ```
 
+### Batch Reads with multi_get
+
+When you need to retrieve multiple keys at once, `multi_get/3` is more efficient than calling `get/3` multiple times. It retrieves all keys in a single operation:
+
+```erlang
+%% Insert some data
+ok = rocksdb:put(Db, <<"key1">>, <<"value1">>, []),
+ok = rocksdb:put(Db, <<"key2">>, <<"value2">>, []),
+ok = rocksdb:put(Db, <<"key3">>, <<"value3">>, []),
+
+%% Retrieve multiple keys at once
+Keys = [<<"key1">>, <<"key2">>, <<"key3">>, <<"missing">>],
+Results = rocksdb:multi_get(Db, Keys, []),
+%% Results = [{ok, <<"value1">>}, {ok, <<"value2">>}, {ok, <<"value3">>}, not_found]
+```
+
+The results are returned in the same order as the input keys. Each result is either:
+- `{ok, Value}` - the key was found
+- `not_found` - the key does not exist
+- `{error, Reason}` - an error occurred
+
+For column families, use `multi_get/4`:
+
+```erlang
+Results = rocksdb:multi_get(Db, ColumnFamily, Keys, []).
+```
+
+You can also use snapshots with `multi_get` to get a consistent view:
+
+```erlang
+{ok, Snapshot} = rocksdb:snapshot(Db),
+Results = rocksdb:multi_get(Db, Keys, [{snapshot, Snapshot}]),
+rocksdb:release_snapshot(Snapshot).
+```
+
 ### Atomic Updates
 
 Note that if the process dies after the Put of key2 but before the delete of key1, the same value may be left stored under multiple keys. Such problems can be avoided by using the function `rocksdb:write/3` class to atomically apply a set of updates:
