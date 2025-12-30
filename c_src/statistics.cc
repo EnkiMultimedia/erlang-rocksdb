@@ -600,6 +600,32 @@ bool TickerAtomToEnum(ERL_NIF_TERM atom, rocksdb::Tickers* ticker)
         *ticker = rocksdb::WAL_FILE_SYNCED;
         return true;
     }
+    // Transaction Statistics Tickers
+    else if (atom == ATOM_TXN_PREPARE_MUTEX_OVERHEAD)
+    {
+        *ticker = rocksdb::TXN_PREPARE_MUTEX_OVERHEAD;
+        return true;
+    }
+    else if (atom == ATOM_TXN_OLD_COMMIT_MAP_MUTEX_OVERHEAD)
+    {
+        *ticker = rocksdb::TXN_OLD_COMMIT_MAP_MUTEX_OVERHEAD;
+        return true;
+    }
+    else if (atom == ATOM_TXN_DUPLICATE_KEY_OVERHEAD)
+    {
+        *ticker = rocksdb::TXN_DUPLICATE_KEY_OVERHEAD;
+        return true;
+    }
+    else if (atom == ATOM_TXN_SNAPSHOT_MUTEX_OVERHEAD)
+    {
+        *ticker = rocksdb::TXN_SNAPSHOT_MUTEX_OVERHEAD;
+        return true;
+    }
+    else if (atom == ATOM_TXN_GET_TRY_AGAIN)
+    {
+        *ticker = rocksdb::TXN_GET_TRY_AGAIN;
+        return true;
+    }
     return false;
 }
 

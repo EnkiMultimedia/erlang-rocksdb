@@ -656,6 +656,13 @@ ERL_NIF_TERM ATOM_WRITE_DONE_BY_SELF;
 ERL_NIF_TERM ATOM_WRITE_DONE_BY_OTHER;
 ERL_NIF_TERM ATOM_WAL_FILE_SYNCED;
 
+// Transaction Statistics Tickers
+ERL_NIF_TERM ATOM_TXN_PREPARE_MUTEX_OVERHEAD;
+ERL_NIF_TERM ATOM_TXN_OLD_COMMIT_MAP_MUTEX_OVERHEAD;
+ERL_NIF_TERM ATOM_TXN_DUPLICATE_KEY_OVERHEAD;
+ERL_NIF_TERM ATOM_TXN_SNAPSHOT_MUTEX_OVERHEAD;
+ERL_NIF_TERM ATOM_TXN_GET_TRY_AGAIN;
+
 // Histogram result keys
 ERL_NIF_TERM ATOM_MEDIAN;
 ERL_NIF_TERM ATOM_PERCENTILE95;
@@ -1152,6 +1159,13 @@ try
   ATOM(erocksdb::ATOM_WRITE_DONE_BY_SELF, "write_done_by_self");
   ATOM(erocksdb::ATOM_WRITE_DONE_BY_OTHER, "write_done_by_other");
   ATOM(erocksdb::ATOM_WAL_FILE_SYNCED, "wal_file_synced");
+
+  // Transaction Statistics Tickers
+  ATOM(erocksdb::ATOM_TXN_PREPARE_MUTEX_OVERHEAD, "txn_prepare_mutex_overhead");
+  ATOM(erocksdb::ATOM_TXN_OLD_COMMIT_MAP_MUTEX_OVERHEAD, "txn_old_commit_map_mutex_overhead");
+  ATOM(erocksdb::ATOM_TXN_DUPLICATE_KEY_OVERHEAD, "txn_duplicate_key_overhead");
+  ATOM(erocksdb::ATOM_TXN_SNAPSHOT_MUTEX_OVERHEAD, "txn_snapshot_mutex_overhead");
+  ATOM(erocksdb::ATOM_TXN_GET_TRY_AGAIN, "txn_get_try_again");
 
   // Histogram result keys
   ATOM(erocksdb::ATOM_MEDIAN, "median");
