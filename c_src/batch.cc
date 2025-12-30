@@ -78,7 +78,16 @@ NewBatch(
         const ERL_NIF_TERM[] /*argv*/)
 {
     rocksdb::WriteBatch* wb = reinterpret_cast<rocksdb::WriteBatch*>(enif_alloc(sizeof(rocksdb::WriteBatch)));
+    if (wb == nullptr)
+        return error_tuple(env, ATOM_ERROR, "out of memory");
+
     Batch* batch = reinterpret_cast<Batch*>(enif_alloc_resource(m_Batch_RESOURCE, sizeof(Batch)));
+    if (batch == nullptr)
+    {
+        enif_free(wb);
+        return error_tuple(env, ATOM_ERROR, "out of memory");
+    }
+
     batch->wb = new(wb) rocksdb::WriteBatch();
     batch->env = enif_alloc_env();
     ERL_NIF_TERM result = enif_make_resource(env, batch);
