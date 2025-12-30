@@ -240,6 +240,7 @@ Iterators(
 
     ERL_NIF_TERM result = enif_make_list(env, 0);
     ItrObject * itr_ptr;
+    bool exception_occurred = false;
     try {
         for (size_t i = 0; i < iterators.size(); i++) {
             itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterators[i]);
@@ -263,12 +264,18 @@ Iterators(
             enif_release_resource(itr_ptr);
         }
     } catch (const std::exception&) {
-        // pass through and return nullptr
+        exception_occurred = true;
     }
 
     // Clean up original bounds after all iterators are created with clones
     delete bounds.upper_bound_slice;
     delete bounds.lower_bound_slice;
+
+    if (exception_occurred)
+    {
+        return error_tuple(env, ATOM_ERROR, "iterator creation failed");
+    }
+
     ERL_NIF_TERM result_out;
     enif_make_reverse_list(env, result, &result_out);
 
