@@ -83,7 +83,12 @@ parse_iterator_options(
                 ERL_NIF_TERM lower_bound = enif_make_copy(itr_env, option[1]);
                 ErlNifBinary lower_bound_bin;
                 if(!enif_inspect_binary(itr_env, lower_bound, &lower_bound_bin))
+                {
+                    // Clean up already allocated upper_bound_slice
+                    delete bounds.upper_bound_slice;
+                    bounds.upper_bound_slice = nullptr;
                     return 0;
+                }
                 bounds.lower_bound_slice = new rocksdb::Slice(
                         reinterpret_cast<char*>(lower_bound_bin.data),
                         lower_bound_bin.size);
@@ -101,7 +106,14 @@ parse_iterator_options(
                 snapshot_ptr.assign(erocksdb::SnapshotObject::RetrieveSnapshotObject(env, option[1]));
 
                 if(NULL==snapshot_ptr.get())
+                {
+                    // Clean up already allocated bound slices
+                    delete bounds.upper_bound_slice;
+                    delete bounds.lower_bound_slice;
+                    bounds.upper_bound_slice = nullptr;
+                    bounds.lower_bound_slice = nullptr;
                     return 0;
+                }
 
                 opts.snapshot = snapshot_ptr->m_Snapshot;
             }
@@ -152,6 +164,8 @@ Iterator(
         if(!enif_get_cf(env, argv[1], &cf_ptr))
         {
             delete opts;
+            delete bounds.upper_bound_slice;
+            delete bounds.lower_bound_slice;
             return enif_make_badarg(env);
         }
         iterator = db_ptr->m_Db->NewIterator(*opts, cf_ptr->m_ColumnFamily);
