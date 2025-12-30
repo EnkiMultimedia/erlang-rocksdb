@@ -547,6 +547,13 @@
       compaction_time |
       flush_time.
 
+-type io_sync_histogram() :: sst_read_micros |
+      sst_write_micros |
+      table_sync_micros |
+      wal_file_sync_micros |
+      bytes_per_read |
+      bytes_per_write.
+
 -type compaction_ticker() :: compact_read_bytes |
       compact_write_bytes |
       flush_write_bytes |
@@ -2224,7 +2231,7 @@ statistics_ticker(_Statistics, _Ticker) ->
 %% Returns histogram information including median, percentiles, average, etc.
 %% For integrated BlobDB, relevant histograms are blob_db_blob_file_write_micros,
 %% blob_db_blob_file_read_micros, blob_db_compression_micros, etc.
--spec statistics_histogram(statistics_handle(), blob_db_histogram() | core_operation_histogram()) -> {ok, histogram_info()}.
+-spec statistics_histogram(statistics_handle(), blob_db_histogram() | core_operation_histogram() | io_sync_histogram()) -> {ok, histogram_info()}.
 statistics_histogram(_Statistics, _Histogram) ->
   ?nif_stub.
 

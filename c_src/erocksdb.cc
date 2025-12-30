@@ -616,6 +616,14 @@ ERL_NIF_TERM ATOM_DB_SEEK;
 ERL_NIF_TERM ATOM_COMPACTION_TIME;
 ERL_NIF_TERM ATOM_FLUSH_TIME;
 
+// I/O and Sync Histograms
+ERL_NIF_TERM ATOM_SST_READ_MICROS;
+ERL_NIF_TERM ATOM_SST_WRITE_MICROS;
+ERL_NIF_TERM ATOM_TABLE_SYNC_MICROS;
+ERL_NIF_TERM ATOM_WAL_FILE_SYNC_MICROS;
+ERL_NIF_TERM ATOM_BYTES_PER_READ;
+ERL_NIF_TERM ATOM_BYTES_PER_WRITE;
+
 // Compaction Statistics Tickers
 ERL_NIF_TERM ATOM_COMPACT_READ_BYTES;
 ERL_NIF_TERM ATOM_COMPACT_WRITE_BYTES;
@@ -1127,6 +1135,14 @@ try
   ATOM(erocksdb::ATOM_DB_SEEK, "db_seek");
   ATOM(erocksdb::ATOM_COMPACTION_TIME, "compaction_time");
   ATOM(erocksdb::ATOM_FLUSH_TIME, "flush_time");
+
+  // I/O and Sync Histograms
+  ATOM(erocksdb::ATOM_SST_READ_MICROS, "sst_read_micros");
+  ATOM(erocksdb::ATOM_SST_WRITE_MICROS, "sst_write_micros");
+  ATOM(erocksdb::ATOM_TABLE_SYNC_MICROS, "table_sync_micros");
+  ATOM(erocksdb::ATOM_WAL_FILE_SYNC_MICROS, "wal_file_sync_micros");
+  ATOM(erocksdb::ATOM_BYTES_PER_READ, "bytes_per_read");
+  ATOM(erocksdb::ATOM_BYTES_PER_WRITE, "bytes_per_write");
 
   // Compaction Statistics Tickers
   ATOM(erocksdb::ATOM_COMPACT_READ_BYTES, "compact_read_bytes");

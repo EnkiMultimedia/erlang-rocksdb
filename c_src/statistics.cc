@@ -746,6 +746,37 @@ bool HistogramAtomToEnum(ERL_NIF_TERM atom, rocksdb::Histograms* histogram)
         *histogram = rocksdb::FLUSH_TIME;
         return true;
     }
+    // I/O and Sync Histograms
+    else if (atom == ATOM_SST_READ_MICROS)
+    {
+        *histogram = rocksdb::SST_READ_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_SST_WRITE_MICROS)
+    {
+        *histogram = rocksdb::SST_WRITE_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_TABLE_SYNC_MICROS)
+    {
+        *histogram = rocksdb::TABLE_SYNC_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_WAL_FILE_SYNC_MICROS)
+    {
+        *histogram = rocksdb::WAL_FILE_SYNC_MICROS;
+        return true;
+    }
+    else if (atom == ATOM_BYTES_PER_READ)
+    {
+        *histogram = rocksdb::BYTES_PER_READ;
+        return true;
+    }
+    else if (atom == ATOM_BYTES_PER_WRITE)
+    {
+        *histogram = rocksdb::BYTES_PER_WRITE;
+        return true;
+    }
     return false;
 }
 
