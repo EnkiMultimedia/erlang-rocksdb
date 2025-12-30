@@ -1,3 +1,39 @@
+## erlang-rocksdb 2.2.0, released on 2025/12/30
+
+### New Features
+
+- add `multi_get/2,3,4` API for efficient batch key retrieval
+- add extended statistics support with 45+ tickers and 13+ histograms:
+  - Block cache statistics: `block_cache_miss`, `block_cache_hit`, `block_cache_bytes_read/write`
+  - Read/write operation statistics: `bytes_written/read`, `number_keys_written/read/updated`
+  - Compaction statistics: `compact_read/write_bytes`, `num_files_in_single_compaction`
+  - Memtable statistics: `memtable_hit/miss`, `write_done_by_self/other`, `wal_synced`
+  - Transaction statistics: `txn_overhead_mutex`, `txn_duplicate_key_overhead`
+  - Core operation histograms: `db_get`, `db_write`, `db_seek`, `flush_time`, `compaction_time`
+  - I/O histograms: `sst_read/write_micros`, `wal_file_sync_micros`, `bytes_per_read/write`
+  - Transaction histograms: `num_commit/filter_per_transaction`
+- add BlobDB enhancements:
+  - `get_blob_statistics/1,2`: BlobDB tickers (blob_bytes_read/written, blob_gc_*)
+  - `get_blob_histogram/2,3`: BlobDB histograms (blob_db_get/put/seek_micros)
+  - `get_blob_cache_properties/1`: blob cache usage and capacity
+  - `allow_unprepared_value` iterator option for lazy blob loading
+  - `iterator_prepare_value/1` for explicit blob value loading
+  - `get_column_family_metadata/1,2` with blob file information
+
+### Bug Fixes
+
+- fix memory leak in `parse_iterator_options` on error paths
+- fix null pointer dereference in `Iterators()` for invalid column family handles
+- fix null check for `enif_alloc` in `NewBatch()` preventing crash on OOM
+- fix double-free in `Iterators()` when using shared bound slices
+- fix exception handling in `Iterators()` to return proper error tuple
+- fix typo PREPOLUATE -> PREPOPULATE in blob cache atom
+
+### Documentation
+
+- add comprehensive statistics guide
+- add multi_get usage to getting started guide
+
 ## erlang-rocksdb 2.1.0, released on 2025/12/28
 
 - add Pessimistic Transaction support for high-contention workloads:
