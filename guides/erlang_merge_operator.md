@@ -59,7 +59,7 @@ ok = rocksdb:merge(Db, <<"list">>, term_to_binary({list_append, [c, d]}), []),
 [a, b, c, d] = binary_to_term(Bin1),
 ```
 
-* `list_substract`: like `lists:substract/2` or `--`, Returns a new list List3 that is a copy of List1, subjected to the following procedure: for each element in List2, its first occurrence in List1 is deleted.
+* `list_substract`: like `lists:subtract/2` or `--`, Returns a new list List3 that is a copy of List1, subjected to the following procedure: for each element in List2, its first occurrence in List1 is deleted.
 
 ```erlang
 ok = rocksdb:put(Db, <<"list">>, term_to_binary([a, b, c, d, e, a, b, c]), []),
