@@ -1,8 +1,8 @@
-Starting in version 0.21.0, Erlang Rocksdb support a [Merge Operator](Erlang-Merge-Operator) for Erlang data types. 
+Starting in version 0.21.0, Erlang Rocksdb supports a Merge Operator for Erlang data types. 
 
 RocksDB offers the possibility of doing appends to existing key values efficiently through the use of a [merge operator](https://github.com/facebook/rocksdb/wiki/Merge-Operator). This operator is a user-provided callback that knows how to merge the old value ("the message") and the new value ("the delta") into a single value ("the merged value").
 
-The [Erlang Merge Operator](Erlang-Merge-Operator) allows two combine two values of the same Erlang data type in a single value. As long as your data is stored as Erlang binary term (encoded using the `term_to_binary` function), , it should be possible to apply a single predefined merge operator in order to take advantage of the RocksDB merge operation. 
+The Erlang Merge Operator allows you to combine two values of the same Erlang data type into a single value. As long as your data is stored as Erlang binary term (encoded using the `term_to_binary` function), , it should be possible to apply a single predefined merge operator in order to take advantage of the RocksDB merge operation. 
 
 For example appending an item to a list (like `++`):
 

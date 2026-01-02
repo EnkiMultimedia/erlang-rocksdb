@@ -116,7 +116,7 @@ Batch = [
 rocksdb:write(DB, Batch, [])
 ```
 
-You can also use the [Batch API](Batch-API) that gives you more control about the atomic transactions.
+You can also use the [Batch API](batch_api.md) that gives you more control about the atomic transactions.
 
 ### Synchronous writes
 

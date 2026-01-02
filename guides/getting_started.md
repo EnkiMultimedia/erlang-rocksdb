@@ -116,7 +116,7 @@ Batch = [
 rocksdb:write(DB, Batch, [])
 ```
 
-You can also use the [Batch API](Batch-API) that gives you more control about the atomic transactions.
+You can also use the [Batch API](batch_api.md) that gives you more control about the atomic transactions.
 
 ### Synchronous writes
 
@@ -179,7 +179,7 @@ rocksdb:release_snapshot(Snapshot)
 
 ### Merge Operator
 
-Starting in version 0.21.0, Erlang Rocksdb supports a [Merge Operator](Erlang-Merge-Operator) for Erlang data types. A [Bitset Merge Operator](bitset_merge_operator) and a [Counter Merge Operator](counter_merge_operator) are also available to change a bit at a position in a string or maintain a simple counter.
+Starting in version 0.21.0, Erlang Rocksdb supports a [Merge Operator](erlang_merge_operator.md) for Erlang data types. A [Bitset Merge Operator](bitset_merge_operator.md) and a [Counter Merge Operator](counter_merge_operator.md) are also available to change a bit at a position in a string or maintain a simple counter.
 
 ### Transactions
 
