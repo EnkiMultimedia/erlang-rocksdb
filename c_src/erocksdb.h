@@ -145,6 +145,29 @@ ERL_NIF_TERM ReleaseSstFileManager(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
 ERL_NIF_TERM SstFileManagerFlag(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM SstFileManagerInfo(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
+// sst file writer
+ERL_NIF_TERM SstFileWriterOpen(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileWriterPut(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileWriterPutEntity(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileWriterMerge(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileWriterDelete(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileWriterDeleteRange(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileWriterFinish(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileWriterFileSize(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM ReleaseSstFileWriter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+// ingest external file
+ERL_NIF_TERM IngestExternalFile(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+// sst file reader
+ERL_NIF_TERM SstFileReaderOpen(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileReaderIterator(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileReaderGetTableProperties(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileReaderVerifyChecksum(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileReaderIteratorMove(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileReaderIteratorClose(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM ReleaseSstFileReader(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
 // write buffer manager
 ERL_NIF_TERM NewWriteBufferManager(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM ReleaseWriteBufferManager(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);

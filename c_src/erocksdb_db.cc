@@ -2467,4 +2467,140 @@ GetColumnFamilyMetaData(
 }   // GetColumnFamilyMetaData
 
 
+ERL_NIF_TERM
+parse_ingest_external_file_option(ErlNifEnv* env, ERL_NIF_TERM item,
+                                   rocksdb::IngestExternalFileOptions& opts)
+{
+    int arity;
+    const ERL_NIF_TERM* option;
+    if (enif_get_tuple(env, item, &arity, &option) && 2 == arity)
+    {
+        if (option[0] == ATOM_MOVE_FILES)
+        {
+            opts.move_files = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_FAILED_MOVE_FALL_BACK_TO_COPY)
+        {
+            opts.failed_move_fall_back_to_copy = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_SNAPSHOT_CONSISTENCY)
+        {
+            opts.snapshot_consistency = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_ALLOW_GLOBAL_SEQNO)
+        {
+            opts.allow_global_seqno = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_ALLOW_BLOCKING_FLUSH)
+        {
+            opts.allow_blocking_flush = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_INGEST_BEHIND)
+        {
+            opts.ingest_behind = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_VERIFY_CHECKSUMS_BEFORE_INGEST)
+        {
+            opts.verify_checksums_before_ingest = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_VERIFY_CHECKSUMS_READAHEAD_SIZE)
+        {
+            ErlNifUInt64 readahead_size;
+            if (enif_get_uint64(env, option[1], &readahead_size))
+                opts.verify_checksums_readahead_size = static_cast<size_t>(readahead_size);
+        }
+        else if (option[0] == ATOM_VERIFY_FILE_CHECKSUM)
+        {
+            opts.verify_file_checksum = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_FAIL_IF_NOT_BOTTOMMOST_LEVEL)
+        {
+            opts.fail_if_not_bottommost_level = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_ALLOW_DB_GENERATED_FILES)
+        {
+            opts.allow_db_generated_files = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_FILL_CACHE)
+        {
+            opts.fill_cache = (option[1] == ATOM_TRUE);
+        }
+    }
+    return ATOM_OK;
+}
+
+ERL_NIF_TERM
+IngestExternalFile(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    ReferencePtr<ColumnFamilyObject> cf_ptr;
+    rocksdb::ColumnFamilyHandle* column_family;
+    int i = 1;
+
+    if (!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    // Check if column family is provided
+    if (argc == 4)
+    {
+        if (!enif_get_cf(env, argv[1], &cf_ptr))
+            return enif_make_badarg(env);
+        column_family = cf_ptr->m_ColumnFamily;
+        i = 2;
+    }
+    else
+    {
+        column_family = db_ptr->m_Db->DefaultColumnFamily();
+    }
+
+    // argv[i] is the list of file paths
+    ERL_NIF_TERM file_list = argv[i];
+    ERL_NIF_TERM head, tail;
+    std::vector<std::string> external_files;
+
+    // Get the length of the file list
+    unsigned int list_length;
+    if (!enif_get_list_length(env, file_list, &list_length))
+        return enif_make_badarg(env);
+
+    if (list_length == 0)
+        return enif_make_badarg(env);
+
+    // Parse the list of file paths
+    tail = file_list;
+    while (enif_get_list_cell(env, tail, &head, &tail))
+    {
+        ErlNifBinary path_bin;
+        char path_buffer[4096];
+
+        if (enif_inspect_binary(env, head, &path_bin))
+        {
+            external_files.push_back(
+                std::string(reinterpret_cast<const char*>(path_bin.data), path_bin.size));
+        }
+        else if (enif_get_string(env, head, path_buffer, sizeof(path_buffer), ERL_NIF_LATIN1) > 0)
+        {
+            external_files.push_back(std::string(path_buffer));
+        }
+        else
+        {
+            return enif_make_badarg(env);
+        }
+    }
+
+    // Parse ingest options
+    rocksdb::IngestExternalFileOptions opts;
+    fold(env, argv[i + 1], parse_ingest_external_file_option, opts);
+
+    // Call IngestExternalFile
+    rocksdb::Status status = db_ptr->m_Db->IngestExternalFile(
+        column_family, external_files, opts);
+
+    if (!status.ok())
+        return error_tuple(env, ATOM_ERROR, status);
+
+    return ATOM_OK;
+}   // IngestExternalFile
+
+
 }

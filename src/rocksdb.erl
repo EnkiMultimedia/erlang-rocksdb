@@ -114,6 +114,37 @@
   sst_file_manager_info/1, sst_file_manager_info/2
 ]).
 
+%% sst file writer API
+-export([
+  sst_file_writer_open/2,
+  sst_file_writer_put/3,
+  sst_file_writer_put_entity/3,
+  sst_file_writer_merge/3,
+  sst_file_writer_delete/2,
+  sst_file_writer_delete_range/3,
+  sst_file_writer_finish/1, sst_file_writer_finish/2,
+  sst_file_writer_file_size/1,
+  release_sst_file_writer/1
+]).
+
+%% ingest external file API
+-export([
+  ingest_external_file/3,
+  ingest_external_file/4
+]).
+
+%% sst file reader API
+-export([
+  sst_file_reader_open/2,
+  sst_file_reader_iterator/2,
+  sst_file_reader_get_table_properties/1,
+  sst_file_reader_verify_checksum/1,
+  sst_file_reader_verify_checksum/2,
+  sst_file_reader_iterator_move/2,
+  sst_file_reader_iterator_close/1,
+  release_sst_file_reader/1
+]).
+
 %% write buffer manager API
 -export([
   new_write_buffer_manager/1,
@@ -236,6 +267,12 @@
   backup_engine/0,
   backup_info/0,
   sst_file_manager/0,
+  sst_file_writer/0,
+  sst_file_info/0,
+  sst_file_reader/0,
+  sst_file_reader_itr/0,
+  table_properties/0,
+  ingest_external_file_option/0,
   write_buffer_manager/0,
   statistics_handle/0,
   stats_level/0
@@ -281,6 +318,64 @@
 
 -opaque env_handle() :: reference() | binary().
 -opaque sst_file_manager() :: reference() | binary().
+-opaque sst_file_writer() :: reference() | binary().
+-type sst_file_info() :: #{
+    file_path := binary(),
+    smallest_key := binary(),
+    largest_key := binary(),
+    smallest_range_del_key := binary(),
+    largest_range_del_key := binary(),
+    file_size := non_neg_integer(),
+    num_entries := non_neg_integer(),
+    num_range_del_entries := non_neg_integer(),
+    sequence_number := non_neg_integer()
+}.
+-type ingest_external_file_option() ::
+    {move_files, boolean()} |
+    {failed_move_fall_back_to_copy, boolean()} |
+    {snapshot_consistency, boolean()} |
+    {allow_global_seqno, boolean()} |
+    {allow_blocking_flush, boolean()} |
+    {ingest_behind, boolean()} |
+    {verify_checksums_before_ingest, boolean()} |
+    {verify_checksums_readahead_size, non_neg_integer()} |
+    {verify_file_checksum, boolean()} |
+    {fail_if_not_bottommost_level, boolean()} |
+    {allow_db_generated_files, boolean()} |
+    {fill_cache, boolean()}.
+-opaque sst_file_reader() :: reference() | binary().
+-opaque sst_file_reader_itr() :: reference() | binary().
+-type table_properties() :: #{
+    data_size := non_neg_integer(),
+    index_size := non_neg_integer(),
+    index_partitions := non_neg_integer(),
+    top_level_index_size := non_neg_integer(),
+    filter_size := non_neg_integer(),
+    raw_key_size := non_neg_integer(),
+    raw_value_size := non_neg_integer(),
+    num_data_blocks := non_neg_integer(),
+    num_entries := non_neg_integer(),
+    num_deletions := non_neg_integer(),
+    num_merge_operands := non_neg_integer(),
+    num_range_deletions := non_neg_integer(),
+    format_version := non_neg_integer(),
+    fixed_key_len := non_neg_integer(),
+    column_family_id := non_neg_integer(),
+    column_family_name := binary(),
+    filter_policy_name := binary(),
+    comparator_name := binary(),
+    merge_operator_name := binary(),
+    prefix_extractor_name := binary(),
+    property_collectors_names := binary(),
+    compression_name := binary(),
+    compression_options := binary(),
+    creation_time := non_neg_integer(),
+    oldest_key_time := non_neg_integer(),
+    file_creation_time := non_neg_integer(),
+    slow_compression_estimated_data_size := non_neg_integer(),
+    fast_compression_estimated_data_size := non_neg_integer(),
+    external_sst_file_global_seqno_offset := non_neg_integer()
+}.
 -opaque db_handle() :: reference() | binary().
 -opaque cf_handle() :: reference() | binary().
 -opaque itr_handle() :: reference() | binary().
@@ -2178,6 +2273,271 @@ sst_file_manager_info(_SstFileManager) ->
           | max_allowed_space_reached_including_compactions,
     Value :: term().
 sst_file_manager_info(_SstFileManager, _Item) ->
+  ?nif_stub.
+
+
+%% ===================================================================
+%% SstFileWriter functions
+
+%% @doc Open a new SST file for writing.
+%%
+%% Creates an SST file writer that can be used to build SST files externally.
+%% Keys must be added in sorted order (according to the comparator).
+%% Once finished, the SST file can be ingested into the database using
+%% `ingest_external_file/3,4'.
+%%
+%% Options are the same as database options (compression, block_size, etc.)
+-spec sst_file_writer_open(Options, FilePath) -> Result when
+    Options :: db_options() | cf_options(),
+    FilePath :: file:filename_all(),
+    Result :: {ok, sst_file_writer()} | {error, any()}.
+sst_file_writer_open(_Options, _FilePath) ->
+  ?nif_stub.
+
+%% @doc Add a key-value pair to the SST file.
+%%
+%% IMPORTANT: Keys must be added in sorted order according to the comparator.
+%% Adding a key that is not greater than the previous key will result in an error.
+-spec sst_file_writer_put(SstFileWriter, Key, Value) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Key :: binary(),
+    Value :: binary(),
+    Result :: ok | {error, any()}.
+sst_file_writer_put(_SstFileWriter, _Key, _Value) ->
+  ?nif_stub.
+
+%% @doc Add a wide-column entity to the SST file.
+%%
+%% IMPORTANT: Keys must be added in sorted order according to the comparator.
+-spec sst_file_writer_put_entity(SstFileWriter, Key, Columns) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Key :: binary(),
+    Columns :: [{ColumnName :: binary(), ColumnValue :: binary()}],
+    Result :: ok | {error, any()}.
+sst_file_writer_put_entity(_SstFileWriter, _Key, _Columns) ->
+  ?nif_stub.
+
+%% @doc Add a merge operation to the SST file.
+%%
+%% IMPORTANT: Keys must be added in sorted order according to the comparator.
+-spec sst_file_writer_merge(SstFileWriter, Key, Value) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Key :: binary(),
+    Value :: binary(),
+    Result :: ok | {error, any()}.
+sst_file_writer_merge(_SstFileWriter, _Key, _Value) ->
+  ?nif_stub.
+
+%% @doc Add a delete tombstone to the SST file.
+%%
+%% IMPORTANT: Keys must be added in sorted order according to the comparator.
+-spec sst_file_writer_delete(SstFileWriter, Key) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Key :: binary(),
+    Result :: ok | {error, any()}.
+sst_file_writer_delete(_SstFileWriter, _Key) ->
+  ?nif_stub.
+
+%% @doc Add a range delete tombstone to the SST file.
+%%
+%% Deletes all keys in the range [BeginKey, EndKey).
+%% Range deletions can be added in any order.
+-spec sst_file_writer_delete_range(SstFileWriter, BeginKey, EndKey) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    BeginKey :: binary(),
+    EndKey :: binary(),
+    Result :: ok | {error, any()}.
+sst_file_writer_delete_range(_SstFileWriter, _BeginKey, _EndKey) ->
+  ?nif_stub.
+
+%% @doc Finalize writing to the SST file and close it.
+%%
+%% After this call, the SST file is ready to be ingested into the database.
+-spec sst_file_writer_finish(SstFileWriter) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Result :: ok | {error, any()}.
+sst_file_writer_finish(_SstFileWriter) ->
+  ?nif_stub.
+
+%% @doc Finalize writing to the SST file and return file info.
+%%
+%% Returns a map with file metadata including:
+%% - file_path: Path to the created SST file
+%% - smallest_key: Smallest key in the file
+%% - largest_key: Largest key in the file
+%% - file_size: Size of the file in bytes
+%% - num_entries: Number of entries in the file
+%% - sequence_number: Sequence number assigned to keys
+-spec sst_file_writer_finish(SstFileWriter, with_file_info) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Result :: {ok, sst_file_info()} | {error, any()}.
+sst_file_writer_finish(_SstFileWriter, with_file_info) ->
+  ?nif_stub.
+
+%% @doc Get the current file size during writing.
+-spec sst_file_writer_file_size(SstFileWriter) -> Size when
+    SstFileWriter :: sst_file_writer(),
+    Size :: non_neg_integer().
+sst_file_writer_file_size(_SstFileWriter) ->
+  ?nif_stub.
+
+%% @doc Release the SST file writer resource.
+%%
+%% Note: If finish/1,2 was not called, the partially written file may remain.
+-spec release_sst_file_writer(SstFileWriter) -> ok when
+    SstFileWriter :: sst_file_writer().
+release_sst_file_writer(_SstFileWriter) ->
+  ?nif_stub.
+
+
+%% ===================================================================
+%% Ingest External File functions
+%% ===================================================================
+
+%% @doc Ingest external SST files into the database.
+%%
+%% This function loads one or more external SST files created by sst_file_writer
+%% into the database. The files are ingested at the appropriate level in the
+%% LSM tree based on their key ranges.
+%%
+%% Options:
+%% - move_files: Move files instead of copying (default: false)
+%% - failed_move_fall_back_to_copy: Fall back to copy if move fails (default: true)
+%% - snapshot_consistency: Check snapshot consistency (default: true)
+%% - allow_global_seqno: Allow assigning global sequence numbers (default: true)
+%% - allow_blocking_flush: Allow blocking flush (default: true)
+%% - ingest_behind: Ingest files to bottommost level (default: false)
+%% - verify_checksums_before_ingest: Verify checksums before ingest (default: true)
+%% - verify_checksums_readahead_size: Readahead size for checksum verification (default: 0)
+%% - verify_file_checksum: Verify file checksum if present (default: true)
+%% - fail_if_not_bottommost_level: Fail if files don't go to bottommost level (default: false)
+%% - allow_db_generated_files: Allow files generated by this DB (default: false)
+%% - fill_cache: Fill block cache on ingest (default: true)
+-spec ingest_external_file(DbHandle, Files, Options) -> Result when
+    DbHandle :: db_handle(),
+    Files :: [file:filename_all()],
+    Options :: [ingest_external_file_option()],
+    Result :: ok | {error, any()}.
+ingest_external_file(_DbHandle, _Files, _Options) ->
+  ?nif_stub.
+
+%% @doc Ingest external SST files into a specific column family.
+%%
+%% Same as ingest_external_file/3 but allows specifying a column family.
+-spec ingest_external_file(DbHandle, CfHandle, Files, Options) -> Result when
+    DbHandle :: db_handle(),
+    CfHandle :: cf_handle(),
+    Files :: [file:filename_all()],
+    Options :: [ingest_external_file_option()],
+    Result :: ok | {error, any()}.
+ingest_external_file(_DbHandle, _CfHandle, _Files, _Options) ->
+  ?nif_stub.
+
+
+%% ===================================================================
+%% SstFileReader functions
+%% ===================================================================
+
+%% @doc Open an SST file for reading.
+%%
+%% Creates an SST file reader that allows inspecting the contents of an SST file
+%% without loading it into a database. This is useful for offline verification,
+%% debugging, or extracting data from SST files.
+%%
+%% Options are the same as database options (compression, block_size, etc.)
+-spec sst_file_reader_open(Options, FilePath) -> Result when
+    Options :: db_options() | cf_options(),
+    FilePath :: file:filename_all(),
+    Result :: {ok, sst_file_reader()} | {error, any()}.
+sst_file_reader_open(_Options, _FilePath) ->
+  ?nif_stub.
+
+%% @doc Create an iterator for reading the contents of the SST file.
+%%
+%% Returns an iterator that can be used to scan through all key-value pairs
+%% in the SST file. The iterator supports the same movement operations as
+%% regular database iterators.
+%%
+%% Options:
+%% - verify_checksums: Verify block checksums during iteration (default: false)
+%% - fill_cache: Fill block cache during iteration (default: true)
+-spec sst_file_reader_iterator(SstFileReader, Options) -> Result when
+    SstFileReader :: sst_file_reader(),
+    Options :: read_options(),
+    Result :: {ok, sst_file_reader_itr()} | {error, any()}.
+sst_file_reader_iterator(_SstFileReader, _Options) ->
+  ?nif_stub.
+
+%% @doc Get the table properties of the SST file.
+%%
+%% Returns a map containing metadata about the SST file including:
+%% - data_size: Size of data blocks in bytes
+%% - index_size: Size of index blocks in bytes
+%% - filter_size: Size of filter block (if any)
+%% - num_entries: Number of key-value entries
+%% - num_deletions: Number of delete tombstones
+%% - compression_name: Name of compression algorithm used
+%% - creation_time: Unix timestamp when file was created
+%% And many more properties.
+-spec sst_file_reader_get_table_properties(SstFileReader) -> Result when
+    SstFileReader :: sst_file_reader(),
+    Result :: {ok, table_properties()} | {error, any()}.
+sst_file_reader_get_table_properties(_SstFileReader) ->
+  ?nif_stub.
+
+%% @doc Verify the checksums of all blocks in the SST file.
+%%
+%% Reads through all data blocks and verifies their checksums.
+%% Returns ok if all checksums are valid, or an error if any are corrupted.
+-spec sst_file_reader_verify_checksum(SstFileReader) -> Result when
+    SstFileReader :: sst_file_reader(),
+    Result :: ok | {error, any()}.
+sst_file_reader_verify_checksum(_SstFileReader) ->
+  ?nif_stub.
+
+%% @doc Verify the checksums of all blocks in the SST file.
+%%
+%% Same as verify_checksum/1 but with read options.
+-spec sst_file_reader_verify_checksum(SstFileReader, Options) -> Result when
+    SstFileReader :: sst_file_reader(),
+    Options :: read_options(),
+    Result :: ok | {error, any()}.
+sst_file_reader_verify_checksum(_SstFileReader, _Options) ->
+  ?nif_stub.
+
+%% @doc Move the SST file reader iterator to a new position.
+%%
+%% Supported actions:
+%% - first: Move to the first entry
+%% - last: Move to the last entry
+%% - next: Move to the next entry
+%% - prev: Move to the previous entry
+%% - {seek, Key}: Seek to the entry at or after Key
+%% - {seek_for_prev, Key}: Seek to the entry at or before Key
+%%
+%% Returns {ok, Key, Value} if the iterator is valid, or {error, Reason} if not.
+-spec sst_file_reader_iterator_move(Iterator, Action) -> Result when
+    Iterator :: sst_file_reader_itr(),
+    Action :: first | last | next | prev | {seek, binary()} | {seek_for_prev, binary()},
+    Result :: {ok, Key :: binary(), Value :: binary()} | {error, any()}.
+sst_file_reader_iterator_move(_Iterator, _Action) ->
+  ?nif_stub.
+
+%% @doc Close an SST file reader iterator.
+%%
+%% Releases resources associated with the iterator.
+-spec sst_file_reader_iterator_close(Iterator) -> ok when
+    Iterator :: sst_file_reader_itr().
+sst_file_reader_iterator_close(_Iterator) ->
+  ?nif_stub.
+
+%% @doc Release the SST file reader resource.
+%%
+%% Closes the SST file and releases all associated resources.
+%% Any iterators created from this reader will become invalid.
+-spec release_sst_file_reader(SstFileReader) -> ok when
+    SstFileReader :: sst_file_reader().
+release_sst_file_reader(_SstFileReader) ->
   ?nif_stub.
 
 

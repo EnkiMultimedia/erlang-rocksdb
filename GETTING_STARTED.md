@@ -219,3 +219,78 @@ Starting in version 0.21.0, Erlang Rocksdb supports a [Merge Operator](erlang_me
 ### Transactions
 
 Erlang RocksDB has preliminary support of multi-operation transactions. See [Transactions](transactions.html)
+
+### SST File Operations
+
+Erlang RocksDB provides comprehensive support for working with SST (Sorted String Table) files, the core storage format of RocksDB. This enables bulk data loading, offline inspection, and data migration.
+
+#### Creating SST Files
+
+Use `sst_file_writer` to create SST files outside the database:
+
+```erlang
+%% Create an SST file
+{ok, Writer} = rocksdb:sst_file_writer_open([], "/tmp/data.sst"),
+
+%% Add key-value pairs (MUST be in sorted order)
+ok = rocksdb:sst_file_writer_put(Writer, <<"key1">>, <<"value1">>),
+ok = rocksdb:sst_file_writer_put(Writer, <<"key2">>, <<"value2">>),
+ok = rocksdb:sst_file_writer_put(Writer, <<"key3">>, <<"value3">>),
+
+%% Finish and get file info
+{ok, FileInfo} = rocksdb:sst_file_writer_finish(Writer, with_file_info),
+ok = rocksdb:release_sst_file_writer(Writer),
+
+%% FileInfo contains: file_path, smallest_key, largest_key,
+%% file_size, num_entries, sequence_number
+```
+
+#### Ingesting SST Files
+
+Load SST files directly into a database:
+
+```erlang
+{ok, Db} = rocksdb:open("/tmp/mydb", [{create_if_missing, true}]),
+
+%% Ingest SST files into the database
+ok = rocksdb:ingest_external_file(Db, ["/tmp/data.sst"], []),
+
+%% Data is now queryable
+{ok, <<"value1">>} = rocksdb:get(Db, <<"key1">>, []),
+
+%% Ingest into a specific column family
+ok = rocksdb:ingest_external_file(Db, ColumnFamily, ["/tmp/cf_data.sst"], []),
+
+rocksdb:close(Db).
+```
+
+#### Reading SST Files
+
+Inspect SST files without loading them into a database:
+
+```erlang
+%% Open an SST file for reading
+{ok, Reader} = rocksdb:sst_file_reader_open([], "/tmp/data.sst"),
+
+%% Get table properties (metadata)
+{ok, Props} = rocksdb:sst_file_reader_get_table_properties(Reader),
+io:format("Entries: ~p, Size: ~p bytes~n",
+    [maps:get(num_entries, Props), maps:get(data_size, Props)]),
+
+%% Iterate through the file
+{ok, Itr} = rocksdb:sst_file_reader_iterator(Reader, []),
+{ok, Key1, Value1} = rocksdb:sst_file_reader_iterator_move(Itr, first),
+{ok, Key2, Value2} = rocksdb:sst_file_reader_iterator_move(Itr, next),
+
+%% Seek to a specific key
+{ok, Key, Value} = rocksdb:sst_file_reader_iterator_move(Itr, {seek, <<"key2">>}),
+
+%% Verify file integrity
+ok = rocksdb:sst_file_reader_verify_checksum(Reader),
+
+%% Cleanup
+ok = rocksdb:sst_file_reader_iterator_close(Itr),
+ok = rocksdb:release_sst_file_reader(Reader).
+```
+
+See [SST Files Guide](sst_files.html) for more details including options, best practices, and advanced use cases.

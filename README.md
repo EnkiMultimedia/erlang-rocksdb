@@ -25,6 +25,7 @@ Feedback and pull requests welcome! If a particular feature of RocksDB is import
 - Pessimistic transactions with row-level locking
 - Backup support
 - Erlang merge operator
+- SST file support (write, ingest, read)
 - Customized build support
 - Tested on macOS, FreeBSD, Solaris and Linux
 

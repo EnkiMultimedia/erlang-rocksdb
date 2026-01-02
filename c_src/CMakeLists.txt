@@ -272,6 +272,8 @@ target_sources(${ErlangRocksDBNIF_TARGET}
     ${CMAKE_CURRENT_SOURCE_DIR}/rate_limiter.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/refobjects.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/sst_file_manager.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/sst_file_writer.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/sst_file_reader.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/transaction_log.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/util.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/write_buffer_manager.cc
