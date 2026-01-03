@@ -473,6 +473,8 @@ namespace erocksdb {
         ItrBounds bounds;
         auto itr_env = std::make_shared<ErlEnvCtr>();
         if (!parse_iterator_options(env, itr_env->env, argv[i], *opts, bounds)) {
+            delete bounds.upper_bound_slice;
+            delete bounds.lower_bound_slice;
             delete opts;
             return enif_make_badarg(env);
         }
@@ -483,6 +485,8 @@ namespace erocksdb {
         if (argc == 3) {
             ReferencePtr<ColumnFamilyObject> cf_ptr;
             if(!enif_get_cf(env, argv[1], &cf_ptr)) {
+                delete bounds.upper_bound_slice;
+                delete bounds.lower_bound_slice;
                 delete opts;
                 return enif_make_badarg(env);
             }
