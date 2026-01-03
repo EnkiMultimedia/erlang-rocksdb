@@ -209,6 +209,7 @@
          transaction_get/3, transaction_get/4,
          transaction_get_for_update/3, transaction_get_for_update/4,
          transaction_multi_get/3, transaction_multi_get/4,
+         transaction_multi_get_for_update/3, transaction_multi_get_for_update/4,
          %% see comment in c_src/transaction.cc
          %% transaction_merge/3, transaction_merge/4,
          transaction_delete/2, transaction_delete/3,
@@ -1769,6 +1770,25 @@ transaction_multi_get(_Transaction, _Keys, _Opts) ->
                              Opts :: read_options()) ->
           [{ok, binary()} | not_found | {error, any()}].
 transaction_multi_get(_Transaction, _ColumnFamily, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc batch get multiple values and track keys for conflict detection.
+%% For optimistic transactions, this records the keys so that if another
+%% transaction modifies any of them before commit, the commit will fail.
+-spec transaction_multi_get_for_update(Transaction :: transaction_handle(),
+                                        Keys :: [binary()],
+                                        Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+transaction_multi_get_for_update(_Transaction, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc like `transaction_multi_get_for_update/3' but apply to a column family
+-spec transaction_multi_get_for_update(Transaction :: transaction_handle(),
+                                        ColumnFamily :: cf_handle(),
+                                        Keys :: [binary()],
+                                        Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+transaction_multi_get_for_update(_Transaction, _ColumnFamily, _Keys, _Opts) ->
   ?nif_stub.
 
 %% see comment in c_src/transaction.cc

@@ -128,6 +128,8 @@ static ErlNifFunc nif_funcs[] =
         {"transaction_get_for_update", 4, erocksdb::GetForUpdateTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"transaction_multi_get", 3, erocksdb::MultiGetTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"transaction_multi_get", 4, erocksdb::MultiGetTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"transaction_multi_get_for_update", 3, erocksdb::MultiGetForUpdateTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"transaction_multi_get_for_update", 4, erocksdb::MultiGetForUpdateTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"transaction_delete", 2, erocksdb::DelTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"transaction_delete", 3, erocksdb::DelTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"transaction_iterator", 2, erocksdb::IteratorTransaction, ERL_NIF_DIRTY_JOB_IO_BOUND},
