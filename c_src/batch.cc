@@ -90,6 +90,13 @@ NewBatch(
 
     batch->wb = new(wb) rocksdb::WriteBatch();
     batch->env = enif_alloc_env();
+    if (batch->env == nullptr)
+    {
+        batch->wb->~WriteBatch();
+        enif_free(wb);
+        enif_release_resource(batch);
+        return error_tuple(env, ATOM_ERROR, "out of memory");
+    }
     ERL_NIF_TERM result = enif_make_resource(env, batch);
     enif_release_resource(batch);
     return enif_make_tuple2(env, ATOM_OK, result);
