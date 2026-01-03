@@ -1,3 +1,26 @@
+## erlang-rocksdb 2.3.0, released on 2026/01/03
+
+### New Features
+
+- add SST file support:
+  - SST File Writer: `sst_file_writer_open/2,3`, `sst_file_writer_put/3`, `sst_file_writer_merge/3`, `sst_file_writer_delete/2`, `sst_file_writer_delete_range/3`, `sst_file_writer_finish/1,2`
+  - Ingest External File: `ingest_external_file/3,4` for loading SST files into database
+  - SST File Reader: `sst_file_reader_open/2`, `sst_file_reader_iterator/2`, `sst_file_reader_table_properties/1`, `sst_file_reader_verify_checksum/1`
+  - Merge operator support in SST files (counter, erlang, bitset)
+- add `sst_file_manager_tracked_files/1` API to get files tracked by SST File Manager
+
+### Improvements
+
+- add FreeBSD CI testing using vmactions/freebsd-vm
+
+### Documentation
+
+- add SST files guide
+- update backup guide with correct function names and additional functions
+- improve transactions documentation
+- add multi_get to getting started guide
+- fix documentation links and typos
+
 ## erlang-rocksdb 2.2.0, released on 2025/12/30
 
 ### New Features
