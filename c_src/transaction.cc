@@ -172,6 +172,61 @@ namespace erocksdb {
 
     
     ERL_NIF_TERM
+    GetForUpdateTransaction(ErlNifEnv* env,
+                            int argc,
+                            const ERL_NIF_TERM argv[])
+    {
+        ReferencePtr<erocksdb::TransactionObject> tx_ptr;
+        ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
+
+        if(!enif_get_transaction(env, argv[0], &tx_ptr))
+          return enif_make_badarg(env);
+
+        int i = 1;
+        if(argc == 4)
+          i = 2;
+
+        rocksdb::Slice key;
+        if(!binary_to_slice(env, argv[i], &key)) {
+            return enif_make_badarg(env);
+        }
+
+        rocksdb::ReadOptions opts;
+        fold(env, argv[i+1], parse_read_option, opts);
+
+        rocksdb::Status status;
+        rocksdb::PinnableSlice pvalue;
+
+        if(argc == 4) {
+            if(!enif_get_cf(env, argv[1], &cf_ptr)) {
+                return enif_make_badarg(env);
+            }
+            status = tx_ptr->m_Tx->GetForUpdate(opts, cf_ptr->m_ColumnFamily, key, &pvalue);
+        } else {
+            status = tx_ptr->m_Tx->GetForUpdate(opts, tx_ptr->m_DbPtr->m_Db->DefaultColumnFamily(), key, &pvalue);
+        }
+
+        if (!status.ok())
+        {
+            if (status.IsNotFound())
+                return ATOM_NOT_FOUND;
+
+            if (status.IsBusy())
+                return error_tuple(env, ATOM_BUSY, status);
+
+            if (status.IsCorruption())
+                return error_tuple(env, ATOM_CORRUPTION, status);
+
+            return error_tuple(env, ATOM_UNKNOWN_STATUS_ERROR, status);
+        }
+
+        ERL_NIF_TERM value_bin;
+        memcpy(enif_make_new_binary(env, pvalue.size(), &value_bin), pvalue.data(), pvalue.size());
+        pvalue.Reset();
+        return enif_make_tuple2(env, ATOM_OK, value_bin);
+    }
+
+    ERL_NIF_TERM
     DelTransaction(ErlNifEnv* env,
                    int argc,
                    const ERL_NIF_TERM argv[])

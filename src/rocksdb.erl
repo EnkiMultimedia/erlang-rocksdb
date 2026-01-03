@@ -207,6 +207,7 @@
          release_transaction/1,
          transaction_put/3, transaction_put/4,
          transaction_get/3, transaction_get/4,
+         transaction_get_for_update/3, transaction_get_for_update/4,
          %% see comment in c_src/transaction.cc
          %% transaction_merge/3, transaction_merge/4,
          transaction_delete/2, transaction_delete/3,
@@ -1722,6 +1723,33 @@ transaction_get(_Transaction, _Key, _Opts) ->
                  {error, {corruption, string()}} |
                  {error, any()}.
 transaction_get(_Transaction, _ColumnFamily, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc get a value and track the key for conflict detection at commit time.
+%% For optimistic transactions, this records the key so that if another
+%% transaction modifies it before commit, the commit will fail with a conflict.
+-spec transaction_get_for_update(Transaction :: transaction_handle(),
+                                  Key :: binary(),
+                                  Opts :: read_options()) ->
+          Res :: {ok, binary()} |
+                 not_found |
+                 {error, busy} |
+                 {error, {corruption, string()}} |
+                 {error, any()}.
+transaction_get_for_update(_Transaction, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc like `transaction_get_for_update/3' but apply the operation to a column family
+-spec transaction_get_for_update(Transaction :: transaction_handle(),
+                                  ColumnFamily :: cf_handle(),
+                                  Key :: binary(),
+                                  Opts :: read_options()) ->
+          Res :: {ok, binary()} |
+                 not_found |
+                 {error, busy} |
+                 {error, {corruption, string()}} |
+                 {error, any()}.
+transaction_get_for_update(_Transaction, _ColumnFamily, _Key, _Opts) ->
   ?nif_stub.
 
 %% see comment in c_src/transaction.cc

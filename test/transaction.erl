@@ -141,3 +141,33 @@ rollback_test() ->
 
     close_destroy(Db, "transaction_testdb"),
     ok.
+
+get_for_update_test() ->
+    Db = destroy_reopen("transaction_testdb", [{create_if_missing, true}]),
+
+    %% Put some initial data
+    ok = rocksdb:put(Db, <<"key1">>, <<"value1">>, []),
+    ok = rocksdb:put(Db, <<"key2">>, <<"value2">>, []),
+
+    %% Start a transaction
+    {ok, Txn} = rocksdb:transaction(Db, []),
+
+    %% Get with conflict tracking
+    ?assertEqual({ok, <<"value1">>}, rocksdb:transaction_get_for_update(Txn, <<"key1">>, [])),
+    ?assertEqual({ok, <<"value2">>}, rocksdb:transaction_get_for_update(Txn, <<"key2">>, [])),
+    ?assertEqual(not_found, rocksdb:transaction_get_for_update(Txn, <<"key3">>, [])),
+
+    %% Modify the value within the transaction
+    ok = rocksdb:transaction_put(Txn, <<"key1">>, <<"modified1">>),
+
+    %% Get the modified value
+    ?assertEqual({ok, <<"modified1">>}, rocksdb:transaction_get_for_update(Txn, <<"key1">>, [])),
+
+    ok = rocksdb:transaction_commit(Txn),
+
+    %% Verify the committed value
+    ?assertEqual({ok, <<"modified1">>}, rocksdb:get(Db, <<"key1">>, [])),
+
+    ok = rocksdb:release_transaction(Txn),
+    close_destroy(Db, "transaction_testdb"),
+    ok.
