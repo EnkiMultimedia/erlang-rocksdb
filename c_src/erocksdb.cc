@@ -152,6 +152,8 @@ static ErlNifFunc nif_funcs[] =
         {"pessimistic_transaction_get_for_update", 4, erocksdb::PessimisticTransactionGetForUpdate, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"pessimistic_transaction_multi_get", 3, erocksdb::PessimisticTransactionMultiGet, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"pessimistic_transaction_multi_get", 4, erocksdb::PessimisticTransactionMultiGet, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_multi_get_for_update", 3, erocksdb::PessimisticTransactionMultiGetForUpdate, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pessimistic_transaction_multi_get_for_update", 4, erocksdb::PessimisticTransactionMultiGetForUpdate, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"pessimistic_transaction_delete", 2, erocksdb::PessimisticTransactionDelete, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"pessimistic_transaction_delete", 3, erocksdb::PessimisticTransactionDelete, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"pessimistic_transaction_iterator", 2, erocksdb::PessimisticTransactionIterator, ERL_NIF_DIRTY_JOB_IO_BOUND},

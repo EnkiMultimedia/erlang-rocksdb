@@ -570,3 +570,38 @@ multi_get_test() ->
 
     close_destroy(Db, "pessimistic_tx_testdb"),
     ok.
+
+%% Test multi_get_for_update - batch get with exclusive locks
+multi_get_for_update_test() ->
+    Db = destroy_reopen("pessimistic_tx_testdb", [{create_if_missing, true}]),
+
+    %% Put some initial data
+    ok = rocksdb:put(Db, <<"key1">>, <<"value1">>, []),
+    ok = rocksdb:put(Db, <<"key2">>, <<"value2">>, []),
+    ok = rocksdb:put(Db, <<"key3">>, <<"value3">>, []),
+
+    %% Start a transaction
+    {ok, Txn} = rocksdb:pessimistic_transaction(Db, []),
+
+    %% Multi-get with exclusive locks
+    Results = rocksdb:pessimistic_transaction_multi_get_for_update(Txn, [<<"key1">>, <<"key2">>, <<"key4">>], []),
+    ?assertEqual([{ok, <<"value1">>}, {ok, <<"value2">>}, not_found], Results),
+
+    %% Modify the locked keys
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"key1">>, <<"modified1">>),
+    ok = rocksdb:pessimistic_transaction_put(Txn, <<"key2">>, <<"modified2">>),
+
+    %% Get again should see the modifications
+    Results2 = rocksdb:pessimistic_transaction_multi_get_for_update(Txn, [<<"key1">>, <<"key2">>], []),
+    ?assertEqual([{ok, <<"modified1">>}, {ok, <<"modified2">>}], Results2),
+
+    %% Commit
+    ok = rocksdb:pessimistic_transaction_commit(Txn),
+    ok = rocksdb:release_pessimistic_transaction(Txn),
+
+    %% Verify committed values
+    ?assertEqual({ok, <<"modified1">>}, rocksdb:get(Db, <<"key1">>, [])),
+    ?assertEqual({ok, <<"modified2">>}, rocksdb:get(Db, <<"key2">>, [])),
+
+    close_destroy(Db, "pessimistic_tx_testdb"),
+    ok.

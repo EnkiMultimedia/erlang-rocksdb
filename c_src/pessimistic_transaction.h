@@ -34,6 +34,7 @@ ERL_NIF_TERM PessimisticTransactionPut(ErlNifEnv* env, int argc, const ERL_NIF_T
 ERL_NIF_TERM PessimisticTransactionGet(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PessimisticTransactionGetForUpdate(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PessimisticTransactionMultiGet(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PessimisticTransactionMultiGetForUpdate(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PessimisticTransactionDelete(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 // Transaction control
