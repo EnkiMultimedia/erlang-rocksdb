@@ -8,6 +8,9 @@
   - SST File Reader: `sst_file_reader_open/2`, `sst_file_reader_iterator/2`, `sst_file_reader_table_properties/1`, `sst_file_reader_verify_checksum/1`
   - Merge operator support in SST files (counter, erlang, bitset)
 - add `sst_file_manager_tracked_files/1` API to get files tracked by SST File Manager
+- add transaction batch get operations:
+  - Optimistic transactions: `transaction_get_for_update/3,4`, `transaction_multi_get/3,4`, `transaction_multi_get_for_update/3,4`
+  - Pessimistic transactions: `pessimistic_transaction_multi_get/3,4`, `pessimistic_transaction_multi_get_for_update/3,4`
 
 ### Improvements
 
