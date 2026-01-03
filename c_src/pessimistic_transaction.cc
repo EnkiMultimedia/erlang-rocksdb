@@ -593,6 +593,8 @@ PessimisticTransactionIterator(ErlNifEnv* env,
     auto itr_env = std::make_shared<ErlEnvCtr>();
     if(!parse_iterator_options(env, itr_env->env, argv[opts_idx], *opts, bounds))
     {
+        delete bounds.upper_bound_slice;
+        delete bounds.lower_bound_slice;
         delete opts;
         return enif_make_badarg(env);
     }
@@ -605,6 +607,8 @@ PessimisticTransactionIterator(ErlNifEnv* env,
         ReferencePtr<ColumnFamilyObject> cf_ptr;
         if(!enif_get_cf(env, argv[1], &cf_ptr))
         {
+            delete bounds.upper_bound_slice;
+            delete bounds.lower_bound_slice;
             delete opts;
             return enif_make_badarg(env);
         }
