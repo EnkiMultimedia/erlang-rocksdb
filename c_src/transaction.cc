@@ -227,6 +227,99 @@ namespace erocksdb {
     }
 
     ERL_NIF_TERM
+    MultiGetTransaction(ErlNifEnv* env,
+                        int argc,
+                        const ERL_NIF_TERM argv[])
+    {
+        ReferencePtr<erocksdb::TransactionObject> tx_ptr;
+        ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
+
+        if(!enif_get_transaction(env, argv[0], &tx_ptr))
+            return enif_make_badarg(env);
+
+        // Determine argument positions based on arity
+        // argc == 3: transaction_multi_get(Txn, Keys, ReadOpts)
+        // argc == 4: transaction_multi_get(Txn, CF, Keys, ReadOpts)
+        int keys_idx = (argc == 4) ? 2 : 1;
+        int opts_idx = keys_idx + 1;
+
+        // Get column family handle if provided
+        rocksdb::ColumnFamilyHandle* cfh = tx_ptr->m_DbPtr->m_Db->DefaultColumnFamily();
+        if (argc == 4)
+        {
+            if(!enif_get_cf(env, argv[1], &cf_ptr))
+                return enif_make_badarg(env);
+            cfh = cf_ptr->m_ColumnFamily;
+        }
+
+        // Parse keys list
+        ERL_NIF_TERM keys_list = argv[keys_idx];
+        unsigned int num_keys;
+        if (!enif_get_list_length(env, keys_list, &num_keys))
+            return enif_make_badarg(env);
+
+        // Handle empty list case
+        if (num_keys == 0)
+            return enif_make_list(env, 0);
+
+        // Allocate arrays for keys and values
+        std::vector<rocksdb::Slice> keys(num_keys);
+        std::vector<ErlNifBinary> key_binaries(num_keys);
+        std::vector<std::string> values(num_keys);
+
+        // Convert Erlang binaries to Slices
+        ERL_NIF_TERM head, tail = keys_list;
+        for (unsigned int i = 0; i < num_keys; i++)
+        {
+            if (!enif_get_list_cell(env, tail, &head, &tail))
+                return enif_make_badarg(env);
+
+            if (!enif_inspect_binary(env, head, &key_binaries[i]))
+                return enif_make_badarg(env);
+
+            keys[i] = rocksdb::Slice(reinterpret_cast<const char*>(key_binaries[i].data),
+                                      key_binaries[i].size);
+        }
+
+        // Parse read options
+        rocksdb::ReadOptions opts;
+        fold(env, argv[opts_idx], parse_read_option, opts);
+
+        // Call MultiGet on transaction
+        std::vector<rocksdb::ColumnFamilyHandle*> cfs(num_keys, cfh);
+        std::vector<rocksdb::Status> statuses = tx_ptr->m_Tx->MultiGet(opts, cfs, keys, &values);
+
+        // Build result list (from tail to head for efficiency)
+        ERL_NIF_TERM result = enif_make_list(env, 0);
+        for (int i = num_keys - 1; i >= 0; i--)
+        {
+            ERL_NIF_TERM item;
+            if (statuses[i].ok())
+            {
+                ERL_NIF_TERM value_bin;
+                memcpy(enif_make_new_binary(env, values[i].size(), &value_bin),
+                       values[i].data(), values[i].size());
+                item = enif_make_tuple2(env, ATOM_OK, value_bin);
+            }
+            else if (statuses[i].IsNotFound())
+            {
+                item = ATOM_NOT_FOUND;
+            }
+            else if (statuses[i].IsCorruption())
+            {
+                item = error_tuple(env, ATOM_CORRUPTION, statuses[i]);
+            }
+            else
+            {
+                item = error_tuple(env, ATOM_UNKNOWN_STATUS_ERROR, statuses[i]);
+            }
+            result = enif_make_list_cell(env, item, result);
+        }
+
+        return result;
+    }
+
+    ERL_NIF_TERM
     DelTransaction(ErlNifEnv* env,
                    int argc,
                    const ERL_NIF_TERM argv[])

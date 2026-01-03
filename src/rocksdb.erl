@@ -208,6 +208,7 @@
          transaction_put/3, transaction_put/4,
          transaction_get/3, transaction_get/4,
          transaction_get_for_update/3, transaction_get_for_update/4,
+         transaction_multi_get/3, transaction_multi_get/4,
          %% see comment in c_src/transaction.cc
          %% transaction_merge/3, transaction_merge/4,
          transaction_delete/2, transaction_delete/3,
@@ -1750,6 +1751,24 @@ transaction_get_for_update(_Transaction, _Key, _Opts) ->
                  {error, {corruption, string()}} |
                  {error, any()}.
 transaction_get_for_update(_Transaction, _ColumnFamily, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc batch get multiple values within a transaction.
+%% Returns a list of results in the same order as the input keys.
+-spec transaction_multi_get(Transaction :: transaction_handle(),
+                             Keys :: [binary()],
+                             Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+transaction_multi_get(_Transaction, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc like `transaction_multi_get/3' but apply the operation to a column family
+-spec transaction_multi_get(Transaction :: transaction_handle(),
+                             ColumnFamily :: cf_handle(),
+                             Keys :: [binary()],
+                             Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+transaction_multi_get(_Transaction, _ColumnFamily, _Keys, _Opts) ->
   ?nif_stub.
 
 %% see comment in c_src/transaction.cc
