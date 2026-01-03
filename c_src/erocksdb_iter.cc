@@ -123,6 +123,12 @@ parse_iterator_options(
                 opts.auto_readahead_size = (option[1] == erocksdb::ATOM_TRUE);
             else if (option[0] == erocksdb::ATOM_ALLOW_UNPREPARED_VALUE)
                 opts.allow_unprepared_value = (option[1] == erocksdb::ATOM_TRUE);
+            else if (option[0] == erocksdb::ATOM_READAHEAD_SIZE)
+            {
+                ErlNifUInt64 readahead_size;
+                if (enif_get_uint64(env, option[1], &readahead_size))
+                    opts.readahead_size = static_cast<size_t>(readahead_size);
+            }
         }
     }
     return 1;

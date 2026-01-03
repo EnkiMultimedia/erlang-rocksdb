@@ -538,6 +538,7 @@
                          {snapshot, snapshot_handle()} |
                          {auto_refresh_iterator_with_snapshot, boolean()} |
                          {auto_readahead_size, boolean()} |
+                         {readahead_size, non_neg_integer()} |
                          {allow_unprepared_value, boolean()}].
 
 -type write_options() :: [{sync, boolean()} |

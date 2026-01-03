@@ -142,3 +142,44 @@ iterate_n_times(Itr, N) ->
         {ok, _, _} -> iterate_n_times(Itr, N - 1);
         {error, invalid_iterator} -> ok
     end.
+
+%% Test readahead_size option
+%% readahead_size configures the size of the readahead buffer for iterators
+%% This is particularly useful for sequential reads
+readahead_size_test() ->
+    ?rm_rf("test_readahead_size"),
+    {ok, Db} = rocksdb:open(
+        "test_readahead_size",
+        [{create_if_missing, true}]),
+    try
+        %% Write enough data to benefit from readahead
+        lists:foreach(
+            fun(I) ->
+                Key = <<"readahead_key", (integer_to_binary(I))/binary>>,
+                Value = list_to_binary(lists:duplicate(500, $z)),
+                ok = rocksdb:put(Db, Key, Value, [])
+            end,
+            lists:seq(1, 200)),
+        ok = rocksdb:flush(Db, []),
+
+        %% Test with readahead_size = 0 (disabled)
+        {ok, Itr1} = rocksdb:iterator(Db, [{readahead_size, 0}]),
+        {ok, _, _} = rocksdb:iterator_move(Itr1, first),
+        iterate_n_times(Itr1, 50),
+        ok = rocksdb:iterator_close(Itr1),
+
+        %% Test with larger readahead_size (2MB)
+        {ok, Itr2} = rocksdb:iterator(Db, [{readahead_size, 2 * 1024 * 1024}]),
+        {ok, _, _} = rocksdb:iterator_move(Itr2, first),
+        iterate_n_times(Itr2, 50),
+        ok = rocksdb:iterator_close(Itr2),
+
+        %% Test with get operation
+        {ok, _} = rocksdb:get(Db, <<"readahead_key1">>, [{readahead_size, 1024 * 1024}]),
+
+        ok
+    after
+        ok = rocksdb:close(Db),
+        ?rm_rf("test_readahead_size")
+    end,
+    ok.

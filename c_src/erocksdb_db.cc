@@ -879,6 +879,12 @@ ERL_NIF_TERM parse_read_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ReadO
         }
         else if (option[0] == erocksdb::ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT)
             opts.auto_refresh_iterator_with_snapshot = (option[1] == erocksdb::ATOM_TRUE);
+        else if (option[0] == erocksdb::ATOM_READAHEAD_SIZE)
+        {
+            ErlNifUInt64 readahead_size;
+            if (enif_get_uint64(env, option[1], &readahead_size))
+                opts.readahead_size = static_cast<size_t>(readahead_size);
+        }
     }
 
     return erocksdb::ATOM_OK;
