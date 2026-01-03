@@ -308,6 +308,8 @@ CoalescingIterator(
     auto itr_env = std::make_shared<ErlEnvCtr>();
     if (!parse_iterator_options(env, itr_env->env, argv[2], opts, bounds))
     {
+        delete bounds.upper_bound_slice;
+        delete bounds.lower_bound_slice;
         return enif_make_badarg(env);
     }
 
@@ -318,7 +320,11 @@ CoalescingIterator(
         ReferencePtr<ColumnFamilyObject> cf_ptr;
         cf_ptr.assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
         if(NULL == cf_ptr.get())
+        {
+            delete bounds.upper_bound_slice;
+            delete bounds.lower_bound_slice;
             return enif_make_badarg(env);
+        }
         column_families.push_back(cf_ptr->m_ColumnFamily);
     }
 
@@ -326,6 +332,8 @@ CoalescingIterator(
         db_ptr->m_Db->NewCoalescingIterator(opts, column_families);
 
     if (!iterator) {
+        delete bounds.upper_bound_slice;
+        delete bounds.lower_bound_slice;
         rocksdb::Status status = rocksdb::Status::NotSupported("CoalescingIterator not available");
         return error_tuple(env, ATOM_ERROR, status);
     }
