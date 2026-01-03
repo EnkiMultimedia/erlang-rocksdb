@@ -226,6 +226,7 @@
          pessimistic_transaction_put/3, pessimistic_transaction_put/4,
          pessimistic_transaction_get/3, pessimistic_transaction_get/4,
          pessimistic_transaction_get_for_update/3, pessimistic_transaction_get_for_update/4,
+         pessimistic_transaction_multi_get/3, pessimistic_transaction_multi_get/4,
          pessimistic_transaction_delete/2, pessimistic_transaction_delete/3,
          pessimistic_transaction_iterator/2, pessimistic_transaction_iterator/3,
          pessimistic_transaction_commit/1,
@@ -1939,6 +1940,25 @@ pessimistic_transaction_get_for_update(_Transaction, _Key, _Opts) ->
                                               Opts :: read_options()) ->
     {ok, binary()} | not_found | {error, busy} | {error, timed_out} | {error, any()}.
 pessimistic_transaction_get_for_update(_Transaction, _ColumnFamily, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc batch get multiple values within a pessimistic transaction.
+%% Returns a list of results in the same order as the input keys.
+%% This does not acquire locks on the keys.
+-spec pessimistic_transaction_multi_get(Transaction :: transaction_handle(),
+                                         Keys :: [binary()],
+                                         Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+pessimistic_transaction_multi_get(_Transaction, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc like `pessimistic_transaction_multi_get/3' but apply to a column family
+-spec pessimistic_transaction_multi_get(Transaction :: transaction_handle(),
+                                         ColumnFamily :: cf_handle(),
+                                         Keys :: [binary()],
+                                         Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+pessimistic_transaction_multi_get(_Transaction, _ColumnFamily, _Keys, _Opts) ->
   ?nif_stub.
 
 %% @doc delete a key from the transaction.
