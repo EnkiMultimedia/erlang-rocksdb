@@ -440,6 +440,7 @@ ERL_NIF_TERM ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT;
 ERL_NIF_TERM ATOM_AUTO_READAHEAD_SIZE;
 ERL_NIF_TERM ATOM_ALLOW_UNPREPARED_VALUE;
 ERL_NIF_TERM ATOM_READAHEAD_SIZE;
+ERL_NIF_TERM ATOM_ASYNC_IO;
 
 // Related to Write Options
 ERL_NIF_TERM ATOM_SYNC;
@@ -1021,6 +1022,7 @@ try
   ATOM(erocksdb::ATOM_AUTO_READAHEAD_SIZE, "auto_readahead_size");
   ATOM(erocksdb::ATOM_ALLOW_UNPREPARED_VALUE, "allow_unprepared_value");
   ATOM(erocksdb::ATOM_READAHEAD_SIZE, "readahead_size");
+  ATOM(erocksdb::ATOM_ASYNC_IO, "async_io");
 
   // Related to Write Options
   ATOM(erocksdb::ATOM_SYNC, "sync");

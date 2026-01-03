@@ -183,3 +183,43 @@ readahead_size_test() ->
         ?rm_rf("test_readahead_size")
     end,
     ok.
+
+%% Test async_io option
+%% async_io enables asynchronous I/O for iterators
+async_io_test() ->
+    ?rm_rf("test_async_io"),
+    {ok, Db} = rocksdb:open(
+        "test_async_io",
+        [{create_if_missing, true}]),
+    try
+        %% Write data
+        lists:foreach(
+            fun(I) ->
+                Key = <<"async_key", (integer_to_binary(I))/binary>>,
+                Value = list_to_binary(lists:duplicate(200, $a)),
+                ok = rocksdb:put(Db, Key, Value, [])
+            end,
+            lists:seq(1, 100)),
+        ok = rocksdb:flush(Db, []),
+
+        %% Test with async_io=false (default)
+        {ok, Itr1} = rocksdb:iterator(Db, [{async_io, false}]),
+        {ok, _, _} = rocksdb:iterator_move(Itr1, first),
+        iterate_n_times(Itr1, 25),
+        ok = rocksdb:iterator_close(Itr1),
+
+        %% Test with async_io=true
+        {ok, Itr2} = rocksdb:iterator(Db, [{async_io, true}]),
+        {ok, _, _} = rocksdb:iterator_move(Itr2, first),
+        iterate_n_times(Itr2, 25),
+        ok = rocksdb:iterator_close(Itr2),
+
+        %% Test with get operation
+        {ok, _} = rocksdb:get(Db, <<"async_key1">>, [{async_io, true}]),
+
+        ok
+    after
+        ok = rocksdb:close(Db),
+        ?rm_rf("test_async_io")
+    end,
+    ok.

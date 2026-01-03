@@ -129,6 +129,8 @@ parse_iterator_options(
                 if (enif_get_uint64(env, option[1], &readahead_size))
                     opts.readahead_size = static_cast<size_t>(readahead_size);
             }
+            else if (option[0] == erocksdb::ATOM_ASYNC_IO)
+                opts.async_io = (option[1] == erocksdb::ATOM_TRUE);
         }
     }
     return 1;
