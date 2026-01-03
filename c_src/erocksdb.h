@@ -102,6 +102,9 @@ ERL_NIF_TERM GetLatestSequenceNumber(ErlNifEnv* env, int argc, const ERL_NIF_TER
 /* Transactions */
 ERL_NIF_TERM NewTransaction(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM GetTransaction(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM GetForUpdateTransaction(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM MultiGetTransaction(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM MultiGetForUpdateTransaction(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PutTransaction(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 // see note in transaction.cc
 // ERL_NIF_TERM MergeTransaction(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);

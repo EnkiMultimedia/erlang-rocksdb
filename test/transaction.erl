@@ -141,3 +141,95 @@ rollback_test() ->
 
     close_destroy(Db, "transaction_testdb"),
     ok.
+
+get_for_update_test() ->
+    Db = destroy_reopen("transaction_testdb", [{create_if_missing, true}]),
+
+    %% Put some initial data
+    ok = rocksdb:put(Db, <<"key1">>, <<"value1">>, []),
+    ok = rocksdb:put(Db, <<"key2">>, <<"value2">>, []),
+
+    %% Start a transaction
+    {ok, Txn} = rocksdb:transaction(Db, []),
+
+    %% Get with conflict tracking
+    ?assertEqual({ok, <<"value1">>}, rocksdb:transaction_get_for_update(Txn, <<"key1">>, [])),
+    ?assertEqual({ok, <<"value2">>}, rocksdb:transaction_get_for_update(Txn, <<"key2">>, [])),
+    ?assertEqual(not_found, rocksdb:transaction_get_for_update(Txn, <<"key3">>, [])),
+
+    %% Modify the value within the transaction
+    ok = rocksdb:transaction_put(Txn, <<"key1">>, <<"modified1">>),
+
+    %% Get the modified value
+    ?assertEqual({ok, <<"modified1">>}, rocksdb:transaction_get_for_update(Txn, <<"key1">>, [])),
+
+    ok = rocksdb:transaction_commit(Txn),
+
+    %% Verify the committed value
+    ?assertEqual({ok, <<"modified1">>}, rocksdb:get(Db, <<"key1">>, [])),
+
+    ok = rocksdb:release_transaction(Txn),
+    close_destroy(Db, "transaction_testdb"),
+    ok.
+
+multi_get_test() ->
+    Db = destroy_reopen("transaction_testdb", [{create_if_missing, true}]),
+
+    %% Put some initial data
+    ok = rocksdb:put(Db, <<"key1">>, <<"value1">>, []),
+    ok = rocksdb:put(Db, <<"key2">>, <<"value2">>, []),
+    ok = rocksdb:put(Db, <<"key3">>, <<"value3">>, []),
+
+    %% Start a transaction and add some changes
+    {ok, Txn} = rocksdb:transaction(Db, []),
+
+    %% Add a new key and modify an existing one within the transaction
+    ok = rocksdb:transaction_put(Txn, <<"key4">>, <<"value4">>),
+    ok = rocksdb:transaction_put(Txn, <<"key1">>, <<"modified1">>),
+
+    %% Test multi_get - should see uncommitted changes within transaction
+    Results = rocksdb:transaction_multi_get(Txn, [<<"key1">>, <<"key2">>, <<"key4">>, <<"key5">>], []),
+    ?assertEqual([{ok, <<"modified1">>}, {ok, <<"value2">>}, {ok, <<"value4">>}, not_found], Results),
+
+    %% Commit and verify
+    ok = rocksdb:transaction_commit(Txn),
+    ok = rocksdb:release_transaction(Txn),
+
+    %% Verify via regular multi_get
+    Results2 = rocksdb:multi_get(Db, [<<"key1">>, <<"key2">>, <<"key4">>], []),
+    ?assertEqual([{ok, <<"modified1">>}, {ok, <<"value2">>}, {ok, <<"value4">>}], Results2),
+
+    close_destroy(Db, "transaction_testdb"),
+    ok.
+
+multi_get_for_update_test() ->
+    Db = destroy_reopen("transaction_testdb", [{create_if_missing, true}]),
+
+    %% Put some initial data
+    ok = rocksdb:put(Db, <<"key1">>, <<"value1">>, []),
+    ok = rocksdb:put(Db, <<"key2">>, <<"value2">>, []),
+    ok = rocksdb:put(Db, <<"key3">>, <<"value3">>, []),
+
+    %% Start a transaction
+    {ok, Txn} = rocksdb:transaction(Db, []),
+
+    %% Multi-get with conflict tracking
+    Results = rocksdb:transaction_multi_get_for_update(Txn, [<<"key1">>, <<"key2">>, <<"key4">>], []),
+    ?assertEqual([{ok, <<"value1">>}, {ok, <<"value2">>}, not_found], Results),
+
+    %% Modify one of the tracked keys
+    ok = rocksdb:transaction_put(Txn, <<"key1">>, <<"modified1">>),
+
+    %% Get again should see the modification
+    Results2 = rocksdb:transaction_multi_get_for_update(Txn, [<<"key1">>, <<"key2">>], []),
+    ?assertEqual([{ok, <<"modified1">>}, {ok, <<"value2">>}], Results2),
+
+    %% Commit should succeed
+    ok = rocksdb:transaction_commit(Txn),
+    ok = rocksdb:release_transaction(Txn),
+
+    %% Verify committed values
+    ?assertEqual({ok, <<"modified1">>}, rocksdb:get(Db, <<"key1">>, [])),
+
+    close_destroy(Db, "transaction_testdb"),
+    ok.
