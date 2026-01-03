@@ -111,7 +111,8 @@
   new_sst_file_manager/1, new_sst_file_manager/2,
   release_sst_file_manager/1,
   sst_file_manager_flag/3,
-  sst_file_manager_info/1, sst_file_manager_info/2
+  sst_file_manager_info/1, sst_file_manager_info/2,
+  sst_file_manager_tracked_files/1
 ]).
 
 %% sst file writer API
@@ -2273,6 +2274,14 @@ sst_file_manager_info(_SstFileManager) ->
           | max_allowed_space_reached_including_compactions,
     Value :: term().
 sst_file_manager_info(_SstFileManager, _Item) ->
+  ?nif_stub.
+
+%% @doc Returns a list of all SST files being tracked and their sizes.
+%% Each element is a tuple of {FilePath, Size} where FilePath is a binary
+%% and Size is the file size in bytes.
+-spec sst_file_manager_tracked_files(SstFileManager) -> [{binary(), non_neg_integer()}] when
+    SstFileManager :: sst_file_manager().
+sst_file_manager_tracked_files(_SstFileManager) ->
   ?nif_stub.
 
 

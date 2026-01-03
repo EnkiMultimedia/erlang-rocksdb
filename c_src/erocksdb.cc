@@ -217,6 +217,7 @@ static ErlNifFunc nif_funcs[] =
         {"sst_file_manager_flag", 3, erocksdb::SstFileManagerFlag, ERL_NIF_REGULAR_BOUND},
         {"sst_file_manager_info", 1, erocksdb::SstFileManagerInfo, ERL_NIF_REGULAR_BOUND},
         {"sst_file_manager_info", 2, erocksdb::SstFileManagerInfo, ERL_NIF_REGULAR_BOUND},
+        {"sst_file_manager_tracked_files", 1, erocksdb::SstFileManagerTrackedFiles, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
         // SST File Writer
         {"sst_file_writer_open", 2, erocksdb::SstFileWriterOpen, ERL_NIF_DIRTY_JOB_IO_BOUND},

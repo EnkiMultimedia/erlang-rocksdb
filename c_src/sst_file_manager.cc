@@ -263,4 +263,26 @@ SstFileManagerInfo(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     return info;
 }
 
+ERL_NIF_TERM
+SstFileManagerTrackedFiles(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
+{
+    SstFileManager* mgr_ptr;
+    mgr_ptr = erocksdb::SstFileManager::RetrieveSstFileManagerResource(env, argv[0]);
+    if(nullptr==mgr_ptr)
+        return enif_make_badarg(env);
+
+    auto tracked_files = mgr_ptr->sst_file_manager()->GetTrackedFiles();
+    ERL_NIF_TERM result = enif_make_list(env, 0);
+
+    for (const auto& [path, size] : tracked_files) {
+        ERL_NIF_TERM path_term;
+        unsigned char* buf = enif_make_new_binary(env, path.size(), &path_term);
+        memcpy(buf, path.data(), path.size());
+
+        ERL_NIF_TERM tuple = enif_make_tuple2(env, path_term, enif_make_uint64(env, size));
+        result = enif_make_list_cell(env, tuple, result);
+    }
+    return result;
+}
+
 }

@@ -144,6 +144,7 @@ ERL_NIF_TERM NewSstFileManager(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 ERL_NIF_TERM ReleaseSstFileManager(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM SstFileManagerFlag(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM SstFileManagerInfo(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM SstFileManagerTrackedFiles(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 // sst file writer
 ERL_NIF_TERM SstFileWriterOpen(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);

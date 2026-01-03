@@ -54,3 +54,33 @@ simple_options_test() ->
   ok = rocksdb:destroy("rocksdb_sst_file_mgr.test", []),
   ok = rocksdb_test_util:rm_rf("rocksdb_sst_file_mgr.test"),
   ok.
+
+tracked_files_test() ->
+  {ok, Env} = rocksdb:default_env(),
+  {ok, Mgr} = rocksdb:new_sst_file_manager(Env),
+  Options = [{create_if_missing, true}, {env, Env}, {sst_file_manager, Mgr}],
+  {ok, Db} = rocksdb:open("rocksdb_tracked_files.test", Options),
+
+  %% Write some data to create SST files
+  [ok = rocksdb:put(Db, <<"key", (integer_to_binary(I))/binary>>,
+                    crypto:strong_rand_bytes(1000), [])
+   || I <- lists:seq(1, 100)],
+  ok = rocksdb:flush(Db, []),
+
+  %% Check tracked files
+  TrackedFiles = rocksdb:sst_file_manager_tracked_files(Mgr),
+  ?assert(is_list(TrackedFiles)),
+  %% After flush, there should be at least one SST file
+  ?assert(length(TrackedFiles) > 0),
+  lists:foreach(fun({Path, Size}) ->
+      ?assert(is_binary(Path)),
+      ?assert(is_integer(Size)),
+      ?assert(Size > 0)
+  end, TrackedFiles),
+
+  ok = rocksdb:close(Db),
+  ok = rocksdb:release_sst_file_manager(Mgr),
+  ok = rocksdb:destroy_env(Env),
+  ok = rocksdb:destroy("rocksdb_tracked_files.test", []),
+  ok = rocksdb_test_util:rm_rf("rocksdb_tracked_files.test"),
+  ok.
