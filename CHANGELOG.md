@@ -15,6 +15,13 @@
   - `readahead_size`: configure readahead buffer size for sequential reads
   - `async_io`: enable asynchronous I/O for iterators
 
+### Bug Fixes
+
+- fix memory leak in CoalescingIterator error paths
+- fix memory leak in TransactionIterator error paths
+- fix memory leak in PessimisticTransactionIterator error paths
+- add null check for enif_alloc_env in NewBatch
+
 ### Improvements
 
 - add FreeBSD CI testing using vmactions/freebsd-vm
