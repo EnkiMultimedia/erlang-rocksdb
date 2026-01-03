@@ -96,4 +96,5 @@ jobs:
           prepare: |
             pkg install -y erlang rebar3 cmake git gmake
           run: |
+            git config --global --add safe.directory $GITHUB_WORKSPACE
             rebar3 eunit
