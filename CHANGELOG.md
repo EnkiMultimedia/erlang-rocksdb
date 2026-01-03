@@ -11,6 +11,9 @@
 - add transaction batch get operations:
   - Optimistic transactions: `transaction_get_for_update/3,4`, `transaction_multi_get/3,4`, `transaction_multi_get_for_update/3,4`
   - Pessimistic transactions: `pessimistic_transaction_multi_get/3,4`, `pessimistic_transaction_multi_get_for_update/3,4`
+- add new read options:
+  - `readahead_size`: configure readahead buffer size for sequential reads
+  - `async_io`: enable asynchronous I/O for iterators
 
 ### Improvements
 
