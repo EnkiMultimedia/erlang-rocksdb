@@ -67,7 +67,7 @@
 
 ### Documentation
 
-- add comprehensive statistics guide
+- add statistics guide
 - add multi_get usage to getting started guide
 
 ## erlang-rocksdb 2.1.0, released on 2025/12/28

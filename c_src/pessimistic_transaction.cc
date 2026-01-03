@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------
-// Copyright (c) 2016-2025 Benoit Chesneau. All Rights Reserved.
+// Copyright (c) 2016-2026 Benoit Chesneau. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file

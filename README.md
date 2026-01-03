@@ -5,7 +5,7 @@
 
 **Current version: 2.3.0**
 
-Copyright (c) 2016-2025 Benoît Chesneau
+Copyright (c) 2016-2026 Benoît Chesneau
 
 Feedback and pull requests welcome! If a particular feature of RocksDB is important to you, please let me know by opening an issue, and I'll prioritize it.
 

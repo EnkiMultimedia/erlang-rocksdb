@@ -1,4 +1,4 @@
-%% Copyright (c) 2016-2025 Benoît Chesneau.
+%% Copyright (c) 2016-2026 Benoît Chesneau.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file

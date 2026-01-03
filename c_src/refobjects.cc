@@ -3,7 +3,7 @@
 // eleveldb: Erlang Wrapper for LevelDB (http://code.google.com/p/leveldb/)
 //
 // Copyright (c) 2011-2013 Basho Technologies, Inc. All Rights Reserved.
-// Copyright (c) 2016-2025 Benoit Chesneau/
+// Copyright (c) 2016-2026 Benoit Chesneau/
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
