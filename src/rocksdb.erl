@@ -24,6 +24,10 @@
   open_readonly/2, open_readonly/3,
   open_optimistic_transaction_db/2, open_optimistic_transaction_db/3,
   open_with_ttl/4,
+  open_with_ttl_cf/4,
+  get_ttl/2,
+  set_ttl/2, set_ttl/3,
+  create_column_family_with_ttl/4,
   close/1,
   set_db_background_threads/2, set_db_background_threads/3,
   destroy/2,
@@ -880,6 +884,53 @@ open_optimistic_transaction_db(_Name, _DbOpts, _CFDescriptors) ->
 open_with_ttl(_Name, _DBOpts, _TTL, _ReadOnly) ->
   ?nif_stub.
 
+%% @doc Open a RocksDB database with TTL support and multiple column families.
+%% Each column family can have its own TTL value.
+%% @see open_with_ttl/4
+-spec open_with_ttl_cf(Name, DBOpts, CFDescriptors, ReadOnly) ->
+       {ok, db_handle(), [cf_handle()]} | {error, any()}
+         when Name :: file:filename_all(),
+              DBOpts :: db_options(),
+              CFDescriptors :: [{Name :: string(), CFOpts :: cf_options(), TTL :: integer()}],
+              ReadOnly :: boolean().
+open_with_ttl_cf(_Name, _DBOpts, _CFDescriptors, _ReadOnly) ->
+  ?nif_stub.
+
+%% @doc Get the current TTL for a column family in a TTL database.
+%% Returns the TTL in seconds.
+-spec get_ttl(DBHandle, CFHandle) -> {ok, integer()} | {error, any()}
+         when DBHandle :: db_handle(),
+              CFHandle :: cf_handle().
+get_ttl(_DBHandle, _CFHandle) ->
+  ?nif_stub.
+
+%% @doc Set the default TTL for a TTL database.
+%% The TTL is specified in seconds.
+-spec set_ttl(DBHandle, TTL) -> ok | {error, any()}
+         when DBHandle :: db_handle(),
+              TTL :: integer().
+set_ttl(_DBHandle, _TTL) ->
+  ?nif_stub.
+
+%% @doc Set the TTL for a specific column family in a TTL database.
+%% The TTL is specified in seconds.
+-spec set_ttl(DBHandle, CFHandle, TTL) -> ok | {error, any()}
+         when DBHandle :: db_handle(),
+              CFHandle :: cf_handle(),
+              TTL :: integer().
+set_ttl(_DBHandle, _CFHandle, _TTL) ->
+  ?nif_stub.
+
+%% @doc Create a new column family with a specific TTL in a TTL database.
+%% The TTL is specified in seconds.
+-spec create_column_family_with_ttl(DBHandle, Name, CFOpts, TTL) ->
+       {ok, cf_handle()} | {error, any()}
+         when DBHandle :: db_handle(),
+              Name :: string(),
+              CFOpts :: cf_options(),
+              TTL :: integer().
+create_column_family_with_ttl(_DBHandle, _Name, _CFOpts, _TTL) ->
+  ?nif_stub.
 
 %% @doc Close RocksDB
 -spec close(DBHandle) -> Res when

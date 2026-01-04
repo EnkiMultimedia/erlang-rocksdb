@@ -186,6 +186,7 @@ class DbObject : public ErlRefObject
 public:
     rocksdb::DB* m_Db;                             // NULL or rocksdb database object
     bool m_IsPessimistic;                          //!< true if opened as PessimisticTransactionDB
+    bool m_IsTTL;                                  //!< true if opened as DBWithTTL
     std::mutex m_ItrMutex;                         //!< mutex protecting m_ItrList
     std::mutex m_SnapshotMutex;                    //!< mutex protecting m_SnapshotList
     std::mutex m_ColumnFamilyMutex;                //!< mutex protecting m_ColumnFamily
@@ -202,7 +203,7 @@ protected:
     static ErlNifResourceType* m_Db_RESOURCE;
 
 public:
-    DbObject(rocksdb::DB * DbPtr, bool IsPessimistic = false); // Open with default CF
+    DbObject(rocksdb::DB * DbPtr, bool IsPessimistic = false, bool IsTTL = false); // Open with default CF
 
     DbObject() = delete;                             // no default construct
     DbObject(const DbObject&) = delete;              // nocopy
@@ -239,7 +240,7 @@ public:
 
     static void CreateDbObjectType(ErlNifEnv * Env);
 
-    static DbObject * CreateDbObject(rocksdb::DB * Db, bool IsPessimistic = false);
+    static DbObject * CreateDbObject(rocksdb::DB * Db, bool IsPessimistic = false, bool IsTTL = false);
 
     static DbObject * RetrieveDbObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm);
 
