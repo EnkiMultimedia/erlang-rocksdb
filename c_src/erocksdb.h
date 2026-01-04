@@ -185,6 +185,9 @@ ERL_NIF_TERM StatisticsTicker(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
 ERL_NIF_TERM StatisticsHistogram(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM ReleaseStatistics(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
+// Compaction Filter
+ERL_NIF_TERM CompactionFilterReply(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
 void CreateBatchType(ErlNifEnv* env);
 void CreateTransactionType(ErlNifEnv* env);
 

@@ -28,6 +28,7 @@
 #include "sst_file_reader.h"
 #include "write_buffer_manager.h"
 #include "pessimistic_transaction.h"
+#include "compaction_filter.h"
 
 // See erl_nif(3) Data Types sections for ErlNifFunc for more deails
 #define ERL_NIF_REGULAR_BOUND 0
@@ -269,6 +270,9 @@ static ErlNifFunc nif_funcs[] =
         {"statistics_ticker", 2, erocksdb::StatisticsTicker, ERL_NIF_REGULAR_BOUND},
         {"statistics_histogram", 2, erocksdb::StatisticsHistogram, ERL_NIF_REGULAR_BOUND},
         {"release_statistics", 1, erocksdb::ReleaseStatistics, ERL_NIF_REGULAR_BOUND},
+
+        // Compaction Filter
+        {"compaction_filter_reply", 2, erocksdb::CompactionFilterReply, ERL_NIF_REGULAR_BOUND},
         };
 
 namespace erocksdb {
@@ -461,6 +465,11 @@ ERL_NIF_TERM ATOM_EXCLUSIVE_MANUAL_COMPACTION;
 ERL_NIF_TERM ATOM_CHANGE_LEVEL;
 ERL_NIF_TERM ATOM_TARGET_LEVEL;
 ERL_NIF_TERM ATOM_ALLOW_WRITE_STALL;
+ERL_NIF_TERM ATOM_BOTTOMMOST_LEVEL_COMPACTION;
+ERL_NIF_TERM ATOM_SKIP;
+ERL_NIF_TERM ATOM_IF_HAVE_COMPACTION_FILTER;
+ERL_NIF_TERM ATOM_FORCE;
+ERL_NIF_TERM ATOM_FORCE_OPTIMIZED;
 
 // Related to CompactionOptionsFIFO
 ERL_NIF_TERM ATOM_COMPACTION_OPTIONS_FIFO;
@@ -561,6 +570,27 @@ ERL_NIF_TERM ATOM_CAPPED_PREFIX_TRANSFORM;
 ERL_NIF_TERM ATOM_COMPARATOR;
 ERL_NIF_TERM ATOM_BYTEWISE_COMPARATOR;
 ERL_NIF_TERM ATOM_REVERSE_BYTEWISE_COMPARATOR;
+
+// compaction filter
+ERL_NIF_TERM ATOM_COMPACTION_FILTER;
+ERL_NIF_TERM ATOM_RULES;
+ERL_NIF_TERM ATOM_HANDLER;
+ERL_NIF_TERM ATOM_BATCH_SIZE;
+ERL_NIF_TERM ATOM_TIMEOUT;
+
+// compaction filter rule types
+ERL_NIF_TERM ATOM_KEY_PREFIX;
+ERL_NIF_TERM ATOM_KEY_SUFFIX;
+ERL_NIF_TERM ATOM_KEY_CONTAINS;
+ERL_NIF_TERM ATOM_VALUE_EMPTY;
+ERL_NIF_TERM ATOM_VALUE_PREFIX;
+ERL_NIF_TERM ATOM_TTL_FROM_KEY;
+ERL_NIF_TERM ATOM_ALWAYS_DELETE;
+
+// compaction filter decisions
+ERL_NIF_TERM ATOM_KEEP;
+ERL_NIF_TERM ATOM_REMOVE;
+ERL_NIF_TERM ATOM_CHANGE_VALUE;
 
 // range
 
@@ -858,6 +888,7 @@ try
   erocksdb::SstFileWriterObject::CreateSstFileWriterType(env);
   erocksdb::SstFileReaderObject::CreateSstFileReaderType(env);
   erocksdb::WriteBufferManager::CreateWriteBufferManagerType(env);
+  erocksdb::CreateCompactionBatchResourceType(env);
 
   // must initialize atoms before processing options
 #define ATOM(Id, Value) { Id = enif_make_atom(env, Value); }
@@ -1043,6 +1074,11 @@ try
   ATOM(erocksdb::ATOM_CHANGE_LEVEL, "change_level");
   ATOM(erocksdb::ATOM_TARGET_LEVEL, "target_level");
   ATOM(erocksdb::ATOM_ALLOW_WRITE_STALL, "allow_write_stall");
+  ATOM(erocksdb::ATOM_BOTTOMMOST_LEVEL_COMPACTION, "bottommost_level_compaction");
+  ATOM(erocksdb::ATOM_SKIP, "skip");
+  ATOM(erocksdb::ATOM_IF_HAVE_COMPACTION_FILTER, "if_have_compaction_filter");
+  ATOM(erocksdb::ATOM_FORCE, "force");
+  ATOM(erocksdb::ATOM_FORCE_OPTIMIZED, "force_optimized");
 
   // FIFO options
   ATOM(erocksdb::ATOM_COMPACTION_OPTIONS_FIFO, "compaction_options_fifo");
@@ -1144,6 +1180,27 @@ try
   ATOM(erocksdb::ATOM_COMPARATOR, "comparator");
   ATOM(erocksdb::ATOM_BYTEWISE_COMPARATOR, "bytewise_comparator");
   ATOM(erocksdb::ATOM_REVERSE_BYTEWISE_COMPARATOR, "reverse_bytewise_comparator");
+
+  // compaction filter
+  ATOM(erocksdb::ATOM_COMPACTION_FILTER, "compaction_filter");
+  ATOM(erocksdb::ATOM_RULES, "rules");
+  ATOM(erocksdb::ATOM_HANDLER, "handler");
+  ATOM(erocksdb::ATOM_BATCH_SIZE, "batch_size");
+  ATOM(erocksdb::ATOM_TIMEOUT, "timeout");
+
+  // compaction filter rule types
+  ATOM(erocksdb::ATOM_KEY_PREFIX, "key_prefix");
+  ATOM(erocksdb::ATOM_KEY_SUFFIX, "key_suffix");
+  ATOM(erocksdb::ATOM_KEY_CONTAINS, "key_contains");
+  ATOM(erocksdb::ATOM_VALUE_EMPTY, "value_empty");
+  ATOM(erocksdb::ATOM_VALUE_PREFIX, "value_prefix");
+  ATOM(erocksdb::ATOM_TTL_FROM_KEY, "ttl_from_key");
+  ATOM(erocksdb::ATOM_ALWAYS_DELETE, "always_delete");
+
+  // compaction filter decisions
+  ATOM(erocksdb::ATOM_KEEP, "keep");
+  ATOM(erocksdb::ATOM_REMOVE, "remove");
+  ATOM(erocksdb::ATOM_CHANGE_VALUE, "change_value");
 
   // range
   ATOM(erocksdb::ATOM_NONE, "none");

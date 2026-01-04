@@ -254,6 +254,9 @@
   restore_db_from_latest_backup/2, restore_db_from_latest_backup/3
 ]).
 
+%% Compaction Filter
+-export([compaction_filter_reply/2]).
+
 
 -export_type([
   env/0,
@@ -281,7 +284,10 @@
   ingest_external_file_option/0,
   write_buffer_manager/0,
   statistics_handle/0,
-  stats_level/0
+  stats_level/0,
+  filter_rule/0,
+  filter_decision/0,
+  compaction_filter_opts/0
 ]).
 
 -deprecated({count, 1, next_major_release}).
@@ -424,6 +430,26 @@
 
 -type prepopulate_blob_cache() :: disable | flush_only.
 
+%% Compaction Filter Types
+-type filter_rule() ::
+    {key_prefix, binary()} |
+    {key_suffix, binary()} |
+    {key_contains, binary()} |
+    {value_empty} |
+    {value_prefix, binary()} |
+    {ttl_from_key, Offset :: non_neg_integer(),
+                   Length :: non_neg_integer(),
+                   TTLSeconds :: non_neg_integer()} |
+    {always_delete}.
+
+-type filter_decision() :: keep | remove | {change_value, binary()}.
+
+-type compaction_filter_opts() ::
+    #{rules := [filter_rule()]} |
+    #{handler := pid(),
+      batch_size => pos_integer(),
+      timeout => pos_integer()}.
+
 -type cf_options() :: [{block_cache_size_mb_for_point_lookup, non_neg_integer()} |
                        {memtable_memory_budget, pos_integer()} |
                        {write_buffer_size,  pos_integer()} |
@@ -470,7 +496,8 @@
                        {optimize_filters_for_hits, boolean()} |
                        {prefix_extractor, {fixed_prefix_transform, integer()} | 
                                            {capped_prefix_transform, integer()}} |
-                       {merge_operator, merge_operator()}
+                       {merge_operator, merge_operator()} |
+                       {compaction_filter, compaction_filter_opts()}
                       ].
 
 -type db_options() :: [{env, env()} |
@@ -556,11 +583,14 @@
                           {single_delete, ColumnFamilyHandle::cf_handle(), Key::binary()} |
                           clear].
 
+-type bottommost_level_compaction() :: skip | if_have_compaction_filter | force | force_optimized.
+
 -type compact_range_options()  :: [{exclusive_manual_compaction, boolean()} |
                                    {change_level, boolean()} |
                                    {target_level, integer()} |
                                    {allow_write_stall, boolean()} |
-                                   {max_subcompactions, non_neg_integer()}].
+                                   {max_subcompactions, non_neg_integer()} |
+                                   {bottommost_level_compaction, bottommost_level_compaction()}].
 
 -type flush_options() :: [{wait, boolean()} |
                           {allow_write_stall, boolean()}].
@@ -2742,6 +2772,40 @@ statistics_histogram(_Statistics, _Histogram) ->
 %% @doc release the Statistics Handle
 -spec release_statistics(statistics_handle()) -> ok.
 release_statistics(_Statistics) ->
+    ?nif_stub.
+
+%% ===================================================================
+%% Compaction Filter
+%% ===================================================================
+
+%% @doc Reply to a compaction filter callback request.
+%% This function is called by the Erlang handler process when it has
+%% processed a batch of keys sent by the compaction filter.
+%%
+%% BatchRef is the reference received in the {compaction_filter, BatchRef, Keys} message.
+%% Decisions is a list of filter_decision() values corresponding to each key:
+%%   - keep: Keep the key-value pair
+%%   - remove: Delete the key-value pair
+%%   - {change_value, NewBinary}: Keep the key but replace the value
+%%
+%% Example handler:
+%% ```
+%% filter_handler() ->
+%%     receive
+%%         {compaction_filter, BatchRef, Keys} ->
+%%             Decisions = [decide(K, V) || {_Level, K, V} <- Keys],
+%%             rocksdb:compaction_filter_reply(BatchRef, Decisions),
+%%             filter_handler()
+%%     end.
+%%
+%% decide(<<"tmp_", _/binary>>, _Value) -> remove;
+%% decide(_Key, <<>>) -> remove;
+%% decide(_Key, Value) when byte_size(Value) > 1000 ->
+%%     {change_value, binary:part(Value, 0, 1000)};
+%% decide(_, _) -> keep.
+%% '''
+-spec compaction_filter_reply(reference(), [filter_decision()]) -> ok.
+compaction_filter_reply(_BatchRef, _Decisions) ->
     ?nif_stub.
 
 %% ===================================================================

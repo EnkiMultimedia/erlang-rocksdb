@@ -47,6 +47,7 @@
 #include "erlang_merge.h"
 #include "bitset_merge_operator.h"
 #include "counter_merge_operator.h"
+#include "compaction_filter.h"
 
 ERL_NIF_TERM 
 parse_bbt_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::BlockBasedTableOptions& opts) {
@@ -731,6 +732,119 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
             else if (option[1] == erocksdb::ATOM_REVERSE_BYTEWISE_COMPARATOR)
                 opts.comparator = rocksdb::ReverseBytewiseComparator();
         }
+        else if (option[0] == erocksdb::ATOM_COMPACTION_FILTER)
+        {
+            // Parse compaction filter options from a map
+            // Expected format:
+            // {compaction_filter, #{rules => [...], handler => Pid, ...}}
+            if (enif_is_map(env, option[1])) {
+                ERL_NIF_TERM rules_term, handler_term, batch_term, timeout_term;
+
+                // Check for rules-based mode
+                if (enif_get_map_value(env, option[1],
+                    erocksdb::ATOM_RULES, &rules_term)) {
+
+                    std::vector<erocksdb::FilterRule> rules;
+                    ERL_NIF_TERM head, tail = rules_term;
+
+                    while (enif_get_list_cell(env, tail, &head, &tail)) {
+                        int rule_arity;
+                        const ERL_NIF_TERM* tuple;
+
+                        if (!enif_get_tuple(env, head, &rule_arity, &tuple) || rule_arity < 1) {
+                            continue;
+                        }
+
+                        erocksdb::FilterRule rule;
+
+                        if (tuple[0] == erocksdb::ATOM_KEY_PREFIX && rule_arity == 2) {
+                            rule.type = erocksdb::RuleType::KeyPrefix;
+                            ErlNifBinary bin;
+                            if (enif_inspect_binary(env, tuple[1], &bin)) {
+                                rule.pattern = std::string((char*)bin.data, bin.size);
+                                rules.push_back(rule);
+                            }
+                        }
+                        else if (tuple[0] == erocksdb::ATOM_KEY_SUFFIX && rule_arity == 2) {
+                            rule.type = erocksdb::RuleType::KeySuffix;
+                            ErlNifBinary bin;
+                            if (enif_inspect_binary(env, tuple[1], &bin)) {
+                                rule.pattern = std::string((char*)bin.data, bin.size);
+                                rules.push_back(rule);
+                            }
+                        }
+                        else if (tuple[0] == erocksdb::ATOM_KEY_CONTAINS && rule_arity == 2) {
+                            rule.type = erocksdb::RuleType::KeyContains;
+                            ErlNifBinary bin;
+                            if (enif_inspect_binary(env, tuple[1], &bin)) {
+                                rule.pattern = std::string((char*)bin.data, bin.size);
+                                rules.push_back(rule);
+                            }
+                        }
+                        else if (tuple[0] == erocksdb::ATOM_VALUE_EMPTY && rule_arity == 1) {
+                            rule.type = erocksdb::RuleType::ValueEmpty;
+                            rules.push_back(rule);
+                        }
+                        else if (tuple[0] == erocksdb::ATOM_VALUE_PREFIX && rule_arity == 2) {
+                            rule.type = erocksdb::RuleType::ValuePrefix;
+                            ErlNifBinary bin;
+                            if (enif_inspect_binary(env, tuple[1], &bin)) {
+                                rule.pattern = std::string((char*)bin.data, bin.size);
+                                rules.push_back(rule);
+                            }
+                        }
+                        else if (tuple[0] == erocksdb::ATOM_TTL_FROM_KEY && rule_arity == 4) {
+                            rule.type = erocksdb::RuleType::TTLFromKey;
+                            unsigned int offset, length;
+                            ErlNifUInt64 ttl;
+                            if (enif_get_uint(env, tuple[1], &offset) &&
+                                enif_get_uint(env, tuple[2], &length) &&
+                                enif_get_uint64(env, tuple[3], &ttl)) {
+                                rule.offset = offset;
+                                rule.length = length;
+                                rule.ttl_seconds = ttl;
+                                rules.push_back(rule);
+                            }
+                        }
+                        else if (tuple[0] == erocksdb::ATOM_ALWAYS_DELETE && rule_arity == 1) {
+                            rule.type = erocksdb::RuleType::Always;
+                            rules.push_back(rule);
+                        }
+                    }
+
+                    if (!rules.empty()) {
+                        opts.compaction_filter_factory =
+                            erocksdb::CreateCompactionFilterFactory(rules);
+                    }
+                }
+                // Check for handler-based mode
+                else if (enif_get_map_value(env, option[1],
+                    erocksdb::ATOM_HANDLER, &handler_term)) {
+
+                    ErlNifPid handler_pid;
+                    if (!enif_get_local_pid(env, handler_term, &handler_pid)) {
+                        return erocksdb::ATOM_BADARG;
+                    }
+
+                    unsigned int batch_size = 100;  // default
+                    unsigned int timeout_ms = 5000; // default
+
+                    if (enif_get_map_value(env, option[1],
+                        erocksdb::ATOM_BATCH_SIZE, &batch_term)) {
+                        enif_get_uint(env, batch_term, &batch_size);
+                    }
+
+                    if (enif_get_map_value(env, option[1],
+                        erocksdb::ATOM_TIMEOUT, &timeout_term)) {
+                        enif_get_uint(env, timeout_term, &timeout_ms);
+                    }
+
+                    opts.compaction_filter_factory =
+                        erocksdb::CreateCompactionFilterFactory(
+                            handler_pid, batch_size, timeout_ms);
+                }
+            }
+        }
         else if (option[0] == erocksdb::ATOM_ENABLE_BLOB_FILES)
         {
           opts.enable_blob_files = (option[1] ==erocksdb::ATOM_TRUE); 
@@ -957,6 +1071,17 @@ ERL_NIF_TERM parse_compact_range_option(ErlNifEnv *env, ERL_NIF_TERM item, rocks
             unsigned int max_subcompactions;
             if (enif_get_uint(env, option[1], &max_subcompactions))
                 opts.max_subcompactions = max_subcompactions;
+        }
+        else if (option[0] == erocksdb::ATOM_BOTTOMMOST_LEVEL_COMPACTION)
+        {
+            if (option[1] == erocksdb::ATOM_SKIP)
+                opts.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kSkip;
+            else if (option[1] == erocksdb::ATOM_IF_HAVE_COMPACTION_FILTER)
+                opts.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kIfHaveCompactionFilter;
+            else if (option[1] == erocksdb::ATOM_FORCE)
+                opts.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForce;
+            else if (option[1] == erocksdb::ATOM_FORCE_OPTIMIZED)
+                opts.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForceOptimized;
         }
     }
 

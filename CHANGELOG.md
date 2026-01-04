@@ -1,3 +1,60 @@
+## erlang-rocksdb 2.4.0, released on 2026/01/04
+
+### New Features
+
+- add Erlang compaction filter support with two modes:
+  - **Declarative rules mode** (fast C++ execution):
+    - `{key_prefix, Binary}`: delete keys with matching prefix
+    - `{key_suffix, Binary}`: delete keys with matching suffix
+    - `{key_contains, Binary}`: delete keys containing pattern
+    - `{value_empty}`: delete keys with empty values
+    - `{value_prefix, Binary}`: delete keys with matching value prefix
+    - `{ttl_from_key, Offset, Length, TTLSeconds}`: delete expired keys based on timestamp in key
+    - `{always_delete}`: delete all keys (use with caution)
+  - **Erlang callback mode** (flexible):
+    - Register an Erlang process as compaction filter handler
+    - Handler receives `{compaction_filter, BatchRef, Keys}` messages
+    - Reply with `rocksdb:compaction_filter_reply(BatchRef, Decisions)`
+    - Supports `keep`, `remove`, and `{change_value, NewBinary}` decisions
+    - Configurable batch_size and timeout with safe fallback behavior
+- add `bottommost_level_compaction` option to `compact_range/4,5`:
+  - `skip`: skip bottommost level compaction
+  - `if_have_compaction_filter`: compact bottommost only if filter is configured
+  - `force`: force compaction filter to run on all data
+  - `force_optimized`: force with optimizations
+
+### Example Usage
+
+```erlang
+%% Declarative rules mode - delete temporary and expired keys
+{ok, Db} = rocksdb:open("mydb", [
+    {create_if_missing, true},
+    {compaction_filter, #{
+        rules => [
+            {key_prefix, <<"tmp_">>},
+            {key_suffix, <<"_expired">>},
+            {ttl_from_key, 0, 8, 3600}  % 1 hour TTL from key bytes
+        ]
+    }}
+]).
+
+%% Erlang callback mode - custom filter logic
+%% Handler must be a PID of a running process
+HandlerPid = spawn(fun filter_loop/0),
+{ok, Db} = rocksdb:open("mydb", [
+    {compaction_filter, #{
+        handler => HandlerPid,  % PID of the handler process
+        batch_size => 100,
+        timeout => 5000
+    }}
+]).
+
+%% Force compaction filter to run on all data
+ok = rocksdb:compact_range(Db, undefined, undefined, [
+    {bottommost_level_compaction, force}
+]).
+```
+
 ## erlang-rocksdb 2.3.0, released on 2026/01/03
 
 ### New Features
