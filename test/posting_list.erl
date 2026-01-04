@@ -20,26 +20,12 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% ===================================================================
-%% Test helpers
-%% ===================================================================
-
-db_path(Name) ->
-    {ok, Cwd} = file:get_cwd(),
-    filename:join([Cwd, "test_dbs", atom_to_list(?MODULE) ++ "_" ++ Name]).
-
-clean_db(Name) ->
-    Path = db_path(Name),
-    rocksdb:destroy(Path, []),
-    ok.
-
-%% ===================================================================
 %% Basic Tests
 %% ===================================================================
 
 posting_list_add_test() ->
-    Name = "add_test",
-    clean_db(Name),
-    DbPath = db_path(Name),
+    DbPath = "posting_list_add.test",
+    rocksdb_test_util:rm_rf(DbPath),
     {ok, Db} = rocksdb:open(DbPath, [
         {create_if_missing, true},
         {merge_operator, posting_list_merge_operator}
@@ -59,12 +45,12 @@ posting_list_add_test() ->
     ?assertEqual(3, rocksdb:posting_list_count(Bin)),
 
     ok = rocksdb:close(Db),
-    clean_db(Name).
+    rocksdb:destroy(DbPath, []),
+    rocksdb_test_util:rm_rf(DbPath).
 
 posting_list_delete_test() ->
-    Name = "delete_test",
-    clean_db(Name),
-    DbPath = db_path(Name),
+    DbPath = "posting_list_delete.test",
+    rocksdb_test_util:rm_rf(DbPath),
     {ok, Db} = rocksdb:open(DbPath, [
         {create_if_missing, true},
         {merge_operator, posting_list_merge_operator}
@@ -87,7 +73,8 @@ posting_list_delete_test() ->
     ?assertEqual(2, rocksdb:posting_list_count(Bin)),
 
     ok = rocksdb:close(Db),
-    clean_db(Name).
+    rocksdb:destroy(DbPath, []),
+    rocksdb_test_util:rm_rf(DbPath).
 
 posting_list_compaction_test() ->
     %% Test that merge operator cleans up tombstones during merge
