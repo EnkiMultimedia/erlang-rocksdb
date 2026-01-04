@@ -125,9 +125,9 @@ namespace erocksdb {
             return false;
         }
 
-        if (tuple[0] == ATOM_POSTING_ADD) {
+        if (enif_is_identical(tuple[0], ATOM_POSTING_ADD)) {
             is_tombstone = false;
-        } else if (tuple[0] == ATOM_POSTING_DELETE) {
+        } else if (enif_is_identical(tuple[0], ATOM_POSTING_DELETE)) {
             is_tombstone = true;
         } else {
             enif_free_env(env);

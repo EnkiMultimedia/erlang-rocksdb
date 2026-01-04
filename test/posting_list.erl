@@ -76,6 +76,47 @@ posting_list_delete_test() ->
     rocksdb:destroy(DbPath, []),
     rocksdb_test_util:rm_rf(DbPath).
 
+posting_list_batch_merge_test() ->
+    DbPath = "posting_list_batch_merge.test",
+    rocksdb_test_util:rm_rf(DbPath),
+    {ok, Db} = rocksdb:open(DbPath, [
+        {create_if_missing, true},
+        {merge_operator, posting_list_merge_operator}
+    ]),
+
+    %% Create a batch with posting list operations
+    {ok, Batch} = rocksdb:batch(),
+    ok = rocksdb:batch_merge(Batch, <<"term1">>, {posting_add, <<"doc1">>}),
+    ok = rocksdb:batch_merge(Batch, <<"term1">>, {posting_add, <<"doc2">>}),
+    ok = rocksdb:batch_merge(Batch, <<"term1">>, {posting_add, <<"doc3">>}),
+    ok = rocksdb:batch_merge(Batch, <<"term2">>, {posting_add, <<"doc1">>}),
+    ok = rocksdb:batch_merge(Batch, <<"term2">>, {posting_add, <<"doc2">>}),
+    %% Delete doc2 from term1 in the same batch
+    ok = rocksdb:batch_merge(Batch, <<"term1">>, {posting_delete, <<"doc2">>}),
+
+    %% Write the batch
+    ok = rocksdb:write_batch(Db, Batch, []),
+    ok = rocksdb:release_batch(Batch),
+
+    %% Verify term1: should have doc1 and doc3 (doc2 was deleted)
+    {ok, Bin1} = rocksdb:get(Db, <<"term1">>, []),
+    Keys1 = rocksdb:posting_list_keys(Bin1),
+    ?assert(lists:member(<<"doc1">>, Keys1)),
+    ?assertNot(lists:member(<<"doc2">>, Keys1)),
+    ?assert(lists:member(<<"doc3">>, Keys1)),
+    ?assertEqual(2, rocksdb:posting_list_count(Bin1)),
+
+    %% Verify term2: should have doc1 and doc2
+    {ok, Bin2} = rocksdb:get(Db, <<"term2">>, []),
+    Keys2 = rocksdb:posting_list_keys(Bin2),
+    ?assert(lists:member(<<"doc1">>, Keys2)),
+    ?assert(lists:member(<<"doc2">>, Keys2)),
+    ?assertEqual(2, rocksdb:posting_list_count(Bin2)),
+
+    ok = rocksdb:close(Db),
+    rocksdb:destroy(DbPath, []),
+    rocksdb_test_util:rm_rf(DbPath).
+
 posting_list_compaction_test() ->
     %% Test that merge operator cleans up tombstones during merge
     %% Tombstones are removed during reads (FullMergeV2) and compaction (PartialMergeMulti)

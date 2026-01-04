@@ -1,3 +1,12 @@
+## erlang-rocksdb 2.4.1, released on 2026/01/04
+
+### Bug Fixes
+
+- fix posting list merge operator not recognizing operands in `batch_merge`:
+  - Fixed atom comparison in `ParseOperand` to use `enif_is_identical()` instead of direct `==` comparison
+  - Atoms decoded via `enif_binary_to_term` require proper NIF comparison functions
+  - Added `posting_list_batch_merge_test` to verify batch operations work correctly
+
 ## erlang-rocksdb 2.4.0, released on 2026/01/04
 
 ### New Features
