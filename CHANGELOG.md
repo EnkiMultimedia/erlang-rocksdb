@@ -1,4 +1,4 @@
-## erlang-rocksdb 2.4.0, unreleased
+## erlang-rocksdb 2.4.0, released on 2026/01/04
 
 ### New Features
 
@@ -89,6 +89,17 @@ ok = rocksdb:compact_range(Db, undefined, undefined, [
     {bottommost_level_compaction, force}
 ]).
 ```
+
+### Bug Fixes
+
+- fix compaction filter resource lifetime bug: keep native reference until callback completes
+  to prevent use-after-free when handler times out or dies
+- fix FreeBSD build: add system include path for malloc_np.h in RocksDB build
+- replace std::atomic with mutex-protected bool for better portability
+
+### Improvements
+
+- FreeBSD CI now uses erlang-runtime28 with LLVM 18 for full C++20 support
 
 ## erlang-rocksdb 2.3.0, released on 2026/01/03
 
