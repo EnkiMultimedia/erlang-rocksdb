@@ -257,6 +257,17 @@
 %% Compaction Filter
 -export([compaction_filter_reply/2]).
 
+%% Posting List Helpers
+-export([
+  posting_list_decode/1,
+  posting_list_fold/3,
+  posting_list_keys/1,
+  posting_list_contains/2,
+  posting_list_find/2,
+  posting_list_count/1,
+  posting_list_to_map/1
+]).
+
 
 -export_type([
   env/0,
@@ -972,25 +983,45 @@ put(_DBHandle, _CFHandle, _Key, _Value, _WriteOpts) ->
    ?nif_stub.
 
 %% @doc Merge a key/value pair into the default column family
+%% For posting list operations, Value can be:
+%% - `{posting_add, Key}' to add a key to the posting list
+%% - `{posting_delete, Key}' to mark a key as tombstoned
 -spec merge(DBHandle, Key, Value, WriteOpts) -> Res when
   DBHandle::db_handle(),
   Key::binary(),
-  Value::binary(),
+  Value::binary() | {posting_add, binary()} | {posting_delete, binary()},
   WriteOpts::write_options(),
   Res :: ok | {error, any()}.
-merge(_DBHandle, _Key, _Value, _WriteOpts) ->
-  ?nif_stub.
+merge(DBHandle, Key, Value, WriteOpts) ->
+  merge_nif(DBHandle, Key, encode_merge_value(Value), WriteOpts).
 
 %% @doc Merge a key/value pair into the specified column family
+%% For posting list operations, Value can be:
+%% - `{posting_add, Key}' to add a key to the posting list
+%% - `{posting_delete, Key}' to mark a key as tombstoned
 -spec merge(DBHandle, CFHandle, Key, Value, WriteOpts) -> Res when
   DBHandle::db_handle(),
   CFHandle::cf_handle(),
   Key::binary(),
-  Value::binary(),
+  Value::binary() | {posting_add, binary()} | {posting_delete, binary()},
   WriteOpts::write_options(),
   Res :: ok | {error, any()}.
-merge(_DBHandle, _CFHandle, _Key, _Value, _WriteOpts) ->
-   ?nif_stub.
+merge(DBHandle, CFHandle, Key, Value, WriteOpts) ->
+   merge_nif(DBHandle, CFHandle, Key, encode_merge_value(Value), WriteOpts).
+
+%% Internal NIF stubs for merge
+merge_nif(_DBHandle, _Key, _Value, _WriteOpts) ->
+  ?nif_stub.
+merge_nif(_DBHandle, _CFHandle, _Key, _Value, _WriteOpts) ->
+  ?nif_stub.
+
+%% Encode merge value - convert posting list tuples to term_to_binary format
+encode_merge_value({posting_add, Key}) when is_binary(Key) ->
+  term_to_binary({posting_add, Key});
+encode_merge_value({posting_delete, Key}) when is_binary(Key) ->
+  term_to_binary({posting_delete, Key});
+encode_merge_value(Value) when is_binary(Value) ->
+  Value.
 
 %% @doc Delete a key/value pair in the default column family
 -spec(delete(DBHandle, Key, WriteOpts) ->
@@ -1641,13 +1672,25 @@ batch_put(_Batch, _ColumnFamily, _Key, _Value) ->
   ?nif_stub.
 
 %% @doc add a merge operation to the batch
--spec batch_merge(Batch :: batch_handle(), Key :: binary(), Value :: binary()) -> ok.
-batch_merge(_Batch, _Key, _Value) ->
-  ?nif_stub.
+%% For posting list operations, Value can be:
+%% - `{posting_add, Key}' to add a key to the posting list
+%% - `{posting_delete, Key}' to mark a key as tombstoned
+-spec batch_merge(Batch :: batch_handle(), Key :: binary(), Value :: binary() | {posting_add, binary()} | {posting_delete, binary()}) -> ok.
+batch_merge(Batch, Key, Value) ->
+  batch_merge_nif(Batch, Key, encode_merge_value(Value)).
 
 %% @doc like `batch_mege/3' but apply the operation to a column family
--spec batch_merge(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Key :: binary(), Value :: binary()) -> ok.
-batch_merge(_Batch, _ColumnFamily, _Key, _Value) ->
+%% For posting list operations, Value can be:
+%% - `{posting_add, Key}' to add a key to the posting list
+%% - `{posting_delete, Key}' to mark a key as tombstoned
+-spec batch_merge(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Key :: binary(), Value :: binary() | {posting_add, binary()} | {posting_delete, binary()}) -> ok.
+batch_merge(Batch, ColumnFamily, Key, Value) ->
+  batch_merge_nif(Batch, ColumnFamily, Key, encode_merge_value(Value)).
+
+%% Internal NIF stubs for batch_merge
+batch_merge_nif(_Batch, _Key, _Value) ->
+  ?nif_stub.
+batch_merge_nif(_Batch, _ColumnFamily, _Key, _Value) ->
   ?nif_stub.
 
 %% @doc batch implementation of delete operation to the batch
@@ -2807,6 +2850,72 @@ release_statistics(_Statistics) ->
 -spec compaction_filter_reply(reference(), [filter_decision()]) -> ok.
 compaction_filter_reply(_BatchRef, _Decisions) ->
     ?nif_stub.
+
+
+%% ===================================================================
+%% Posting List API
+%% ===================================================================
+%%
+%% Posting lists are used for inverted indexes, search engines, and document
+%% tagging systems. Each posting list is a binary containing a sequence of
+%% entries with format: <<KeyLength:32/big, Flag:8, KeyData:KeyLength/binary>>
+%%
+%% Where Flag is 0 for normal entries and non-zero for tombstones.
+%%
+%% Use with {merge_operator, posting_list_merge_operator} and optionally
+%% {compaction_filter, #{rules => [{posting_list_tombstones}]}} to clean up
+%% tombstones during compaction.
+%% ===================================================================
+
+-type posting_entry() :: {Key :: binary(), IsTombstone :: boolean()}.
+
+%% @doc Decode a posting list binary to a list of entries.
+%% Returns all entries including tombstones, in order of appearance.
+-spec posting_list_decode(binary()) -> [posting_entry()].
+posting_list_decode(<<Len:32/big, Flag:8, Key:Len/binary, Rest/binary>>) ->
+    IsTombstone = Flag =/= 0,
+    [{Key, IsTombstone} | posting_list_decode(Rest)];
+posting_list_decode(<<>>) ->
+    [].
+
+%% @doc Fold over all entries in a posting list (including tombstones).
+-spec posting_list_fold(Fun, Acc, binary()) -> Acc when
+    Fun :: fun((Key :: binary(), IsTombstone :: boolean(), Acc) -> Acc),
+    Acc :: term().
+posting_list_fold(Fun, Acc, Bin) ->
+    lists:foldl(fun({K, T}, A) -> Fun(K, T, A) end, Acc, posting_list_decode(Bin)).
+
+%% @doc Get list of active keys (deduplicated, tombstones filtered out).
+%% This is a NIF function for efficiency.
+-spec posting_list_keys(binary()) -> [binary()].
+posting_list_keys(_Bin) ->
+    ?nif_stub.
+
+%% @doc Check if a key is active (exists and not tombstoned).
+%% This is a NIF function for efficiency.
+-spec posting_list_contains(binary(), binary()) -> boolean().
+posting_list_contains(_Bin, _Key) ->
+    ?nif_stub.
+
+%% @doc Find a key in the posting list.
+%% Returns {ok, IsTombstone} if found, or not_found if not present.
+%% This is a NIF function for efficiency.
+-spec posting_list_find(binary(), binary()) -> {ok, boolean()} | not_found.
+posting_list_find(_Bin, _Key) ->
+    ?nif_stub.
+
+%% @doc Count the number of active keys (not tombstoned).
+%% This is a NIF function for efficiency.
+-spec posting_list_count(binary()) -> non_neg_integer().
+posting_list_count(_Bin) ->
+    ?nif_stub.
+
+%% @doc Convert posting list to a map of key => active | tombstone.
+%% This is a NIF function for efficiency.
+-spec posting_list_to_map(binary()) -> #{binary() => active | tombstone}.
+posting_list_to_map(_Bin) ->
+    ?nif_stub.
+
 
 %% ===================================================================
 %% Internal functions

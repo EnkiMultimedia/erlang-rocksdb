@@ -188,6 +188,13 @@ ERL_NIF_TERM ReleaseStatistics(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 // Compaction Filter
 ERL_NIF_TERM CompactionFilterReply(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
+// Posting List Helpers (NIF functions)
+ERL_NIF_TERM PostingListKeys(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListContains(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListFind(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListCount(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListToMap(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
 void CreateBatchType(ErlNifEnv* env);
 void CreateTransactionType(ErlNifEnv* env);
 

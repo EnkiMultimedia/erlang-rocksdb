@@ -25,6 +25,8 @@
 #include <condition_variable>
 #include <atomic>
 #include <chrono>
+#include <unordered_set>
+#include <unordered_map>
 
 #include "rocksdb/compaction_filter.h"
 #include "erl_nif.h"
@@ -53,13 +55,13 @@ struct FilterResult {
 // Rule types for declarative mode
 //--------------------------------------------------------------------
 enum class RuleType {
-    KeyPrefix,       // Delete if key has this prefix
-    KeySuffix,       // Delete if key has this suffix
-    KeyContains,     // Delete if key contains pattern
-    ValueEmpty,      // Delete if value is empty
-    ValuePrefix,     // Delete if value has prefix
-    TTLFromKey,      // TTL check from key bytes (big-endian timestamp)
-    Always           // Always delete
+    KeyPrefix,           // Delete if key has this prefix
+    KeySuffix,           // Delete if key has this suffix
+    KeyContains,         // Delete if key contains pattern
+    ValueEmpty,          // Delete if value is empty
+    ValuePrefix,         // Delete if value has prefix
+    TTLFromKey,          // TTL check from key bytes (big-endian timestamp)
+    Always               // Always delete
 };
 
 struct FilterRule {

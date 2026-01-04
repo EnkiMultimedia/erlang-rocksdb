@@ -1,6 +1,22 @@
-## erlang-rocksdb 2.4.0, released on 2026/01/04
+## erlang-rocksdb 2.4.0, unreleased
 
 ### New Features
+
+- add posting list merge operator for inverted indexes and tagging systems:
+  - New merge operator: `posting_list_merge_operator`
+  - Merge operations: `{posting_add, Key}` and `{posting_delete, Key}`
+  - Tombstones automatically cleaned during merge operations (no compaction filter needed)
+  - Binary format: `<<KeyLength:32/big, Flag:8, KeyData:KeyLength/binary>>` - simple, fast to parse
+  - Helper functions (pure Erlang):
+    - `posting_list_decode/1`: decode binary to list of entries
+    - `posting_list_fold/3`: fold over all entries
+  - Helper functions (NIF for efficiency):
+    - `posting_list_keys/1`: get active keys only (deduped, tombstones filtered)
+    - `posting_list_contains/2`: check if key is active
+    - `posting_list_find/2`: find key with tombstone status
+    - `posting_list_count/1`: count active keys
+    - `posting_list_to_map/1`: get full state as map
+  - See `guides/posting_lists.md` for documentation
 
 - add Erlang compaction filter support with two modes:
   - **Declarative rules mode** (fast C++ execution):
@@ -24,6 +40,25 @@
   - `force_optimized`: force with optimizations
 
 ### Example Usage
+
+```erlang
+%% Posting list for inverted index
+{ok, Db} = rocksdb:open("mydb", [
+    {create_if_missing, true},
+    {merge_operator, posting_list_merge_operator}
+]).
+
+%% Add keys to posting list
+ok = rocksdb:merge(Db, <<"term:erlang">>, {posting_add, <<"doc1">>}, []),
+ok = rocksdb:merge(Db, <<"term:erlang">>, {posting_add, <<"doc2">>}, []).
+
+%% Delete a key (adds tombstone, cleaned on next read)
+ok = rocksdb:merge(Db, <<"term:erlang">>, {posting_delete, <<"doc1">>}, []).
+
+%% Read and process - tombstones automatically removed
+{ok, Binary} = rocksdb:get(Db, <<"term:erlang">>, []),
+Keys = rocksdb:posting_list_keys(Binary).   %% [<<"doc2">>]
+```
 
 ```erlang
 %% Declarative rules mode - delete temporary and expired keys

@@ -266,6 +266,8 @@ target_sources(${ErlangRocksDBNIF_TARGET}
     ${CMAKE_CURRENT_SOURCE_DIR}/env.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/erlang_merge.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/compaction_filter.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/posting_list_merge_operator.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/posting_list_nif.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/erocksdb_column_family.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/erocksdb_db.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/erocksdb_iter.cc

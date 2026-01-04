@@ -83,8 +83,8 @@ static ErlNifFunc nif_funcs[] =
         {"multi_get", 4, erocksdb::MultiGet, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"put", 4, erocksdb::Put, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"put", 5, erocksdb::Put, ERL_NIF_DIRTY_JOB_IO_BOUND},
-        {"merge", 4, erocksdb::Merge, ERL_NIF_DIRTY_JOB_IO_BOUND},
-        {"merge", 5, erocksdb::Merge, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"merge_nif", 4, erocksdb::Merge, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"merge_nif", 5, erocksdb::Merge, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"delete", 3, erocksdb::Delete, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"delete", 4, erocksdb::Delete, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"single_delete", 3, erocksdb::SingleDelete, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -174,8 +174,8 @@ static ErlNifFunc nif_funcs[] =
         {"write_batch", 3, erocksdb::WriteBatch, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"batch_put", 3, erocksdb::PutBatch, ERL_NIF_REGULAR_BOUND},
         {"batch_put", 4, erocksdb::PutBatch, ERL_NIF_REGULAR_BOUND},
-        {"batch_merge", 3, erocksdb::MergeBatch, ERL_NIF_REGULAR_BOUND},
-        {"batch_merge", 4, erocksdb::MergeBatch, ERL_NIF_REGULAR_BOUND},
+        {"batch_merge_nif", 3, erocksdb::MergeBatch, ERL_NIF_REGULAR_BOUND},
+        {"batch_merge_nif", 4, erocksdb::MergeBatch, ERL_NIF_REGULAR_BOUND},
         {"batch_delete", 2, erocksdb::DeleteBatch, ERL_NIF_REGULAR_BOUND},
         {"batch_delete", 3, erocksdb::DeleteBatch, ERL_NIF_REGULAR_BOUND},
         {"batch_single_delete", 2, erocksdb::SingleDeleteBatch, ERL_NIF_REGULAR_BOUND},
@@ -273,6 +273,13 @@ static ErlNifFunc nif_funcs[] =
 
         // Compaction Filter
         {"compaction_filter_reply", 2, erocksdb::CompactionFilterReply, ERL_NIF_REGULAR_BOUND},
+
+        // Posting List Helpers
+        {"posting_list_keys", 1, erocksdb::PostingListKeys, ERL_NIF_REGULAR_BOUND},
+        {"posting_list_contains", 2, erocksdb::PostingListContains, ERL_NIF_REGULAR_BOUND},
+        {"posting_list_find", 2, erocksdb::PostingListFind, ERL_NIF_REGULAR_BOUND},
+        {"posting_list_count", 1, erocksdb::PostingListCount, ERL_NIF_REGULAR_BOUND},
+        {"posting_list_to_map", 1, erocksdb::PostingListToMap, ERL_NIF_REGULAR_BOUND},
         };
 
 namespace erocksdb {
@@ -563,6 +570,15 @@ ERL_NIF_TERM ATOM_MERGE_BINARY_APPEND;
 ERL_NIF_TERM ATOM_MERGE_BINARY_REPLACE;
 ERL_NIF_TERM ATOM_MERGE_BINARY_INSERT;
 ERL_NIF_TERM ATOM_MERGE_BINARY_ERASE;
+
+// posting list merge operator
+ERL_NIF_TERM ATOM_POSTING_LIST_MERGE_OPERATOR;
+ERL_NIF_TERM ATOM_POSTING_ADD;
+ERL_NIF_TERM ATOM_POSTING_DELETE;
+
+// posting list NIF helpers
+ERL_NIF_TERM ATOM_ACTIVE;
+ERL_NIF_TERM ATOM_TOMBSTONE;
 
 ERL_NIF_TERM ATOM_FIXED_PREFIX_TRANSFORM;
 ERL_NIF_TERM ATOM_CAPPED_PREFIX_TRANSFORM;
@@ -1171,6 +1187,15 @@ try
   ATOM(erocksdb::ATOM_MERGE_BINARY_REPLACE, "binary_replace");
   ATOM(erocksdb::ATOM_MERGE_BINARY_INSERT, "binary_insert");
   ATOM(erocksdb::ATOM_MERGE_BINARY_ERASE, "binary_erase");
+
+  // posting list merge operator
+  ATOM(erocksdb::ATOM_POSTING_LIST_MERGE_OPERATOR, "posting_list_merge_operator");
+  ATOM(erocksdb::ATOM_POSTING_ADD, "posting_add");
+  ATOM(erocksdb::ATOM_POSTING_DELETE, "posting_delete");
+
+  // posting list NIF helpers
+  ATOM(erocksdb::ATOM_ACTIVE, "active");
+  ATOM(erocksdb::ATOM_TOMBSTONE, "tombstone");
 
   // prefix extractor
   ATOM(erocksdb::ATOM_FIXED_PREFIX_TRANSFORM, "fixed_prefix_transform");
