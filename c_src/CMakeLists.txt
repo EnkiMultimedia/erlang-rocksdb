@@ -105,6 +105,8 @@ endif()
 set(CMAKE_BUILD_TYPE Release)
 
 set(CMAKE_THREAD_PREFER_PTHREAD ON)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 option(WITH_CCACHE "Build with ccache." OFF)
 if(WITH_CCACHE)
@@ -324,6 +326,7 @@ target_link_libraries(
     ${BZIP2_LIBRARIES}
     ${ZLIB_LIBRARY}
     ${TBB_LIBRARIES}
+    Threads::Threads
 )
 
 # Link bundled snappy with --whole-archive to include RTTI symbols

@@ -23,7 +23,6 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
-#include <atomic>
 #include <chrono>
 #include <unordered_set>
 #include <unordered_map>
@@ -93,7 +92,7 @@ public:
     FilterResult GetResult(size_t index) const;
 
     // Check if we have a response
-    bool HasResponse() const { return m_HasResponse.load(); }
+    bool HasResponse() const;
 
     // Reset for reuse
     void Reset();
@@ -101,7 +100,7 @@ public:
 private:
     mutable std::mutex m_Mutex;
     std::condition_variable m_Cond;
-    std::atomic<bool> m_HasResponse;
+    bool m_HasResponse;  // Protected by m_Mutex
     std::vector<FilterResult> m_Results;
 };
 
@@ -140,7 +139,7 @@ private:
     ErlNifPid m_HandlerPid;
     [[maybe_unused]] unsigned int m_BatchSize;  // Reserved for future batching implementation
     unsigned int m_TimeoutMs;
-    mutable std::atomic<bool> m_HandlerDead;
+    mutable bool m_HandlerDead;  // Simple flag, one-way transition to true
 
     // Helper methods
     FilterResult ApplyRules(const rocksdb::Slice& key,

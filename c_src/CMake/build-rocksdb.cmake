@@ -31,6 +31,13 @@ list(APPEND rocksdb_CMAKE_ARGS -DWITH_ZLIB=${ZLIB_FOUND})
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_BZ2=${BZIP2_FOUND})
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_ZSTD=${ZSTD_FOUND})
 
+# FreeBSD: ensure system include path is available for malloc_np.h
+if(CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
+    set(FREEBSD_INCLUDE_FLAGS "-I/usr/include -I/usr/local/include")
+    list(APPEND rocksdb_CMAKE_ARGS "-DCMAKE_CXX_FLAGS=${FREEBSD_INCLUDE_FLAGS}")
+    list(APPEND rocksdb_CMAKE_ARGS "-DCMAKE_C_FLAGS=${FREEBSD_INCLUDE_FLAGS}")
+endif()
+
 if(MSVC)
     list(APPEND rocksdb_CMAKE_ARGS -DWITHOUT_THIRDPARTY_INC=ON)
 endif()

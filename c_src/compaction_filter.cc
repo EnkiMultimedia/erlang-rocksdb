@@ -59,7 +59,7 @@ bool CompactionBatchResource::WaitForResponse(unsigned int timeout_ms)
     bool got_response = m_Cond.wait_for(
         lock,
         std::chrono::milliseconds(timeout_ms),
-        [this] { return m_HasResponse.load(); }
+        [this] { return m_HasResponse; }
     );
     return got_response;
 }
@@ -68,8 +68,14 @@ void CompactionBatchResource::SetResponse(const std::vector<FilterResult>& resul
 {
     std::lock_guard<std::mutex> lock(m_Mutex);
     m_Results = results;
-    m_HasResponse.store(true);
+    m_HasResponse = true;
     m_Cond.notify_all();
+}
+
+bool CompactionBatchResource::HasResponse() const
+{
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    return m_HasResponse;
 }
 
 FilterResult CompactionBatchResource::GetResult(size_t index) const
@@ -84,7 +90,7 @@ FilterResult CompactionBatchResource::GetResult(size_t index) const
 void CompactionBatchResource::Reset()
 {
     std::lock_guard<std::mutex> lock(m_Mutex);
-    m_HasResponse.store(false);
+    m_HasResponse = false;
     m_Results.clear();
 }
 
@@ -129,7 +135,7 @@ bool ErlangCompactionFilter::Filter(
 
     if (m_UseErlangCallback) {
         // Check if handler is known to be dead - skip callback if so
-        if (m_HandlerDead.load()) {
+        if (m_HandlerDead) {
             return false;  // Keep all keys when handler is dead
         }
         result = CallErlangHandler(level, key, existing_value);
@@ -249,7 +255,7 @@ FilterResult ErlangCompactionFilter::CallErlangHandler(
 
     // Check if handler process is still alive
     if (!enif_is_process_alive(env, const_cast<ErlNifPid*>(&m_HandlerPid))) {
-        m_HandlerDead.store(true);
+        m_HandlerDead = true;
         enif_free_env(env);
         return FilterResult(FilterDecision::Keep);
     }
@@ -263,12 +269,15 @@ FilterResult ErlangCompactionFilter::CallErlangHandler(
 
     CompactionBatchResource* batch = new (batch_alloc) CompactionBatchResource();
     ERL_NIF_TERM batch_ref = enif_make_resource(env, batch_alloc);
-    enif_release_resource(batch_alloc);  // Reference is held by batch_ref now
+    // NOTE: We keep the native reference until after WaitForResponse completes.
+    // This prevents the resource from being GC'd while we're still using it.
+    // We must call enif_release_resource on ALL exit paths after this point.
 
     // Build key binary
     ERL_NIF_TERM key_bin;
     unsigned char* key_data = enif_make_new_binary(env, key.size(), &key_bin);
     if (key_data == nullptr) {
+        enif_release_resource(batch_alloc);
         enif_free_env(env);
         return FilterResult(FilterDecision::Keep);
     }
@@ -278,6 +287,7 @@ FilterResult ErlangCompactionFilter::CallErlangHandler(
     ERL_NIF_TERM value_bin;
     unsigned char* value_data = enif_make_new_binary(env, value.size(), &value_bin);
     if (value_data == nullptr) {
+        enif_release_resource(batch_alloc);
         enif_free_env(env);
         return FilterResult(FilterDecision::Keep);
     }
@@ -303,7 +313,8 @@ FilterResult ErlangCompactionFilter::CallErlangHandler(
     // Send message to handler process
     if (!enif_send(nullptr, const_cast<ErlNifPid*>(&m_HandlerPid), env, msg)) {
         // Send failed - handler might be dead
-        m_HandlerDead.store(true);
+        m_HandlerDead = true;
+        enif_release_resource(batch_alloc);
         enif_free_env(env);
         return FilterResult(FilterDecision::Keep);
     }
@@ -319,6 +330,8 @@ FilterResult ErlangCompactionFilter::CallErlangHandler(
         result = FilterResult(FilterDecision::Keep);
     }
 
+    // Now safe to release the native reference
+    enif_release_resource(batch_alloc);
     enif_free_env(env);
     return result;
 }
