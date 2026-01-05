@@ -1329,7 +1329,7 @@ OpenWithTTL(
     if(!status.ok())
         return error_tuple(env, ATOM_ERROR_DB_OPEN, status);
 
-    db_ptr = DbObject::CreateDbObject(std::move(db));
+    db_ptr = DbObject::CreateDbObject(std::move(db), false, true);  // IsPessimistic=false, IsTTL=true
     ERL_NIF_TERM result = enif_make_resource(env, db_ptr);
     enif_release_resource(db_ptr);
     return enif_make_tuple2(env, ATOM_OK, result);
@@ -2737,6 +2737,207 @@ IngestExternalFile(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     return ATOM_OK;
 }   // IngestExternalFile
+
+
+// TTL Functions
+
+ERL_NIF_TERM
+GetTtl(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM argv[])
+{
+    DbObject* db_ptr;
+    ColumnFamilyObject* cf_ptr;
+
+    db_ptr = DbObject::RetrieveDbObject(env, argv[0]);
+    if (nullptr == db_ptr)
+        return enif_make_badarg(env);
+
+    if (!db_ptr->m_IsTTL)
+        return error_tuple(env, ATOM_ERROR, "not a TTL database");
+
+    cf_ptr = ColumnFamilyObject::RetrieveColumnFamilyObject(env, argv[1]);
+    if (nullptr == cf_ptr)
+        return enif_make_badarg(env);
+
+    rocksdb::DBWithTTL* ttl_db = static_cast<rocksdb::DBWithTTL*>(db_ptr->m_Db);
+    int32_t ttl;
+    rocksdb::Status status = ttl_db->GetTtl(cf_ptr->m_ColumnFamily, &ttl);
+
+    if (!status.ok())
+        return error_tuple(env, ATOM_ERROR, status);
+
+    return enif_make_tuple2(env, ATOM_OK, enif_make_int(env, ttl));
+}   // GetTtl
+
+
+ERL_NIF_TERM
+SetTtl(
+    ErlNifEnv* env,
+    int argc,
+    const ERL_NIF_TERM argv[])
+{
+    DbObject* db_ptr;
+    int ttl;
+
+    db_ptr = DbObject::RetrieveDbObject(env, argv[0]);
+    if (nullptr == db_ptr)
+        return enif_make_badarg(env);
+
+    if (!db_ptr->m_IsTTL)
+        return error_tuple(env, ATOM_ERROR, "not a TTL database");
+
+    rocksdb::DBWithTTL* ttl_db = static_cast<rocksdb::DBWithTTL*>(db_ptr->m_Db);
+
+    if (argc == 2) {
+        // set_ttl(Db, TTL) - set default TTL
+        if (!enif_get_int(env, argv[1], &ttl))
+            return enif_make_badarg(env);
+
+        ttl_db->SetTtl(ttl);
+    } else {
+        // set_ttl(Db, CF, TTL) - set TTL for column family
+        ColumnFamilyObject* cf_ptr = ColumnFamilyObject::RetrieveColumnFamilyObject(env, argv[1]);
+        if (nullptr == cf_ptr)
+            return enif_make_badarg(env);
+
+        if (!enif_get_int(env, argv[2], &ttl))
+            return enif_make_badarg(env);
+
+        ttl_db->SetTtl(cf_ptr->m_ColumnFamily, ttl);
+    }
+
+    return ATOM_OK;
+}   // SetTtl
+
+
+ERL_NIF_TERM
+OpenWithTTLCf(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM argv[])
+{
+    char db_name[4096];
+    bool read_only;
+    DbObject* db_ptr;
+    rocksdb::DBWithTTL* db;
+
+    if (!enif_get_string(env, argv[0], db_name, sizeof(db_name), ERL_NIF_LATIN1) ||
+        !enif_is_list(env, argv[1]) || !enif_is_list(env, argv[2]) || !enif_is_atom(env, argv[3]))
+    {
+        return enif_make_badarg(env);
+    }
+
+    read_only = (argv[3] == erocksdb::ATOM_TRUE);
+
+    // parse db options
+    rocksdb::DBOptions db_opts;
+    fold(env, argv[1], parse_db_option, db_opts);
+
+    // parse column families with TTLs
+    std::vector<rocksdb::ColumnFamilyDescriptor> column_families;
+    std::vector<int32_t> ttls;
+    ERL_NIF_TERM head, tail;
+    tail = argv[2];
+
+    while (enif_get_list_cell(env, tail, &head, &tail))
+    {
+        const ERL_NIF_TERM* tuple;
+        int arity;
+
+        if (!enif_get_tuple(env, head, &arity, &tuple) || arity != 3)
+            return enif_make_badarg(env);
+
+        // Parse column family name
+        char cf_name[4096];
+        if (!enif_get_string(env, tuple[0], cf_name, sizeof(cf_name), ERL_NIF_LATIN1))
+            return enif_make_badarg(env);
+
+        // Parse column family options
+        rocksdb::ColumnFamilyOptions cf_opts;
+        if (!enif_is_list(env, tuple[1]))
+            return enif_make_badarg(env);
+        fold(env, tuple[1], parse_cf_option, cf_opts);
+
+        // Parse TTL
+        int ttl;
+        if (!enif_get_int(env, tuple[2], &ttl))
+            return enif_make_badarg(env);
+
+        column_families.push_back(rocksdb::ColumnFamilyDescriptor(cf_name, cf_opts));
+        ttls.push_back(ttl);
+    }
+
+    std::vector<rocksdb::ColumnFamilyHandle*> handles;
+    rocksdb::Status status = rocksdb::DBWithTTL::Open(
+        db_opts, db_name, column_families, &handles, &db, ttls, read_only);
+
+    if (!status.ok())
+        return error_tuple(env, ATOM_ERROR_DB_OPEN, status);
+
+    db_ptr = DbObject::CreateDbObject(db, false, true);  // IsPessimistic=false, IsTTL=true
+
+    // Create column family handles list
+    ERL_NIF_TERM cf_list = enif_make_list(env, 0);
+    for (auto it = handles.rbegin(); it != handles.rend(); ++it)
+    {
+        ColumnFamilyObject* cf_ptr = ColumnFamilyObject::CreateColumnFamilyObject(db_ptr, *it);
+        ERL_NIF_TERM cf_term = enif_make_resource(env, cf_ptr);
+        enif_release_resource(cf_ptr);
+        cf_list = enif_make_list_cell(env, cf_term, cf_list);
+    }
+
+    ERL_NIF_TERM db_term = enif_make_resource(env, db_ptr);
+    enif_release_resource(db_ptr);
+
+    return enif_make_tuple3(env, ATOM_OK, db_term, cf_list);
+}   // OpenWithTTLCf
+
+
+ERL_NIF_TERM
+CreateColumnFamilyWithTtl(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM argv[])
+{
+    DbObject* db_ptr;
+    char cf_name[4096];
+    int ttl;
+
+    db_ptr = DbObject::RetrieveDbObject(env, argv[0]);
+    if (nullptr == db_ptr)
+        return enif_make_badarg(env);
+
+    if (!db_ptr->m_IsTTL)
+        return error_tuple(env, ATOM_ERROR, "not a TTL database");
+
+    if (!enif_get_string(env, argv[1], cf_name, sizeof(cf_name), ERL_NIF_LATIN1))
+        return enif_make_badarg(env);
+
+    if (!enif_is_list(env, argv[2]))
+        return enif_make_badarg(env);
+
+    if (!enif_get_int(env, argv[3], &ttl))
+        return enif_make_badarg(env);
+
+    rocksdb::ColumnFamilyOptions cf_opts;
+    fold(env, argv[2], parse_cf_option, cf_opts);
+
+    rocksdb::DBWithTTL* ttl_db = static_cast<rocksdb::DBWithTTL*>(db_ptr->m_Db);
+    rocksdb::ColumnFamilyHandle* handle;
+
+    rocksdb::Status status = ttl_db->CreateColumnFamilyWithTtl(cf_opts, cf_name, &handle, ttl);
+
+    if (!status.ok())
+        return error_tuple(env, ATOM_ERROR, status);
+
+    ColumnFamilyObject* cf_ptr = ColumnFamilyObject::CreateColumnFamilyObject(db_ptr, handle);
+    ERL_NIF_TERM cf_term = enif_make_resource(env, cf_ptr);
+    enif_release_resource(cf_ptr);
+
+    return enif_make_tuple2(env, ATOM_OK, cf_term);
+}   // CreateColumnFamilyWithTtl
 
 
 }
