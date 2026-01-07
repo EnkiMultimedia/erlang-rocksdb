@@ -1,14 +1,18 @@
-This directory contains all Barrel dependencies, except for the libc and utilities that should be provided by the operating system.
+This directory contains all erlang-rocksdb dependencies, except for the libc and utilities that should be provided by the operating system.
 
+## Dependencies
 
-- **lz4** 1.8.3 : compression library
-- **snappy** 1.2.1 : compression library
-- **rocksdb** 5.18.3: db backend to store the data
+- **rocksdb** 10.7.5: key-value storage engine
+- **lz4** 1.8.3: compression library
+- **snappy**: compression library
+- **CRoaring** 4.5.1: roaring bitmap library (used for posting list V2 format)
 
 ## How to upgrade dependencies:
 
-- **rocksdb** follow instructions on our [rocksdb](https://gitlab.com/barrel-db/Deps/rocksdb) repository
+- **rocksdb**: download the latest archive from [RocksDB releases](https://github.com/facebook/rocksdb/releases), extract and replace the `rocksdb` folder
 
-- **snappy**: download the latest archive, replace the `snappy` folder and  and make sure the configure script is available
+- **snappy**: download the latest archive from [Snappy releases](https://github.com/google/snappy/releases), replace the `snappy` folder
 
-- **lz4**: download the latest archive, replace the `lz4` folder by the new sources extracted from it
+- **lz4**: download the latest archive from [LZ4 releases](https://github.com/lz4/lz4/releases), replace the `lz4` folder
+
+- **CRoaring**: download the latest archive from [CRoaring releases](https://github.com/RoaringBitmap/CRoaring/releases), replace the `CRoaring` folder
