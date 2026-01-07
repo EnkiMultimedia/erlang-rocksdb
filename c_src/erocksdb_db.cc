@@ -18,6 +18,7 @@
 // -------------------------------------------------------------------
 
 #include <vector>
+#include <cstring>
 
 #include "rocksdb/db.h"
 #include "rocksdb/utilities/db_ttl.h"
@@ -760,7 +761,7 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
 
                         erocksdb::FilterRule rule;
 
-                        if (tuple[0] == erocksdb::ATOM_KEY_PREFIX && rule_arity == 2) {
+                        if (enif_is_identical(tuple[0], erocksdb::ATOM_KEY_PREFIX) && rule_arity == 2) {
                             rule.type = erocksdb::RuleType::KeyPrefix;
                             ErlNifBinary bin;
                             if (enif_inspect_binary(env, tuple[1], &bin)) {
@@ -768,7 +769,7 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
                                 rules.push_back(rule);
                             }
                         }
-                        else if (tuple[0] == erocksdb::ATOM_KEY_SUFFIX && rule_arity == 2) {
+                        else if (enif_is_identical(tuple[0], erocksdb::ATOM_KEY_SUFFIX) && rule_arity == 2) {
                             rule.type = erocksdb::RuleType::KeySuffix;
                             ErlNifBinary bin;
                             if (enif_inspect_binary(env, tuple[1], &bin)) {
@@ -776,7 +777,7 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
                                 rules.push_back(rule);
                             }
                         }
-                        else if (tuple[0] == erocksdb::ATOM_KEY_CONTAINS && rule_arity == 2) {
+                        else if (enif_is_identical(tuple[0], erocksdb::ATOM_KEY_CONTAINS) && rule_arity == 2) {
                             rule.type = erocksdb::RuleType::KeyContains;
                             ErlNifBinary bin;
                             if (enif_inspect_binary(env, tuple[1], &bin)) {
@@ -784,11 +785,22 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
                                 rules.push_back(rule);
                             }
                         }
-                        else if (tuple[0] == erocksdb::ATOM_VALUE_EMPTY && rule_arity == 1) {
-                            rule.type = erocksdb::RuleType::ValueEmpty;
-                            rules.push_back(rule);
+                        else if (rule_arity == 1) {
+                            // For single-element tuples, check atom name directly
+                            char atom_buf[64];
+                            int atom_len = enif_get_atom(env, tuple[0], atom_buf, sizeof(atom_buf), ERL_NIF_LATIN1);
+                            if (atom_len > 0) {
+                                if (strcmp(atom_buf, "value_empty") == 0) {
+                                    rule.type = erocksdb::RuleType::ValueEmpty;
+                                    rules.push_back(rule);
+                                }
+                                else if (strcmp(atom_buf, "always_delete") == 0) {
+                                    rule.type = erocksdb::RuleType::Always;
+                                    rules.push_back(rule);
+                                }
+                            }
                         }
-                        else if (tuple[0] == erocksdb::ATOM_VALUE_PREFIX && rule_arity == 2) {
+                        else if (enif_is_identical(tuple[0], erocksdb::ATOM_VALUE_PREFIX) && rule_arity == 2) {
                             rule.type = erocksdb::RuleType::ValuePrefix;
                             ErlNifBinary bin;
                             if (enif_inspect_binary(env, tuple[1], &bin)) {
@@ -796,7 +808,7 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
                                 rules.push_back(rule);
                             }
                         }
-                        else if (tuple[0] == erocksdb::ATOM_TTL_FROM_KEY && rule_arity == 4) {
+                        else if (enif_is_identical(tuple[0], erocksdb::ATOM_TTL_FROM_KEY) && rule_arity == 4) {
                             rule.type = erocksdb::RuleType::TTLFromKey;
                             unsigned int offset, length;
                             ErlNifUInt64 ttl;
@@ -808,10 +820,6 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
                                 rule.ttl_seconds = ttl;
                                 rules.push_back(rule);
                             }
-                        }
-                        else if (tuple[0] == erocksdb::ATOM_ALWAYS_DELETE && rule_arity == 1) {
-                            rule.type = erocksdb::RuleType::Always;
-                            rules.push_back(rule);
                         }
                     }
 

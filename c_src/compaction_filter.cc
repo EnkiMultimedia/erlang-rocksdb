@@ -124,19 +124,36 @@ ErlangCompactionFilter::~ErlangCompactionFilter()
 {
 }
 
-bool ErlangCompactionFilter::Filter(
+rocksdb::CompactionFilter::Decision ErlangCompactionFilter::FilterV2(
     int level,
     const rocksdb::Slice& key,
+    ValueType value_type,
     const rocksdb::Slice& existing_value,
     std::string* new_value,
-    bool* value_changed) const
+    std::string* /*skip_until*/) const
 {
+    // Handle merge operands specially
+    if (value_type == ValueType::kMergeOperand) {
+        // For merge operands, we can still apply rules
+        FilterResult result;
+        if (m_UseErlangCallback) {
+            if (m_HandlerDead) {
+                return Decision::kKeep;
+            }
+            result = CallErlangHandler(level, key, existing_value);
+        } else {
+            result = ApplyRules(key, existing_value);
+        }
+        // For merge operands, kRemove means drop the operand
+        return result.decision == FilterDecision::Remove ? Decision::kRemove : Decision::kKeep;
+    }
+
     FilterResult result;
 
     if (m_UseErlangCallback) {
         // Check if handler is known to be dead - skip callback if so
         if (m_HandlerDead) {
-            return false;  // Keep all keys when handler is dead
+            return Decision::kKeep;
         }
         result = CallErlangHandler(level, key, existing_value);
     } else {
@@ -145,16 +162,16 @@ bool ErlangCompactionFilter::Filter(
 
     switch (result.decision) {
         case FilterDecision::Remove:
-            return true;  // Delete the key
+            // Use kPurge for SingleDelete semantics - more aggressive cleanup
+            return Decision::kPurge;
 
         case FilterDecision::ChangeValue:
             *new_value = std::move(result.new_value);
-            *value_changed = true;
-            return false; // Keep but with new value
+            return Decision::kChangeValue;
 
         case FilterDecision::Keep:
         default:
-            return false; // Keep as-is
+            return Decision::kKeep;
     }
 }
 

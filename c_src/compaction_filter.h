@@ -119,14 +119,18 @@ public:
 
     virtual ~ErlangCompactionFilter();
 
-    // rocksdb::CompactionFilter interface
-    virtual bool Filter(int level,
-                       const rocksdb::Slice& key,
-                       const rocksdb::Slice& existing_value,
-                       std::string* new_value,
-                       bool* value_changed) const override;
+    // rocksdb::CompactionFilter interface - using FilterV2 for direct Decision control
+    virtual Decision FilterV2(int level,
+                             const rocksdb::Slice& key,
+                             ValueType value_type,
+                             const rocksdb::Slice& existing_value,
+                             std::string* new_value,
+                             std::string* skip_until) const override;
 
     virtual const char* Name() const override;
+
+    // For debugging
+    size_t GetRulesCount() const { return m_Rules.size(); }
 
 private:
     // Mode indicator

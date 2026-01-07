@@ -108,9 +108,7 @@ filter_key_suffix_test() ->
     ok = destroy_and_rm(DbPath).
 
 %% Test declarative rules: value empty filter
-%% Note: This test verifies configuration is accepted. The value_empty
-%% rule may not always delete keys in tests due to RocksDB optimization
-%% that may skip filtering entries with certain characteristics.
+%% Tests that keys with empty values are deleted during compaction.
 filter_value_empty_test() ->
     DbPath = "compaction_filter_empty.test",
     rocksdb_test_util:rm_rf(DbPath),
@@ -123,30 +121,36 @@ filter_value_empty_test() ->
         }}
     ]),
 
-    %% Write empty values with small padding in key to ensure SST creation
+    %% Write empty values with small padding in key to ensure SST creation (with sync)
     lists:foreach(fun(N) ->
         Key = iolist_to_binary(["empty_key", integer_to_list(N), binary:copy(<<"p">>, 100)]),
-        ok = rocksdb:put(Db, Key, <<>>, [])
+        ok = rocksdb:put(Db, Key, <<>>, [{sync, true}])
     end, lists:seq(1, 100)),
 
-    %% Write non-empty values
+    %% Write non-empty values (with sync)
     lists:foreach(fun(N) ->
         Key = iolist_to_binary(["nonempty_key", integer_to_list(N)]),
         Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"x">>, 1000)]),
-        ok = rocksdb:put(Db, Key, Value, [])
+        ok = rocksdb:put(Db, Key, Value, [{sync, true}])
     end, lists:seq(1, 100)),
 
-    %% Flush and compact with force to ensure filter runs on all data
+    %% Flush and wait a moment
     ok = rocksdb:flush(Db, []),
-    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+    timer:sleep(100),
 
-    %% Verify non-empty values are kept
+    %% Compact specific key ranges (not the whole db)
+    ok = rocksdb:compact_range(Db, <<"empty_key">>, <<"empty_key~">>, [{bottommost_level_compaction, force}]),
+    ok = rocksdb:compact_range(Db, <<"nonempty_key">>, <<"nonempty_key~">>, [{bottommost_level_compaction, force}]),
+
+    %% ASSERT: Verify non-empty values are kept
     {ok, _} = rocksdb:get(Db, <<"nonempty_key50">>, []),
+    {ok, _} = rocksdb:get(Db, <<"nonempty_key1">>, []),
 
-    %% Log result for debugging - empty values should be deleted
-    EmptyKey = iolist_to_binary(["empty_key50", binary:copy(<<"p">>, 100)]),
-    EmptyResult = rocksdb:get(Db, EmptyKey, []),
-    io:format("empty_key50 result: ~p~n", [EmptyResult]),
+    %% ASSERT: Empty value keys should be deleted
+    EmptyKey1 = iolist_to_binary(["empty_key1", binary:copy(<<"p">>, 100)]),
+    EmptyKey50 = iolist_to_binary(["empty_key50", binary:copy(<<"p">>, 100)]),
+    not_found = rocksdb:get(Db, EmptyKey1, []),
+    not_found = rocksdb:get(Db, EmptyKey50, []),
 
     ok = rocksdb:close(Db),
     ok = destroy_and_rm(DbPath).
@@ -238,24 +242,23 @@ filter_ttl_from_key_test() ->
     ok = rocksdb:flush(Db, []),
     ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
 
-    %% Reference keys for testing
-    ExpiredKey = <<ExpiredTs:64/big, "expired_data50">>,
-    ValidKey = <<ValidTs:64/big, "valid_data50">>,
+    %% ASSERT: Valid keys should remain
+    ValidKey1 = <<ValidTs:64/big, "valid_data1">>,
+    ValidKey50 = <<ValidTs:64/big, "valid_data50">>,
+    {ok, _} = rocksdb:get(Db, ValidKey1, []),
+    {ok, _} = rocksdb:get(Db, ValidKey50, []),
 
-    %% Verify valid key remains
-    {ok, _} = rocksdb:get(Db, ValidKey, []),
-
-    %% Log result for expired key
-    ExpiredResult = rocksdb:get(Db, ExpiredKey, []),
-    io:format("expired_key result: ~p~n", [ExpiredResult]),
+    %% ASSERT: Expired keys should be deleted
+    ExpiredKey1 = <<ExpiredTs:64/big, "expired_data1">>,
+    ExpiredKey50 = <<ExpiredTs:64/big, "expired_data50">>,
+    not_found = rocksdb:get(Db, ExpiredKey1, []),
+    not_found = rocksdb:get(Db, ExpiredKey50, []),
 
     ok = rocksdb:close(Db),
     ok = destroy_and_rm(DbPath).
 
 %% Test Erlang callback mode - basic handler
-%% This test verifies the handler configuration is accepted.
-%% Note: The actual handler callback may or may not be invoked depending
-%% on RocksDB's internal compaction scheduling.
+%% This test verifies that the Erlang handler actually filters keys during compaction.
 filter_erlang_handler_test() ->
     DbPath = "compaction_filter_handler.test",
     rocksdb_test_util:rm_rf(DbPath),
@@ -271,21 +274,21 @@ filter_erlang_handler_test() ->
         {compaction_filter, #{
             handler => Handler,
             batch_size => 10,
-            timeout => 1000  % Shorter timeout for test
+            timeout => 5000  % 5 second timeout
         }}
     ]),
 
     %% Write data to delete
     lists:foreach(fun(N) ->
         Key = iolist_to_binary(["delete_key", integer_to_list(N)]),
-        Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"x">>, 500)]),
+        Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"x">>, 1000)]),
         ok = rocksdb:put(Db, Key, Value, [])
     end, lists:seq(1, 50)),
 
     %% Write data to keep
     lists:foreach(fun(N) ->
         Key = iolist_to_binary(["keep_key", integer_to_list(N)]),
-        Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"y">>, 500)]),
+        Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"y">>, 1000)]),
         ok = rocksdb:put(Db, Key, Value, [])
     end, lists:seq(1, 50)),
 
@@ -293,22 +296,36 @@ filter_erlang_handler_test() ->
     ok = rocksdb:flush(Db, []),
     ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
 
-    %% Brief wait for any callbacks - don't block long
-    receive
-        {handler_processed, Count} ->
-            io:format("Handler processed ~p keys~n", [Count])
-    after 1000 ->
-        io:format("Handler not invoked (normal for some RocksDB configurations)~n", [])
-    end,
+    %% Wait for handler to process and collect total processed count
+    TotalProcessed = collect_handler_processed(0, 2000),
+    io:format("Handler processed ~p total keys~n", [TotalProcessed]),
 
-    %% Verify data is accessible (regardless of filter behavior)
-    %% This mainly tests that the configuration doesn't crash
-    _ = rocksdb:get(Db, <<"keep_key25">>, []),
+    %% Verify handler was invoked - should have processed at least some keys
+    ?assert(TotalProcessed > 0),
+
+    %% ASSERT: delete_ keys should be removed
+    not_found = rocksdb:get(Db, <<"delete_key1">>, []),
+    not_found = rocksdb:get(Db, <<"delete_key25">>, []),
+    not_found = rocksdb:get(Db, <<"delete_key50">>, []),
+
+    %% ASSERT: keep_ keys should still exist
+    {ok, _} = rocksdb:get(Db, <<"keep_key1">>, []),
+    {ok, _} = rocksdb:get(Db, <<"keep_key25">>, []),
+    {ok, _} = rocksdb:get(Db, <<"keep_key50">>, []),
 
     %% Clean up
     Handler ! stop,
     ok = rocksdb:close(Db),
     ok = destroy_and_rm(DbPath).
+
+%% Helper to collect all handler_processed messages
+collect_handler_processed(Total, Timeout) ->
+    receive
+        {handler_processed, Count} ->
+            collect_handler_processed(Total + Count, Timeout)
+    after Timeout ->
+        Total
+    end.
 
 filter_handler_loop(Parent) ->
     receive
@@ -398,6 +415,414 @@ filter_handler_dead_test() ->
 
     ok = rocksdb:close(Db),
     ok = destroy_and_rm(DbPath).
+
+%% Test handler change_value decision - handler can modify values during compaction
+filter_handler_change_value_test() ->
+    DbPath = "compaction_filter_change_value.test",
+    rocksdb_test_util:rm_rf(DbPath),
+
+    Self = self(),
+    Handler = spawn_link(fun() -> change_value_handler_loop(Self) end),
+
+    {ok, Db} = rocksdb:open(DbPath, [
+        {create_if_missing, true},
+        {write_buffer_size, 64 * 1024},
+        {level0_file_num_compaction_trigger, 1},
+        {compaction_filter, #{
+            handler => Handler,
+            batch_size => 10,
+            timeout => 5000
+        }}
+    ]),
+
+    %% Write data to transform
+    lists:foreach(fun(N) ->
+        Key = iolist_to_binary(["transform_key", integer_to_list(N)]),
+        Value = iolist_to_binary(["original_value", integer_to_list(N), binary:copy(<<"x">>, 1000)]),
+        ok = rocksdb:put(Db, Key, Value, [])
+    end, lists:seq(1, 50)),
+
+    %% Write data to keep unchanged
+    lists:foreach(fun(N) ->
+        Key = iolist_to_binary(["normal_key", integer_to_list(N)]),
+        Value = iolist_to_binary(["normal_value", integer_to_list(N), binary:copy(<<"y">>, 1000)]),
+        ok = rocksdb:put(Db, Key, Value, [])
+    end, lists:seq(1, 50)),
+
+    %% Flush and force compaction
+    ok = rocksdb:flush(Db, []),
+    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+
+    %% Wait for handler to process
+    TotalProcessed = collect_handler_processed(0, 2000),
+    io:format("Change value handler processed ~p total keys~n", [TotalProcessed]),
+    ?assert(TotalProcessed > 0),
+
+    %% ASSERT: transform_ keys should have modified values
+    {ok, Value1} = rocksdb:get(Db, <<"transform_key1">>, []),
+    ?assertEqual(<<"MODIFIED">>, Value1),
+    {ok, Value25} = rocksdb:get(Db, <<"transform_key25">>, []),
+    ?assertEqual(<<"MODIFIED">>, Value25),
+
+    %% ASSERT: normal_ keys should have original values (unchanged)
+    {ok, NormalValue} = rocksdb:get(Db, <<"normal_key1">>, []),
+    ?assertMatch(<<"normal_value1", _/binary>>, NormalValue),
+
+    Handler ! stop,
+    ok = rocksdb:close(Db),
+    ok = destroy_and_rm(DbPath).
+
+change_value_handler_loop(Parent) ->
+    receive
+        {compaction_filter, BatchRef, Keys} ->
+            Decisions = lists:map(fun({_Level, Key, _Value}) ->
+                case Key of
+                    <<"transform_", _/binary>> -> {change_value, <<"MODIFIED">>};
+                    _ -> keep
+                end
+            end, Keys),
+            rocksdb:compaction_filter_reply(BatchRef, Decisions),
+            Parent ! {handler_processed, length(Keys)},
+            change_value_handler_loop(Parent);
+        stop ->
+            ok
+    after 60000 ->
+        ok
+    end.
+
+%% Test that handler is actually invoked with all keys
+filter_handler_invocation_test() ->
+    DbPath = "compaction_filter_invocation.test",
+    rocksdb_test_util:rm_rf(DbPath),
+
+    Self = self(),
+    %% Use ETS to track received keys
+    Tab = ets:new(received_keys, [set, public]),
+    Handler = spawn_link(fun() -> tracking_handler_loop(Self, Tab) end),
+
+    {ok, Db} = rocksdb:open(DbPath, [
+        {create_if_missing, true},
+        {write_buffer_size, 64 * 1024},
+        {level0_file_num_compaction_trigger, 1},
+        {compaction_filter, #{
+            handler => Handler,
+            batch_size => 20,
+            timeout => 5000
+        }}
+    ]),
+
+    %% Write known keys - need enough data to trigger actual compaction
+    ExpectedKeys = [iolist_to_binary(["key", integer_to_list(N)]) || N <- lists:seq(1, 100)],
+    lists:foreach(fun(Key) ->
+        Value = iolist_to_binary([Key, binary:copy(<<"x">>, 1000)]),
+        ok = rocksdb:put(Db, Key, Value, [])
+    end, ExpectedKeys),
+
+    %% Flush and force compaction
+    ok = rocksdb:flush(Db, []),
+    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+
+    %% Wait for handler
+    TotalProcessed = collect_handler_processed(0, 2000),
+    io:format("Tracking handler processed ~p keys~n", [TotalProcessed]),
+    ?assert(TotalProcessed > 0),
+
+    %% Verify all keys were seen by handler
+    ReceivedKeys = [K || {K} <- ets:tab2list(Tab)],
+    io:format("Received keys count: ~p~n", [length(ReceivedKeys)]),
+
+    %% All expected keys should have been received
+    lists:foreach(fun(Key) ->
+        ?assert(lists:member(Key, ReceivedKeys))
+    end, ExpectedKeys),
+
+    Handler ! stop,
+    ets:delete(Tab),
+    ok = rocksdb:close(Db),
+    ok = destroy_and_rm(DbPath).
+
+tracking_handler_loop(Parent, Tab) ->
+    receive
+        {compaction_filter, BatchRef, Keys} ->
+            %% Track all received keys
+            lists:foreach(fun({_Level, Key, _Value}) ->
+                ets:insert(Tab, {Key})
+            end, Keys),
+            %% Keep all keys
+            Decisions = [keep || _ <- Keys],
+            rocksdb:compaction_filter_reply(BatchRef, Decisions),
+            Parent ! {handler_processed, length(Keys)},
+            tracking_handler_loop(Parent, Tab);
+        stop ->
+            ok
+    after 60000 ->
+        ok
+    end.
+
+%% Test key_contains rule
+filter_key_contains_test() ->
+    DbPath = "compaction_filter_contains.test",
+    rocksdb_test_util:rm_rf(DbPath),
+    {ok, Db} = rocksdb:open(DbPath, [
+        {create_if_missing, true},
+        {write_buffer_size, 64 * 1024},
+        {level0_file_num_compaction_trigger, 1},
+        {compaction_filter, #{
+            rules => [{key_contains, <<"_session_">>}]
+        }}
+    ]),
+
+    %% Write keys containing _session_ pattern
+    lists:foreach(fun(N) ->
+        Key = iolist_to_binary(["user_session_", integer_to_list(N), "_data"]),
+        Value = iolist_to_binary(["session_data", integer_to_list(N), binary:copy(<<"x">>, 1000)]),
+        ok = rocksdb:put(Db, Key, Value, [])
+    end, lists:seq(1, 100)),
+
+    %% Write keys NOT containing the pattern
+    lists:foreach(fun(N) ->
+        Key = iolist_to_binary(["user_data_", integer_to_list(N)]),
+        Value = iolist_to_binary(["user_data", integer_to_list(N), binary:copy(<<"y">>, 1000)]),
+        ok = rocksdb:put(Db, Key, Value, [])
+    end, lists:seq(1, 100)),
+
+    %% Flush and force compaction
+    ok = rocksdb:flush(Db, []),
+    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+
+    %% ASSERT: keys containing _session_ should be deleted
+    not_found = rocksdb:get(Db, <<"user_session_50_data">>, []),
+    not_found = rocksdb:get(Db, <<"user_session_1_data">>, []),
+
+    %% ASSERT: keys NOT containing pattern should remain
+    {ok, _} = rocksdb:get(Db, <<"user_data_50">>, []),
+    {ok, _} = rocksdb:get(Db, <<"user_data_1">>, []),
+
+    ok = rocksdb:close(Db),
+    ok = destroy_and_rm(DbPath).
+
+%% Test value_prefix rule
+filter_value_prefix_test() ->
+    DbPath = "compaction_filter_value_prefix.test",
+    rocksdb_test_util:rm_rf(DbPath),
+    {ok, Db} = rocksdb:open(DbPath, [
+        {create_if_missing, true},
+        {write_buffer_size, 64 * 1024},
+        {level0_file_num_compaction_trigger, 1},
+        {compaction_filter, #{
+            rules => [{value_prefix, <<"DELETED:">>}]
+        }}
+    ]),
+
+    %% Write keys with values starting with DELETED:
+    lists:foreach(fun(N) ->
+        Key = iolist_to_binary(["marked_key", integer_to_list(N)]),
+        Value = iolist_to_binary(["DELETED:", integer_to_list(N), binary:copy(<<"x">>, 1000)]),
+        ok = rocksdb:put(Db, Key, Value, [])
+    end, lists:seq(1, 100)),
+
+    %% Write keys with normal values
+    lists:foreach(fun(N) ->
+        Key = iolist_to_binary(["normal_key", integer_to_list(N)]),
+        Value = iolist_to_binary(["ACTIVE:", integer_to_list(N), binary:copy(<<"y">>, 1000)]),
+        ok = rocksdb:put(Db, Key, Value, [])
+    end, lists:seq(1, 100)),
+
+    %% Flush and force compaction
+    ok = rocksdb:flush(Db, []),
+    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+
+    %% ASSERT: keys with DELETED: value prefix should be removed
+    not_found = rocksdb:get(Db, <<"marked_key50">>, []),
+    not_found = rocksdb:get(Db, <<"marked_key1">>, []),
+
+    %% ASSERT: keys with normal values should remain
+    {ok, _} = rocksdb:get(Db, <<"normal_key50">>, []),
+    {ok, _} = rocksdb:get(Db, <<"normal_key1">>, []),
+
+    ok = rocksdb:close(Db),
+    ok = destroy_and_rm(DbPath).
+
+%% Test always_delete rule
+filter_always_delete_test() ->
+    DbPath = "compaction_filter_always_delete.test",
+    rocksdb_test_util:rm_rf(DbPath),
+    {ok, Db} = rocksdb:open(DbPath, [
+        {create_if_missing, true},
+        {write_buffer_size, 64 * 1024},
+        {level0_file_num_compaction_trigger, 1},
+        {compaction_filter, #{
+            rules => [{always_delete}]
+        }}
+    ]),
+
+    %% Write various keys with sync to ensure durability
+    lists:foreach(fun(N) ->
+        Key = iolist_to_binary(["key", integer_to_list(N)]),
+        Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"x">>, 1000)]),
+        ok = rocksdb:put(Db, Key, Value, [{sync, true}])
+    end, lists:seq(1, 100)),
+
+    %% Flush and wait a moment
+    ok = rocksdb:flush(Db, []),
+    timer:sleep(100),
+
+    %% Compact specific key range (not the whole db)
+    ok = rocksdb:compact_range(Db, <<"key">>, <<"key~">>, [{bottommost_level_compaction, force}]),
+
+    %% ASSERT: ALL keys should be deleted
+    not_found = rocksdb:get(Db, <<"key1">>, []),
+    not_found = rocksdb:get(Db, <<"key50">>, []),
+    not_found = rocksdb:get(Db, <<"key100">>, []),
+
+    ok = rocksdb:close(Db),
+    ok = destroy_and_rm(DbPath).
+
+%% Test handler with invalid decisions - should default to keep
+filter_handler_invalid_decision_test() ->
+    DbPath = "compaction_filter_invalid.test",
+    rocksdb_test_util:rm_rf(DbPath),
+
+    Self = self(),
+    Handler = spawn_link(fun() -> invalid_decision_handler_loop(Self) end),
+
+    {ok, Db} = rocksdb:open(DbPath, [
+        {create_if_missing, true},
+        {write_buffer_size, 64 * 1024},
+        {level0_file_num_compaction_trigger, 1},
+        {compaction_filter, #{
+            handler => Handler,
+            batch_size => 10,
+            timeout => 5000
+        }}
+    ]),
+
+    %% Write data
+    lists:foreach(fun(N) ->
+        Key = iolist_to_binary(["key", integer_to_list(N)]),
+        Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"x">>, 1000)]),
+        ok = rocksdb:put(Db, Key, Value, [])
+    end, lists:seq(1, 50)),
+
+    %% Flush and force compaction
+    ok = rocksdb:flush(Db, []),
+    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+
+    %% Wait for handler
+    TotalProcessed = collect_handler_processed(0, 2000),
+    io:format("Invalid decision handler processed ~p keys~n", [TotalProcessed]),
+
+    %% ASSERT: All keys should be kept (invalid decisions default to keep)
+    {ok, _} = rocksdb:get(Db, <<"key1">>, []),
+    {ok, _} = rocksdb:get(Db, <<"key25">>, []),
+    {ok, _} = rocksdb:get(Db, <<"key50">>, []),
+
+    Handler ! stop,
+    ok = rocksdb:close(Db),
+    ok = destroy_and_rm(DbPath).
+
+invalid_decision_handler_loop(Parent) ->
+    receive
+        {compaction_filter, BatchRef, Keys} ->
+            %% Return invalid decisions - should default to keep
+            Decisions = [invalid_decision || _ <- Keys],
+            rocksdb:compaction_filter_reply(BatchRef, Decisions),
+            Parent ! {handler_processed, length(Keys)},
+            invalid_decision_handler_loop(Parent);
+        stop ->
+            ok
+    after 60000 ->
+        ok
+    end.
+
+%% Test compaction filter with column families
+filter_column_family_test() ->
+    DbPath = "compaction_filter_cf.test",
+    rocksdb_test_util:rm_rf(DbPath),
+
+    %% First create the DB with column families
+    {ok, Db0} = rocksdb:open(DbPath, [{create_if_missing, true}]),
+    {ok, _CF1} = rocksdb:create_column_family(Db0, "cf1", []),
+    {ok, _CF2} = rocksdb:create_column_family(Db0, "cf2", []),
+    ok = rocksdb:close(Db0),
+
+    %% Reopen with CF-specific filters
+    Self = self(),
+    Handler = spawn_link(fun() -> cf_filter_handler_loop(Self) end),
+
+    CF1Opts = [
+        {write_buffer_size, 64 * 1024},
+        {compaction_filter, #{rules => [{key_prefix, <<"tmp_">>}]}}
+    ],
+    CF2Opts = [
+        {write_buffer_size, 64 * 1024},
+        {compaction_filter, #{handler => Handler, batch_size => 10, timeout => 5000}}
+    ],
+
+    {ok, Db, [_DefaultCF, CF1, CF2]} = rocksdb:open_with_cf(DbPath, [
+        {create_if_missing, true}
+    ], [
+        {"default", []},
+        {"cf1", CF1Opts},
+        {"cf2", CF2Opts}
+    ]),
+
+    %% Write to CF1 (rule-based filter) - need enough data for actual compaction
+    lists:foreach(fun(N) ->
+        TmpKey = iolist_to_binary(["tmp_key", integer_to_list(N)]),
+        KeepKey = iolist_to_binary(["keep_key", integer_to_list(N)]),
+        Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"x">>, 1000)]),
+        ok = rocksdb:put(Db, CF1, TmpKey, Value, []),
+        ok = rocksdb:put(Db, CF1, KeepKey, Value, [])
+    end, lists:seq(1, 100)),
+
+    %% Write to CF2 (handler-based filter removes old_ prefix)
+    lists:foreach(fun(N) ->
+        OldKey = iolist_to_binary(["old_key", integer_to_list(N)]),
+        NewKey = iolist_to_binary(["new_key", integer_to_list(N)]),
+        Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"y">>, 1000)]),
+        ok = rocksdb:put(Db, CF2, OldKey, Value, []),
+        ok = rocksdb:put(Db, CF2, NewKey, Value, [])
+    end, lists:seq(1, 100)),
+
+    %% Flush and compact both CFs
+    ok = rocksdb:flush(Db, CF1, []),
+    ok = rocksdb:flush(Db, CF2, []),
+    ok = rocksdb:compact_range(Db, CF1, undefined, undefined, [{bottommost_level_compaction, force}]),
+    ok = rocksdb:compact_range(Db, CF2, undefined, undefined, [{bottommost_level_compaction, force}]),
+
+    %% Wait for handler
+    _ = collect_handler_processed(0, 2000),
+
+    %% ASSERT CF1: tmp_ keys deleted, keep_ keys remain
+    not_found = rocksdb:get(Db, CF1, <<"tmp_key15">>, []),
+    {ok, _} = rocksdb:get(Db, CF1, <<"keep_key15">>, []),
+
+    %% ASSERT CF2: old_ keys deleted by handler, new_ keys remain
+    not_found = rocksdb:get(Db, CF2, <<"old_key15">>, []),
+    {ok, _} = rocksdb:get(Db, CF2, <<"new_key15">>, []),
+
+    Handler ! stop,
+    ok = rocksdb:close(Db),
+    ok = destroy_and_rm(DbPath).
+
+cf_filter_handler_loop(Parent) ->
+    receive
+        {compaction_filter, BatchRef, Keys} ->
+            Decisions = lists:map(fun({_Level, Key, _Value}) ->
+                case Key of
+                    <<"old_", _/binary>> -> remove;
+                    _ -> keep
+                end
+            end, Keys),
+            rocksdb:compaction_filter_reply(BatchRef, Decisions),
+            Parent ! {handler_processed, length(Keys)},
+            cf_filter_handler_loop(Parent);
+        stop ->
+            ok
+    after 60000 ->
+        ok
+    end.
 
 %% Helper function
 destroy_and_rm(DbPath) ->
