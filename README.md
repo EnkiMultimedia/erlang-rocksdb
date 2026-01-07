@@ -3,7 +3,7 @@
 [![Build Status](https://github.com/EnkiMultimedia/erlang-rocksdb/workflows/build/badge.svg)](https://github.com/EnkiMultimedia/erlang-rocksdb/actions?query=workflow%3Abuild)
 [![Hex pm](http://img.shields.io/hexpm/v/rocksdb.svg?style=flat)](https://hex.pm/packages/rocksdb)
 
-**Current version: 2.4.1**
+**Current version: 2.5.0**
 
 Copyright (c) 2016-2026 Benoît Chesneau
 
@@ -44,6 +44,8 @@ See the [Customized builds](https://hexdocs.pm/rocksdb/CUSTOMIZED_BUILDS.html) f
 ## Support
 
 Support, Design and discussions are done via the [Github Tracker](https://github.com/EnkiMultimedia/erlang-rocksdb/issues).
+
+Professional support is available via [Enki Multimedia](https://enki-multimedia.eu). Contact sales@enki-multimedia.eu.
 
 ## License
 

@@ -1,0 +1,27 @@
+name: Ubuntu-NoExceptions-CI
+
+'on':
+  - push
+  - pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ubuntu-gcc
+    runs-on: ubuntu-latest
+
+    env:
+      CC: gcc
+      CXX: g++
+
+    steps: 
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Build and Test
+        run: |
+          mkdir build
+          cd build
+          cmake -DCMAKE_CXX_FLAGS=-fno-exceptions -DROARING_EXCEPTIONS=OFF -DENABLE_ROARING_TESTS=ON .. 
+          cmake --build . 
+          ctest . --output-on-failure

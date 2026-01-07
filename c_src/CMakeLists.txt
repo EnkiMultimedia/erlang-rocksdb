@@ -197,6 +197,13 @@ if(WITH_TBB)
   find_package(TBB REQUIRED)
 endif()
 
+# CRoaring for posting list bitmap operations
+option(WITH_CROARING "build with CRoaring for posting list bitmaps" ON)
+if(WITH_CROARING)
+    include(build-croaring)
+    add_definitions(-DWITH_CROARING)
+endif()
+
 # Use RocksDB provided by host system
 # (for users with extra requirements)
 option(WITH_SYSTEM_ROCKSDB "require and build with system rocksdb" OFF)
@@ -225,6 +232,9 @@ include_directories(${BZIP2_INCLUDE_DIR})
 include_directories(${ZLIB_INCLUDE_DIR})
 include_directories(${SNAPPY_INCLUDE_DIR})
 include_directories(${ROCKSDB_INCLUDE_DIRS})
+if(WITH_CROARING)
+    include_directories(${CROARING_INCLUDE_DIR})
+endif()
 #include_directories(${LIBGFLAGS_INCLUDE_DIR})
 
 #--------------------------------------------------------------------------------
@@ -328,6 +338,15 @@ target_link_libraries(
     ${TBB_LIBRARIES}
     Threads::Threads
 )
+
+# Link CRoaring library
+if(WITH_CROARING)
+    target_link_libraries(
+        ${ErlangRocksDBNIF_TARGET}
+        PRIVATE
+        ${CROARING_LIBRARY}
+    )
+endif()
 
 # Link bundled snappy with --whole-archive to include RTTI symbols
 if(WITH_BUNDLE_SNAPPY AND NOT APPLE AND NOT MSVC)

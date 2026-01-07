@@ -269,7 +269,27 @@
   posting_list_contains/2,
   posting_list_find/2,
   posting_list_count/1,
-  posting_list_to_map/1
+  posting_list_to_map/1,
+  %% V2 format support
+  posting_list_version/1,
+  posting_list_intersection/2,
+  posting_list_union/2,
+  posting_list_difference/2,
+  posting_list_intersection_count/2,
+  posting_list_bitmap_contains/2,
+  posting_list_intersect_all/1,
+  %% Postings resource API (Lucene-style naming)
+  postings_open/1,
+  postings_contains/2,
+  postings_bitmap_contains/2,
+  postings_count/1,
+  postings_keys/1,
+  postings_intersection/2,
+  postings_union/2,
+  postings_difference/2,
+  postings_intersection_count/2,
+  postings_intersect_all/1,
+  postings_to_binary/1
 ]).
 
 
@@ -2967,10 +2987,147 @@ posting_list_count(_Bin) ->
 posting_list_to_map(_Bin) ->
     ?nif_stub.
 
+%% @doc Get the format version of a posting list binary.
+%% Returns 1 for V1 (legacy) format, 2 for V2 (sorted with roaring bitmap).
+-spec posting_list_version(binary()) -> 1 | 2.
+posting_list_version(_Bin) ->
+    ?nif_stub.
+
+%% @doc Compute intersection of two posting lists.
+%% Returns a new V2 posting list containing only keys present in both inputs.
+-spec posting_list_intersection(binary(), binary()) -> binary().
+posting_list_intersection(_Bin1, _Bin2) ->
+    ?nif_stub.
+
+%% @doc Compute union of two posting lists.
+%% Returns a new V2 posting list containing all keys from both inputs.
+-spec posting_list_union(binary(), binary()) -> binary().
+posting_list_union(_Bin1, _Bin2) ->
+    ?nif_stub.
+
+%% @doc Compute difference of two posting lists (Bin1 - Bin2).
+%% Returns keys that are in Bin1 but not in Bin2.
+-spec posting_list_difference(binary(), binary()) -> binary().
+posting_list_difference(_Bin1, _Bin2) ->
+    ?nif_stub.
+
+%% @doc Fast intersection count using roaring bitmap when available.
+%% For V2 posting lists, uses bitmap cardinality for O(1) performance.
+-spec posting_list_intersection_count(binary(), binary()) -> non_neg_integer().
+posting_list_intersection_count(_Bin1, _Bin2) ->
+    ?nif_stub.
+
+%% @doc Fast bitmap-based contains check.
+%% Uses hash lookup for V2 format - may have rare false positives.
+%% Use posting_list_contains/2 for exact checks.
+-spec posting_list_bitmap_contains(binary(), binary()) -> boolean().
+posting_list_bitmap_contains(_Bin, _Key) ->
+    ?nif_stub.
+
+%% @doc Intersect multiple posting lists efficiently.
+%% Processes lists from smallest to largest for optimal performance.
+-spec posting_list_intersect_all([binary()]) -> binary().
+posting_list_intersect_all([]) ->
+    %% Empty intersection - return empty V2 posting list
+    <<2, 0, 0, 0, 0, 0, 0, 0, 0>>;
+posting_list_intersect_all([Single]) ->
+    Single;
+posting_list_intersect_all(Lists) ->
+    %% Sort by size (smallest first) for optimal intersection
+    Sorted = lists:sort(fun(A, B) -> byte_size(A) =< byte_size(B) end, Lists),
+    lists:foldl(fun posting_list_intersection/2, hd(Sorted), tl(Sorted)).
+
+%% @doc Open/parse posting list binary into a resource for fast repeated lookups.
+%% Use this when you need to perform multiple contains checks on the same posting list.
+%% The resource holds parsed keys and bitmap for fast lookups.
+%% @end
+-spec postings_open(binary()) -> {ok, reference()} | {error, term()}.
+postings_open(_Bin) ->
+    ?nif_stub.
+
+%% @doc Check if key exists in postings resource (exact match).
+%% O(log n) lookup using sorted set.
+-spec postings_contains(reference(), binary()) -> boolean().
+postings_contains(_Postings, _Key) ->
+    ?nif_stub.
+
+%% @doc Check if key exists in postings resource (bitmap hash lookup).
+%% O(1) lookup but may have rare false positives due to hash collisions.
+-spec postings_bitmap_contains(reference(), binary()) -> boolean().
+postings_bitmap_contains(_Postings, _Key) ->
+    ?nif_stub.
+
+%% @doc Get count of keys in postings resource.
+-spec postings_count(reference()) -> non_neg_integer().
+postings_count(_Postings) ->
+    ?nif_stub.
+
+%% @doc Get all keys from postings resource (sorted).
+-spec postings_keys(reference()) -> [binary()].
+postings_keys(_Postings) ->
+    ?nif_stub.
+
+%% @doc Intersect two postings (AND).
+%% Accepts binary or resource, returns resource.
+-spec postings_intersection(binary() | reference(), binary() | reference()) ->
+    {ok, reference()} | {error, term()}.
+postings_intersection(A, B) ->
+    BinA = to_posting_binary(A),
+    BinB = to_posting_binary(B),
+    postings_open(posting_list_intersection(BinA, BinB)).
+
+%% @doc Union two postings (OR).
+%% Accepts binary or resource, returns resource.
+-spec postings_union(binary() | reference(), binary() | reference()) ->
+    {ok, reference()} | {error, term()}.
+postings_union(A, B) ->
+    BinA = to_posting_binary(A),
+    BinB = to_posting_binary(B),
+    postings_open(posting_list_union(BinA, BinB)).
+
+%% @doc Difference of two postings (A - B).
+%% Accepts binary or resource, returns resource.
+-spec postings_difference(binary() | reference(), binary() | reference()) ->
+    {ok, reference()} | {error, term()}.
+postings_difference(A, B) ->
+    BinA = to_posting_binary(A),
+    BinB = to_posting_binary(B),
+    postings_open(posting_list_difference(BinA, BinB)).
+
+%% @doc Fast intersection count using bitmap.
+-spec postings_intersection_count(binary() | reference(), binary() | reference()) ->
+    non_neg_integer().
+postings_intersection_count(A, B) ->
+    BinA = to_posting_binary(A),
+    BinB = to_posting_binary(B),
+    posting_list_intersection_count(BinA, BinB).
+
+%% @doc Intersect multiple postings efficiently.
+-spec postings_intersect_all([binary() | reference()]) -> {ok, reference()} | {error, term()}.
+postings_intersect_all([]) ->
+    postings_open(<<2, 0, 0, 0, 0, 0, 0, 0, 0>>);
+postings_intersect_all([Single]) when is_reference(Single) ->
+    {ok, Single};
+postings_intersect_all([Single]) ->
+    postings_open(Single);
+postings_intersect_all(List) ->
+    Bins = [to_posting_binary(X) || X <- List],
+    postings_open(posting_list_intersect_all(Bins)).
+
 
 %% ===================================================================
 %% Internal functions
 %% ===================================================================
+
+%% Convert postings (binary or resource) to binary
+to_posting_binary(Bin) when is_binary(Bin) -> Bin;
+to_posting_binary(Ref) when is_reference(Ref) -> postings_to_binary(Ref).
+
+%% @doc Convert postings resource back to binary (V2 format).
+-spec postings_to_binary(reference()) -> binary().
+postings_to_binary(_Postings) ->
+    ?nif_stub.
+
 do_fold(Itr, Fun, Acc0) ->
   try
     fold_loop(iterator_move(Itr, first), Itr, Fun, Acc0)

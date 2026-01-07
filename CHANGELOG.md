@@ -1,3 +1,55 @@
+## erlang-rocksdb 2.5.0, released on 2026/01/07
+
+### New Features
+
+- add posting list V2 format with roaring64 bitmaps for fast set operations:
+  - New binary format: version byte + serialized roaring bitmap + sorted keys
+  - Keys automatically stored in lexicographic (binary memcmp) order
+  - Automatic V1 to V2 migration on first merge operation
+  - Binary API functions:
+    - `posting_list_version/1`: get format version (1 or 2)
+    - `posting_list_intersection/2`: AND two posting lists
+    - `posting_list_union/2`: OR two posting lists
+    - `posting_list_difference/2`: subtract posting lists (A - B)
+    - `posting_list_intersection_count/2`: fast cardinality via bitmap
+    - `posting_list_bitmap_contains/2`: fast hash-based existence check
+    - `posting_list_intersect_all/1`: intersect multiple posting lists
+  - CRoaring library integration for efficient bitmap operations
+
+- add postings resource API for fast repeated lookups (Lucene-style naming):
+  - Parse once, lookup many times with ~0.1 us/lookup performance
+  - `postings_open/1`: parse binary into resource
+  - `postings_contains/2`: O(log n) exact lookup
+  - `postings_bitmap_contains/2`: O(1) hash lookup
+  - `postings_count/1`: get key count
+  - `postings_keys/1`: get sorted keys
+  - `postings_intersection/2`: AND (accepts binary or resource)
+  - `postings_union/2`: OR (accepts binary or resource)
+  - `postings_difference/2`: A - B (accepts binary or resource)
+  - `postings_intersection_count/2`: fast cardinality
+  - `postings_intersect_all/1`: multi-way AND
+  - `postings_to_binary/1`: convert resource back to binary
+
+- add enhanced TTL support with column family operations (PR #7, thanks @nyo16):
+  - `open_with_ttl_cf/4`: open database with multiple column families, each with its own TTL
+  - `get_ttl/2`: get current TTL for a column family
+  - `set_ttl/2`: set default TTL for the database
+  - `set_ttl/3`: set TTL for a specific column family
+  - `create_column_family_with_ttl/4`: create a new column family with a specific TTL
+  - See `guides/ttl.md` for documentation
+
+### Bug Fixes
+
+- fix compaction filter for `value_empty` and `always_delete` rules:
+  - Use FilterV2 API instead of Filter for direct Decision control
+  - Fix 1-tuple rule parsing using strcmp
+  - Use `enif_is_identical()` for atom comparison
+
+### Improvements
+
+- posting list keys are now returned in sorted order (lexicographic)
+- set operations use roaring bitmap for O(1) existence checks
+
 ## erlang-rocksdb 2.4.1, released on 2026/01/04
 
 ### Bug Fixes

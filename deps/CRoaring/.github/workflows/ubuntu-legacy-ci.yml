@@ -1,0 +1,25 @@
+name: Ubuntu-Legacy-CI
+
+'on':
+  - push
+  - pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ubuntu-gcc
+    runs-on: ubuntu-latest
+
+    steps: 
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Build and Test
+        run: |
+          mkdir build
+          cd build
+          cmake -DROARING_DISABLE_AVX=ON -DCMAKE_INSTALL_PREFIX:PATH=destination -DENABLE_ROARING_TESTS=ON ..
+          cmake --build .
+          ctest . --output-on-failure
+          cmake --install . 
+          cd ../tests/installation/find && mkdir build && cd build && cmake -DCMAKE_INSTALL_PREFIX:PATH=../../../build/destination .. &&  cmake --build .

@@ -285,6 +285,18 @@ static ErlNifFunc nif_funcs[] =
         {"posting_list_find", 2, erocksdb::PostingListFind, ERL_NIF_REGULAR_BOUND},
         {"posting_list_count", 1, erocksdb::PostingListCount, ERL_NIF_REGULAR_BOUND},
         {"posting_list_to_map", 1, erocksdb::PostingListToMap, ERL_NIF_REGULAR_BOUND},
+        {"posting_list_version", 1, erocksdb::PostingListVersion, ERL_NIF_REGULAR_BOUND},
+        {"posting_list_intersection", 2, erocksdb::PostingListIntersection, ERL_NIF_REGULAR_BOUND},
+        {"posting_list_union", 2, erocksdb::PostingListUnion, ERL_NIF_REGULAR_BOUND},
+        {"posting_list_difference", 2, erocksdb::PostingListDifference, ERL_NIF_REGULAR_BOUND},
+        {"posting_list_intersection_count", 2, erocksdb::PostingListIntersectionCount, ERL_NIF_REGULAR_BOUND},
+        {"posting_list_bitmap_contains", 2, erocksdb::PostingListBitmapContains, ERL_NIF_REGULAR_BOUND},
+        {"postings_open", 1, erocksdb::PostingsOpen, ERL_NIF_REGULAR_BOUND},
+        {"postings_contains", 2, erocksdb::PostingsContains, ERL_NIF_REGULAR_BOUND},
+        {"postings_bitmap_contains", 2, erocksdb::PostingsBitmapContains, ERL_NIF_REGULAR_BOUND},
+        {"postings_count", 1, erocksdb::PostingsCount, ERL_NIF_REGULAR_BOUND},
+        {"postings_keys", 1, erocksdb::PostingsKeys, ERL_NIF_REGULAR_BOUND},
+        {"postings_to_binary", 1, erocksdb::PostingsToBinary, ERL_NIF_REGULAR_BOUND},
         };
 
 namespace erocksdb {
@@ -910,6 +922,7 @@ try
   erocksdb::SstFileReaderObject::CreateSstFileReaderType(env);
   erocksdb::WriteBufferManager::CreateWriteBufferManagerType(env);
   erocksdb::CreateCompactionBatchResourceType(env);
+  erocksdb::init_posting_list_resource(env);
 
   // must initialize atoms before processing options
 #define ATOM(Id, Value) { Id = enif_make_atom(env, Value); }

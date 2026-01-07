@@ -200,6 +200,21 @@ ERL_NIF_TERM PostingListContains(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
 ERL_NIF_TERM PostingListFind(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PostingListCount(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PostingListToMap(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListVersion(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListIntersection(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListUnion(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListDifference(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListIntersectionCount(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListBitmapContains(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+// Postings resource API (Lucene-style naming)
+ERL_NIF_TERM PostingsOpen(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsContains(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsBitmapContains(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsCount(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsKeys(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsToBinary(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+bool init_posting_list_resource(ErlNifEnv* env);
 
 void CreateBatchType(ErlNifEnv* env);
 void CreateTransactionType(ErlNifEnv* env);

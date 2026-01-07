@@ -1,0 +1,23 @@
+name: VS17-ARM-CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: windows-vs17
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: ARM64}
+    steps:
+      - name: checkout
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Use cmake
+        run: |
+          cmake -A ${{ matrix.arch }} -DCMAKE_CROSSCOMPILING=1 -B build  &&
+          cmake --build build --verbose

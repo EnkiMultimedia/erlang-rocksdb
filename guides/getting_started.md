@@ -2,7 +2,7 @@ The Erlang Rocksdb binding provides access to most of the key/value API of the r
 
 ## Installation
 
-Download the sources from our [Gitlab repository](https://gitlab.com/barrel-db/erlang-rocksdb)
+Download the sources from our [Github repository](https://github.com/EnkiMultimedia/erlang-rocksdb)
 
 To build the application simply run 'rebar3 compile'. 
 
@@ -16,14 +16,14 @@ Or add it to your rebar config
 ```erlang
 {deps, [
     ....
-    {rocksdb, {rocksdb, "1.2.0"}}
+    {rocksdb, "2.5.0"}
 ]}.
 ```
 
 Or your mix config file:
 
 ```
-{:rocksdb, "~> 1.0"}
+{:rocksdb, "~> 2.5"}
 ```
 
 ## Basic operations
