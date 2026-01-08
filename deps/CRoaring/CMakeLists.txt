@@ -66,9 +66,7 @@ find_package(CTargets)
 find_package(Options)
 find_package(LTO)
 
-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/roaring.pc.in"
-               "${CMAKE_CURRENT_BINARY_DIR}/roaring.pc" @ONLY)
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/roaring.pc" DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+# configure_file for roaring.pc.in removed - not needed for embedded build
 
 ## C header files get installed to /usr/local/include/roaring typically
 
@@ -78,17 +76,7 @@ target_include_directories(roaring-headers INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 add_library(roaring-headers-cpp INTERFACE)
-target_include_directories(roaring-headers-cpp INTERFACE
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp>
-   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-
-####
-### Some users want the C++ header files to be installed as well.
-### C++ header files get installed to /usr/local/include/roaring typically
-SET(CPP_ROARING_HEADERS
-   cpp/roaring/roaring64map.hh
-   cpp/roaring/roaring.hh) # needs to be updated if we add more files
-install(FILES ${CPP_ROARING_HEADERS} DESTINATION include/roaring)
+# C++ headers removed - not needed for embedded build
 install(DIRECTORY include/roaring DESTINATION include)
 
 install(TARGETS roaring-headers roaring-headers-cpp
@@ -99,16 +87,7 @@ install(TARGETS roaring-headers roaring-headers-cpp
    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 include(CTest)
 
-##################################
-#### My understanding is that variable get passed down to subdirectories, so
-#### this needs to be done here.
-set (TEST_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/testdata/")
-set (BENCHMARK_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/realdata/")
-MESSAGE( STATUS "BENCHMARK_DATA_DIR: " ${BENCHMARK_DATA_DIR} )
-MESSAGE( STATUS "TEST_DATA_DIR: " ${TEST_DATA_DIR} )
-configure_file ("${CMAKE_CURRENT_SOURCE_DIR}/tests/config.h.in"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tests/config.h")
-#################################
+# Test/benchmark data directories and config removed - not needed for embedded build
 
 add_subdirectory(src)
 if(ENABLE_ROARING_TESTS AND NOT EMSCRIPTEN)
@@ -178,15 +157,4 @@ set_target_properties(
   WINDOWS_EXPORT_ALL_SYMBOLS YES
 )
 
-set(CPACK_PACKAGE_VENDOR "Daniel Lemire")
-set(CPACK_PACKAGE_CONTACT "lemire@gmail.com")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Roaring bitmaps in C")
-set(CPACK_PACKAGE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
-set(CPACK_PACKAGE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
-set(CPACK_PACKAGE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
-set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
-set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
-
-set(CPACK_RPM_PACKAGE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
-set(CPACK_SOURCE_GENERATOR "TGZ;ZIP")
-include(CPack)
+# CPack configuration removed - not needed for embedded build
