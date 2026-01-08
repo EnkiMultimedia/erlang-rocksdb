@@ -40,6 +40,7 @@
 
 ### Bug Fixes
 
+- fix CRoaring bswap64 build error on FreeBSD: use `<sys/endian.h>` instead of `<byteswap.h>`
 - fix compaction filter for `value_empty` and `always_delete` rules:
   - Use FilterV2 API instead of Filter for direct Decision control
   - Fix 1-tuple rule parsing using strcmp
