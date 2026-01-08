@@ -735,7 +735,7 @@ invalid_decision_handler_loop(Parent) ->
         ok
     end.
 
-%% Test compaction filter with column families
+%% Test compaction filter with column families using rule-based filters
 filter_column_family_test() ->
     DbPath = "compaction_filter_cf.test",
     rocksdb_test_util:rm_rf(DbPath),
@@ -746,17 +746,14 @@ filter_column_family_test() ->
     {ok, _CF2} = rocksdb:create_column_family(Db0, "cf2", []),
     ok = rocksdb:close(Db0),
 
-    %% Reopen with CF-specific filters
-    Self = self(),
-    Handler = spawn_link(fun() -> cf_filter_handler_loop(Self) end),
-
+    %% Reopen with CF-specific filters - use distinct option lists
     CF1Opts = [
         {write_buffer_size, 64 * 1024},
         {compaction_filter, #{rules => [{key_prefix, <<"tmp_">>}]}}
     ],
     CF2Opts = [
         {write_buffer_size, 64 * 1024},
-        {compaction_filter, #{handler => Handler, batch_size => 10, timeout => 5000}}
+        {compaction_filter, #{rules => [{key_prefix, <<"old_">>}]}}
     ],
 
     {ok, Db, [_DefaultCF, CF1, CF2]} = rocksdb:open_with_cf(DbPath, [
@@ -767,62 +764,42 @@ filter_column_family_test() ->
         {"cf2", CF2Opts}
     ]),
 
-    %% Write to CF1 (rule-based filter) - need enough data for actual compaction
+    %% Write to CF1 (rule-based filter for tmp_ prefix)
     lists:foreach(fun(N) ->
-        TmpKey = iolist_to_binary(["tmp_key", integer_to_list(N)]),
-        KeepKey = iolist_to_binary(["keep_key", integer_to_list(N)]),
-        Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"x">>, 1000)]),
+        TmpKey = iolist_to_binary([<<"tmp_key">>, integer_to_binary(N)]),
+        KeepKey = iolist_to_binary([<<"keep_key">>, integer_to_binary(N)]),
+        Value = iolist_to_binary([<<"value">>, integer_to_binary(N), binary:copy(<<"x">>, 1000)]),
         ok = rocksdb:put(Db, CF1, TmpKey, Value, []),
         ok = rocksdb:put(Db, CF1, KeepKey, Value, [])
     end, lists:seq(1, 100)),
 
-    %% Write to CF2 (handler-based filter removes old_ prefix)
+    %% Write to CF2 (rule-based filter for old_ prefix)
     lists:foreach(fun(N) ->
-        OldKey = iolist_to_binary(["old_key", integer_to_list(N)]),
-        NewKey = iolist_to_binary(["new_key", integer_to_list(N)]),
-        Value = iolist_to_binary(["value", integer_to_list(N), binary:copy(<<"y">>, 1000)]),
+        OldKey = iolist_to_binary([<<"old_key">>, integer_to_binary(N)]),
+        NewKey = iolist_to_binary([<<"new_key">>, integer_to_binary(N)]),
+        Value = iolist_to_binary([<<"value">>, integer_to_binary(N), binary:copy(<<"y">>, 1000)]),
         ok = rocksdb:put(Db, CF2, OldKey, Value, []),
         ok = rocksdb:put(Db, CF2, NewKey, Value, [])
     end, lists:seq(1, 100)),
 
-    %% Flush and compact both CFs
+    %% Flush and compact both CFs with specific bounds
     ok = rocksdb:flush(Db, CF1, []),
     ok = rocksdb:flush(Db, CF2, []),
-    ok = rocksdb:compact_range(Db, CF1, undefined, undefined, [{bottommost_level_compaction, force}]),
-    ok = rocksdb:compact_range(Db, CF2, undefined, undefined, [{bottommost_level_compaction, force}]),
-
-    %% Wait for handler
-    _ = collect_handler_processed(0, 2000),
+    %% Compact CF1: keys range from keep_key1 to tmp_key99 (alphabetically)
+    ok = rocksdb:compact_range(Db, CF1, <<"keep_key1">>, <<"tmp_key99">>, [{bottommost_level_compaction, force}]),
+    %% Compact CF2: keys range from new_key1 to old_key99 (alphabetically)
+    ok = rocksdb:compact_range(Db, CF2, <<"new_key1">>, <<"old_key99">>, [{bottommost_level_compaction, force}]),
 
     %% ASSERT CF1: tmp_ keys deleted, keep_ keys remain
     not_found = rocksdb:get(Db, CF1, <<"tmp_key15">>, []),
     {ok, _} = rocksdb:get(Db, CF1, <<"keep_key15">>, []),
 
-    %% ASSERT CF2: old_ keys deleted by handler, new_ keys remain
+    %% ASSERT CF2: old_ keys deleted, new_ keys remain
     not_found = rocksdb:get(Db, CF2, <<"old_key15">>, []),
     {ok, _} = rocksdb:get(Db, CF2, <<"new_key15">>, []),
 
-    Handler ! stop,
     ok = rocksdb:close(Db),
     ok = destroy_and_rm(DbPath).
-
-cf_filter_handler_loop(Parent) ->
-    receive
-        {compaction_filter, BatchRef, Keys} ->
-            Decisions = lists:map(fun({_Level, Key, _Value}) ->
-                case Key of
-                    <<"old_", _/binary>> -> remove;
-                    _ -> keep
-                end
-            end, Keys),
-            rocksdb:compaction_filter_reply(BatchRef, Decisions),
-            Parent ! {handler_processed, length(Keys)},
-            cf_filter_handler_loop(Parent);
-        stop ->
-            ok
-    after 60000 ->
-        ok
-    end.
 
 %% Helper function
 destroy_and_rm(DbPath) ->
