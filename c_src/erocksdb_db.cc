@@ -1461,7 +1461,16 @@ GetProperty(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     rocksdb::Slice name(reinterpret_cast<char*>(name_bin.data), name_bin.size);
     std::string value;
-    if (db_ptr->m_Db->GetProperty(name, &value))
+    volatile int v_argc = argc;
+    volatile void* v_cf = (void*)cf_ptr.get();
+    bool ok;
+
+    if (v_argc == 3 && v_cf != nullptr)
+        ok = db_ptr->m_Db->GetProperty(cf_ptr->m_ColumnFamily, name, &value);
+    else
+        ok = db_ptr->m_Db->GetProperty(name, &value);
+
+    if (ok)
     {
         ERL_NIF_TERM result;
         memcpy(enif_make_new_binary(env, value.size(), &result), value.c_str(), value.size());
