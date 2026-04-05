@@ -1,4 +1,4 @@
-## erlang-rocksdb 2.6.0 (unreleased)
+## erlang-rocksdb 2.6.0, released on 2026/04/05
 
 ### New Features
 
