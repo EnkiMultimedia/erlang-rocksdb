@@ -41,9 +41,41 @@
            "deps",
            "c_src",
            "test"]},
-  {exclude_files, ["deps/rebar3",
-                   "deps/rocksdb/java",
-                   "deps/rocksdb/docs",
-                   "doc"]}
+  {exclude_files, [
+    "doc",
+    "deps/rebar3",
+    %% rocksdb exclusions (46M -> ~25M)
+    "deps/rocksdb/java",
+    "deps/rocksdb/docs",
+    "deps/rocksdb/tools",
+    "deps/rocksdb/db_stress_tool",
+    "deps/rocksdb/buckifier",
+    "deps/rocksdb/build_tools",
+    "deps/rocksdb/test_util",
+    "deps/rocksdb/fuzz",
+    "deps/rocksdb/coverage",
+    %% zstd exclusions (9.5M -> ~3.5M)
+    "deps/zstd/tests",
+    "deps/zstd/doc",
+    "deps/zstd/contrib",
+    "deps/zstd/build",
+    "deps/zstd/programs",
+    "deps/zstd/zlibWrapper",
+    "deps/zstd/examples",
+    %% snappy exclusions (8.9M -> ~0.5M)
+    "deps/snappy/third_party",
+    "deps/snappy/testdata",
+    %% lz4 exclusions
+    "deps/lz4/tests",
+    "deps/lz4/doc",
+    "deps/lz4/programs",
+    "deps/lz4/contrib",
+    "deps/lz4/examples",
+    "deps/lz4/ossfuzz",
+    %% CRoaring exclusions
+    "deps/CRoaring/tests",
+    "deps/CRoaring/benchmarks",
+    "deps/CRoaring/microbenchmarks"
+  ]}
 
  ]}.
