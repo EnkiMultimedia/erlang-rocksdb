@@ -44,14 +44,11 @@
   {exclude_files, [
     "doc",
     "deps/rebar3",
-    %% rocksdb exclusions (46M -> ~25M)
+    %% rocksdb exclusions
     "deps/rocksdb/java",
     "deps/rocksdb/docs",
-    "deps/rocksdb/tools",
     "deps/rocksdb/db_stress_tool",
     "deps/rocksdb/buckifier",
-    "deps/rocksdb/build_tools",
-    "deps/rocksdb/test_util",
     "deps/rocksdb/fuzz",
     "deps/rocksdb/coverage",
     %% zstd exclusions (9.5M -> ~3.5M)
