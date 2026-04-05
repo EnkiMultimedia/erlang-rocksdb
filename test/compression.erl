@@ -33,6 +33,15 @@ open_with_lz4_test() ->
   rocksdb:destroy("erocksdb.lz4.test", []),
   ok.
 
+open_with_zstd_test() ->
+  ?rm_rf("erocksdb.zstd.test"),
+  {ok, Ref} = rocksdb:open("erocksdb.zstd.test", [{create_if_missing, true}, {compression, zstd}]),
+  ok = rocksdb:put(Ref, <<"key1">>, <<"value1">>, []),
+  {ok, <<"value1">>} = rocksdb:get(Ref, <<"key1">>, []),
+  ok = rocksdb:close(Ref),
+  rocksdb:destroy("erocksdb.zstd.test", []),
+  ok.
+
 compression_test() ->
   CompressibleData = list_to_binary([0 || _X <- lists:seq(1,20)]),
   ?rm_rf("erocksdb.compress.0"),

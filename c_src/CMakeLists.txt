@@ -121,11 +121,12 @@ if(WITH_CCACHE)
 endif(WITH_CCACHE)
 
 # Compression library options
-# LZ4 and Snappy: auto-detect by default, unless WITH_BUNDLE_* is set
-# Other compression libs: only enabled if explicitly requested
+# LZ4 and Snappy: auto-detect system libs by default, unless WITH_BUNDLE_* is set
+# Zstd: auto-detect system libs, fallback to bundled if not found
 option(WITH_BUNDLE_LZ4 "Use bundled lz4 instead of system" OFF)
 option(WITH_BUNDLE_SNAPPY "Use bundled snappy instead of system" OFF)
-option(WITH_ZSTD "build with zstd" OFF)
+option(WITH_BUNDLE_ZSTD "Fallback to bundled zstd if system not found" ON)
+option(WITH_ZSTD "build with zstd" ON)
 option(WITH_ZLIB "build with zlib" OFF)
 option(WITH_BZ2 "build with bzip2" OFF)
 
@@ -182,12 +183,17 @@ elseif(WITH_SNAPPY)
     endif()
 endif()
 
-# Zstd: find system library
+# Zstd: try system library first, fallback to bundled if not found
 if(WITH_ZSTD)
     find_package(Zstd)
     if(NOT ZSTD_FOUND AND NOT Zstd_FOUND)
-        message(STATUS "Zstd not found, disabling Zstd support")
-        set(WITH_ZSTD OFF)
+        if(WITH_BUNDLE_ZSTD)
+            message(STATUS "System Zstd not found, using bundled Zstd")
+            include(build-zstd)
+        else()
+            message(STATUS "Zstd not found and bundled disabled, disabling Zstd support")
+            set(WITH_ZSTD OFF)
+        endif()
     endif()
 endif()
 

@@ -14,7 +14,9 @@ There are manyoptions added to customize build (all are `OFF` by default):
 
 * `WITH_ZLIB=ON` the driver will link with zlib shared library provided by host system
 
-* `WITH_ZSTD=ON` the driver will link with zstd shared library provided by host system
+* `WITH_ZSTD=ON` (default) the driver will link with zstd. If system library is not found, bundled zstd is used automatically.
+
+* `WITH_BUNDLE_ZSTD=OFF` disable bundled zstd fallback. If system zstd is not found, zstd support is disabled.
 
 * `WITH_CCACHE=ON` the driver will use ccache to cache part of the build. you can also set the `CCACHE_DIR` 
 

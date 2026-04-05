@@ -2,9 +2,10 @@ This directory contains all erlang-rocksdb dependencies, except for the libc and
 
 ## Dependencies
 
-- **rocksdb** 10.7.5: key-value storage engine
+- **rocksdb** 10.10.1: key-value storage engine
 - **lz4** 1.8.3: compression library
 - **snappy**: compression library
+- **zstd** 1.5.7: compression library (used by default)
 - **CRoaring** 4.5.1: roaring bitmap library (used for posting list V2 format)
 
 ## How to upgrade dependencies:
@@ -14,5 +15,7 @@ This directory contains all erlang-rocksdb dependencies, except for the libc and
 - **snappy**: download the latest archive from [Snappy releases](https://github.com/google/snappy/releases), replace the `snappy` folder
 
 - **lz4**: download the latest archive from [LZ4 releases](https://github.com/lz4/lz4/releases), replace the `lz4` folder
+
+- **zstd**: download the latest archive from [Zstd releases](https://github.com/facebook/zstd/releases), replace the `zstd` folder
 
 - **CRoaring**: download the latest archive from [CRoaring releases](https://github.com/RoaringBitmap/CRoaring/releases), replace the `CRoaring` folder

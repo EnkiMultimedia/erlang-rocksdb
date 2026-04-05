@@ -52,11 +52,12 @@ endif
 
 SNAPPYLIB=$(CURDIR)/snappy/build/libsnappy.a
 LZ4LIB=$(CURDIR)/lz4/lib/liblz4.a
+ZSTDLIB=$(CURDIR)/zstd/lib/libzstd.a
 RDBLIB=$(CURDIR)/rocksdb/librocksdb.a
 
-RDB_CXXFLAGS="$(CXXFLAGS) -DNDEBUG -DSNAPPY -DLZ4 -I$(CURDIR)/snappy/build -I$(CURDIR)/snappy -I$(CURDIR)/lz4/lib -fPIC"
-RDB_CFLAGS="$(CFLAGS) -DNDEBUG -I$(CURDIR)/snappy/build -I$(CURDIR)/snappy -I$(CURDIR)/lz4/lib"
-RDB_LDFLAGS="$(SNAPPYLIB) $(LZ4LIB) $(LDFLAGS) -L$(CURDIR)/snappy/build -L$(CURDIR)/lz4/lib"
+RDB_CXXFLAGS="$(CXXFLAGS) -DNDEBUG -DSNAPPY -DLZ4 -DZSTD -I$(CURDIR)/snappy/build -I$(CURDIR)/snappy -I$(CURDIR)/lz4/lib -I$(CURDIR)/zstd/lib -fPIC"
+RDB_CFLAGS="$(CFLAGS) -DNDEBUG -I$(CURDIR)/snappy/build -I$(CURDIR)/snappy -I$(CURDIR)/lz4/lib -I$(CURDIR)/zstd/lib"
+RDB_LDFLAGS="$(SNAPPYLIB) $(LZ4LIB) $(ZSTDLIB) $(LDFLAGS) -L$(CURDIR)/snappy/build -L$(CURDIR)/lz4/lib -L$(CURDIR)/zstd/lib"
 
 ifeq ($(UNAME_SYS),OpenBSD)
 	RDB_CXXFLAGS="$(RDB_CXXFLAGS) -DOS_OPENBSD"
@@ -76,8 +77,9 @@ distclean:
 	@-(cd rocksdb && $(MAKE) clean) > /dev/null || true
 	@-(cd snappy && rm -rf build) > /dev/null || true
 	@-(cd lz4 && $(MAKE) clean) > /dev/null || true
+	@-(cd zstd && $(MAKE) clean) > /dev/null || true
 
-.PHONT: distclean
+.PHONY: distclean
 
 $(SNAPPYLIB):
 	@mkdir -p snappy/build
@@ -87,15 +89,20 @@ $(SNAPPYLIB):
 .PHONY: snappy
 
 $(LZ4LIB):
-	@cd lz4 && $(MAKE) CFLAGS="-O2 -fPIC" CXX="$(CXX)" 
+	@cd lz4 && $(MAKE) CFLAGS="-O2 -fPIC" CXX="$(CXX)"
 
 .PHONY: lz4
 
+$(ZSTDLIB):
+	@cd zstd && $(MAKE) CFLAGS="-O2 -fPIC" CXX="$(CXX)" lib-mt
+
+.PHONY: zstd
+
 rocksdb: $(RDBLIB)
 
-$(RDBLIB): $(SNAPPYLIB) $(LZ4LIB)
+$(RDBLIB): $(SNAPPYLIB) $(LZ4LIB) $(ZSTDLIB)
 	@cd rocksdb && \
-		CXX=$(CXX) CC=$(CC) $(MAKE) static_lib EXTRA_CXXFLAGS=$(RDB_CXXFLAGS) EXTRA_LDFLAGS=$(RDB_LDFLAGS) USE_RTTI=1 DISABLE_JEMALLOC=1 ROCKSDB_DISABLE_ZSTD=1 DEBUG_LEVEL=0 PORTABLE=1
+		CXX=$(CXX) CC=$(CC) $(MAKE) static_lib EXTRA_CXXFLAGS=$(RDB_CXXFLAGS) EXTRA_LDFLAGS=$(RDB_LDFLAGS) USE_RTTI=1 DISABLE_JEMALLOC=1 DEBUG_LEVEL=0 PORTABLE=1
 
 .PHONY: rocksdb
 
