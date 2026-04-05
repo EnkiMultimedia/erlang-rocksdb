@@ -1,3 +1,13 @@
+## erlang-rocksdb 2.6.0 (unreleased)
+
+### Improvements
+
+- bump to RocksDB version [10.10.1](https://github.com/facebook/rocksdb/releases/tag/v10.10.1)
+  - 10.8.0: New APIs (resumable compaction, FlushWALOptions)
+  - 10.9.0: New features (auto-tuning manifest, target_file_size_is_upper_bound)
+  - 10.10.0: Bug fixes
+  - 10.10.1: Windows build fixes
+
 ## erlang-rocksdb 2.5.0, released on 2026/01/07
 
 ### New Features
