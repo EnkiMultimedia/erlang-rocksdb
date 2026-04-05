@@ -1,3 +1,9 @@
+## erlang-rocksdb 2.6.1, released on 2026/04/05
+
+### Bug Fixes
+
+- fix hex package to include rocksdb tools directory required by CMake
+
 ## erlang-rocksdb 2.6.0, released on 2026/04/05
 
 ### New Features
