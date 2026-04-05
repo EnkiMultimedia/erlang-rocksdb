@@ -40,6 +40,7 @@
   checkpoint/2,
   flush/2, flush/3,
   sync_wal/1,
+  flush_wal/2,
   pause_background_work/1,
   continue_background_work/1,
   disable_manual_compaction/1,
@@ -1617,6 +1618,18 @@ flush(_DbHandle, _Cf, _FlushOptions) ->
 %% Currently only works if allow_mmap_writes = false in Options.
 -spec sync_wal(db_handle()) -> ok | {error, term()}.
 sync_wal(_DbHandle) ->
+  ?nif_stub.
+
+%% @doc Flush WAL with options.
+%% Options:
+%%   {sync, boolean()} - If true, calls SyncWAL() afterwards (default: false)
+%%   {rate_limiter_priority, io_low | io_mid | io_high | io_user | io_total} -
+%%       Rate limiter priority for IO operations (default: io_total which disables rate limiting)
+-type flush_wal_option() :: {sync, boolean()}
+                          | {rate_limiter_priority, io_low | io_mid | io_high | io_user | io_total}.
+-type flush_wal_options() :: [flush_wal_option()].
+-spec flush_wal(db_handle(), flush_wal_options()) -> ok | {error, term()}.
+flush_wal(_DbHandle, _Options) ->
   ?nif_stub.
 
 %% @doc Pause all background work (flush, compaction) for the database.

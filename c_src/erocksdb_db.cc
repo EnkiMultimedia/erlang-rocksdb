@@ -2273,6 +2273,58 @@ EnableManualCompaction(
 } // erocksdb::EnableManualCompaction
 
 ERL_NIF_TERM
+parse_flush_wal_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::FlushWALOptions& opts)
+{
+    int arity;
+    const ERL_NIF_TERM* option;
+    if (enif_get_tuple(env, item, &arity, &option) && 2 == arity)
+    {
+        if (option[0] == ATOM_SYNC)
+        {
+            opts.sync = (option[1] == ATOM_TRUE);
+        }
+        else if (option[0] == ATOM_RATE_LIMITER_PRIORITY)
+        {
+            if (option[1] == ATOM_IO_LOW)
+                opts.rate_limiter_priority = rocksdb::Env::IO_LOW;
+            else if (option[1] == ATOM_IO_MID)
+                opts.rate_limiter_priority = rocksdb::Env::IO_MID;
+            else if (option[1] == ATOM_IO_HIGH)
+                opts.rate_limiter_priority = rocksdb::Env::IO_HIGH;
+            else if (option[1] == ATOM_IO_USER)
+                opts.rate_limiter_priority = rocksdb::Env::IO_USER;
+            else if (option[1] == ATOM_IO_TOTAL)
+                opts.rate_limiter_priority = rocksdb::Env::IO_TOTAL;
+        }
+    }
+    return ATOM_OK;
+}
+
+ERL_NIF_TERM
+FlushWal(
+  ErlNifEnv* env,
+  int /*argc*/,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    if (!enif_is_list(env, argv[1]))
+        return enif_make_badarg(env);
+
+    rocksdb::FlushWALOptions opts;
+    fold(env, argv[1], parse_flush_wal_option, opts);
+
+    rocksdb::Status status = db_ptr->m_Db->FlushWAL(opts);
+
+    if (!status.ok())
+        return error_tuple(env, ATOM_ERROR, status);
+
+    return ATOM_OK;
+} // erocksdb::FlushWal
+
+ERL_NIF_TERM
 SetDBBackgroundThreads(
         ErlNifEnv* env,
         int argc,

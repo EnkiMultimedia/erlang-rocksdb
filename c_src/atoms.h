@@ -616,6 +616,14 @@ extern ERL_NIF_TERM ATOM_GARBAGE_BLOB_BYTES;
 // Background Work Control (RocksDB 10.8+)
 // No new atoms needed - these functions don't take options
 
+// FlushWAL options (RocksDB 10.8+)
+extern ERL_NIF_TERM ATOM_RATE_LIMITER_PRIORITY;
+extern ERL_NIF_TERM ATOM_IO_LOW;
+extern ERL_NIF_TERM ATOM_IO_MID;
+extern ERL_NIF_TERM ATOM_IO_HIGH;
+extern ERL_NIF_TERM ATOM_IO_USER;
+extern ERL_NIF_TERM ATOM_IO_TOTAL;
+
 }   // namespace erocksdb
 
 

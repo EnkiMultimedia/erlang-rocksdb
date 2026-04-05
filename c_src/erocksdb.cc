@@ -59,6 +59,7 @@ static ErlNifFunc nif_funcs[] =
         {"get_property", 3, erocksdb::GetProperty, ERL_NIF_REGULAR_BOUND},
         {"flush", 3, erocksdb::Flush, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"sync_wal", 1, erocksdb::SyncWal, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"flush_wal", 2, erocksdb::FlushWal, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"pause_background_work", 1, erocksdb::PauseBackgroundWork, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"continue_background_work", 1, erocksdb::ContinueBackgroundWork, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"disable_manual_compaction", 1, erocksdb::DisableManualCompaction, ERL_NIF_REGULAR_BOUND},
@@ -887,6 +888,14 @@ ERL_NIF_TERM ATOM_TOTAL_BLOB_BYTES;
 ERL_NIF_TERM ATOM_GARBAGE_BLOB_COUNT;
 ERL_NIF_TERM ATOM_GARBAGE_BLOB_BYTES;
 
+// FlushWAL options (RocksDB 10.8+)
+ERL_NIF_TERM ATOM_RATE_LIMITER_PRIORITY;
+ERL_NIF_TERM ATOM_IO_LOW;
+ERL_NIF_TERM ATOM_IO_MID;
+ERL_NIF_TERM ATOM_IO_HIGH;
+ERL_NIF_TERM ATOM_IO_USER;
+ERL_NIF_TERM ATOM_IO_TOTAL;
+
 }   // namespace erocksdb
 
 
@@ -1504,6 +1513,14 @@ try
   ATOM(erocksdb::ATOM_TOTAL_BLOB_BYTES, "total_blob_bytes");
   ATOM(erocksdb::ATOM_GARBAGE_BLOB_COUNT, "garbage_blob_count");
   ATOM(erocksdb::ATOM_GARBAGE_BLOB_BYTES, "garbage_blob_bytes");
+
+  // FlushWAL options (RocksDB 10.8+)
+  ATOM(erocksdb::ATOM_RATE_LIMITER_PRIORITY, "rate_limiter_priority");
+  ATOM(erocksdb::ATOM_IO_LOW, "io_low");
+  ATOM(erocksdb::ATOM_IO_MID, "io_mid");
+  ATOM(erocksdb::ATOM_IO_HIGH, "io_high");
+  ATOM(erocksdb::ATOM_IO_USER, "io_user");
+  ATOM(erocksdb::ATOM_IO_TOTAL, "io_total");
 
 #undef ATOM
 
