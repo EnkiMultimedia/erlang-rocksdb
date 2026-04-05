@@ -896,6 +896,9 @@ ERL_NIF_TERM ATOM_IO_HIGH;
 ERL_NIF_TERM ATOM_IO_USER;
 ERL_NIF_TERM ATOM_IO_TOTAL;
 
+// Manifest auto-tuning (RocksDB 10.9+)
+ERL_NIF_TERM ATOM_MAX_MANIFEST_SPACE_AMP_PCT;
+
 }   // namespace erocksdb
 
 
@@ -1521,6 +1524,9 @@ try
   ATOM(erocksdb::ATOM_IO_HIGH, "io_high");
   ATOM(erocksdb::ATOM_IO_USER, "io_user");
   ATOM(erocksdb::ATOM_IO_TOTAL, "io_total");
+
+  // Manifest auto-tuning (RocksDB 10.9+)
+  ATOM(erocksdb::ATOM_MAX_MANIFEST_SPACE_AMP_PCT, "max_manifest_space_amp_pct");
 
 #undef ATOM
 

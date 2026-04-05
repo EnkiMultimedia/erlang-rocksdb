@@ -407,6 +407,12 @@ parse_db_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::DBOptions& opts)
         {
             opts.two_write_queues = (option[1] == erocksdb::ATOM_TRUE);
         }
+        else if (option[0] == erocksdb::ATOM_MAX_MANIFEST_SPACE_AMP_PCT)
+        {
+            int val;
+            if (enif_get_int(env, option[1], &val))
+                opts.max_manifest_space_amp_pct = val;
+        }
     }
     return erocksdb::ATOM_OK;
 }

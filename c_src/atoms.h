@@ -624,6 +624,9 @@ extern ERL_NIF_TERM ATOM_IO_HIGH;
 extern ERL_NIF_TERM ATOM_IO_USER;
 extern ERL_NIF_TERM ATOM_IO_TOTAL;
 
+// Manifest auto-tuning (RocksDB 10.9+)
+extern ERL_NIF_TERM ATOM_MAX_MANIFEST_SPACE_AMP_PCT;
+
 }   // namespace erocksdb
 
 

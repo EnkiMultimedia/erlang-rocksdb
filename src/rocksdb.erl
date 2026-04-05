@@ -590,7 +590,8 @@
                        {enable_pipelined_write, boolean()} |
                        {unordered_write, boolean()} |
                        {two_write_queues, boolean()} |
-                       {statistics, statistics_handle()}].
+                       {statistics, statistics_handle()} |
+                       {max_manifest_space_amp_pct, integer()}].
 
 -type options() :: db_options() | cf_options().
 
