@@ -89,10 +89,14 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Finish() call, returns the size of the final generated file.
   uint64_t FileSize() const override;
 
-  // Estimated size of the file generated so far. This is used when
-  // FileSize() cannot estimate final SST size, e.g. parallel compression
-  // is enabled.
+  // Estimated size of the file generated so far (based on data blocks, this
+  // estimate does not include meta blocks). This is used when FileSize() cannot
+  // estimate final SST size, e.g. parallel compression is enabled.
   uint64_t EstimatedFileSize() const override;
+
+  // Estimated tail size of the SST file generated so far. The "tail" refers to
+  // all blocks written after data blocks (index + filter).
+  uint64_t EstimatedTailSize() const override;
 
   // Get the size of the "tail" part of a SST file. "Tail" refers to
   // all blocks after data blocks till the end of the SST file.
@@ -133,15 +137,20 @@ class BlockBasedTableBuilder : public TableBuilder {
 
   // Compress and write block content to the file, from a single-threaded
   // context
+  // @skip_delta_encoding : This is set to non null for data blocks, so that
+  //     caller would know whether the index entry of this data block should
+  //     skip delta encoding or not
   void WriteBlock(const Slice& block_contents, BlockHandle* handle,
-                  BlockType block_type);
+                  BlockType block_type, bool* skip_delta_encoding = nullptr);
   // Directly write data to the file.
-  void WriteMaybeCompressedBlock(
-      const Slice& block_contents, CompressionType, BlockHandle* handle,
-      BlockType block_type, const Slice* uncompressed_block_data = nullptr);
+  void WriteMaybeCompressedBlock(const Slice& block_contents, CompressionType,
+                                 BlockHandle* handle, BlockType block_type,
+                                 const Slice* uncompressed_block_data = nullptr,
+                                 bool* skip_delta_encoding = nullptr);
   IOStatus WriteMaybeCompressedBlockImpl(
       const Slice& block_contents, CompressionType, BlockHandle* handle,
-      BlockType block_type, const Slice* uncompressed_block_data = nullptr);
+      BlockType block_type, const Slice* uncompressed_block_data = nullptr,
+      bool* skip_delta_encoding = nullptr);
 
   void SetupCacheKeyPrefix(const TableBuilderOptions& tbo);
 

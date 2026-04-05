@@ -1,29 +1,64 @@
 # Rocksdb Change Log
 > NOTE: Entries for next release do not go here. Follow instructions in `unreleased_history/README.txt`
 
-## 10.7.5 (10/20/2025)
+## 10.10.1 (02/02/2026)
 ### Bug Fixes
-* Fix a bug in Page unpinning in MultiScan
+* Fix Windows VS 2022 build errors.
 
-## 10.7.4 (10/14/2025)
+## 10.10.0 (12/16/2025)
+### Bug Fixes
+* Fixed a bug in best-efforts recovery that causes use-after-free crashes when accessing SST files that were cached during the recovery.
+* Fix resumable compaction incorrectly allowing resumption from a truncated range deletion that is not well handled currently.
+* Fixed a bug in `PosixRandomFileAccess` IO uring submission queue ownership & management. Fix eliminates the false positive 'Bad cqe data' IO errors in `PosixRandomFileAccess::MultiRead` when interleaved with `PosixRandomFileAccess::ReadAsync` on the same thread.
+
+## 10.9.0 (11/21/2025)
+### New Features
+* Added an auto-tuning feature for DB manifest file size that also (by default) improves the safety of existing configurations in case `max_manifest_file_size` is repeatedly exceeded. The new recommendation is to set `max_manifest_file_size` to something small like 1MB and tune `max_manifest_space_amp_pct` as needed to balance write amp and space amp in the manifest. Refer to comments on those options in `DBOptions` for details. Both options are (now) mutable.
+* Added a new API to support option migration for multiple column families
+* Added new option target_file_size_is_upper_bound  that makes most compaction output SST files come close to the target file size without exceeding it, rather than commonly exceeding it by some fraction (current behavior). For now the new behavior is off by default, but we expect to enable it by default in the future.
+* Add a new option allow_trivial_move in CompactionOptions to allow CompactFiles to perform trivial move if possible. By default the flag of allow_trivial_move is false, so it preserve the original behavior.
+
 ### Public API Changes
+* To reduce risk of ODR violations or similar, `ROCKSDB_USING_THREAD_STATUS` has been removed from public headers and replaced with static `const bool ThreadStatus::kEnabled`. Some other uses of conditional compilation have been removed from public API headers to reduce risk of ODR violations or other issues.
+
+### Behavior Changes
+* PosixWritableFile now repositions the seek pointer to the new end of file after a call to Truncate.
+* Updated standalone range deletion L0 file compaction behavior to avoid compacting with any newer L0 files (which is expensive and not useful).
+
+### Bug Fixes
+* Fix a bug where compaction with range deletion can persist kTypeMaxValid in MANIFEST as file metadata. kTypeMaxValid is not supposed to be persisted and can change as new value types are introduced. This can cause a forward compatibility issue where older versions of RocksDB don't recognize kTypeMaxValid from newer versions. A new placeholder value type kTypeTruncatedRangeDeletionSentinel is also introduced to replace kTypeMaxValid when reading existing SST files' metadata from MANIFEST. This allows us to strengthen some checks to avoid using kTypeMaxValid in the future.
+* Fixed a bug where `DB::GetSortedWalFiles()` could hang when waiting for a purge operation that found nothing to do (potentially triggered by iterator release, flush, compaction, etc.).
+* Fixed a bug in MultiScan where `max_sequential_skip_in_iterations` could cause the iterator to seek backward to already-unpinned blocks when the same user key spans multiple data blocks, leading to assertion failures or seg fault.
+* Fixed a bug for `WAL_ttl_seconds > 0` use cases where the newest archived WAL files could be incorrectly deleted when the system clock moved backwards.
+
+### Performance Improvements
+* Added optimization that allowed for the asynchronous prefetching of all data outlined in a multiscan iterator. This optimization was applied to the level iterator, which prefetches all data through each of the block-based iterators.
+
+## 10.8.0 (10/21/2025)
+### New Features
+* Add kFSPrefetch to FSSupportedOps enum to allow file systems to indicate prefetch support capability, avoiding unnecessary prefetch system calls on file systems that don't support them.
+* Added experimental support `OpenAndCompactOptions::allow_resumption` for resumable compaction that persists progress during `OpenAndCompact()`, allowing interrupted compactions to resume from the last progress persitence. The default behavior is to not persist progress.
+
+### Public API Changes
+* Allow specifying output temperature in CompactionOptions
+* Added `DB::FlushWAL(const FlushWALOptions&)` as an alternative to `DB::FlushWAL(bool sync)`, where `FlushWALOptions` includes a new `rate_limiter_priority` field (default `Env::IO_TOTAL`) that allows rate limiting and priority passing of manual WAL flush's IO operations.
 * The MultiScan API contract is updated. After a multi scan range got prepared with Prepare API call, the following seeks must seek the start of each prepared scan range in order. In addition, when limit is set, upper bound must be set to the same value of limit before each seek
 
-## 10.7.3 (10/06/2025)
-### Bug Fixes
-* Fix a few bugs in MultiScan
+### Behavior Changes
+* `kChangeTemperature` FIFO compaction will now honor `compaction_target_temp` to all levels regardless of `cf_options::last_level_temperature`
+* Allow UDIs with a non BytewiseComparator
 
-## 10.7.2 (09/30/2025)
 ### Bug Fixes
 * Fix incorrect MultiScan seek error status due to bugs in handling range limit falling between adjacent SST files key range.
+* Fix a bug in Page unpinning in MultiScan
 
 ### Performance Improvements
 * Fixed a performance regression in LZ4 compression that started in version 10.6.0
 
-## 10.7.0 (09/24/2025)
+## 10.7.0 (09/19/2025)
 ### New Features
 * Add the fail_if_no_udi_on_open flag in BlockBasedTableOption to control whether a missing user defined index block in a SST is a hard error or not.
-* A new flag memtable_veirfy_per_key_checksum_on_seek is added to AdvancedColumnFamilyOptions. When it is enabled, it will validate key checksum along the binary search path on skiplist based memtable during seek operation.
+* A new flag memtable_verify_per_key_checksum_on_seek is added to AdvancedColumnFamilyOptions. When it is enabled, it will validate key checksum along the binary search path on skiplist based memtable during seek operation.
 * Introduce option MultiScanArgs::use_async_io to enable asynchronous I/O during MultiScan, instead of waiting for I/O to be done in Prepare().
 * Add new option `MultiScanArgs::max_prefetch_size` that limits the memory usage of per file pinning of prefetched blocks.
 * Improved `sst_dump` by allowing standalone file and directory arguments without `--file=`. Also added new options and better output for `sst_dump --command=recompress`. See `sst_dump --help`
@@ -35,7 +70,6 @@
 
 ### Behavior Changes
 * The default provided block cache implementation is now HyperClockCache instead of LRUCache, when `block_cache` is nullptr (default) and `no_block_cache==false` (default). We recommend explicitly creating a HyperClockCache block cache based on memory budget and sharing it across all column families and even DB instances. This change could expose previously hidden memory or resource leaks.
-* Allow UDIs with a non BytewiseComparator
 
 ### Bug Fixes
 * Reported numbers for compaction and flush CPU usage now include time spent by parallel compression worker threads. This now means compaction/flush CPU usage could exceed the wall clock time.
@@ -82,7 +116,7 @@ Together, a new configuration TransactionOptions::deadlock_timeout_us is added, 
 * DB option skip_checking_sst_file_sizes_on_db_open is deprecated, in favor of validating file size in parallel in a thread pool, when db is opened. When DB is opened, with paranoid check enabled, a file with the wrong size would fail the DB open. With paranoid check disabled, the DB open would succeed, the column family with the corrupted file would not be read or write, while the other healthy column families could be read and write normally. When max_open_files option is not set to -1, only a subset of the files will be opened and checked. The rest of the files will be opened and checked when they are accessed.
 
 ### Behavior Changes
-* PessimisticTransaction::GetWaitingTxns now returns waiting transaction information even if the current transaction has timed out. This allows the information to be surfaced to users for debugging purposes once it is known that the timeout has occured.
+* PessimisticTransaction::GetWaitingTxns now returns waiting transaction information even if the current transaction has timed out. This allows the information to be surfaced to users for debugging purposes once it is known that the timeout has occurred.
 * A new API GetFileSize is added to FSRandomAccessFile interface class. It uses fstat vs stat on the posix implementation which is more efficient. Caller could use it to get file size faster. This function might be required in the future for FileSystem implementation outside of the RocksDB code base.
 * RocksDB now triggers eligible compactions every 12 hours when periodic compaction is configured. This solves a limitation of the compaction trigger mechanism, which would only trigger compaction after specific events like flush, compaction, or SetOptions.
 
@@ -139,7 +173,7 @@ system's prefetch) on SST file during compaction read
 * Deprecated API `DB::MaxMemCompactionLevel()`.
 * Deprecated `ReadOptions::ignore_range_deletions`.
 * Deprecated API `experimental::PromoteL0()`.
-* Added arbitrary string map for additional options to be overriden for remote compactions
+* Added arbitrary string map for additional options to be overridden for remote compactions
 * The fail_if_options_file_error option in DBOptions has been removed. The behavior now is to always return failure in any API that fails to persist the OPTIONS file.
 
 ### Behavior Changes
@@ -289,7 +323,7 @@ system's prefetch) on SST file during compaction read
 * In FIFO compaction, compactions for changing file temperature (configured by option `file_temperature_age_thresholds`) will compact one file at a time, instead of merging multiple eligible file together (#13018).
 * Support ingesting db generated files using hard link, i.e. IngestExternalFileOptions::move_files/link_files and IngestExternalFileOptions::allow_db_generated_files.
 * Add a new file ingestion option `IngestExternalFileOptions::link_files` to hard link input files and preserve original files links after ingestion.
-* DB::Close now untracks files in SstFileManager, making avaialble any space used
+* DB::Close now untracks files in SstFileManager, making available any space used
 by them. Prior to this change they would be orphaned until the DB is re-opened.
 
 ### Bug Fixes
@@ -485,7 +519,7 @@ MultiGetBenchmarks.multiGetList10 no_column_family 10000 16 100 1024 thrpt 25 76
 * Removed deprecated option `ColumnFamilyOptions::check_flush_compaction_key_order`
 * Remove the default `WritableFile::GetFileSize` and `FSWritableFile::GetFileSize` implementation that returns 0 and make it pure virtual, so that subclasses are enforced to explicitly provide an implementation.
 * Removed deprecated option `ColumnFamilyOptions::level_compaction_dynamic_file_size`
-* Removed tickers with typos "rocksdb.error.handler.bg.errro.count", "rocksdb.error.handler.bg.io.errro.count", "rocksdb.error.handler.bg.retryable.io.errro.count".
+* Removed tickers with typos "rocksdb.error.handler.bg.error.count", "rocksdb.error.handler.bg.io.error.count", "rocksdb.error.handler.bg.retryable.io.error.count".
 * Remove the force mode for `EnableFileDeletions` API because it is unsafe with no known legitimate use.
 * Removed deprecated option `ColumnFamilyOptions::ignore_max_compaction_bytes_for_input`
 * `sst_dump --command=check` now compares the number of records in a table with `num_entries` in table property, and reports corruption if there is a mismatch. API `SstFileDumper::ReadSequential()` is updated to optionally do this verification. (#12322)
@@ -512,7 +546,7 @@ MultiGetBenchmarks.multiGetList10 no_column_family 10000 16 100 1024 thrpt 25 76
 * Exposed options ttl via c api.
 
 ### Behavior Changes
-* `rocksdb.blobdb.blob.file.write.micros` expands to also measure time writing the header and footer. Therefore the COUNT may be higher and values may be smaller than before. For stacked BlobDB, it no longer measures the time of explictly flushing blob file.
+* `rocksdb.blobdb.blob.file.write.micros` expands to also measure time writing the header and footer. Therefore the COUNT may be higher and values may be smaller than before. For stacked BlobDB, it no longer measures the time of explicitly flushing blob file.
 * Files will be compacted to the next level if the data age exceeds periodic_compaction_seconds except for the last level.
 * Reduced the compaction debt ratio trigger for scheduling parallel compactions
 * For leveled compaction with default compaction pri (kMinOverlappingRatio), files marked for compaction will be prioritized over files not marked when picking a file from a level for compaction.
@@ -577,7 +611,7 @@ want to continue to use force enabling, they need to explicitly pass a `true` to
 
 ### Behavior Changes
 * During off-peak hours defined by `daily_offpeak_time_utc`, the compaction picker will select a larger number of files for periodic compaction. This selection will include files that are projected to expire by the next off-peak start time, ensuring that these files are not chosen for periodic compaction outside of off-peak hours.
-* If an error occurs when writing to a trace file after `DB::StartTrace()`, the subsequent trace writes are skipped to avoid writing to a file that has previously seen error. In this case, `DB::EndTrace()` will also return a non-ok status with info about the error occured previously in its status message.
+* If an error occurs when writing to a trace file after `DB::StartTrace()`, the subsequent trace writes are skipped to avoid writing to a file that has previously seen error. In this case, `DB::EndTrace()` will also return a non-ok status with info about the error occurred previously in its status message.
 * Deleting stale files upon recovery are delegated to SstFileManger if available so they can be rate limited.
 * Make RocksDB only call `TablePropertiesCollector::Finish()` once.
 * When `WAL_ttl_seconds > 0`, we now process archived WALs for deletion at least every `WAL_ttl_seconds / 2` seconds. Previously it could be less frequent in case of small `WAL_ttl_seconds` values when size-based expiration (`WAL_size_limit_MB > 0 `) was simultaneously enabled.
@@ -1365,7 +1399,7 @@ Note: The next release will be major release 7.0. See https://github.com/faceboo
 ### Public API change
 * Extend WriteBatch::AssignTimestamp and AssignTimestamps API so that both functions can accept an optional `checker` argument that performs additional checking on timestamp sizes.
 * Introduce a new EventListener callback that will be called upon the end of automatic error recovery.
-* Add IncreaseFullHistoryTsLow API so users can advance each column family's full_history_ts_low seperately.
+* Add IncreaseFullHistoryTsLow API so users can advance each column family's full_history_ts_low separately.
 * Add GetFullHistoryTsLow API so users can query current full_history_low value of specified column family.
 
 ### Performance Improvements

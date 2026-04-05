@@ -5,27 +5,69 @@ import argparse
 import math
 import os
 import random
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 
+per_iteration_random_seed_override = 0
+remain_argv = None
+
+
+def get_random_seed(override):
+    if override == 0:
+        return random.randint(1, 2**64)
+    else:
+        return override
+
+
+def quote_arg_for_display(arg):
+    """
+    Quote only the value after '=' for shell display.
+    This makes the printed command safe to copy/paste into a Unix shell.
+    Note: shlex is Unix-focused; Non-Unix shell users may need to adjust quoting after copying.
+    """
+    if "=" not in arg:
+        return arg
+    flag, value = arg.split("=", 1)
+    return f"{flag}={shlex.quote(value)}"
+
 
 def setup_random_seed_before_main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--random_seed",
+        "--initial_random_seed_override",
         default=0,
         type=int,
-        help="Random seed used for reproduce the same test parameter set",
+        help="Random seed used for initialize the test parameters at the beginning of stress test run",
     )
-    args, _ = parser.parse_known_args()
-    random_seed = (
-        random.randint(1, 2**64) if args.random_seed == 0 else args.random_seed
+    # sometimes the failure appeared after a few iteration, to reproduce the error, we have to wait for the test to run
+    # multiple iterations to reach the iteration that fails the test. By overriding the seed used within each iteration,
+    # we could skip all the previous iterations.
+    parser.add_argument(
+        "--per_iteration_random_seed_override",
+        default=0,
+        type=int,
+        help="Random seed used for initialize the test parameters in each iteration of the stress test run",
     )
-    print(f"Start with random seed {random_seed}")
-    random.seed(random_seed)
+
+    global remain_args
+    args, remain_args = parser.parse_known_args()
+    init_random_seed = get_random_seed(args.initial_random_seed_override)
+    global per_iteration_random_seed_override
+    per_iteration_random_seed_override = args.per_iteration_random_seed_override
+
+    print(f"Start with random seed {init_random_seed}")
+    random.seed(init_random_seed)
+
+
+def apply_random_seed_per_iteration():
+    global per_iteration_random_seed_override
+    per_iteration_random_seed = get_random_seed(per_iteration_random_seed_override)
+    print(f"Use random seed for iteration {per_iteration_random_seed}")
+    random.seed(per_iteration_random_seed)
 
 
 # Random seed has to be setup before the rest of the script, so that the random
@@ -216,8 +258,9 @@ default_params = {
     # Test small max_manifest_file_size in a smaller chance, as most of the
     # time we wnat manifest history to be preserved to help debug
     "max_manifest_file_size": lambda: random.choice(
-        [t * 16384 if t < 3 else 1024 * 1024 * 1024 for t in range(1, 30)]
+        [t * 2048 if t < 5 else 1024 * 1024 * 1024 for t in range(1, 30)]
     ),
+    "max_manifest_space_amp_pct": lambda: random.choice([0, 10, 100, 1000]),
     # Sync mode might make test runs slower so running it in a smaller chance
     "sync": lambda: random.choice([1 if t == 0 else 0 for t in range(0, 20)]),
     "bytes_per_sync": lambda: random.choice([0, 262144]),
@@ -344,6 +387,10 @@ default_params = {
     "enable_sst_partitioner_factory": lambda: random.choice([0, 1]),
     "enable_do_not_compress_roles": lambda: random.choice([0, 1]),
     "block_align": lambda: random.choice([0, 1]),
+    "super_block_alignment_size": lambda: random.choice(
+        [0, 128 * 1024, 512 * 1024, 2 * 1024 * 1024]
+    ),
+    "super_block_alignment_space_overhead_ratio": lambda: random.choice([0, 32, 4096]),
     "lowest_used_cache_tier": lambda: random.choice([0, 1, 2]),
     "enable_custom_split_merge": lambda: random.choice([0, 1]),
     "adm_policy": lambda: random.choice([0, 1, 2, 3]),
@@ -369,6 +416,7 @@ default_params = {
     # TODO(hx235): enable `track_and_verify_wals` after stabalizing the stress test
     "track_and_verify_wals": lambda: random.choice([0]),
     "remote_compaction_worker_threads": lambda: random.choice([0, 8]),
+    "allow_resumption_one_in": lambda: random.choice([0, 1, 2, 20]),
     # TODO(jaykorean): Change to lambda: random.choice([0, 1]) after addressing all remote compaction failures
     "remote_compaction_failure_fall_back_to_local": 1,
     "auto_refresh_iterator_with_snapshot": lambda: random.choice([0, 1]),
@@ -644,6 +692,8 @@ ts_params = {
     # Below flag is randomly picked once and kept consistent in following runs.
     "persist_user_defined_timestamps": random.choice([0, 1, 1]),
     "use_merge": 0,
+    # Causing failures and not yet compatible
+    "use_multiscan": 0,
     "use_full_merge_v1": 0,
     "use_txn": 0,
     "ingest_external_file_one_in": 0,
@@ -812,6 +862,24 @@ def finalize_and_sanitize(src_params):
         dest_params["checkpoint_one_in"] = 0
         dest_params["use_timed_put_one_in"] = 0
         dest_params["test_secondary"] = 0
+        dest_params["mmap_read"] = 0
+
+        # Disable database open fault injection to prevent test inefficiency described below.
+        # When fault injection occurs during DB open, the db will wait for compaction
+        # to finish to clean up the database before retrying without injected error.
+        # However remote compaction threads are not yet created at that point
+        # so the db has to wait for the timeout (currently 30 seconds) to fall back to
+        # local compaction in order for the compaction to finish.
+        #
+        # TODO: Consider moving compaction thread creation earlier in the startup sequence
+        # to allow db open fault injection testing without this performance penalty
+        dest_params["open_metadata_write_fault_one_in"] = 0
+        dest_params["open_metadata_read_fault_one_in"] = 0
+        dest_params["open_write_fault_one_in"] = 0
+        dest_params["open_read_fault_one_in"] = 0
+        dest_params["sync_fault_injection"] = 0
+    else:
+        dest_params["allow_resumption_one_in"] = 0
 
     # Multi-key operations are not currently compatible with transactions or
     # timestamp.
@@ -1164,6 +1232,20 @@ def finalize_and_sanitize(src_params):
         dest_params["prefixpercent"] = 0
         dest_params["read_fault_one_in"] = 0
         dest_params["memtable_prefix_bloom_size_ratio"] = 0
+        dest_params["max_sequential_skip_in_iterations"] = sys.maxsize
+        # This option ingests a delete range that might partially overlap with
+        # existing key range, which will cause a reseek that's currently not
+        # supported by multiscan
+        dest_params["test_ingest_standalone_range_deletion_one_in"] = 0
+        # LevelIterator multiscan currently relies on num_entries and num_range_deletions,
+        # which are not updated if skip_stats_update_on_db_open is true
+        dest_params["skip_stats_update_on_db_open"] = 0
+
+    # inplace update and key checksum verification during seek would cause race condition
+    # Therefore, when inplace_update_support is enabled, disable memtable_veirfy_per_key_checksum_on_seek
+    if dest_params["inplace_update_support"] == 1:
+        dest_params["memtable_veirfy_per_key_checksum_on_seek"] = 0
+
     return dest_params
 
 
@@ -1232,7 +1314,6 @@ def gen_cmd(params, unknown_params):
             not in {
                 "test_type",
                 "simple",
-                "random_seed",
                 "duration",
                 "interval",
                 "random_kill_odd",
@@ -1258,7 +1339,10 @@ def gen_cmd(params, unknown_params):
 
 def execute_cmd(cmd, timeout=None, timeout_pstack=False):
     child = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-    print("Running db_stress with pid=%d: %s\n\n" % (child.pid, " ".join(cmd)))
+    print(
+        "Running db_stress with pid=%d: %s\n\n"
+        % (child.pid, " ".join(quote_arg_for_display(arg) for arg in cmd))
+    )
     pid = child.pid
 
     try:
@@ -1316,6 +1400,7 @@ def blackbox_crash_main(args, unknown_args):
     )
 
     while time.time() < exit_time:
+        apply_random_seed_per_iteration()
         cmd = gen_cmd(
             dict(list(cmd_params.items()) + list({"db": dbname}.items())), unknown_args
         )
@@ -1378,6 +1463,7 @@ def whitebox_crash_main(args, unknown_args):
     succeeded = True
     hit_timeout = False
     while time.time() < exit_time:
+        apply_random_seed_per_iteration()
         if check_mode == 0:
             additional_opts = {
                 # use large ops per thread since we will kill it anyway
@@ -1578,8 +1664,9 @@ def main():
     for k, v in all_params.items():
         parser.add_argument("--" + k, type=type(v() if callable(v) else v))
     # unknown_args are passed directly to db_stress
-    args, unknown_args = parser.parse_known_args()
 
+    global remain_args
+    args, unknown_args = parser.parse_known_args(remain_args)
     test_tmpdir = os.environ.get(_TEST_DIR_ENV_VAR)
     if test_tmpdir is not None and not args.skip_tmpdir_check:
         isdir = False
