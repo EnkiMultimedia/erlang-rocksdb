@@ -537,7 +537,8 @@
                        {prefix_extractor, {fixed_prefix_transform, integer()} | 
                                            {capped_prefix_transform, integer()}} |
                        {merge_operator, merge_operator()} |
-                       {compaction_filter, compaction_filter_opts()}
+                       {compaction_filter, compaction_filter_opts()} |
+                       {target_file_size_is_upper_bound, boolean()}
                       ].
 
 -type db_options() :: [{env, env()} |

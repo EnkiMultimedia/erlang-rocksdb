@@ -576,6 +576,10 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
             if (enif_get_int(env, option[1], &target_file_size_multiplier))
                 opts.target_file_size_multiplier = target_file_size_multiplier;
         }
+        else if (option[0] == erocksdb::ATOM_TARGET_FILE_SIZE_IS_UPPER_BOUND)
+        {
+            opts.target_file_size_is_upper_bound = (option[1] == erocksdb::ATOM_TRUE);
+        }
         else if (option[0] == erocksdb::ATOM_MAX_BYTES_FOR_LEVEL_BASE)
         {
             ErlNifUInt64 max_bytes_for_level_base;

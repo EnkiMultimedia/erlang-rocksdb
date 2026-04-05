@@ -899,6 +899,9 @@ ERL_NIF_TERM ATOM_IO_TOTAL;
 // Manifest auto-tuning (RocksDB 10.9+)
 ERL_NIF_TERM ATOM_MAX_MANIFEST_SPACE_AMP_PCT;
 
+// CF option for compaction file size control (RocksDB 10.10+)
+ERL_NIF_TERM ATOM_TARGET_FILE_SIZE_IS_UPPER_BOUND;
+
 }   // namespace erocksdb
 
 
@@ -1527,6 +1530,9 @@ try
 
   // Manifest auto-tuning (RocksDB 10.9+)
   ATOM(erocksdb::ATOM_MAX_MANIFEST_SPACE_AMP_PCT, "max_manifest_space_amp_pct");
+
+  // CF option for compaction file size control (RocksDB 10.10+)
+  ATOM(erocksdb::ATOM_TARGET_FILE_SIZE_IS_UPPER_BOUND, "target_file_size_is_upper_bound");
 
 #undef ATOM
 
