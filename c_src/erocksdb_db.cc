@@ -2207,6 +2207,72 @@ SyncWal(
 } // erocksdb::SyncWal
 
 ERL_NIF_TERM
+PauseBackgroundWork(
+  ErlNifEnv* env,
+  int /*argc*/,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    rocksdb::Status status = db_ptr->m_Db->PauseBackgroundWork();
+
+    if (!status.ok())
+        return error_tuple(env, ATOM_ERROR, status);
+
+    return ATOM_OK;
+} // erocksdb::PauseBackgroundWork
+
+ERL_NIF_TERM
+ContinueBackgroundWork(
+  ErlNifEnv* env,
+  int /*argc*/,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    rocksdb::Status status = db_ptr->m_Db->ContinueBackgroundWork();
+
+    if (!status.ok())
+        return error_tuple(env, ATOM_ERROR, status);
+
+    return ATOM_OK;
+} // erocksdb::ContinueBackgroundWork
+
+ERL_NIF_TERM
+DisableManualCompaction(
+  ErlNifEnv* env,
+  int /*argc*/,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    db_ptr->m_Db->DisableManualCompaction();
+
+    return ATOM_OK;
+} // erocksdb::DisableManualCompaction
+
+ERL_NIF_TERM
+EnableManualCompaction(
+  ErlNifEnv* env,
+  int /*argc*/,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    db_ptr->m_Db->EnableManualCompaction();
+
+    return ATOM_OK;
+} // erocksdb::EnableManualCompaction
+
+ERL_NIF_TERM
 SetDBBackgroundThreads(
         ErlNifEnv* env,
         int argc,

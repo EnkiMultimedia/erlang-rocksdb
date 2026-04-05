@@ -40,6 +40,10 @@
   checkpoint/2,
   flush/2, flush/3,
   sync_wal/1,
+  pause_background_work/1,
+  continue_background_work/1,
+  disable_manual_compaction/1,
+  enable_manual_compaction/1,
   stats/1, stats/2,
   get_property/2, get_property/3,
   get_approximate_sizes/3, get_approximate_sizes/4,
@@ -1615,7 +1619,29 @@ flush(_DbHandle, _Cf, _FlushOptions) ->
 sync_wal(_DbHandle) ->
   ?nif_stub.
 
+%% @doc Pause all background work (flush, compaction) for the database.
+%% This is useful when you need to take a consistent backup.
+%% Use continue_background_work/1 to resume.
+-spec pause_background_work(db_handle()) -> ok | {error, term()}.
+pause_background_work(_DbHandle) ->
+  ?nif_stub.
 
+%% @doc Continue background work (flush, compaction) that was previously paused.
+%% Call this after pause_background_work/1 to resume normal operation.
+-spec continue_background_work(db_handle()) -> ok | {error, term()}.
+continue_background_work(_DbHandle) ->
+  ?nif_stub.
+
+%% @doc Disable manual compaction (CompactRange, CompactFiles).
+%% If a manual compaction is in progress, this will wait until it completes.
+-spec disable_manual_compaction(db_handle()) -> ok.
+disable_manual_compaction(_DbHandle) ->
+  ?nif_stub.
+
+%% @doc Re-enable manual compaction after it was disabled.
+-spec enable_manual_compaction(db_handle()) -> ok.
+enable_manual_compaction(_DbHandle) ->
+  ?nif_stub.
 
 %% @doc Return the approximate number of keys in the default column family.
 %% Implemented by calling GetIntProperty with "rocksdb.estimate-num-keys"

@@ -613,6 +613,9 @@ extern ERL_NIF_TERM ATOM_TOTAL_BLOB_BYTES;
 extern ERL_NIF_TERM ATOM_GARBAGE_BLOB_COUNT;
 extern ERL_NIF_TERM ATOM_GARBAGE_BLOB_BYTES;
 
+// Background Work Control (RocksDB 10.8+)
+// No new atoms needed - these functions don't take options
+
 }   // namespace erocksdb
 
 

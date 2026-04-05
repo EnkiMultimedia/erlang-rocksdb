@@ -59,6 +59,10 @@ static ErlNifFunc nif_funcs[] =
         {"get_property", 3, erocksdb::GetProperty, ERL_NIF_REGULAR_BOUND},
         {"flush", 3, erocksdb::Flush, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"sync_wal", 1, erocksdb::SyncWal, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"pause_background_work", 1, erocksdb::PauseBackgroundWork, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"continue_background_work", 1, erocksdb::ContinueBackgroundWork, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"disable_manual_compaction", 1, erocksdb::DisableManualCompaction, ERL_NIF_REGULAR_BOUND},
+        {"enable_manual_compaction", 1, erocksdb::EnableManualCompaction, ERL_NIF_REGULAR_BOUND},
         {"set_db_background_threads", 2, erocksdb::SetDBBackgroundThreads, ERL_NIF_REGULAR_BOUND},
 
         {"get_approximate_sizes", 3, erocksdb::GetApproximateSizes, ERL_NIF_DIRTY_JOB_IO_BOUND},
