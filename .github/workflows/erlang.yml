@@ -94,6 +94,7 @@ jobs:
           usesh: true
           envs: 'ERLANG_ROCKSDB_OPTS'
           prepare: |
+            pkg upgrade -y
             pkg install -y erlang-runtime28 rebar3 cmake git gmake llvm18
           run: |
             # Ensure Erlang 28 is in PATH
