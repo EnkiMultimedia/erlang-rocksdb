@@ -1424,6 +1424,56 @@ Status DBImpl::CompactFiles(const CompactionOptions& compact_options,
   return s;
 }
 
+Status DBImpl::PerformTrivialMove(Compaction& c, LogBuffer* log_buffer,
+                                  bool& compaction_released,
+                                  size_t& moved_files, size_t& moved_bytes) {
+  mutex_.AssertHeld();
+
+  ROCKS_LOG_BUFFER(log_buffer, "[%s] Moving %d files to level-%d\n",
+                   c.column_family_data()->GetName().c_str(),
+                   static_cast<int>(c.num_input_files(0)), c.output_level());
+
+  // Move files to the output level by editing the manifest
+  for (unsigned int l = 0; l < c.num_input_levels(); l++) {
+    if (c.level(l) == c.output_level()) {
+      continue;
+    }
+    for (size_t i = 0; i < c.num_input_files(l); i++) {
+      FileMetaData* f = c.input(l, i);
+      c.edit()->DeleteFile(c.level(l), f->fd.GetNumber());
+      c.edit()->AddFile(c.output_level(), f->fd.GetNumber(), f->fd.GetPathId(),
+                        f->fd.GetFileSize(), f->smallest, f->largest,
+                        f->fd.smallest_seqno, f->fd.largest_seqno,
+                        f->marked_for_compaction, f->temperature,
+                        f->oldest_blob_file_number, f->oldest_ancester_time,
+                        f->file_creation_time, f->epoch_number,
+                        f->file_checksum, f->file_checksum_func_name,
+                        f->unique_id, f->compensated_range_deletion_size,
+                        f->tail_size, f->user_defined_timestamps_persisted);
+      moved_bytes += static_cast<size_t>(c.input(l, i)->fd.GetFileSize());
+      ROCKS_LOG_BUFFER(
+          log_buffer, "[%s] Moved #%" PRIu64 " to level-%d %" PRIu64 " bytes\n",
+          c.column_family_data()->GetName().c_str(), f->fd.GetNumber(),
+          c.output_level(), f->fd.GetFileSize());
+    }
+    moved_files += c.num_input_files(l);
+  }
+
+  // Install the new version
+  const ReadOptions read_options(Env::IOActivity::kCompaction);
+  const WriteOptions write_options(Env::IOActivity::kCompaction);
+  Status status = versions_->LogAndApply(
+      c.column_family_data(), read_options, write_options, c.edit(), &mutex_,
+      directories_.GetDbDir(), /*new_descriptor_log=*/false,
+      /*column_family_options=*/nullptr,
+      [&c, &compaction_released](const Status& s) {
+        c.ReleaseCompactionFiles(s);
+        compaction_released = true;
+      });
+
+  return status;
+}
+
 Status DBImpl::CompactFilesImpl(
     const CompactionOptions& compact_options, ColumnFamilyData* cfd,
     Version* version, const std::vector<std::string>& input_file_names,
@@ -1511,6 +1561,63 @@ Status DBImpl::CompactFilesImpl(
   // deletion compaction currently not allowed in CompactFiles.
   assert(!c->deletion_compaction());
 
+  // Check if this can be a trivial move (metadata-only update)
+  // Similar to the logic in DBImpl::BackgroundCompaction
+  // Note: We disable trivial move when compaction_service is present because
+  // the service expects all compactions to go through CompactionJob for
+  // tracking
+  bool is_trivial_move = compact_options.allow_trivial_move &&
+                         c->IsTrivialMove() &&
+                         immutable_db_options().compaction_service == nullptr;
+
+  if (is_trivial_move) {
+    // Perform trivial move: just update manifest without rewriting data
+    TEST_SYNC_POINT("DBImpl::CompactFilesImpl:TrivialMove");
+
+    bool compaction_released = false;
+    size_t moved_files = 0;
+    size_t moved_bytes = 0;
+    Status status = PerformTrivialMove(
+        *c.get(), log_buffer, compaction_released, moved_files, moved_bytes);
+
+    if (status.ok()) {
+      InstallSuperVersionAndScheduleWork(
+          c->column_family_data(), job_context->superversion_contexts.data());
+
+      // Populate output file names for trivial move
+      if (output_file_names != nullptr) {
+        for (const auto& newf : c->edit()->GetNewFiles()) {
+          output_file_names->push_back(TableFileName(
+              c->immutable_options().cf_paths, newf.second.fd.GetNumber(),
+              newf.second.fd.GetPathId()));
+        }
+      }
+
+      ROCKS_LOG_BUFFER(
+          log_buffer,
+          "[%s] Trivial move succeeded for %zu files, %zu bytes total\n",
+          c->column_family_data()->GetName().c_str(), moved_files, moved_bytes);
+    } else {
+      if (!compaction_released) {
+        c->ReleaseCompactionFiles(status);
+      }
+      ROCKS_LOG_BUFFER(log_buffer, "[%s] Trivial move failed: %s\n",
+                       c->column_family_data()->GetName().c_str(),
+                       status.ToString().c_str());
+      error_handler_.SetBGError(status, BackgroundErrorReason::kCompaction);
+    }
+
+    c.reset();
+    bg_compaction_scheduled_--;
+    if (bg_compaction_scheduled_ == 0) {
+      bg_cv_.SignalAll();
+    }
+    MaybeScheduleFlushOrCompaction();
+
+    return status;
+  }
+
+  // Not a trivial move, proceed with full compaction
   InitSnapshotContext(job_context);
 
   std::unique_ptr<std::list<uint64_t>::iterator> pending_outputs_inserted_elem(
@@ -1843,8 +1950,7 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
         ,
         LLONG_MAX /* max compaction bytes, not applicable */,
         0 /* output path ID, not applicable */, mutable_cf_options.compression,
-        mutable_cf_options.compression_opts,
-        mutable_cf_options.default_write_temperature,
+        mutable_cf_options.compression_opts, Temperature::kUnknown,
         0 /* max_subcompactions, not applicable */,
         {} /* grandparents, not applicable */,
         std::nullopt /* earliest_snapshot */, nullptr /* snapshot_checker */,
@@ -3861,7 +3967,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
       uint64_t out_file_creation_time = static_cast<uint64_t>(tmp_current_time);
 
       FileOptions copied_file_options = file_options_;
-      copied_file_options.temperature = c->output_temperature();
+      copied_file_options.temperature = c->GetOutputTemperature();
       std::unique_ptr<WritableFileWriter> dest_writer;
       {
         std::unique_ptr<FSWritableFile> dest_file;
@@ -3879,7 +3985,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
               "NewWritableFile %s\n"
               " out_fname=%s, temperature=%s, io_status=%s",
               c->column_family_data()->GetName().c_str(), out_fname.c_str(),
-              temperature_to_string[c->output_temperature()].c_str(),
+              temperature_to_string[c->GetOutputTemperature()].c_str(),
               io_s.ToString().c_str());
           break;
         }
@@ -3901,7 +4007,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
           c->column_family_data()->GetName().c_str(), in_fname.c_str(),
           temperature_to_string[in_file->temperature].c_str(),
           out_fname.c_str(),
-          temperature_to_string[c->output_temperature()].c_str(),
+          temperature_to_string[c->GetOutputTemperature()].c_str(),
           c->mutable_cf_options()
               .compaction_options_fifo.trivial_copy_buffer_size);
       // Add IO_LOW HINT for compaction
@@ -3941,7 +4047,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
               c->column_family_data()->GetName().c_str(), in_fname.c_str(),
               temperature_to_string[in_file->temperature].c_str(),
               out_fname.c_str(),
-              temperature_to_string[c->output_temperature()].c_str(),
+              temperature_to_string[c->GetOutputTemperature()].c_str(),
               io_s.ToString().c_str());
           break;
         }
@@ -3950,15 +4056,15 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
       io_s = copy_file_io_status;
 
       if (!io_s.ok()) {
-        ROCKS_LOG_BUFFER(log_buffer,
-                         "[%s] Failed to copy from: %s\n"
-                         " temperature=%s, to=%s, temperature=%s, io_status=%s",
-                         c->column_family_data()->GetName().c_str(),
-                         in_fname.c_str(),
-                         temperature_to_string[in_file->temperature].c_str(),
-                         out_fname.c_str(),
-                         temperature_to_string[c->output_temperature()].c_str(),
-                         io_s.ToString().c_str());
+        ROCKS_LOG_BUFFER(
+            log_buffer,
+            "[%s] Failed to copy from: %s\n"
+            " temperature=%s, to=%s, temperature=%s, io_status=%s",
+            c->column_family_data()->GetName().c_str(), in_fname.c_str(),
+            temperature_to_string[in_file->temperature].c_str(),
+            out_fname.c_str(),
+            temperature_to_string[c->GetOutputTemperature()].c_str(),
+            io_s.ToString().c_str());
         break;
       }
       ROCKS_LOG_BUFFER(log_buffer,
@@ -3968,7 +4074,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
                        in_fname.c_str(),
                        temperature_to_string[in_file->temperature].c_str(),
                        out_fname.c_str(),
-                       temperature_to_string[c->output_temperature()].c_str(),
+                       temperature_to_string[c->GetOutputTemperature()].c_str(),
                        io_s.ToString().c_str());
 
       FileMetaData out_file_metadata{
@@ -3980,7 +4086,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
           in_file->fd.smallest_seqno,
           in_file->fd.largest_seqno,
           false /* marked_for_compact */,
-          c->output_temperature() /* temperature */,
+          c->GetOutputTemperature() /* temperature */,
           in_file->oldest_blob_file_number,
           in_file->oldest_ancester_time,
           out_file_creation_time,
@@ -4049,7 +4155,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
             " temperature=%s, to temperature=%s, status=%s, io_status=%s",
             c->column_family_data()->GetName().c_str(), in_fname.c_str(),
             temperature_to_string[in_file->temperature].c_str(),
-            temperature_to_string[c->output_temperature()].c_str(),
+            temperature_to_string[c->GetOutputTemperature()].c_str(),
             status.ToString().c_str(), io_s.ToString().c_str());
       }
     }
@@ -4075,35 +4181,6 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
                             compaction_job_stats, job_context->job_id);
 
-    // Move files to next level
-    int32_t moved_files = 0;
-    int64_t moved_bytes = 0;
-    for (unsigned int l = 0; l < c->num_input_levels(); l++) {
-      if (c->level(l) == c->output_level()) {
-        continue;
-      }
-      for (size_t i = 0; i < c->num_input_files(l); i++) {
-        FileMetaData* f = c->input(l, i);
-        c->edit()->DeleteFile(c->level(l), f->fd.GetNumber());
-        c->edit()->AddFile(
-            c->output_level(), f->fd.GetNumber(), f->fd.GetPathId(),
-            f->fd.GetFileSize(), f->smallest, f->largest, f->fd.smallest_seqno,
-            f->fd.largest_seqno, f->marked_for_compaction, f->temperature,
-            f->oldest_blob_file_number, f->oldest_ancester_time,
-            f->file_creation_time, f->epoch_number, f->file_checksum,
-            f->file_checksum_func_name, f->unique_id,
-            f->compensated_range_deletion_size, f->tail_size,
-            f->user_defined_timestamps_persisted);
-
-        ROCKS_LOG_BUFFER(
-            log_buffer,
-            "[%s] Moving #%" PRIu64 " to level-%d %" PRIu64 " bytes\n",
-            c->column_family_data()->GetName().c_str(), f->fd.GetNumber(),
-            c->output_level(), f->fd.GetFileSize());
-        ++moved_files;
-        moved_bytes += f->fd.GetFileSize();
-      }
-    }
     if (c->compaction_reason() == CompactionReason::kLevelMaxLevelSize &&
         c->immutable_options().compaction_pri == kRoundRobin) {
       int start_level = c->start_level();
@@ -4114,14 +4191,12 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
             vstorage->GetNextCompactCursor(start_level, c->num_input_files(0)));
       }
     }
-    status = versions_->LogAndApply(
-        c->column_family_data(), read_options, write_options, c->edit(),
-        &mutex_, directories_.GetDbDir(),
-        /*new_descriptor_log=*/false, /*column_family_options=*/nullptr,
-        [&c, &compaction_released](const Status& s) {
-          c->ReleaseCompactionFiles(s);
-          compaction_released = true;
-        });
+
+    // Perform the trivial move
+    size_t moved_files = 0;
+    size_t moved_bytes = 0;
+    status = PerformTrivialMove(*c.get(), log_buffer, compaction_released,
+                                moved_files, moved_bytes);
     io_s = versions_->io_status();
     InstallSuperVersionAndScheduleWork(
         c->column_family_data(), job_context->superversion_contexts.data());
@@ -4136,8 +4211,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
           << "total_files_size" << moved_bytes;
     }
     ROCKS_LOG_BUFFER(
-        log_buffer,
-        "[%s] Moved #%d files to level-%d %" PRIu64 " bytes %s: %s\n",
+        log_buffer, "[%s] Moved #%d files to level-%zu %zu bytes %s: %s\n",
         c->column_family_data()->GetName().c_str(), moved_files,
         c->output_level(), moved_bytes, status.ToString().c_str(),
         c->column_family_data()->current()->storage_info()->LevelSummary(&tmp));
@@ -4428,7 +4502,7 @@ Compaction* DBImpl::CreateIntendedCompactionForwardedToBottomPriorityPool(
                      c->output_level(), c->target_output_file_size(),
                      c->max_compaction_bytes(), c->output_path_id(),
                      c->output_compression(), c->output_compression_opts(),
-                     c->output_temperature(), c->max_subcompactions(),
+                     c->GetOutputTemperature(), c->max_subcompactions(),
                      c->grandparents(), std::nullopt /* earliest_snapshot */,
                      nullptr /* snapshot_checker */, c->compaction_reason());
 

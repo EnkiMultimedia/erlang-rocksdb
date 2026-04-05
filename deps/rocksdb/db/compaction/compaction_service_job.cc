@@ -326,7 +326,9 @@ CompactionServiceCompactionJob::CompactionServiceCompactionJob(
       compaction_input_(compaction_service_input),
       compaction_result_(compaction_service_result) {}
 
-void CompactionServiceCompactionJob::Prepare() {
+void CompactionServiceCompactionJob::Prepare(
+    const CompactionProgress& compaction_progress,
+    log::Writer* compaction_progress_writer) {
   std::optional<Slice> begin;
   if (compaction_input_.has_begin) {
     begin = compaction_input_.begin;
@@ -335,7 +337,8 @@ void CompactionServiceCompactionJob::Prepare() {
   if (compaction_input_.has_end) {
     end = compaction_input_.end;
   }
-  CompactionJob::Prepare(std::make_pair(begin, end));
+  CompactionJob::Prepare(std::make_pair(begin, end), compaction_progress,
+                         compaction_progress_writer);
 }
 
 Status CompactionServiceCompactionJob::Run() {
@@ -408,7 +411,7 @@ Status CompactionServiceCompactionJob::Run() {
   // 2. Update job-level output stats with the aggregated internal_stats_
   // Please note that input stats will be updated by primary host when all
   // subcompactions are finished
-  UpdateCompactionJobOutputStatsFromInternalStats(internal_stats_);
+  UpdateCompactionJobOutputStatsFromInternalStats(status, internal_stats_);
   // and set fields that are not propagated as part of the update
   compaction_result_->stats.is_manual_compaction = c->is_manual_compaction();
   compaction_result_->stats.is_full_compaction = c->is_full_compaction();

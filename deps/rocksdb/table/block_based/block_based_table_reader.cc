@@ -2705,7 +2705,7 @@ Status BlockBasedTable::Prefetch(const ReadOptions& read_options,
   }
   BlockCacheLookupContext lookup_context{TableReaderCaller::kPrefetch};
   IndexBlockIter iiter_on_stack;
-  auto iiter = NewIndexIterator(read_options, /*need_upper_bound_check=*/false,
+  auto iiter = NewIndexIterator(read_options, /*disable_prefix_seek=*/false,
                                 &iiter_on_stack, /*get_context=*/nullptr,
                                 &lookup_context);
   std::unique_ptr<InternalIteratorBase<IndexValue>> iiter_unique_ptr;
@@ -2742,7 +2742,7 @@ Status BlockBasedTable::Prefetch(const ReadOptions& read_options,
     DataBlockIter biter;
     Status tmp_status;
     NewDataBlockIterator<DataBlockIter>(
-        read_options, block_handle, &biter, /*type=*/BlockType::kData,
+        read_options, block_handle, &biter, /*block_type=*/BlockType::kData,
         /*get_context=*/nullptr, &lookup_context,
         /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
         /*async_read=*/false, tmp_status, /*use_block_cache_for_lookup=*/true);
@@ -2757,7 +2757,8 @@ Status BlockBasedTable::Prefetch(const ReadOptions& read_options,
 }
 
 Status BlockBasedTable::VerifyChecksum(const ReadOptions& read_options,
-                                       TableReaderCaller caller) {
+                                       TableReaderCaller caller,
+                                       bool meta_blocks_only) {
   Status s;
   // Check Meta blocks
   std::unique_ptr<Block> metaindex;
@@ -2770,6 +2771,9 @@ Status BlockBasedTable::VerifyChecksum(const ReadOptions& read_options,
       return s;
     }
   } else {
+    return s;
+  }
+  if (meta_blocks_only) {
     return s;
   }
   // Check Data blocks
@@ -2967,7 +2971,7 @@ bool BlockBasedTable::TEST_BlockInCache(const BlockHandle& handle) const {
 bool BlockBasedTable::TEST_KeyInCache(const ReadOptions& options,
                                       const Slice& key) {
   std::unique_ptr<InternalIteratorBase<IndexValue>> iiter(NewIndexIterator(
-      options, /*need_upper_bound_check=*/false, /*input_iter=*/nullptr,
+      options, /*disable_prefix_seek=*/false, /*input_iter=*/nullptr,
       /*get_context=*/nullptr, /*lookup_context=*/nullptr));
   iiter->Seek(key);
   assert(iiter->status().ok());
@@ -3174,9 +3178,9 @@ bool BlockBasedTable::TEST_IndexBlockInCache() const {
 Status BlockBasedTable::GetKVPairsFromDataBlocks(
     const ReadOptions& read_options, std::vector<KVPairBlock>* kv_pair_blocks) {
   std::unique_ptr<InternalIteratorBase<IndexValue>> blockhandles_iter(
-      NewIndexIterator(read_options, /*need_upper_bound_check=*/false,
+      NewIndexIterator(read_options, /*disable_prefix_seek=*/false,
                        /*input_iter=*/nullptr, /*get_context=*/nullptr,
-                       /*lookup_contex=*/nullptr));
+                       /*lookup_context=*/nullptr));
 
   Status s = blockhandles_iter->status();
   if (!s.ok()) {
@@ -3196,7 +3200,7 @@ Status BlockBasedTable::GetKVPairsFromDataBlocks(
     Status tmp_status;
     datablock_iter.reset(NewDataBlockIterator<DataBlockIter>(
         read_options, blockhandles_iter->value().handle,
-        /*input_iter=*/nullptr, /*type=*/BlockType::kData,
+        /*input_iter=*/nullptr, /*block_type=*/BlockType::kData,
         /*get_context=*/nullptr, /*lookup_context=*/nullptr,
         /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
         /*async_read=*/false, tmp_status, /*use_block_cache_for_lookup=*/true));
@@ -3228,7 +3232,8 @@ Status BlockBasedTable::GetKVPairsFromDataBlocks(
   return Status::OK();
 }
 
-Status BlockBasedTable::DumpTable(WritableFile* out_file) {
+Status BlockBasedTable::DumpTable(WritableFile* out_file,
+                                  bool show_sequence_number_type) {
   WritableFileStringStreamAdapter out_file_wrapper(out_file);
   std::ostream out_stream(&out_file_wrapper);
   // Output Footer
@@ -3321,15 +3326,15 @@ Status BlockBasedTable::DumpTable(WritableFile* out_file) {
       out_stream << "Range deletions:\n"
                     "--------------------------------------\n";
       for (; range_del_iter->Valid(); range_del_iter->Next()) {
-        DumpKeyValue(range_del_iter->key(), range_del_iter->value(),
-                     out_stream);
+        DumpKeyValue(range_del_iter->key(), range_del_iter->value(), out_stream,
+                     show_sequence_number_type);
       }
       out_stream << "\n";
     }
     delete range_del_iter;
   }
   // Output Data blocks
-  s = DumpDataBlocks(out_stream);
+  s = DumpDataBlocks(out_stream, show_sequence_number_type);
 
   if (!s.ok()) {
     return s;
@@ -3347,9 +3352,9 @@ Status BlockBasedTable::DumpIndexBlock(std::ostream& out_stream) {
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
   std::unique_ptr<InternalIteratorBase<IndexValue>> blockhandles_iter(
-      NewIndexIterator(read_options, /*need_upper_bound_check=*/false,
+      NewIndexIterator(read_options, /*disable_prefix_seek=*/false,
                        /*input_iter=*/nullptr, /*get_context=*/nullptr,
-                       /*lookup_contex=*/nullptr));
+                       /*lookup_context=*/nullptr));
   Status s = blockhandles_iter->status();
   if (!s.ok()) {
     out_stream << "Can not read Index Block \n\n";
@@ -3394,13 +3399,14 @@ Status BlockBasedTable::DumpIndexBlock(std::ostream& out_stream) {
   return Status::OK();
 }
 
-Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream) {
+Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream,
+                                       bool show_sequence_number_type) {
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
   std::unique_ptr<InternalIteratorBase<IndexValue>> blockhandles_iter(
-      NewIndexIterator(read_options, /*need_upper_bound_check=*/false,
+      NewIndexIterator(read_options, /*disable_prefix_seek=*/false,
                        /*input_iter=*/nullptr, /*get_context=*/nullptr,
-                       /*lookup_contex=*/nullptr));
+                       /*lookup_context=*/nullptr));
   Status s = blockhandles_iter->status();
   if (!s.ok()) {
     out_stream << "Can not read Index Block \n\n";
@@ -3433,7 +3439,7 @@ Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream) {
     Status tmp_status;
     datablock_iter.reset(NewDataBlockIterator<DataBlockIter>(
         read_options, blockhandles_iter->value().handle,
-        /*input_iter=*/nullptr, /*type=*/BlockType::kData,
+        /*input_iter=*/nullptr, /*block_type=*/BlockType::kData,
         /*get_context=*/nullptr, /*lookup_context=*/nullptr,
         /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
         /*async_read=*/false, tmp_status, /*use_block_cache_for_lookup=*/true));
@@ -3451,7 +3457,8 @@ Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream) {
         out_stream << "Error reading the block - Skipped \n";
         break;
       }
-      DumpKeyValue(datablock_iter->key(), datablock_iter->value(), out_stream);
+      DumpKeyValue(datablock_iter->key(), datablock_iter->value(), out_stream,
+                   show_sequence_number_type);
     }
     out_stream << "\n";
   }
@@ -3473,14 +3480,26 @@ Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream) {
 }
 
 void BlockBasedTable::DumpKeyValue(const Slice& key, const Slice& value,
-                                   std::ostream& out_stream) {
-  InternalKey ikey;
-  ikey.DecodeFrom(key);
+                                   std::ostream& out_stream,
+                                   bool show_sequence_number_type) {
+  ParsedInternalKey result;
+  auto s = ParseInternalKey(key, &result, true);
+  if (!s.ok()) {
+    out_stream << "Error parsing internal key - Skipped \n";
+    return;
+  }
 
-  out_stream << "  HEX    " << ikey.user_key().ToString(true) << ": "
-             << value.ToString(true) << "\n";
+  if (show_sequence_number_type) {
+    out_stream << "  HEX    " << result.user_key.ToString(true)
+               << "  seq: " << result.sequence
+               << "  type: " << std::to_string(result.type) << " : "
+               << value.ToString(true) << "\n";
+  } else {
+    out_stream << "  HEX    " << result.user_key.ToString(true) << ": "
+               << value.ToString(true) << "\n";
+  }
 
-  std::string str_key = ikey.user_key().ToString();
+  std::string str_key = result.user_key.ToString();
   std::string str_value = value.ToString();
   std::string res_key, res_value;
   char cspace = ' ';

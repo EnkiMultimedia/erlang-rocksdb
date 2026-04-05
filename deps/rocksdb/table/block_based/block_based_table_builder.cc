@@ -110,6 +110,19 @@ FilterBlockBuilder* CreateFilterBlockBuilder(
   }
 }
 
+// A convenience function for populating the Compressor* fields; see ~Rep()
+Compressor* MaybeCloneSpecialized(
+    Compressor* compressor, CacheEntryRole block_type,
+    Compressor::DictSampleArgs&& dict_samples = {}) {
+  auto specialized =
+      compressor->MaybeCloneSpecialized(block_type, std::move(dict_samples));
+  if (specialized) {
+    // Caller is responsible for freeing when distinct
+    return specialized.release();
+  } else {
+    return compressor;
+  }
+}
 }  // namespace
 
 // kBlockBasedTableMagicNumber was picked by running
@@ -824,15 +837,17 @@ struct BlockBasedTableBuilder::Rep {
 
   // *** Compressors & decompressors - Yes, it seems like a lot here but ***
   // *** these are distinct fields to minimize extra conditionals and    ***
-  // *** field reads on hot code paths.                                  ***
+  // *** field reads on hot code paths. And to avoid interlocked         ***
+  // *** instructions associated with shared_ptr.                        ***
 
   // A compressor for blocks in general, without dictionary compression
   std::unique_ptr<Compressor> basic_compressor;
-  // A compressor using dictionary compression (when applicable)
-  std::unique_ptr<Compressor> compressor_with_dict;
-  // Once configured/determined, points to one of the above Compressors to
-  // use on data blocks.
-  Compressor* data_block_compressor = nullptr;
+  // A compressor for data blocks, which might be tuned differently and might
+  // use dictionary compression (when applicable). See ~Rep() for some details.
+  UnownedPtr<Compressor> data_block_compressor = nullptr;
+  // A compressor for index blocks, which might be tuned differently from
+  // basic_compressor. See ~Rep() for some details.
+  UnownedPtr<Compressor> index_block_compressor = nullptr;
   // A decompressor corresponding to basic_compressor (when non-nullptr).
   // Used for verification and cache warming.
   std::shared_ptr<Decompressor> basic_decompressor;
@@ -853,7 +868,7 @@ struct BlockBasedTableBuilder::Rep {
       compression_types_used;
 
   // Working area for basic_compressor when compression_parallel_threads==1
-  WorkingAreaPair basic_working_area;
+  WorkingAreaPair index_block_working_area;
   // Working area for data_block_compressor, for emit/compaction thread
   WorkingAreaPair data_block_working_area;
 
@@ -894,6 +909,7 @@ struct BlockBasedTableBuilder::Rep {
   std::unique_ptr<FilterBlockBuilder> filter_builder;
   OffsetableCacheKey base_cache_key;
   const TableFileCreationReason reason;
+  const bool target_file_size_is_upper_bound;
 
   BlockHandle pending_handle;  // Handle to add to index block
 
@@ -1041,6 +1057,8 @@ struct BlockBasedTableBuilder::Rep {
         use_delta_encoding_for_index_values(table_opt.format_version >= 4 &&
                                             !table_opt.block_align),
         reason(tbo.reason),
+        target_file_size_is_upper_bound(
+            tbo.moptions.target_file_size_is_upper_bound),
         flush_block_policy(
             table_options.flush_block_policy_factory->NewFlushBlockPolicy(
                 table_options, data_block)),
@@ -1096,7 +1114,10 @@ struct BlockBasedTableBuilder::Rep {
         filter_context, tbo.compression_opts, tbo.compression_type);
     if (basic_compressor) {
       if (table_options.enable_index_compression) {
-        basic_working_area.compress = basic_compressor->ObtainWorkingArea();
+        index_block_compressor = MaybeCloneSpecialized(
+            basic_compressor.get(), CacheEntryRole::kIndexBlock);
+        index_block_working_area.compress =
+            index_block_compressor->ObtainWorkingArea();
       }
       max_dict_sample_bytes = basic_compressor->GetMaxSampleSizeIfWantDict(
           CacheEntryRole::kDataBlock);
@@ -1111,8 +1132,10 @@ struct BlockBasedTableBuilder::Rep {
                                   tbo.compression_opts.max_dict_buffer_bytes);
         }
       } else {
-        // No distinct data block compressor using dictionary
-        data_block_compressor = basic_compressor.get();
+        // No distinct data block compressor using dictionary, but
+        // implementation might still want to specialize for data blocks
+        data_block_compressor = MaybeCloneSpecialized(
+            basic_compressor.get(), CacheEntryRole::kDataBlock);
         data_block_working_area.compress =
             data_block_compressor->ObtainWorkingArea();
       }
@@ -1126,8 +1149,9 @@ struct BlockBasedTableBuilder::Rep {
       if (table_options.verify_compression) {
         verify_decompressor = basic_decompressor.get();
         if (table_options.enable_index_compression) {
-          basic_working_area.verify = verify_decompressor->ObtainWorkingArea(
-              basic_compressor->GetPreferredCompressionType());
+          index_block_working_area.verify =
+              verify_decompressor->ObtainWorkingArea(
+                  index_block_compressor->GetPreferredCompressionType());
         }
         if (state == State::kUnbuffered) {
           assert(data_block_compressor);
@@ -1292,8 +1316,19 @@ struct BlockBasedTableBuilder::Rep {
   }
 
   ~Rep() {
+    // Delete working areas before their compressors.
+    index_block_working_area = {};
+    data_block_working_area = {};
     // Must have been cleaned up by StopParallelCompression
     assert(pc_rep == nullptr);
+    // Delete specialized compressors if they were distinct (avoiding extra
+    // fields and interlocked instructions with shared_ptr)
+    if (data_block_compressor.get() != basic_compressor.get()) {
+      delete data_block_compressor.get();
+    }
+    if (index_block_compressor.get() != basic_compressor.get()) {
+      delete index_block_compressor.get();
+    }
   }
 
   Rep(const Rep&) = delete;
@@ -1611,6 +1646,17 @@ void BlockBasedTableBuilder::Flush(const Slice* first_key_in_next_block) {
     rep_->data_begin_offset += uncompressed_block_data.size();
     MaybeEnterUnbuffered(first_key_in_next_block);
   } else {
+    // Increment num_data_blocks when a data block is finalized in the
+    // emit thread to avoid data races with write worker threads
+    ++r->props.num_data_blocks;
+
+    // Notify filter builder that a data block has been finalized
+    // This must happen on the emit thread before the block is added to the
+    // ring buffer to avoid race conditions with worker threads
+    if (r->filter_builder) {
+      r->filter_builder->OnDataBlockFinalized(r->props.num_data_blocks);
+    }
+
     if (r->IsParallelCompressionActive()) {
       EmitBlockForParallel(r->data_block.MutableBuffer(), r->last_ikey,
                            first_key_in_next_block);
@@ -1686,7 +1732,11 @@ void BlockBasedTableBuilder::EmitBlock(std::string& uncompressed,
   // Single-threaded context only
   assert(!r->IsParallelCompressionActive());
   assert(uncompressed.size() > 0);
-  WriteBlock(uncompressed, &r->pending_handle, BlockType::kData);
+  // When data blocks are aligned with super block alignment, delta encoding
+  // needs to be skipped for the first block after padding.
+  bool skip_delta_encoding = false;
+  WriteBlock(uncompressed, &r->pending_handle, BlockType::kData,
+             &skip_delta_encoding);
   if (LIKELY(ok())) {
     // We do not emit the index entry for a block until we have seen the
     // first key for the next data block.  This allows us to use shorter
@@ -1695,24 +1745,27 @@ void BlockBasedTableBuilder::EmitBlock(std::string& uncompressed,
     // "the r" as the key for the index block entry since it is >= all
     // entries in the first block and < all entries in subsequent
     // blocks.
-    r->index_builder->AddIndexEntry(last_key_in_current_block,
-                                    first_key_in_next_block, r->pending_handle,
-                                    &r->index_separator_scratch);
+    r->index_builder->AddIndexEntry(
+        last_key_in_current_block, first_key_in_next_block, r->pending_handle,
+        &r->index_separator_scratch, skip_delta_encoding);
   }
 }
 
 void BlockBasedTableBuilder::WriteBlock(const Slice& uncompressed_block_data,
                                         BlockHandle* handle,
-                                        BlockType block_type) {
+                                        BlockType block_type,
+                                        bool* skip_delta_encoding) {
   Rep* r = rep_.get();
   assert(r->state == Rep::State::kUnbuffered);
   // Single-threaded context only
   assert(!r->IsParallelCompressionActive());
   CompressionType type;
   bool is_data_block = block_type == BlockType::kData;
+  // NOTE: only index and data blocks are currently compressed
+  assert(is_data_block || block_type == BlockType::kIndex);
   Status compress_status = CompressAndVerifyBlock(
       uncompressed_block_data, is_data_block,
-      is_data_block ? r->data_block_working_area : r->basic_working_area,
+      is_data_block ? r->data_block_working_area : r->index_block_working_area,
       &r->single_threaded_compressed_output, &type);
   r->SetStatus(compress_status);
   if (UNLIKELY(!ok())) {
@@ -1722,15 +1775,14 @@ void BlockBasedTableBuilder::WriteBlock(const Slice& uncompressed_block_data,
   TEST_SYNC_POINT_CALLBACK(
       "BlockBasedTableBuilder::WriteBlock:TamperWithCompressedData",
       &r->single_threaded_compressed_output);
-  WriteMaybeCompressedBlock(type == kNoCompression
-                                ? uncompressed_block_data
-                                : Slice(r->single_threaded_compressed_output),
-                            type, handle, block_type, &uncompressed_block_data);
+  WriteMaybeCompressedBlock(
+      type == kNoCompression ? uncompressed_block_data
+                             : Slice(r->single_threaded_compressed_output),
+      type, handle, block_type, &uncompressed_block_data, skip_delta_encoding);
   r->single_threaded_compressed_output.Reset();
   if (is_data_block) {
     r->props.data_size = r->get_offset();
     r->props.uncompressed_data_size += uncompressed_block_data.size();
-    ++r->props.num_data_blocks;
   }
 }
 
@@ -1770,18 +1822,19 @@ void BlockBasedTableBuilder::BGWorker(WorkingAreaPair& working_area) {
     auto write_fn = [this, block_rep, &ios]() {
       Slice compressed = block_rep->compressed;
       Slice uncompressed = block_rep->uncompressed;
+      bool skip_delta_encoding = false;
       ios = WriteMaybeCompressedBlockImpl(
           block_rep->compression_type == kNoCompression ? uncompressed
                                                         : compressed,
           block_rep->compression_type, &rep_->pending_handle, BlockType::kData,
-          &uncompressed);
+          &uncompressed, &skip_delta_encoding);
       if (LIKELY(ios.ok())) {
         rep_->props.data_size = rep_->get_offset();
         rep_->props.uncompressed_data_size += block_rep->uncompressed.size();
-        ++rep_->props.num_data_blocks;
 
         rep_->index_builder->FinishIndexEntry(
-            rep_->pending_handle, block_rep->prepared_index_entry.get());
+            rep_->pending_handle, block_rep->prepared_index_entry.get(),
+            skip_delta_encoding);
       }
     };
     switch (thread_state) {
@@ -1826,13 +1879,13 @@ Status BlockBasedTableBuilder::CompressAndVerifyBlock(
   Rep* r = rep_.get();
   Status status;
 
-  Compressor* compressor = nullptr;
+  UnownedPtr<Compressor> compressor = nullptr;
   Decompressor* verify_decomp = nullptr;
   if (is_data_block) {
     compressor = r->data_block_compressor;
     verify_decomp = r->data_block_verify_decompressor.get();
   } else {
-    compressor = r->basic_compressor.get();
+    compressor = r->index_block_compressor;
     verify_decomp = r->verify_decompressor.get();
   }
 
@@ -1931,20 +1984,33 @@ Status BlockBasedTableBuilder::CompressAndVerifyBlock(
 
 void BlockBasedTableBuilder::WriteMaybeCompressedBlock(
     const Slice& block_contents, CompressionType comp_type, BlockHandle* handle,
-    BlockType block_type, const Slice* uncompressed_block_data) {
+    BlockType block_type, const Slice* uncompressed_block_data,
+    bool* skip_delta_encoding) {
+  // Must have pre-checked status in single-threaded context
+  assert(status().ok());
+  assert(io_status().ok());
   rep_->SetIOStatus(WriteMaybeCompressedBlockImpl(
-      block_contents, comp_type, handle, block_type, uncompressed_block_data));
+      block_contents, comp_type, handle, block_type, uncompressed_block_data,
+      skip_delta_encoding));
 }
 
 IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
     const Slice& block_contents, CompressionType comp_type, BlockHandle* handle,
-    BlockType block_type, const Slice* uncompressed_block_data) {
+    BlockType block_type, const Slice* uncompressed_block_data,
+    bool* skip_delta_encoding) {
   // File format contains a sequence of blocks where each block has:
   //    block_data: uint8[n]
   //    compression_type: uint8
   //    checksum: uint32
   Rep* r = rep_.get();
   bool is_data_block = block_type == BlockType::kData;
+  // For data block, skip_delta_encoding must be non null
+  if (is_data_block) {
+    assert(skip_delta_encoding != nullptr);
+  }
+  if (skip_delta_encoding != nullptr) {
+    *skip_delta_encoding = false;
+  }
   IOOptions io_options;
   // Always return io_s for NRVO
   IOStatus io_s =
@@ -1954,11 +2020,49 @@ IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
   }
   // Old, misleading name of this function: WriteRawBlock
   StopWatch sw(r->ioptions.clock, r->ioptions.stats, WRITE_RAW_BLOCK_MICROS);
-  const uint64_t offset = r->get_offset();
+
+  auto offset = r->get_offset();
+  // try to align the data block page to the super alignment size, if enabled
+  if ((r->table_options.super_block_alignment_size != 0) && is_data_block) {
+    auto super_block_alignment_mask =
+        r->table_options.super_block_alignment_size - 1;
+    if ((r->table_options.super_block_alignment_space_overhead_ratio != 0) &&
+        (offset & (~super_block_alignment_mask)) !=
+            ((offset + block_contents.size()) &
+             (~super_block_alignment_mask))) {
+      auto allowed_max_padding_size =
+          r->table_options.super_block_alignment_size /
+          r->table_options.super_block_alignment_space_overhead_ratio;
+      // new block would cross the super block boundary
+      auto pad_bytes = r->table_options.super_block_alignment_size -
+                       (offset & super_block_alignment_mask);
+      if (pad_bytes < allowed_max_padding_size) {
+        io_s = r->file->Pad(io_options, pad_bytes, allowed_max_padding_size);
+        if (UNLIKELY(!io_s.ok())) {
+          r->SetIOStatus(io_s);
+          return io_s;
+        }
+        r->pre_compression_size += pad_bytes;
+        offset += pad_bytes;
+        r->set_offset(offset);
+        if (skip_delta_encoding != nullptr) {
+          // Skip delta encoding in index block builder when a super block
+          // alignment padding is added for data block.
+          *skip_delta_encoding = true;
+        }
+        TEST_SYNC_POINT(
+            "BlockBasedTableBuilder::WriteMaybeCompressedBlock:"
+            "SuperBlockAlignment");
+      } else {
+        TEST_SYNC_POINT(
+            "BlockBasedTableBuilder::WriteMaybeCompressedBlock:"
+            "SuperBlockAlignmentPaddingBytesExceedLimit");
+      }
+    }
+  }
+
   handle->set_offset(offset);
   handle->set_size(block_contents.size());
-  assert(status().ok());
-  assert(io_status().ok());
   if (uncompressed_block_data == nullptr) {
     uncompressed_block_data = &block_contents;
     assert(comp_type == kNoCompression);
@@ -2018,7 +2122,7 @@ IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
          ((block_contents.size() + kBlockTrailerSize) & (r->alignment - 1))) &
         (r->alignment - 1);
 
-    io_s = r->file->Pad(io_options, pad_bytes);
+    io_s = r->file->Pad(io_options, pad_bytes, kDefaultPageSize);
     if (LIKELY(io_s.ok())) {
       r->pre_compression_size += pad_bytes;
       r->set_offset(r->get_offset() + pad_bytes);
@@ -2046,7 +2150,7 @@ void BlockBasedTableBuilder::MaybeStartParallelCompression() {
   // that latency. So even with some optimizations, turning on the parallel
   // framework when compression is disabled just eats more CPU with little-to-no
   // improvement in throughput.
-  if (rep_->data_block_compressor == nullptr) {
+  if (!rep_->data_block_compressor) {
     // Force the generally best configuration for no compression: no parallelism
     return;
   }
@@ -2083,8 +2187,9 @@ void BlockBasedTableBuilder::StopParallelCompression(bool abort) {
     pc_rep.SetAbort(pc_rep.emit_thread_state);
   } else if (pc_rep.emit_thread_state !=
              ParallelCompressionRep::ThreadState::kEnd) {
-    // In case we didn't do a final flush with no next key
-    assert(rep_->props.num_data_blocks == 0);
+    // In case we didn't do a final flush with no next key, which might have
+    // been skipped if !ok() was set after the start of Finish()
+    assert(rep_->props.num_data_blocks == 0 || !ok());
     pc_rep.SetNoMoreToEmit(pc_rep.emit_thread_state, pc_rep.emit_slot);
   }
 #ifdef BBTB_PC_WATCHDOG
@@ -2392,8 +2497,8 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
 void BlockBasedTableBuilder::WriteCompressionDictBlock(
     MetaIndexBuilder* meta_index_builder) {
   Slice compression_dict;
-  if (rep_->compressor_with_dict) {
-    compression_dict = rep_->compressor_with_dict->GetSerializedDict();
+  if (rep_->data_block_compressor) {
+    compression_dict = rep_->data_block_compressor->GetSerializedDict();
   }
   if (!compression_dict.empty()) {
     BlockHandle compression_dict_block_handle;
@@ -2488,6 +2593,7 @@ void BlockBasedTableBuilder::MaybeEnterUnbuffered(
     // The below code is neither safe nor necessary for handling zero data
     // blocks.
     // For PostPopulateCompressionProperties()
+    assert(!r->data_block_compressor);
     r->data_block_compressor = r->basic_compressor.get();
     return;
   }
@@ -2529,15 +2635,12 @@ void BlockBasedTableBuilder::MaybeEnterUnbuffered(
 
   assert(samples.sample_data.size() > 0);
 
-  // final sample data block flushed, now we can generate dictionary
-  r->compressor_with_dict = r->basic_compressor->MaybeCloneSpecialized(
-      CacheEntryRole::kDataBlock, std::move(samples));
+  // final sample data block flushed, now we can generate dictionary (or it
+  // might opt not to use a dictionary and that's ok)
+  r->data_block_compressor =
+      MaybeCloneSpecialized(r->basic_compressor.get(),
+                            CacheEntryRole::kDataBlock, std::move(samples));
 
-  // The compressor might opt not to use a dictionary, in which case we
-  // can use the same compressor as for e.g. index blocks.
-  r->data_block_compressor = r->compressor_with_dict
-                                 ? r->compressor_with_dict.get()
-                                 : r->basic_compressor.get();
   Slice serialized_dict = r->data_block_compressor->GetSerializedDict();
   if (r->verify_decompressor) {
     if (serialized_dict.empty()) {
@@ -2631,6 +2734,20 @@ void BlockBasedTableBuilder::MaybeEnterUnbuffered(
 Status BlockBasedTableBuilder::Finish() {
   Rep* r = rep_.get();
   assert(r->state != Rep::State::kClosed);
+
+#ifndef NDEBUG
+  {
+    // This sync point callback is a simple approximation of a failure detected
+    // in parallel compression after the start of calling Finish() but before
+    // Finish() calls Flush()
+    IOStatus s = rep_->GetIOStatus();
+    TEST_SYNC_POINT_CALLBACK("BlockBasedTableBuilder::Finish:ParallelIOStatus",
+                             &s);
+    if (!s.ok()) {
+      rep_->SetIOStatus(s);
+    }
+  }
+#endif  // !NDEBUG
   // To make sure properties block is able to keep the accurate size of index
   // block, we will finish writing all index entries first, in Flush().
   Flush(/*first_key_in_next_block=*/nullptr);
@@ -2643,6 +2760,8 @@ Status BlockBasedTableBuilder::Finish() {
   }
 
   r->props.tail_start_offset = r->offset.LoadRelaxed();
+
+  uint64_t last_estimated_tail_size = EstimatedTailSize();
 
   // Write meta blocks, metaindex block and footer in the following order.
   //    1. [meta block: filter]
@@ -2669,6 +2788,24 @@ Status BlockBasedTableBuilder::Finish() {
   }
   r->state = Rep::State::kClosed;
   r->tail_size = r->offset.LoadRelaxed() - r->props.tail_start_offset;
+
+  // Assert tail size estimation is an overestimate only when tail size
+  // estimation option is enabled for compaction files with supported
+  // index/filter types:
+  // - Shortened indexes (kBinarySearch, kBinarySearchWithFirstKey)
+  // - Partitioned indexes (kTwoLevelIndexSearch)
+  // - Full filters
+  // - Partitioned filters
+  if (r->target_file_size_is_upper_bound &&
+      r->reason == TableFileCreationReason::kCompaction &&
+      r->table_options.index_type != BlockBasedTableOptions::kHashSearch) {
+    ROCKS_LOG_WARN(r->ioptions.info_log,
+                   "File number: %" PRIu64 ", Estimated tail size = %" PRIu64
+                   " bytes, Actual tail size = %" PRIu64 " bytes",
+                   r->props.orig_file_number, last_estimated_tail_size,
+                   r->tail_size);
+    assert(r->tail_size <= last_estimated_tail_size);
+  }
 
   return r->GetStatus();
 }
@@ -2705,6 +2842,49 @@ uint64_t BlockBasedTableBuilder::EstimatedFileSize() const {
   } else {
     return FileSize();
   }
+}
+
+uint64_t BlockBasedTableBuilder::EstimatedTailSize() const {
+  uint64_t estimated_tail_size = 0;
+
+  // 1. Estimate index size
+  if (rep_->table_options.index_type ==
+      BlockBasedTableOptions::kTwoLevelIndexSearch) {
+    assert(rep_->p_index_builder_);
+    estimated_tail_size += rep_->p_index_builder_->CurrentIndexSizeEstimate();
+  } else {
+    assert(rep_->index_builder);
+    estimated_tail_size += rep_->index_builder->CurrentIndexSizeEstimate();
+  }
+
+  // 2. Estimate filter size
+  if (rep_->filter_builder) {
+    estimated_tail_size += rep_->filter_builder->CurrentFilterSizeEstimate();
+  }
+
+  // 3. Estimate compression dictionary size
+  if (rep_->data_block_compressor) {
+    Slice dict = rep_->data_block_compressor->GetSerializedDict();
+    if (!dict.empty()) {
+      estimated_tail_size += dict.size();
+    }
+  }
+
+  // 4. Estimate range deletion block size
+  if (!rep_->range_del_block.empty()) {
+    estimated_tail_size += rep_->range_del_block.CurrentSizeEstimate();
+  }
+
+  // 5. Estimate properties block size conservatively (~1-2KB)
+  estimated_tail_size += 2048;
+
+  // 6. Estimate meta-index block size conservatively (~1KB)
+  estimated_tail_size += 1024;
+
+  // 7. Add footer size
+  estimated_tail_size += Footer::kMaxEncodedLength;
+
+  return estimated_tail_size;
 }
 
 uint64_t BlockBasedTableBuilder::GetTailSize() const { return rep_->tail_size; }

@@ -1178,7 +1178,7 @@ TEST_F(CompactionPickerTest, FIFOToCold1) {
     ASSERT_TRUE(compaction.get() != nullptr);
     ASSERT_EQ(compaction->compaction_reason(),
               CompactionReason::kChangeTemperature);
-    ASSERT_EQ(compaction->output_temperature(), Temperature::kCold);
+    ASSERT_EQ(compaction->GetOutputTemperature(), Temperature::kCold);
     ASSERT_EQ(1U, compaction->num_input_files(0));
     ASSERT_EQ(3U, compaction->input(0, 0)->fd.GetNumber());
   }
@@ -1248,7 +1248,7 @@ TEST_F(CompactionPickerTest, FIFOToColdMaxCompactionSize) {
     ASSERT_EQ(compaction->compaction_reason(),
               CompactionReason::kChangeTemperature);
     // Compaction picker picks older files first and picks one file at a time.
-    ASSERT_EQ(compaction->output_temperature(), Temperature::kCold);
+    ASSERT_EQ(compaction->GetOutputTemperature(), Temperature::kCold);
     ASSERT_EQ(1U, compaction->num_input_files(0));
     ASSERT_EQ(1U, compaction->input(0, 0)->fd.GetNumber());
   }
@@ -1316,7 +1316,7 @@ TEST_F(CompactionPickerTest, FIFOToColdWithExistingCold) {
     ASSERT_EQ(compaction->compaction_reason(),
               CompactionReason::kChangeTemperature);
     // Compaction picker picks older files first and picks one file at a time.
-    ASSERT_EQ(compaction->output_temperature(), Temperature::kCold);
+    ASSERT_EQ(compaction->GetOutputTemperature(), Temperature::kCold);
     ASSERT_EQ(1U, compaction->num_input_files(0));
     ASSERT_EQ(2U, compaction->input(0, 0)->fd.GetNumber());
   }
@@ -1383,7 +1383,7 @@ TEST_F(CompactionPickerTest, FIFOToColdWithHotBetweenCold) {
     ASSERT_TRUE(compaction.get() != nullptr);
     ASSERT_EQ(compaction->compaction_reason(),
               CompactionReason::kChangeTemperature);
-    ASSERT_EQ(compaction->output_temperature(), Temperature::kCold);
+    ASSERT_EQ(compaction->GetOutputTemperature(), Temperature::kCold);
     ASSERT_EQ(1U, compaction->num_input_files(0));
     ASSERT_EQ(2U, compaction->input(0, 0)->fd.GetNumber());
   }
@@ -1464,10 +1464,33 @@ TEST_F(CompactionPickerTest, FIFOToHotAndWarm) {
     ASSERT_EQ(compaction->compaction_reason(),
               CompactionReason::kChangeTemperature);
     // Compaction picker picks older files first and picks one file at a time.
-    ASSERT_EQ(compaction->output_temperature(), Temperature::kWarm);
+    ASSERT_EQ(compaction->GetOutputTemperature(), Temperature::kWarm);
     ASSERT_EQ(1U, compaction->num_input_files(0));
     ASSERT_EQ(1U, compaction->input(0, 0)->fd.GetNumber());
   }
+}
+
+TEST_F(CompactionPickerTest, CompactFilesOutputTemperature) {
+  NewVersionStorage(6, kCompactionStyleLevel);
+  auto file_number = 66U;
+  Add(0, file_number, "150", "200", 1000000000U);
+  UpdateVersionStorageInfo();
+
+  std::unordered_set<uint64_t> input{file_number};
+  std::vector<CompactionInputFiles> input_files;
+  ASSERT_OK(level_compaction_picker.GetCompactionInputsFromFileNumbers(
+      &input_files, &input, vstorage_.get(), CompactionOptions()));
+
+  auto compaction_options = CompactionOptions();
+  compaction_options.output_temperature_override = Temperature::kCold;
+
+  std::unique_ptr<Compaction> compaction(
+      level_compaction_picker.PickCompactionForCompactFiles(
+          compaction_options, input_files, 1, vstorage_.get(),
+          mutable_cf_options_, mutable_db_options_, /*output_path_id=*/0));
+
+  ASSERT_TRUE(compaction.get() != nullptr);
+  ASSERT_EQ(compaction->GetOutputTemperature(), Temperature::kCold);
 }
 
 TEST_F(CompactionPickerTest, CompactionPriMinOverlapping1) {
@@ -4691,6 +4714,53 @@ TEST_F(CompactionPickerTest, UniversalMaxReadAmpSmallDB) {
             vstorage_.get(), &log_buffer_));
     ASSERT_EQ(nullptr, compaction);
   }
+}
+
+TEST_F(CompactionPickerTest, StandaloneRangeDeletionOnlyPicksOlderFiles) {
+  NewVersionStorage(6, kCompactionStyleUniversal);
+
+  // Create L0 files with overlapping ranges
+  // File 1: newest regular file (epoch 5), keys [100, 200]
+  Add(0, 1U, "100", "200", 1U, 0, 100, 100, 0, false, Temperature::kUnknown,
+      kUnknownOldestAncesterTime, kUnknownNewestKeyTime, Slice(), Slice(), 5);
+
+  // File 2: standalone range deletion (epoch 4), keys [150, 250]
+  // This file should be marked as having only range deletions
+  Add(0, 2U, "150", "250", 1U, 0, 200, 200, 0, true, Temperature::kUnknown,
+      kUnknownOldestAncesterTime, kUnknownNewestKeyTime, Slice(), Slice(), 4);
+
+  // Manually set file 2 as standalone range deletion
+  FileMetaData* range_del_file = file_map_[2U].first;
+  range_del_file->num_entries = 1;
+  range_del_file->num_range_deletions = 1;
+  ASSERT_TRUE(range_del_file->FileIsStandAloneRangeTombstone());
+
+  Add(4, 10U, "000", "400", 1U);
+  Add(5, 20U, "000", "400", 100);
+
+  UpdateVersionStorageInfo();
+  UniversalCompactionPicker universal_compaction_picker(ioptions_, &icmp_);
+  ASSERT_TRUE(universal_compaction_picker.NeedsCompaction(vstorage_.get()));
+
+  std::unique_ptr<Compaction> compaction(
+      universal_compaction_picker.PickCompaction(
+          cf_name_, mutable_cf_options_, mutable_db_options_,
+          /*existing_snapshots=*/{}, /* snapshot_checker */ nullptr,
+          vstorage_.get(), &log_buffer_));
+
+  ASSERT_NE(nullptr, compaction);
+  ASSERT_EQ(2U, compaction->num_input_levels());
+  // First input level should be L0 with only the standalone range del file
+  // (file 2)
+  ASSERT_EQ(0, compaction->level(0));
+  ASSERT_EQ(1U, compaction->num_input_files(0));
+  ASSERT_EQ(2U, compaction->input(0, 0)->fd.GetNumber());
+  ASSERT_TRUE(compaction->input(0, 0)->FileIsStandAloneRangeTombstone());
+
+  // Second input level should be L4 with file 10
+  ASSERT_EQ(4, compaction->level(1));
+  ASSERT_EQ(1U, compaction->num_input_files(1));
+  ASSERT_EQ(10U, compaction->input(1, 0)->fd.GetNumber());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

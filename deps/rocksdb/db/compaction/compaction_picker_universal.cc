@@ -1093,7 +1093,7 @@ Compaction* UniversalCompactionBuilder::PickCompactionToReduceSortedRuns(
                                            output_level, 1, enable_compression),
                         GetCompressionOptions(mutable_cf_options_, vstorage_,
                                               output_level, enable_compression),
-                        mutable_cf_options_.default_write_temperature,
+                        Temperature::kUnknown,
                         /* max_subcompactions */ 0, grandparents,
                         /* earliest_snapshot */ std::nullopt,
                         /* snapshot_checker */ nullptr, compaction_reason,
@@ -1441,7 +1441,7 @@ Compaction* UniversalCompactionBuilder::PickIncrementalForReduceSizeAmp(
                          true /* enable_compression */),
       GetCompressionOptions(mutable_cf_options_, vstorage_, output_level,
                             true /* enable_compression */),
-      mutable_cf_options_.default_write_temperature,
+      Temperature::kUnknown,
       /* max_subcompactions */ 0, /* grandparents */ {},
       /* earliest_snapshot */ std::nullopt,
       /* snapshot_checker */ nullptr,
@@ -1544,9 +1544,18 @@ Compaction* UniversalCompactionBuilder::PickDeleteTriggeredCompaction() {
     }
 
     if (output_level != 0) {
+      // For standalone range deletion, we don't want to compact it with newer
+      // L0 files that it doesn't cover.
+      const FileMetaData* starting_l0_file =
+          (start_level == 0 && start_level_inputs.size() == 1 &&
+           start_level_inputs.files[0]->FileIsStandAloneRangeTombstone())
+              ? start_level_inputs.files[0]
+              : nullptr;
+
       if (start_level == 0) {
         if (!picker_->GetOverlappingL0Files(vstorage_, &start_level_inputs,
-                                            output_level, nullptr)) {
+                                            output_level, nullptr,
+                                            starting_l0_file)) {
           return nullptr;
         }
       }
@@ -1557,7 +1566,8 @@ Compaction* UniversalCompactionBuilder::PickDeleteTriggeredCompaction() {
       output_level_inputs.level = output_level;
       if (!picker_->SetupOtherInputs(cf_name_, mutable_cf_options_, vstorage_,
                                      &start_level_inputs, &output_level_inputs,
-                                     &parent_index, -1)) {
+                                     &parent_index, -1, false,
+                                     starting_l0_file)) {
         return nullptr;
       }
       inputs.push_back(start_level_inputs);
@@ -1594,7 +1604,7 @@ Compaction* UniversalCompactionBuilder::PickDeleteTriggeredCompaction() {
       /* max_grandparent_overlap_bytes */ GetMaxOverlappingBytes(), path_id,
       GetCompressionType(vstorage_, mutable_cf_options_, output_level, 1),
       GetCompressionOptions(mutable_cf_options_, vstorage_, output_level),
-      mutable_cf_options_.default_write_temperature,
+      Temperature::kUnknown,
       /* max_subcompactions */ 0, grandparents, earliest_snapshot_,
       snapshot_checker_, CompactionReason::kFilesMarkedForCompaction,
       /* trim_ts */ "", score_,
@@ -1690,7 +1700,7 @@ Compaction* UniversalCompactionBuilder::PickCompactionWithSortedRunRange(
                          true /* enable_compression */),
       GetCompressionOptions(mutable_cf_options_, vstorage_, output_level,
                             true /* enable_compression */),
-      mutable_cf_options_.default_write_temperature,
+      Temperature::kUnknown,
       /* max_subcompactions */ 0, /* grandparents */ {},
       /* earliest_snapshot */ std::nullopt,
       /* snapshot_checker */ nullptr, compaction_reason,
