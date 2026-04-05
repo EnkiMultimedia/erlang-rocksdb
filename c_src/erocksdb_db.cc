@@ -34,6 +34,7 @@
 #include "rocksdb/utilities/optimistic_transaction_db.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "rocksdb/metadata.h"
+#include "rocksdb/convenience.h"
 
 #include "atoms.h"
 #include "refobjects.h"
@@ -2333,6 +2334,49 @@ FlushWal(
 
     return ATOM_OK;
 } // erocksdb::FlushWal
+
+ERL_NIF_TERM
+SupportedCompressions(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM /*argv*/[])
+{
+    const std::vector<rocksdb::CompressionType>& compressions = rocksdb::GetSupportedCompressions();
+    std::vector<ERL_NIF_TERM> result;
+
+    for (const auto& compression : compressions)
+    {
+        switch (compression)
+        {
+            case rocksdb::CompressionType::kSnappyCompression:
+                result.push_back(ATOM_COMPRESSION_TYPE_SNAPPY);
+                break;
+            case rocksdb::CompressionType::kZlibCompression:
+                result.push_back(ATOM_COMPRESSION_TYPE_ZLIB);
+                break;
+            case rocksdb::CompressionType::kBZip2Compression:
+                result.push_back(ATOM_COMPRESSION_TYPE_BZIP2);
+                break;
+            case rocksdb::CompressionType::kLZ4Compression:
+                result.push_back(ATOM_COMPRESSION_TYPE_LZ4);
+                break;
+            case rocksdb::CompressionType::kLZ4HCCompression:
+                result.push_back(ATOM_COMPRESSION_TYPE_LZ4H);
+                break;
+            case rocksdb::CompressionType::kZSTD:
+                result.push_back(ATOM_COMPRESSION_TYPE_ZSTD);
+                break;
+            case rocksdb::CompressionType::kNoCompression:
+                result.push_back(ATOM_COMPRESSION_TYPE_NONE);
+                break;
+            default:
+                // Skip unknown compression types
+                break;
+        }
+    }
+
+    return enif_make_list_from_array(env, result.data(), result.size());
+} // erocksdb::SupportedCompressions
 
 ERL_NIF_TERM
 SetDBBackgroundThreads(

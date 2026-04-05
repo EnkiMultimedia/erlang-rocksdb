@@ -88,6 +88,9 @@ ERL_NIF_TERM EnableManualCompaction(ErlNifEnv* env, int argc, const ERL_NIF_TERM
 ERL_NIF_TERM GetBlockCacheUsage(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM BlockCacheCapacity(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
+// Compression support
+ERL_NIF_TERM SupportedCompressions(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
 /* Transaction Log */
 ERL_NIF_TERM TransactionLogIterator(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM TransactionLogIteratorClose(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);

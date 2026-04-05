@@ -60,6 +60,7 @@ static ErlNifFunc nif_funcs[] =
         {"flush", 3, erocksdb::Flush, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"sync_wal", 1, erocksdb::SyncWal, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"flush_wal", 2, erocksdb::FlushWal, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"supported_compressions", 0, erocksdb::SupportedCompressions, ERL_NIF_REGULAR_BOUND},
         {"pause_background_work", 1, erocksdb::PauseBackgroundWork, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"continue_background_work", 1, erocksdb::ContinueBackgroundWork, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"disable_manual_compaction", 1, erocksdb::DisableManualCompaction, ERL_NIF_REGULAR_BOUND},

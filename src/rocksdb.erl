@@ -41,6 +41,7 @@
   flush/2, flush/3,
   sync_wal/1,
   flush_wal/2,
+  supported_compressions/0,
   pause_background_work/1,
   continue_background_work/1,
   disable_manual_compaction/1,
@@ -1632,6 +1633,13 @@ sync_wal(_DbHandle) ->
 -type flush_wal_options() :: [flush_wal_option()].
 -spec flush_wal(db_handle(), flush_wal_options()) -> ok | {error, term()}.
 flush_wal(_DbHandle, _Options) ->
+  ?nif_stub.
+
+%% @doc Return the list of compression types supported by this build.
+%% This queries RocksDB to determine which compression libraries were
+%% compiled in. Common types include: snappy, lz4, lz4h, zstd, zlib, bzip2, none.
+-spec supported_compressions() -> [compression_type()].
+supported_compressions() ->
   ?nif_stub.
 
 %% @doc Pause all background work (flush, compaction) for the database.
