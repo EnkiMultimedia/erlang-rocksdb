@@ -3,7 +3,7 @@
 [![Build Status](https://github.com/EnkiMultimedia/erlang-rocksdb/workflows/build/badge.svg)](https://github.com/EnkiMultimedia/erlang-rocksdb/actions?query=workflow%3Abuild)
 [![Hex pm](http://img.shields.io/hexpm/v/rocksdb.svg?style=flat)](https://hex.pm/packages/rocksdb)
 
-**Current version: 2.5.0**
+**Current version: 2.6.0**
 
 Copyright (c) 2016-2026 Benoît Chesneau
 
@@ -11,7 +11,7 @@ Feedback and pull requests welcome! If a particular feature of RocksDB is import
 
 ## Features
 
-- RocksDB 10.7.5 with snappy 1.2.1, lz4 1.10.0
+- RocksDB 10.10.1 with snappy 1.2.1, lz4 1.10.0, zstd 1.5.7
 - Erlang 22+ with dirty-nifs enabled
 - All basic db operations (get, put, delete, merge, multi_get)
 - Wide-column entity API (put_entity, get_entity, iterator_columns)

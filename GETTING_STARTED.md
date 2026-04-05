@@ -16,14 +16,14 @@ Or add it to your rebar config
 ```erlang
 {deps, [
     ....
-    {rocksdb, "2.5.0"}
+    {rocksdb, "2.6.0"}
 ]}.
 ```
 
 Or your mix config file:
 
 ```
-{:rocksdb, "~> 2.5"}
+{:rocksdb, "~> 2.6"}
 ```
 
 ## Basic operations
