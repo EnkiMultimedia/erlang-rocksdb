@@ -17,7 +17,7 @@
 {application, rocksdb,
  [
   {description, "RocksDB for Erlang"},
-  {vsn, "2.6.1"},
+  {vsn, "2.6.2"},
   {registered, []},
   {applications, [
           kernel,
@@ -44,13 +44,9 @@
   {exclude_files, [
     "doc",
     "deps/rebar3",
-    %% rocksdb exclusions
+    %% rocksdb exclusions (only truly optional dirs)
     "deps/rocksdb/java",
     "deps/rocksdb/docs",
-    "deps/rocksdb/db_stress_tool",
-    "deps/rocksdb/buckifier",
-    "deps/rocksdb/fuzz",
-    "deps/rocksdb/coverage",
     %% zstd exclusions (9.5M -> ~3.5M)
     "deps/zstd/tests",
     "deps/zstd/doc",
