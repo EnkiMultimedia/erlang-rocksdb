@@ -28,6 +28,8 @@
   - Falls back to bundled zstd 1.5.7 if system library not found
   - Set `WITH_BUNDLE_ZSTD=OFF` to disable fallback
 
+- add `supported_compressions/0`: returns list of compression types supported by this build
+
 ### Improvements
 
 - bump to RocksDB version [10.10.1](https://github.com/facebook/rocksdb/releases/tag/v10.10.1)
