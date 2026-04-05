@@ -22,6 +22,12 @@
   - Prevents SST files from exceeding target_file_size_base
   - Default: false
 
+- add zstd compression support with bundled fallback:
+  - zstd enabled by default (`WITH_ZSTD=ON`)
+  - Uses system zstd library if available
+  - Falls back to bundled zstd 1.5.7 if system library not found
+  - Set `WITH_BUNDLE_ZSTD=OFF` to disable fallback
+
 ### Improvements
 
 - bump to RocksDB version [10.10.1](https://github.com/facebook/rocksdb/releases/tag/v10.10.1)
