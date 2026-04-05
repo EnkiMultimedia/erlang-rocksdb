@@ -1,5 +1,27 @@
 ## erlang-rocksdb 2.6.0 (unreleased)
 
+### New Features
+
+- add background work control APIs (RocksDB 10.8+):
+  - `pause_background_work/1`: pause all background processes (flush, compaction)
+  - `continue_background_work/1`: resume background processes
+  - `disable_manual_compaction/1`: disable CompactRange/CompactFiles
+  - `enable_manual_compaction/1`: re-enable manual compactions
+
+- add `flush_wal/2` with options (RocksDB 10.8+):
+  - `{sync, boolean()}`: call SyncWAL afterwards (default: false)
+  - `{rate_limiter_priority, io_low | io_mid | io_high | io_user | io_total}`: rate limiter priority for IO operations
+
+- add `max_manifest_space_amp_pct` DB option (RocksDB 10.9+):
+  - Controls manifest write/space amplification tradeoff
+  - Default: 500 (0.2 write amp, up to ~5.0 space amp)
+  - Lower values mean more manifest compactions but smaller manifest files
+
+- add `target_file_size_is_upper_bound` CF option (RocksDB 10.10+):
+  - When true, considers estimated tail size (filter + index + meta blocks) when cutting compaction output files
+  - Prevents SST files from exceeding target_file_size_base
+  - Default: false
+
 ### Improvements
 
 - bump to RocksDB version [10.10.1](https://github.com/facebook/rocksdb/releases/tag/v10.10.1)
