@@ -86,12 +86,34 @@ parse_bbt_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::BlockBasedTableOpti
         else if (option[0] == erocksdb::ATOM_CACHE_INDEX_AND_FILTER_BLOCKS) {
             opts.cache_index_and_filter_blocks = (option[1] == erocksdb::ATOM_TRUE);
         }
+        else if (option[0] == erocksdb::ATOM_INDEX_BLOCK_SEARCH_TYPE) {
+            // RocksDB 11.0/11.1: interpolation search for uniformly distributed keys
+            if (option[1] == erocksdb::ATOM_BINARY_SEARCH)
+                opts.index_block_search_type = rocksdb::BlockBasedTableOptions::kBinary;
+            else if (option[1] == erocksdb::ATOM_INTERPOLATION)
+                opts.index_block_search_type = rocksdb::BlockBasedTableOptions::kInterpolation;
+            else if (option[1] == erocksdb::ATOM_AUTO)
+                opts.index_block_search_type = rocksdb::BlockBasedTableOptions::kAuto;
+        }
+        else if (option[0] == erocksdb::ATOM_UNIFORM_CV_THRESHOLD) {
+            double threshold;
+            if (enif_get_double(env, option[1], &threshold))
+                opts.uniform_cv_threshold = threshold;
+        }
+        else if (option[0] == erocksdb::ATOM_PREPOPULATE_BLOCK_CACHE) {
+            if (option[1] == erocksdb::ATOM_DISABLE)
+                opts.prepopulate_block_cache = rocksdb::BlockBasedTableOptions::PrepopulateBlockCache::kDisable;
+            else if (option[1] == erocksdb::ATOM_FLUSH_ONLY)
+                opts.prepopulate_block_cache = rocksdb::BlockBasedTableOptions::PrepopulateBlockCache::kFlushOnly;
+            else if (option[1] == erocksdb::ATOM_FLUSH_AND_COMPACTION)
+                opts.prepopulate_block_cache = rocksdb::BlockBasedTableOptions::PrepopulateBlockCache::kFlushAndCompaction;
+        }
     }
 
     return erocksdb::ATOM_OK;
 }
 
-ERL_NIF_TERM 
+ERL_NIF_TERM
 parse_compaction_options_fifo(ErlNifEnv *env, ERL_NIF_TERM item, rocksdb::CompactionOptionsFIFO &opts)
 {
     int arity;
@@ -107,6 +129,17 @@ parse_compaction_options_fifo(ErlNifEnv *env, ERL_NIF_TERM item, rocksdb::Compac
         else if (option[0] == erocksdb::ATOM_ALLOW_COMPACTION)
         {
             opts.allow_compaction = (option[1] == erocksdb::ATOM_TRUE);
+        }
+        else if (option[0] == erocksdb::ATOM_MAX_DATA_FILES_SIZE)
+        {
+          // RocksDB 11.0: FIFO trimming based on combined SST + blob file sizes
+          ErlNifUInt64 max_data_files_size;
+          if (enif_get_uint64(env, option[1], &max_data_files_size))
+            opts.max_data_files_size = max_data_files_size;
+        }
+        else if (option[0] == erocksdb::ATOM_USE_KV_RATIO_COMPACTION)
+        {
+            opts.use_kv_ratio_compaction = (option[1] == erocksdb::ATOM_TRUE);
         }
     }
     return erocksdb::ATOM_OK;
@@ -414,6 +447,19 @@ parse_db_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::DBOptions& opts)
             if (enif_get_int(env, option[1], &val))
                 opts.max_manifest_space_amp_pct = val;
         }
+        else if (option[0] == erocksdb::ATOM_OPEN_FILES_ASYNC)
+        {
+            // RocksDB 11.1: validate SST files in background on open
+            opts.open_files_async = (option[1] == erocksdb::ATOM_TRUE);
+        }
+        else if (option[0] == erocksdb::ATOM_ENFORCE_WRITE_BUFFER_MANAGER_DURING_RECOVERY)
+        {
+            opts.enforce_write_buffer_manager_during_recovery = (option[1] == erocksdb::ATOM_TRUE);
+        }
+        else if (option[0] == erocksdb::ATOM_VERIFY_MANIFEST_CONTENT_ON_CLOSE)
+        {
+            opts.verify_manifest_content_on_close = (option[1] == erocksdb::ATOM_TRUE);
+        }
     }
     return erocksdb::ATOM_OK;
 }
@@ -580,6 +626,11 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
         else if (option[0] == erocksdb::ATOM_TARGET_FILE_SIZE_IS_UPPER_BOUND)
         {
             opts.target_file_size_is_upper_bound = (option[1] == erocksdb::ATOM_TRUE);
+        }
+        else if (option[0] == erocksdb::ATOM_MEMTABLE_BATCH_LOOKUP_OPTIMIZATION)
+        {
+            // RocksDB 11.1: batch lookup optimization for memtable MultiGet
+            opts.memtable_batch_lookup_optimization = (option[1] == erocksdb::ATOM_TRUE);
         }
         else if (option[0] == erocksdb::ATOM_MAX_BYTES_FOR_LEVEL_BASE)
         {
@@ -1175,10 +1226,13 @@ Open(
     // final options
     rocksdb::Options *opts = new rocksdb::Options(*db_opts, *cf_opts);
     rocksdb::Status status;
+    // RocksDB 11.0 removed the raw DB** Open variants; open into a unique_ptr
+    // and release ownership to the reference-counted DbObject.
+    std::unique_ptr<rocksdb::DB> db_uptr;
     if (read_only) {
-        status = rocksdb::DB::OpenForReadOnly(*opts, db_name, &db);
+        status = rocksdb::DB::OpenForReadOnly(*opts, db_name, &db_uptr);
     } else {
-        status = rocksdb::DB::Open(*opts, db_name, &db);
+        status = rocksdb::DB::Open(*opts, db_name, &db_uptr);
     }
     delete opts;
     delete db_opts;
@@ -1187,6 +1241,7 @@ Open(
     if(!status.ok())
         return error_tuple(env, ATOM_ERROR_DB_OPEN, status);
 
+    db = db_uptr.release();
     db_ptr = DbObject::CreateDbObject(std::move(db));
     ERL_NIF_TERM result = enif_make_resource(env, db_ptr);
     enif_release_resource(db_ptr);
@@ -1247,15 +1302,19 @@ OpenWithCf(
 
     std::vector<rocksdb::ColumnFamilyHandle*> handles;
     rocksdb::Status status;
+    // RocksDB 11.0 removed the raw DB** Open variants; open into a unique_ptr
+    // and release ownership to the reference-counted DbObject.
+    std::unique_ptr<rocksdb::DB> db_uptr;
     if (read_only) {
-        status = rocksdb::DB::OpenForReadOnly(db_opts, db_name, column_families, &handles, &db);
+        status = rocksdb::DB::OpenForReadOnly(db_opts, db_name, column_families, &handles, &db_uptr);
     } else {
-        status = rocksdb::DB::Open(db_opts, db_name, column_families, &handles, &db);
+        status = rocksdb::DB::Open(db_opts, db_name, column_families, &handles, &db_uptr);
     }
 
     if(!status.ok())
         return error_tuple(env, ATOM_ERROR_DB_OPEN, status);
 
+    db = db_uptr.release();
     db_ptr = DbObject::CreateDbObject(std::move(db));
 
     ERL_NIF_TERM result = enif_make_resource(env, db_ptr);
@@ -2282,6 +2341,36 @@ EnableManualCompaction(
 
     return ATOM_OK;
 } // erocksdb::EnableManualCompaction
+
+ERL_NIF_TERM
+AbortAllCompactions(
+  ErlNifEnv* env,
+  int /*argc*/,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    db_ptr->m_Db->AbortAllCompactions();
+
+    return ATOM_OK;
+} // erocksdb::AbortAllCompactions
+
+ERL_NIF_TERM
+ResumeAllCompactions(
+  ErlNifEnv* env,
+  int /*argc*/,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    db_ptr->m_Db->ResumeAllCompactions();
+
+    return ATOM_OK;
+} // erocksdb::ResumeAllCompactions
 
 ERL_NIF_TERM
 parse_flush_wal_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::FlushWALOptions& opts)

@@ -64,7 +64,7 @@ basic_test() ->
 column_family_test() ->
   ?rm_rf("test_blob_meta_cf"),
   {ok, Db, [DefaultH]} =
-    rocksdb:open_with_cf(
+    rocksdb:open(
       "test_blob_meta_cf",
       [{create_if_missing, true}],
       [{"default", [{enable_blob_files, true}, {min_blob_size, 0}]}]),

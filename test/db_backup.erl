@@ -76,7 +76,7 @@ restore_latest_test() ->
   rocksdb:restore_db_from_latest_backup(Backup2, ?latest),
   LatestDb = open_latest(),
 
-  100 = rocksdb:count(LatestDb),
+  100 = rocksdb_test_util:count(LatestDb),
 
   rocksdb:close_backup_engine(Backup2),
   rocksdb:close(LatestDb),

@@ -63,7 +63,7 @@ seek_for_prev_test() ->
 
 cf_iterator_test() ->
   rocksdb_test_util:rm_rf("ltest"),  % NOTE
-  {ok, Ref, [DefaultH]} = rocksdb:open_with_cf("ltest", [{create_if_missing, true}], [{"default", []}]),
+  {ok, Ref, [DefaultH]} = rocksdb:open("ltest", [{create_if_missing, true}], [{"default", []}]),
   {ok, TestH} = rocksdb:create_column_family(Ref, "test", []),
   try
     rocksdb:put(Ref, DefaultH, <<"a">>, <<"x">>, []),
@@ -90,7 +90,7 @@ cf_iterator_test() ->
 
 cf_iterators_test() ->
   rocksdb_test_util:rm_rf("ltest"),  % NOTE
-  {ok, Ref, [DefaultH]} = rocksdb:open_with_cf("ltest", [{create_if_missing, true}], [{"default", []}]),
+  {ok, Ref, [DefaultH]} = rocksdb:open("ltest", [{create_if_missing, true}], [{"default", []}]),
   {ok, TestH} = rocksdb:create_column_family(Ref, "test", []),
   try
     rocksdb:put(Ref, DefaultH, <<"a">>, <<"x">>, []),
@@ -116,7 +116,7 @@ cf_iterators_test() ->
 
 drop_cf_with_iterator_test() ->
   rocksdb_test_util:rm_rf("ltest"),  % NOTE
-  {ok, Ref, [DefaultH]} = rocksdb:open_with_cf("ltest", [{create_if_missing, true}], [{"default", []}]),
+  {ok, Ref, [DefaultH]} = rocksdb:open("ltest", [{create_if_missing, true}], [{"default", []}]),
   {ok, TestH} = rocksdb:create_column_family(Ref, "test", []),
   try
     rocksdb:put(Ref, DefaultH, <<"a">>, <<"x">>, []),
@@ -130,7 +130,7 @@ drop_cf_with_iterator_test() ->
     ?assertEqual({ok, <<"a">>, <<"x">>},rocksdb:iterator_move(DefaultIt, <<>>)),
     ?assertEqual({ok, <<"a">>, <<"x1">>},rocksdb:iterator_move(TestIt, <<>>)),
 
-    ok = rocksdb:drop_column_family(TestH),
+    ok = rocksdb:drop_column_family(Ref, TestH),
 
     %% make sure we can read the read iterator
     ?assertEqual({ok, <<"b">>, <<"y">>},rocksdb:iterator_move(DefaultIt, next)),

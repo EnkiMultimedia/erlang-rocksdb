@@ -57,7 +57,7 @@ jobs:
       - name: build
         run: rebar3 eunit
   macos:
-    runs-on: macos-15
+    runs-on: macos-26
     strategy:
       matrix:
         otp:  ["27"]

@@ -147,7 +147,7 @@ ingest_with_column_family_test() ->
     ok = rocksdb:release_sst_file_writer(Writer),
 
     %% Open database with column families
-    {ok, Db, [_DefaultCf, TestCf]} = rocksdb:open_with_cf(
+    {ok, Db, [_DefaultCf, TestCf]} = rocksdb:open(
         TestDb,
         [{create_if_missing, true}, {create_missing_column_families, true}],
         [{"default", []}, {"test_cf", []}]

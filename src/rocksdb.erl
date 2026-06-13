@@ -46,15 +46,15 @@
   continue_background_work/1,
   disable_manual_compaction/1,
   enable_manual_compaction/1,
+  abort_all_compactions/1,
+  resume_all_compactions/1,
   stats/1, stats/2,
   get_property/2, get_property/3,
   get_approximate_sizes/3, get_approximate_sizes/4,
   get_approximate_memtable_stats/3, get_approximate_memtable_stats/4
 ]).
 
--export([open_with_cf/3, open_with_cf_readonly/3]).
--export([drop_column_family/1]).
--export([destroy_column_family/1]).
+-export([open_with_cf_readonly/3]).
 -export([get_column_family_metadata/1, get_column_family_metadata/2]).
 
 -export([get_latest_sequence_number/1]).
@@ -89,14 +89,6 @@
   delete_entity/3, delete_entity/4
 ]).
 
-%% deprecated API
-
--export([write/3]).
--export([count/1, count/2]).
--export([fold/4, fold/5, fold_keys/4, fold_keys/5]).
-
-
-
 %% Cache API
 -export([new_cache/2,
          release_cache/1,
@@ -104,11 +96,6 @@
          cache_info/2,
          set_capacity/2,
          set_strict_capacity_limit/2]).
-
--export([new_lru_cache/1, new_clock_cache/1]).
--export([get_usage/1]).
--export([get_pinned_usage/1]).
--export([get_capacity/1]).
 
 %% Limiter API
 -export([
@@ -180,7 +167,6 @@
   set_env_background_threads/2, set_env_background_threads/3,
   destroy_env/1
 ]).
--export([default_env/0, mem_env/0]).
 
 %% Log Iterator API
 -export([tlog_iterator/2,
@@ -189,11 +175,6 @@
          tlog_next_update/1]).
 
 -export([write_binary_update/3]).
-
--export([updates_iterator/2]).
--export([close_updates_iterator/1]).
--export([next_binary_update/1]).
--export([next_update/1]).
 
 %% Batch API
 -export([batch/0,
@@ -331,28 +312,6 @@
   compaction_filter_opts/0
 ]).
 
--deprecated({count, 1, next_major_release}).
--deprecated({count, 2, next_major_release}).
--deprecated({fold, 4, next_major_release}).
--deprecated({fold, 5, next_major_release}).
--deprecated({fold_keys, 4, next_major_release}).
--deprecated({fold_keys, 5, next_major_release}).
--deprecated({write, 3, next_major_release}).
--deprecated({updates_iterator, 2, next_major_release}).
--deprecated({close_updates_iterator, 1, next_major_release}).
--deprecated({next_binary_update, 1, next_major_release}).
--deprecated({next_update, 1, next_major_release}).
--deprecated({default_env, 0, next_major_release}).
--deprecated({mem_env, 0, next_major_release}).
--deprecated({new_lru_cache, 1, next_major_release}).
--deprecated({new_clock_cache, 1, next_major_release}).
--deprecated({get_pinned_usage, 1, next_major_release}).
--deprecated({get_usage, 1, next_major_release}).
--deprecated({get_capacity, 1, next_major_release}).
--deprecated({drop_column_family, 1, next_major_release}).
--deprecated({destroy_column_family, 1, next_major_release}).
--deprecated({open_with_cf, 3, next_major_release}).
-
 -record(db_path, {path        :: file:filename_all(),
           target_size :: non_neg_integer()}).
 
@@ -448,16 +407,24 @@
 -type env_priority() :: priority_high | priority_low.
 
 -type compaction_options_fifo() :: [{max_table_file_size, pos_integer()} |
-                                    {allow_compaction, boolean()}].
+                                    {allow_compaction, boolean()} |
+                                    %% RocksDB 11.0+
+                                    {max_data_files_size, non_neg_integer()} |
+                                    {use_kv_ratio_compaction, boolean()}].
 
 
+%% Note: RocksDB 11.0 dropped support for `format_version' < 2.
 -type block_based_table_options() :: [{no_block_cache, boolean()} |
                                       {block_size, pos_integer()} |
                                       {block_cache, cache_handle()} |
                                       {block_cache_size, pos_integer()} |
                                       {bloom_filter_policy, BitsPerKey :: pos_integer()} |
-                                      {format_version, 0 | 1 | 2 | 3 | 4 | 5} |
-                                      {cache_index_and_filter_blocks, boolean()}].
+                                      {format_version, 2 | 3 | 4 | 5 | 6 | 7} |
+                                      {cache_index_and_filter_blocks, boolean()} |
+                                      %% RocksDB 11.0/11.1
+                                      {index_block_search_type, binary_search | interpolation | auto} |
+                                      {uniform_cv_threshold, float()} |
+                                      {prepopulate_block_cache, disable | flush_only | flush_and_compaction}].
 
 -type merge_operator() :: erlang_merge_operator |
                           bitset_merge_operator |
@@ -539,7 +506,9 @@
                                            {capped_prefix_transform, integer()}} |
                        {merge_operator, merge_operator()} |
                        {compaction_filter, compaction_filter_opts()} |
-                       {target_file_size_is_upper_bound, boolean()}
+                       {target_file_size_is_upper_bound, boolean()} |
+                       %% RocksDB 11.1+
+                       {memtable_batch_lookup_optimization, boolean()}
                       ].
 
 -type db_options() :: [{env, env()} |
@@ -593,7 +562,12 @@
                        {unordered_write, boolean()} |
                        {two_write_queues, boolean()} |
                        {statistics, statistics_handle()} |
-                       {max_manifest_space_amp_pct, integer()}].
+                       {max_manifest_space_amp_pct, integer()} |
+                       %% RocksDB 11.1+
+                       %% open_files_async requires skip_stats_update_on_db_open = true
+                       {open_files_async, boolean()} |
+                       {enforce_write_buffer_manager_during_recovery, boolean()} |
+                       {verify_manifest_content_on_close, boolean()}].
 
 -type options() :: db_options() | cf_options().
 
@@ -873,9 +847,6 @@ open(_Name, _DBOpts, _CFDescriptors) ->
 open_readonly(_Name, _DBOpts, _CFDescriptors) ->
   ?nif_stub.
 
-open_with_cf(Name, DbOpts, CFDescriptors) ->
-  open(Name, DbOpts, CFDescriptors).
-
 open_with_cf_readonly(Name, DbOpts, CFDescriptors) ->
   open_readonly(Name, DbOpts, CFDescriptors).
 
@@ -1003,12 +974,6 @@ drop_column_family(_DbHandle, _CFHandle) ->
   CFHandle :: cf_handle(),
   Res :: ok | {error, any()}.
 destroy_column_family(_DBHandle, _CFHandle) ->
-  ?nif_stub.
-
-drop_column_family(_CFHandle) ->
-  ?nif_stub.
-
-destroy_column_family(_CFHandle) ->
   ?nif_stub.
 
 %% @doc Get column family metadata including blob file information.
@@ -1152,49 +1117,6 @@ single_delete(_DBHandle, _Key, _WriteOpts) ->
   Res ::  ok | {error, any()}.
 single_delete(_DBHandle, _CFHandle, _Key, _WriteOpts) ->
   ?nif_stub.
-
-%% @doc Apply the specified updates to the database.
-%% this function will be removed on the next major release. You should use the `batch_*' API instead.
--spec write(DBHandle, WriteActions, WriteOpts) -> Res when
-  DBHandle::db_handle(),
-   WriteActions::write_actions(),
-   WriteOpts::write_options(),
-   Res :: ok | {error, any()}.
-write(DBHandle, WriteOps, WriteOpts) ->
-  {ok, Batch} = batch(),
-  try write_1(WriteOps, Batch, DBHandle, WriteOpts)
-  after release_batch(Batch)
-  end.
-
-write_1([{put, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_put(Batch, Key, Value),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{put, CfHandle, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_put(Batch, CfHandle, Key, Value),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{merge, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_merge(Batch, Key, Value),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{merge, CfHandle, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_merge(Batch, CfHandle, Key, Value),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{delete, Key} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_delete(Batch, Key),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{delete, CfHandle, Key} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_delete(Batch, CfHandle, Key),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{single_delete, Key} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_single_delete(Batch, Key),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{single_delete, CfHandle, Key} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_single_delete(Batch, CfHandle, Key),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([_ | _], _Batch, _DbHandle, _WriteOpts) ->
-  erlang:error(badarg);
-write_1([], Batch, DbHandle, WriteOpts) ->
-  write_batch(DbHandle, Batch, WriteOpts).
-
 
 %% @doc Retrieve a key/value pair in the default column family
 -spec get(DBHandle, Key, ReadOpts) ->  Res when
@@ -1504,82 +1426,6 @@ delete_entity(DBHandle, Key, WriteOpts) ->
 delete_entity(DBHandle, CFHandle, Key, WriteOpts) ->
     delete(DBHandle, CFHandle, Key, WriteOpts).
 
--type fold_fun() :: fun(({Key::binary(), Value::binary()}, any()) -> any()).
-
-%% @doc Calls Fun(Elem, AccIn) on successive elements in the default column family
-%% starting with AccIn == Acc0.
-%% Fun/2 must return a new accumulator which is passed to the next call.
-%% The function returns the final value of the accumulator.
-%% Acc0 is returned if the default column family is empty.
-%%
-%% this function is deprecated and will be removed in next major release.
-%% You should use the `iterator' API instead.
--spec fold(DBHandle, Fun, AccIn, ReadOpts) -> AccOut when
-  DBHandle::db_handle(),
-  Fun::fold_fun(),
-  AccIn::any(),
-  ReadOpts::read_options(),
-  AccOut :: any().
-fold(DBHandle, Fun, Acc0, ReadOpts) ->
-  {ok, Itr} = iterator(DBHandle, ReadOpts),
-  do_fold(Itr, Fun, Acc0).
-
-%% @doc Calls Fun(Elem, AccIn) on successive elements in the specified column family
-%% Other specs are same with fold/4
-%%
-%% this function is deprecated and will be removed in next major release.
-%% You should use the `iterator' API instead.
--spec fold(DBHandle, CFHandle, Fun, AccIn, ReadOpts) -> AccOut when
-  DBHandle::db_handle(),
-  CFHandle::cf_handle(),
-  Fun::fold_fun(),
-  AccIn::any(),
-  ReadOpts::read_options(),
-  AccOut :: any().
-fold(DbHandle, CFHandle, Fun, Acc0, ReadOpts) ->
-  {ok, Itr} = iterator(DbHandle, CFHandle, ReadOpts),
-  do_fold(Itr, Fun, Acc0).
-
--type fold_keys_fun() :: fun((Key::binary(), any()) -> any()).
-
-%% @doc Calls Fun(Elem, AccIn) on successive elements in the default column family
-%% starting with AccIn == Acc0.
-%% Fun/2 must return a new accumulator which is passed to the next call.
-%% The function returns the final value of the accumulator.
-%% Acc0 is returned if the default column family is empty.
-%%
-%% this function is deprecated and will be removed in next major release.
-%% You should use the `iterator' API instead.
--spec fold_keys(DBHandle, Fun, AccIn, ReadOpts) -> AccOut when
-  DBHandle::db_handle(),
-  Fun::fold_keys_fun(),
-  AccIn::any(),
-  ReadOpts::read_options(),
-  AccOut :: any().
-fold_keys(DBHandle, UserFun, Acc0, ReadOpts) ->
-  WrapperFun = fun({K, _V}, Acc) -> UserFun(K, Acc);
-                  (Else, Acc) -> UserFun(Else, Acc) end,
-  {ok, Itr} = iterator(DBHandle, ReadOpts),
-  do_fold(Itr, WrapperFun, Acc0).
-
-%% @doc Calls Fun(Elem, AccIn) on successive elements in the specified column family
-%% Other specs are same with fold_keys/4
-%%
-%% this function is deprecated and will be removed in next major release.
-%% You should use the `iterator' API instead.
--spec fold_keys(DBHandle, CFHandle, Fun, AccIn, ReadOpts) -> AccOut when
-  DBHandle::db_handle(),
-  CFHandle::cf_handle(),
-  Fun::fold_keys_fun(),
-  AccIn::any(),
-  ReadOpts::read_options(),
-  AccOut :: any().
-fold_keys(DBHandle, CFHandle, UserFun, Acc0, ReadOpts) ->
-  WrapperFun = fun({K, _V}, Acc) -> UserFun(K, Acc);
-                  (Else, Acc) -> UserFun(Else, Acc) end,
-  {ok, Itr} = iterator(DBHandle, CFHandle, ReadOpts),
-  do_fold(Itr, WrapperFun, Acc0).
-
 %% @doc is the database empty
 -spec  is_empty(DBHandle::db_handle()) -> true | false.
 is_empty(_DbHandle) ->
@@ -1666,24 +1512,20 @@ disable_manual_compaction(_DbHandle) ->
 enable_manual_compaction(_DbHandle) ->
   ?nif_stub.
 
-%% @doc Return the approximate number of keys in the default column family.
-%% Implemented by calling GetIntProperty with "rocksdb.estimate-num-keys"
-%%
-%% this function is deprecated and will be removed in next major release.
--spec count(DBHandle::db_handle()) ->  non_neg_integer() | {error, any()}.
-count(DBHandle) ->
-  count_1(get_property(DBHandle, <<"rocksdb.estimate-num-keys">>)).
+%% @doc Abort all running and scheduled compactions (RocksDB 11.0+).
+%% In-progress compactions are actively cancelled and report a status for which
+%% `rocksdb:is_compaction_aborted/1' (a RocksDB `kCompactionAborted' status) is
+%% true. Call `resume_all_compactions/1' as many times as this was called to
+%% resume.
+-spec abort_all_compactions(db_handle()) -> ok | {error, term()}.
+abort_all_compactions(_DbHandle) ->
+  ?nif_stub.
 
-%% @doc
-%% Return the approximate number of keys in the specified column family.
-%%
-%% this function is deprecated and will be removed in next major release.
--spec count(DBHandle::db_handle(), CFHandle::cf_handle()) -> non_neg_integer() | {error, any()}.
-count(DBHandle, CFHandle) ->
-  count_1(get_property(DBHandle, CFHandle, <<"rocksdb.estimate-num-keys">>)).
-
-count_1({ok, BinCount}) -> erlang:binary_to_integer(BinCount);
-count_1(Error) -> Error.
+%% @doc Resume compactions previously aborted by `abort_all_compactions/1'
+%% (RocksDB 11.0+). Must be called as many times as `abort_all_compactions/1'.
+-spec resume_all_compactions(db_handle()) -> ok | {error, term()}.
+resume_all_compactions(_DbHandle) ->
+  ?nif_stub.
 
 %% @doc Return the current stats of the default column family
 %% Implemented by calling GetProperty with "rocksdb.stats"
@@ -1754,13 +1596,6 @@ tlog_next_update(_Iterator) ->
        ) -> ok | {error, term()}.
 write_binary_update(_DbHandle, _Update, _WriteOptions) ->
   ?nif_stub.
-
-
-
-updates_iterator(DBH, Since) -> tlog_iterator(DBH, Since).
-close_updates_iterator(Itr) -> tlog_iterator_close(Itr).
-next_binary_update(Itr) -> tlog_next_binary_update(Itr).
-next_update(Itr) -> tlog_next_update(Itr).
 
 %% ===================================================================
 %% Batch API
@@ -2416,12 +2251,6 @@ set_strict_capacity_limit(_Cache, _StrictCapacityLimit) ->
 release_cache(_Cache) ->
   ?nif_stub.
 
-new_lru_cache(Capacity) -> new_cache(lru, Capacity).
-new_clock_cache(Capacity) -> new_cache(clock, Capacity).
-get_usage(Cache) -> cache_info(Cache, usage).
-get_pinned_usage(Cache) -> cache_info(Cache, pinned_usage).
-get_capacity(Cache) -> cache_info(Cache, capacity).
-
 %% ===================================================================
 %% Limiter functions
 
@@ -2476,10 +2305,6 @@ set_db_background_threads(_Db, _N) ->
 -spec set_db_background_threads(DB :: db_handle(), N :: non_neg_integer(), Priority :: env_priority()) -> ok.
 set_db_background_threads(_Db, _N, _PRIORITY) ->
   ?nif_stub.
-
-default_env() -> new_env(default).
-
-mem_env() -> new_env(memenv).
 
 %% ===================================================================
 %% SstFileManager functions
@@ -3176,21 +3001,3 @@ to_posting_binary(Ref) when is_reference(Ref) -> postings_to_binary(Ref).
 -spec postings_to_binary(reference()) -> binary().
 postings_to_binary(_Postings) ->
     ?nif_stub.
-
-do_fold(Itr, Fun, Acc0) ->
-  try
-    fold_loop(iterator_move(Itr, first), Itr, Fun, Acc0)
-  after
-    iterator_close(Itr)
-  end.
-
-fold_loop({error, iterator_closed}, _Itr, _Fun, Acc0) ->
-  throw({iterator_closed, Acc0});
-fold_loop({error, invalid_iterator}, _Itr, _Fun, Acc0) ->
-  Acc0;
-fold_loop({ok, K}, Itr, Fun, Acc0) ->
-  Acc = Fun(K, Acc0),
-  fold_loop(iterator_move(Itr, next), Itr, Fun, Acc);
-fold_loop({ok, K, V}, Itr, Fun, Acc0) ->
-  Acc = Fun({K, V}, Acc0),
-  fold_loop(iterator_move(Itr, next), Itr, Fun, Acc).

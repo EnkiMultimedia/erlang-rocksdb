@@ -756,7 +756,7 @@ filter_column_family_test() ->
         {compaction_filter, #{rules => [{key_prefix, <<"old_">>}]}}
     ],
 
-    {ok, Db, [_DefaultCF, CF1, CF2]} = rocksdb:open_with_cf(DbPath, [
+    {ok, Db, [_DefaultCF, CF1, CF2]} = rocksdb:open(DbPath, [
         {create_if_missing, true}
     ], [
         {"default", []},

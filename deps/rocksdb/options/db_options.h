@@ -24,6 +24,7 @@ struct ImmutableDBOptions {
   bool create_missing_column_families;
   bool error_if_exists;
   bool paranoid_checks;
+  bool open_files_async;
   bool flush_verify_memtable_count;
   bool compaction_verify_record_count;
   bool track_and_verify_wals_in_manifest;
@@ -70,13 +71,13 @@ struct ImmutableDBOptions {
   uint64_t write_thread_max_yield_usec;
   uint64_t write_thread_slow_yield_usec;
   bool skip_stats_update_on_db_open;
-  bool skip_checking_sst_file_sizes_on_db_open;
   WALRecoveryMode wal_recovery_mode;
   bool allow_2pc;
   std::shared_ptr<Cache> row_cache;
   WalFilter* wal_filter;
   bool dump_malloc_stats;
   bool avoid_flush_during_recovery;
+  bool enforce_write_buffer_manager_during_recovery;
   bool allow_ingest_behind;
   bool two_write_queues;
   bool manual_wal_flush;
@@ -147,6 +148,7 @@ struct MutableDBOptions {
   uint64_t max_manifest_file_size;
   int max_manifest_space_amp_pct;
   size_t manifest_preallocation_size;
+  bool verify_manifest_content_on_close;
   std::string daily_offpeak_time_utc;
 };
 

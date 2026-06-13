@@ -674,7 +674,7 @@ class PosixFileSystem : public FileSystem {
 
   IOStatus GetFileSize(const std::string& fname, const IOOptions& /*opts*/,
                        uint64_t* size, IODebugContext* /*dbg*/) override {
-    struct stat sbuf {};
+    struct stat sbuf{};
     if (stat(fname.c_str(), &sbuf) != 0) {
       *size = 0;
       return IOError("while stat a file for size", fname, errno);
@@ -981,7 +981,7 @@ class PosixFileSystem : public FileSystem {
   // file size. However this API only works on opened file.
   IOStatus GetFileSizeOnOpenedFile(const int fd, const std::string& name,
                                    uint64_t* size) {
-    struct stat sb {};
+    struct stat sb{};
     *size = 0;
     // Get file information using fstat
     if (fstat(fd, &sb) == -1) {
@@ -1129,25 +1129,7 @@ class PosixFileSystem : public FileSystem {
         // Reset cqe data to catch any stray reuse of it
         static_cast<struct io_uring_cqe*>(cqe)->user_data = 0xd5d5d5d5d5d5d5d5;
 
-        FSReadRequest req;
-        req.scratch = posix_handle->scratch;
-        req.offset = posix_handle->offset;
-        req.len = posix_handle->len;
-
-        size_t finished_len = 0;
-        size_t bytes_read = 0;
-        bool read_again = false;
-        UpdateResult(cqe, "", req.len, posix_handle->iov.iov_len,
-                     true /*async_read*/, posix_handle->use_direct_io,
-                     posix_handle->alignment, finished_len, &req, bytes_read,
-                     read_again);
-        posix_handle->is_finished = true;
-        io_uring_cqe_seen(iu, cqe);
-        posix_handle->cb(req, posix_handle->cb_arg);
-
-        (void)finished_len;
-        (void)bytes_read;
-        (void)read_again;
+        FinalizeAsyncRead(iu, cqe, posix_handle);
 
         if (static_cast<Posix_IOHandle*>(io_handles[i]) == posix_handle) {
           break;
@@ -1187,6 +1169,11 @@ class PosixFileSystem : public FileSystem {
       if (posix_handle->iu != iu) {
         return IOStatus::IOError("");
       }
+
+      // Mark this handle as being aborted. This is used when processing
+      // completions to distinguish between aborted handles (expect 2
+      // completions: original + cancel) and non-aborted handles (expect 1).
+      posix_handle->is_being_aborted = true;
 
       // Prepare the cancel request.
       struct io_uring_sqe* sqe;
@@ -1234,6 +1221,14 @@ class PosixFileSystem : public FileSystem {
         }
         posix_handle->req_count++;
 
+        if (!posix_handle->is_being_aborted) {
+          // This is a completion for a handle NOT being aborted.
+          // It only has 1 outstanding request (the original read), so we
+          // should finalize it now.
+          FinalizeAsyncRead(iu, cqe, posix_handle);
+          continue;
+        }
+
         // Reset cqe data to catch any stray reuse of it
         static_cast<struct io_uring_cqe*>(cqe)->user_data = 0xd5d5d5d5d5d5d5d5;
         io_uring_cqe_seen(iu, cqe);
@@ -1247,16 +1242,23 @@ class PosixFileSystem : public FileSystem {
         // - And finally, if the request to cancel wasn't
         //   found, the cancel request is completed with -ENOENT.
         //
-        // Every handle has to wait for 2 requests completion: original one and
-        // the cancel request which is tracked by PosixHandle::req_count.
-        if (posix_handle->req_count == 2 &&
-            static_cast<Posix_IOHandle*>(io_handles[i]) == posix_handle) {
+        // Every handle being aborted has to wait for 2 requests completion:
+        // original one and the cancel request which is tracked by
+        // PosixHandle::req_count.
+        // Note: We must mark is_finished and invoke the callback for ANY handle
+        // that reaches req_count == 2, not just the one we're currently waiting
+        // for (io_handles[i]). Otherwise, if completions arrive out of order,
+        // we consume another handle's completions without marking it finished,
+        // causing an infinite hang when we later wait for that handle.
+        if (posix_handle->req_count == 2) {
           posix_handle->is_finished = true;
           FSReadRequest req;
           req.status = IOStatus::Aborted();
           posix_handle->cb(req, posix_handle->cb_arg);
 
-          break;
+          if (static_cast<Posix_IOHandle*>(io_handles[i]) == posix_handle) {
+            break;
+          }
         }
       }
     }
@@ -1272,7 +1274,7 @@ class PosixFileSystem : public FileSystem {
   void SupportedOps(int64_t& supported_ops) override {
     supported_ops = 0;
 #if defined(ROCKSDB_IOURING_PRESENT)
-    if (IsIOUringEnabled()) {
+    if (IsIOUringEnabled() && thread_local_async_read_io_urings_) {
       // Underlying FS supports async_io
       supported_ops |= (1 << FSSupportedOps::kAsyncIO);
     }
@@ -1338,9 +1340,8 @@ PosixFileSystem::PosixFileSystem()
       page_size_(getpagesize()),
       allow_non_owner_access_(true) {
 #if defined(ROCKSDB_IOURING_PRESENT)
-  // Test whether IOUring is supported, and if it does, create a managing
-  // object for thread local point so that in the future thread-local
-  // io_uring can be created.
+  // Test whether IOUring is supported with the same flags that ReadAsync and
+  // MultiRead will use at runtime.
   struct io_uring* new_io_uring = CreateIOUring();
   if (new_io_uring != nullptr) {
     thread_local_async_read_io_urings_.reset(new ThreadLocalPtr(DeleteIOUring));

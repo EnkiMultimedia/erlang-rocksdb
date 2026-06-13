@@ -29,8 +29,6 @@ namespace ROCKSDB_NAMESPACE {
 const std::string kPropertiesBlockName = "rocksdb.properties";
 // NB: only used with format_version >= 6
 const std::string kIndexBlockName = "rocksdb.index";
-// Old property block name for backward compatibility
-const std::string kPropertiesBlockOldName = "rocksdb.stats";
 const std::string kCompressionDictBlockName = "rocksdb.compression_dict";
 const std::string kRangeDelBlockName = "rocksdb.range_del";
 
@@ -169,6 +167,18 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   }
   if (props.key_smallest_seqno != UINT64_MAX) {
     Add(TablePropertiesNames::kKeySmallestSeqno, props.key_smallest_seqno);
+  }
+  if (props.data_block_restart_interval > 0) {
+    Add(TablePropertiesNames::kDataBlockRestartInterval,
+        props.data_block_restart_interval);
+  }
+  if (props.index_block_restart_interval > 0) {
+    Add(TablePropertiesNames::kIndexBlockRestartInterval,
+        props.index_block_restart_interval);
+  }
+  if (props.separate_key_value_in_data_block > 0) {
+    Add(TablePropertiesNames::kSeparateKeyValueInDataBlock,
+        props.separate_key_value_in_data_block);
   }
 }
 
@@ -316,6 +326,12 @@ Status ParsePropertiesBlock(
        &new_table_properties->key_largest_seqno},
       {TablePropertiesNames::kKeySmallestSeqno,
        &new_table_properties->key_smallest_seqno},
+      {TablePropertiesNames::kDataBlockRestartInterval,
+       &new_table_properties->data_block_restart_interval},
+      {TablePropertiesNames::kIndexBlockRestartInterval,
+       &new_table_properties->index_block_restart_interval},
+      {TablePropertiesNames::kSeparateKeyValueInDataBlock,
+       &new_table_properties->separate_key_value_in_data_block},
   };
 
   Status s;
@@ -476,7 +492,8 @@ Status ReadTablePropertiesHelper(
     // (See write_global_seqno comment above)
     if (s.ok() && footer.GetBlockTrailerSize() > 0) {
       s = VerifyBlockChecksum(footer, properties_block.data(), block_size,
-                              file->file_name(), handle.offset());
+                              file->file_name(), handle.offset(),
+                              BlockType::kProperties);
       if (s.IsCorruption()) {
         if (new_table_properties->external_sst_file_global_seqno_offset != 0) {
           std::string tmp_buf(properties_block.data(), len);
@@ -485,7 +502,8 @@ Status ReadTablePropertiesHelper(
               handle.offset();
           EncodeFixed64(&tmp_buf[static_cast<size_t>(global_seqno_offset)], 0);
           s = VerifyBlockChecksum(footer, tmp_buf.data(), block_size,
-                                  file->file_name(), handle.offset());
+                                  file->file_name(), handle.offset(),
+                                  BlockType::kProperties);
         }
       }
     }
@@ -543,14 +561,6 @@ Status FindOptionalMetaBlock(InternalIterator* meta_index_iter,
     if (meta_index_iter->Valid() && meta_index_iter->key() == meta_block_name) {
       Slice v = meta_index_iter->value();
       return block_handle->DecodeFrom(&v);
-    } else if (meta_block_name == kPropertiesBlockName) {
-      // Have to try old name for compatibility
-      meta_index_iter->Seek(kPropertiesBlockOldName);
-      if (meta_index_iter->status().ok() && meta_index_iter->Valid() &&
-          meta_index_iter->key() == kPropertiesBlockOldName) {
-        Slice v = meta_index_iter->value();
-        return block_handle->DecodeFrom(&v);
-      }
     }
   }
   // else

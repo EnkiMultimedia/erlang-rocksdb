@@ -11,8 +11,8 @@
 
 // NOTE: in 'main' development branch, this should be the *next*
 // minor or major version number planned for release.
-#define ROCKSDB_MAJOR 10
-#define ROCKSDB_MINOR 10
+#define ROCKSDB_MAJOR 11
+#define ROCKSDB_MINOR 1
 #define ROCKSDB_PATCH 1
 
 // Make it easy to do conditional compilation based on version checks, i.e.

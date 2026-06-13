@@ -193,7 +193,7 @@ open_cf() ->
   case filelib:is_dir(?CF_INSTANCE_DIR) of
     true ->
       {ok, CFs} = rocksdb:list_column_families(?CF_INSTANCE_DIR, []),
-      rocksdb:open_with_cf(
+      rocksdb:open(
         ?CF_INSTANCE_DIR,
         [{create_if_missing, true}],
         [{CF, []} || CF <- CFs]

@@ -395,6 +395,28 @@ void Java_org_rocksdb_Options_setParanoidChecks(JNIEnv*, jclass, jlong jhandle,
 
 /*
  * Class:     org_rocksdb_Options
+ * Method:    openFilesAsync
+ * Signature: (J)Z
+ */
+jboolean Java_org_rocksdb_Options_openFilesAsync(JNIEnv*, jclass,
+                                                 jlong jhandle) {
+  return reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle)
+      ->open_files_async;
+}
+
+/*
+ * Class:     org_rocksdb_Options
+ * Method:    setOpenFilesAsync
+ * Signature: (JZ)V
+ */
+void Java_org_rocksdb_Options_setOpenFilesAsync(JNIEnv*, jclass, jlong jhandle,
+                                                jboolean open_files_async) {
+  reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle)->open_files_async =
+      static_cast<bool>(open_files_async);
+}
+
+/*
+ * Class:     org_rocksdb_Options
  * Method:    setEnv
  * Signature: (JJ)V
  */
@@ -1957,30 +1979,6 @@ jboolean Java_org_rocksdb_Options_skipStatsUpdateOnDbOpen(JNIEnv*, jclass,
                                                           jlong jhandle) {
   auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
   return static_cast<jboolean>(opt->skip_stats_update_on_db_open);
-}
-
-/*
- * Class:     org_rocksdb_Options
- * Method:    setSkipCheckingSstFileSizesOnDbOpen
- * Signature: (JZ)V
- */
-void Java_org_rocksdb_Options_setSkipCheckingSstFileSizesOnDbOpen(
-    JNIEnv*, jclass, jlong jhandle,
-    jboolean jskip_checking_sst_file_sizes_on_db_open) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
-  opt->skip_checking_sst_file_sizes_on_db_open =
-      static_cast<bool>(jskip_checking_sst_file_sizes_on_db_open);
-}
-
-/*
- * Class:     org_rocksdb_Options
- * Method:    skipCheckingSstFileSizesOnDbOpen
- * Signature: (J)Z
- */
-jboolean Java_org_rocksdb_Options_skipCheckingSstFileSizesOnDbOpen(
-    JNIEnv*, jclass, jlong jhandle) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
-  return static_cast<jboolean>(opt->skip_checking_sst_file_sizes_on_db_open);
 }
 
 /*
@@ -6022,6 +6020,29 @@ jboolean Java_org_rocksdb_DBOptions_paranoidChecks(JNIEnv*, jclass,
 
 /*
  * Class:     org_rocksdb_DBOptions
+ * Method:    setOpenFilesAsync
+ * Signature: (JZ)V
+ */
+void Java_org_rocksdb_DBOptions_setOpenFilesAsync(JNIEnv*, jclass,
+                                                  jlong jhandle,
+                                                  jboolean open_files_async) {
+  reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle)->open_files_async =
+      static_cast<bool>(open_files_async);
+}
+
+/*
+ * Class:     org_rocksdb_DBOptions
+ * Method:    openFilesAsync
+ * Signature: (J)Z
+ */
+jboolean Java_org_rocksdb_DBOptions_openFilesAsync(JNIEnv*, jclass,
+                                                   jlong jhandle) {
+  return reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle)
+      ->open_files_async;
+}
+
+/*
+ * Class:     org_rocksdb_DBOptions
  * Method:    setRateLimiter
  * Signature: (JJ)V
  */
@@ -7361,30 +7382,6 @@ jboolean Java_org_rocksdb_DBOptions_skipStatsUpdateOnDbOpen(JNIEnv*, jclass,
 
 /*
  * Class:     org_rocksdb_DBOptions
- * Method:    setSkipCheckingSstFileSizesOnDbOpen
- * Signature: (JZ)V
- */
-void Java_org_rocksdb_DBOptions_setSkipCheckingSstFileSizesOnDbOpen(
-    JNIEnv*, jclass, jlong jhandle,
-    jboolean jskip_checking_sst_file_sizes_on_db_open) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
-  opt->skip_checking_sst_file_sizes_on_db_open =
-      static_cast<bool>(jskip_checking_sst_file_sizes_on_db_open);
-}
-
-/*
- * Class:     org_rocksdb_DBOptions
- * Method:    skipCheckingSstFileSizesOnDbOpen
- * Signature: (J)Z
- */
-jboolean Java_org_rocksdb_DBOptions_skipCheckingSstFileSizesOnDbOpen(
-    JNIEnv*, jclass, jlong jhandle) {
-  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
-  return static_cast<jboolean>(opt->skip_checking_sst_file_sizes_on_db_open);
-}
-
-/*
- * Class:     org_rocksdb_DBOptions
  * Method:    setWalRecoveryMode
  * Signature: (JB)V
  */
@@ -8077,26 +8074,6 @@ void Java_org_rocksdb_ReadOptions_setTailing(JNIEnv*, jclass, jlong jhandle,
  */
 jboolean Java_org_rocksdb_ReadOptions_tailing(JNIEnv*, jclass, jlong jhandle) {
   return reinterpret_cast<ROCKSDB_NAMESPACE::ReadOptions*>(jhandle)->tailing;
-}
-
-/*
- * Class:     org_rocksdb_ReadOptions
- * Method:    managed
- * Signature: (J)Z
- */
-jboolean Java_org_rocksdb_ReadOptions_managed(JNIEnv*, jclass, jlong jhandle) {
-  return reinterpret_cast<ROCKSDB_NAMESPACE::ReadOptions*>(jhandle)->managed;
-}
-
-/*
- * Class:     org_rocksdb_ReadOptions
- * Method:    setManaged
- * Signature: (JZ)V
- */
-void Java_org_rocksdb_ReadOptions_setManaged(JNIEnv*, jclass, jlong jhandle,
-                                             jboolean jmanaged) {
-  reinterpret_cast<ROCKSDB_NAMESPACE::ReadOptions*>(jhandle)->managed =
-      static_cast<bool>(jmanaged);
 }
 
 /*

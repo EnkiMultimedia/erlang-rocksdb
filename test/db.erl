@@ -28,7 +28,7 @@ open_test_Z() ->
   ok = rocksdb:put(Ref, <<"abc">>, <<"123">>, []),
   false = rocksdb:is_empty(Ref),
   {ok, <<"123">>} = rocksdb:get(Ref, <<"abc">>, []),
-  {ok, 1} = rocksdb:count(Ref),
+  {ok, 1} = rocksdb_test_util:count(Ref),
   not_found = rocksdb:get(Ref, <<"def">>, []),
   ok = rocksdb:delete(Ref, <<"abc">>, []),
   not_found = rocksdb:get(Ref, <<"abc">>, []),
@@ -64,7 +64,7 @@ fold_test_Z() ->
   ok = rocksdb:put(Ref, <<"hij">>, <<"789">>, []),
   [{<<"abc">>, <<"123">>},
   {<<"def">>, <<"456">>},
-  {<<"hij">>, <<"789">>}] = lists:reverse(rocksdb:fold(Ref,
+  {<<"hij">>, <<"789">>}] = lists:reverse(rocksdb_test_util:fold(Ref,
   fun({K, V}, Acc) ->
     [{K, V} | Acc]
   end,
@@ -77,7 +77,7 @@ fold_keys_test_Z() ->
   ok = rocksdb:put(Ref, <<"def">>, <<"456">>, []),
   ok = rocksdb:put(Ref, <<"abc">>, <<"123">>, []),
   ok = rocksdb:put(Ref, <<"hij">>, <<"789">>, []),
-  [<<"abc">>, <<"def">>, <<"hij">>] = lists:reverse(rocksdb:fold_keys(Ref,
+  [<<"abc">>, <<"def">>, <<"hij">>] = lists:reverse(rocksdb_test_util:fold_keys(Ref,
   fun(K, Acc) -> [K | Acc] end,
   [], [])).
 
@@ -107,7 +107,7 @@ close_fold_test_Z() ->
   {ok, Ref} = rocksdb:open("erocksdb.close_fold.test", [{create_if_missing, true}], []),
   ok = rocksdb:put(Ref, <<"k">>,<<"v">>,[]),
   ?assertException(throw, {iterator_closed, ok}, % ok is returned by close as the acc
-                   rocksdb:fold(Ref, fun(_,_A) -> rocksdb:close(Ref) end, undefined, [])),
+                   rocksdb_test_util:fold(Ref, fun(_,_A) -> rocksdb:close(Ref) end, undefined, [])),
   ?rm_rf("erocksdb.close_fold.test").
 
 write_opts_test() ->
@@ -145,7 +145,7 @@ fixed_prefix_extractor_test() ->
   ok = rocksdb:put(Ref, <<"k1">>, <<"v1">>, []),
   ok = rocksdb:put(Ref, <<"k2">>, <<"v2">>, []),
 
-  [<<"k1">>, <<"k2">>] = lists:reverse(rocksdb:fold_keys(Ref,
+  [<<"k1">>, <<"k2">>] = lists:reverse(rocksdb_test_util:fold_keys(Ref,
                                                          fun(K, Acc) -> [K | Acc] end,
                                                          [], [])),
 
@@ -163,7 +163,7 @@ capped_prefix_extractor_test() ->
   ok = rocksdb:put(Ref, <<"k1">>, <<"v1">>, []),
   ok = rocksdb:put(Ref, <<"k2">>, <<"v2">>, []),
 
-  [<<"k1">>, <<"k2">>] = lists:reverse(rocksdb:fold_keys(Ref,
+  [<<"k1">>, <<"k2">>] = lists:reverse(rocksdb_test_util:fold_keys(Ref,
                                                          fun(K, Acc) -> [K | Acc] end,
                                                          [], [])),
 
