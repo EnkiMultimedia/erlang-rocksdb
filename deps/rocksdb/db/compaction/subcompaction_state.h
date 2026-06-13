@@ -95,6 +95,14 @@ class SubcompactionState {
     proximal_level_outputs_.RemoveLastEmptyOutput();
   }
 
+  // Cleanup output builders for abandoning in-progress files.
+  void CleanupOutputs() {
+    compaction_outputs_.Cleanup();
+    if (compaction->SupportsPerKeyPlacement()) {
+      proximal_level_outputs_.Cleanup();
+    }
+  }
+
   void BuildSubcompactionJobInfo(
       SubcompactionJobInfo& subcompaction_job_info) const {
     const Compaction* c = compaction;
@@ -162,7 +170,7 @@ class SubcompactionState {
     }
   }
 
-  void Cleanup(Cache* cache);
+  void Cleanup(Cache* cache, const Status& overall_status);
 
   void AggregateCompactionOutputStats(
       InternalStats::CompactionStatsFull& internal_stats) const;

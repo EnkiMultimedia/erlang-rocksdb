@@ -18,20 +18,22 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class Statistics;
+
 class BlockBuilder {
  public:
   BlockBuilder(const BlockBuilder&) = delete;
   void operator=(const BlockBuilder&) = delete;
 
-  explicit BlockBuilder(int block_restart_interval,
-                        bool use_delta_encoding = true,
-                        bool use_value_delta_encoding = false,
-                        BlockBasedTableOptions::DataBlockIndexType index_type =
-                            BlockBasedTableOptions::kDataBlockBinarySearch,
-                        double data_block_hash_table_util_ratio = 0.75,
-                        size_t ts_sz = 0,
-                        bool persist_user_defined_timestamps = true,
-                        bool is_user_key = false);
+  explicit BlockBuilder(
+      int block_restart_interval, bool use_delta_encoding = true,
+      bool use_value_delta_encoding = false,
+      BlockBasedTableOptions::DataBlockIndexType index_type =
+          BlockBasedTableOptions::kDataBlockBinarySearch,
+      double data_block_hash_table_util_ratio = 0.75, size_t ts_sz = 0,
+      bool persist_user_defined_timestamps = true, bool is_user_key = false,
+      bool use_separated_kv_storage = false, Statistics* statistics = nullptr,
+      double uniform_cv_threshold = -1.0);
 
   // Reset the contents as if the BlockBuilder was just constructed.
   void Reset();
@@ -90,6 +92,10 @@ class BlockBuilder {
                                  const Slice* const delta_value,
                                  bool skip_delta_encoding, size_t buffer_size);
 
+  bool ScanForUniformity() const;
+
+  Slice GetRestartKey(uint32_t index, const char* limit) const;
+
   inline const Slice MaybeStripTimestampFromKey(std::string* key_buf,
                                                 const Slice& key);
 
@@ -124,6 +130,16 @@ class BlockBuilder {
   bool finished_;  // Has Finish() been called?
   std::string last_key_;
   DataBlockHashIndexBuilder data_block_hash_index_builder_;
+  const double uniform_cv_threshold_;
+  Statistics* statistics_;
+
+  const bool use_separated_kv_storage_;  // When enabled, keys are stored first,
+                                         // followed by values in a separate
+                                         // section. Value offset is stored as
+                                         // varint only at restart points; for
+                                         // other entries, offset is computed
+                                         // as prev_offset + prev_length.
+  std::string values_buffer_;
 #ifndef NDEBUG
   bool add_with_last_key_called_ = false;
 #endif

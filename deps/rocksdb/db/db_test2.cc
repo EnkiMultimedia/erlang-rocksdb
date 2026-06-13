@@ -39,7 +39,7 @@ class DBTest2 : public DBTestBase {
 };
 
 TEST_F(DBTest2, OpenForReadOnly) {
-  DB* db_ptr = nullptr;
+  std::unique_ptr<DB> db_ptr;
   std::string dbname = test::PerThreadDBPath("db_readonly");
   Options options = CurrentOptions();
   options.create_if_missing = true;
@@ -63,7 +63,7 @@ TEST_F(DBTest2, OpenForReadOnly) {
 }
 
 TEST_F(DBTest2, OpenForReadOnlyWithColumnFamilies) {
-  DB* db_ptr = nullptr;
+  std::unique_ptr<DB> db_ptr;
   std::string dbname = test::PerThreadDBPath("db_readonly");
   Options options = CurrentOptions();
   options.create_if_missing = true;
@@ -92,6 +92,44 @@ TEST_F(DBTest2, OpenForReadOnlyWithColumnFamilies) {
       DB::OpenForReadOnly(options, dbname, column_families, &handles, &db_ptr));
   // With create_if_missing false, there should not be a dir in the file system
   ASSERT_NOK(env_->FileExists(dbname));
+}
+
+// Regression test: wal_in_db_path_ was not initialized in the read-only DB
+// open path, causing UBSan "invalid-bool-load" when CloseHelper calls
+// PurgeObsoleteFiles -> DeleteObsoleteFileImpl which reads wal_in_db_path_.
+TEST_F(DBTest2, ReadOnlyDBWalInDbPathInitialized) {
+  // Create a normal DB with some data and WAL files
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key2", "value2"));
+  Close();
+
+  // Reopen as read-only — wal_in_db_path_ must be properly initialized.
+  // Before the fix, closing this DB would read an uninitialized bool in
+  // DeleteObsoleteFileImpl, which UBSan catches as undefined behavior.
+  std::unique_ptr<DB> db_ptr;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &db_ptr));
+  std::string value;
+  ASSERT_OK(db_ptr->Get(ReadOptions(), "key1", &value));
+  ASSERT_EQ("value1", value);
+  // Close the read-only DB — this triggers PurgeObsoleteFiles which reads
+  // wal_in_db_path_. Under UBSan, an uninitialized bool here would fail.
+  db_ptr.reset();
+
+  // Also test the column-families variant
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.emplace_back(kDefaultColumnFamilyName,
+                               ColumnFamilyOptions(options));
+  std::vector<ColumnFamilyHandle*> handles;
+  ASSERT_OK(DB::OpenForReadOnly(DBOptions(options), dbname_, column_families,
+                                &handles, &db_ptr));
+  for (auto* h : handles) {
+    delete h;
+  }
+  db_ptr.reset();
 }
 
 class PartitionedIndexTestListener : public EventListener {
@@ -349,9 +387,9 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   ASSERT_OK(Put(3, Key(1), DummyString(1), wo));
   ASSERT_OK(Put(0, Key(1), DummyString(1), wo));
   ASSERT_OK(Flush(0));
-  ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+  ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "default"),
             static_cast<uint64_t>(1));
-  ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+  ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "nikitich"),
             static_cast<uint64_t>(1));
 
   flush_listener->expected_flush_reason = FlushReason::kWriteBufferManager;
@@ -371,13 +409,13 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   // No flush should trigger
   wait_flush();
   {
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "default"),
               static_cast<uint64_t>(1));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "pikachu"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "dobrynia"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "nikitich"),
               static_cast<uint64_t>(1));
   }
 
@@ -387,13 +425,13 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   ASSERT_OK(Put(0, Key(1), DummyString(1), wo));
   wait_flush();
   {
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "default"),
               static_cast<uint64_t>(1));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "pikachu"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "dobrynia"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "nikitich"),
               static_cast<uint64_t>(2));
   }
 
@@ -405,13 +443,13 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   ASSERT_OK(Put(2, Key(1), DummyString(1), wo));
   wait_flush();
   {
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "default"),
               static_cast<uint64_t>(1));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "pikachu"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "dobrynia"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "nikitich"),
               static_cast<uint64_t>(2));
   }
 
@@ -428,13 +466,13 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   ASSERT_OK(Put(0, Key(1), DummyString(1), wo));
   wait_flush();
   {
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "default"),
               static_cast<uint64_t>(2));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "pikachu"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "dobrynia"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "nikitich"),
               static_cast<uint64_t>(2));
   }
 
@@ -450,13 +488,13 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   wait_flush();
 
   {
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "default"),
               static_cast<uint64_t>(2));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "pikachu"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "dobrynia"),
               static_cast<uint64_t>(1));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "nikitich"),
               static_cast<uint64_t>(2));
   }
   if (cost_cache_) {
@@ -506,7 +544,7 @@ TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
   CreateAndReopenWithCF({"cf1", "cf2"}, options);
 
   ASSERT_OK(DestroyDB(dbname2, options));
-  DB* db2 = nullptr;
+  std::unique_ptr<DB> db2;
   ASSERT_OK(DB::Open(options, dbname2, &db2));
 
   WriteOptions wo;
@@ -516,12 +554,12 @@ TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
     ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[0]));
     ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[1]));
     ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[2]));
-    ASSERT_OK(static_cast<DBImpl*>(db2)->TEST_WaitForFlushMemTable());
+    ASSERT_OK(static_cast<DBImpl*>(db2.get())->TEST_WaitForFlushMemTable());
     // Ensure background work is fully finished including listener callbacks
     // before accessing listener state.
     ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
-    ASSERT_OK(
-        static_cast_with_check<DBImpl>(db2)->TEST_WaitForBackgroundWork());
+    ASSERT_OK(static_cast_with_check<DBImpl>(db2.get())
+                  ->TEST_WaitForBackgroundWork());
   };
 
   // Trigger a flush on cf2
@@ -537,13 +575,13 @@ TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
 
   ASSERT_OK(Put(2, Key(1), DummyString(1), wo));
   wait_flush();
-  ASSERT_OK(static_cast<DBImpl*>(db2)->TEST_WaitForFlushMemTable());
+  ASSERT_OK(static_cast<DBImpl*>(db2.get())->TEST_WaitForFlushMemTable());
   {
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default") +
-                  GetNumberOfSstFilesForColumnFamily(db_, "cf1") +
-                  GetNumberOfSstFilesForColumnFamily(db_, "cf2"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "default") +
+                  GetNumberOfSstFilesForColumnFamily(db_.get(), "cf1") +
+                  GetNumberOfSstFilesForColumnFamily(db_.get(), "cf2"),
               static_cast<uint64_t>(1));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db2, "default"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db2.get(), "default"),
               static_cast<uint64_t>(0));
   }
 
@@ -553,13 +591,13 @@ TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
   ASSERT_OK(Put(2, Key(1), DummyString(1), wo));
   wait_flush();
   {
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "default"),
               static_cast<uint64_t>(1));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "cf1"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "cf1"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "cf2"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "cf2"),
               static_cast<uint64_t>(1));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db2, "default"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db2.get(), "default"),
               static_cast<uint64_t>(0));
   }
 
@@ -568,19 +606,19 @@ TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
   wait_flush();
   ASSERT_OK(db2->Put(wo, Key(1), DummyString(1)));
   wait_flush();
-  ASSERT_OK(static_cast<DBImpl*>(db2)->TEST_WaitForFlushMemTable());
+  ASSERT_OK(static_cast<DBImpl*>(db2.get())->TEST_WaitForFlushMemTable());
   {
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "default"),
               static_cast<uint64_t>(1));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "cf1"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "cf1"),
               static_cast<uint64_t>(0));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "cf2"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_.get(), "cf2"),
               static_cast<uint64_t>(1));
-    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db2, "default"),
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db2.get(), "default"),
               static_cast<uint64_t>(1));
   }
 
-  delete db2;
+  db2.reset();
   ASSERT_OK(DestroyDB(dbname2, options));
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
@@ -785,7 +823,7 @@ TEST_F(DBTest2, WalFilterTest) {
     while (true) {
       // Ensure that expected keys exists
       // and not expected keys don't exist after recovery
-      ValidateKeyExistence(db_, keys_must_exist, keys_must_not_exist);
+      ValidateKeyExistence(db_.get(), keys_must_exist, keys_must_not_exist);
 
       if (checked_after_reopen) {
         break;
@@ -922,7 +960,7 @@ TEST_F(DBTest2, WalFilterTestWithChangeBatch) {
   while (true) {
     // Ensure that expected keys exists
     // and not expected keys don't exist after recovery
-    ValidateKeyExistence(db_, keys_must_exist, keys_must_not_exist);
+    ValidateKeyExistence(db_.get(), keys_must_exist, keys_must_not_exist);
 
     if (checked_after_reopen) {
       break;
@@ -1004,7 +1042,7 @@ TEST_F(DBTest2, WalFilterTestWithChangeBatchExtraKeys) {
     }
   }
 
-  ValidateKeyExistence(db_, keys_must_exist, keys_must_not_exist);
+  ValidateKeyExistence(db_.get(), keys_must_exist, keys_must_not_exist);
 }
 
 TEST_F(DBTest2, WalFilterTestWithColumnFamilies) {
@@ -1292,7 +1330,7 @@ TEST_F(DBTest2, DuplicateSnapshot) {
   Options options;
   options = CurrentOptions(options);
   std::vector<const Snapshot*> snapshots;
-  DBImpl* dbi = static_cast_with_check<DBImpl>(db_);
+  DBImpl* dbi = dbfull();
   SequenceNumber oldest_ww_snap, first_ww_snap;
 
   ASSERT_OK(Put("k", "v"));  // inc seq
@@ -3694,16 +3732,16 @@ TEST_F(DBTest2, TraceAndReplay) {
 
   // Using a different name than db2, to pacify infer's use-after-lifetime
   // warnings (http://fbinfer.com).
-  DB* db2_init = nullptr;
+  std::unique_ptr<DB> db2_init;
   options.create_if_missing = true;
   ASSERT_OK(DB::Open(options, dbname2, &db2_init));
   ColumnFamilyHandle* cf;
   ASSERT_OK(
       db2_init->CreateColumnFamily(ColumnFamilyOptions(), "pikachu", &cf));
   delete cf;
-  delete db2_init;
+  db2_init.reset();
 
-  DB* db2 = nullptr;
+  std::unique_ptr<DB> db2;
   std::vector<ColumnFamilyDescriptor> column_families;
   ColumnFamilyOptions cf_options;
   cf_options.merge_operator = MergeOperators::CreatePutOperator();
@@ -3790,7 +3828,7 @@ TEST_F(DBTest2, TraceAndReplay) {
   for (auto handle : handles) {
     delete handle;
   }
-  delete db2;
+  db2.reset();
   ASSERT_OK(DestroyDB(dbname2, options));
 }
 
@@ -3885,16 +3923,16 @@ TEST_F(DBTest2, TraceAndManualReplay) {
 
   // Using a different name than db2, to pacify infer's use-after-lifetime
   // warnings (http://fbinfer.com).
-  DB* db2_init = nullptr;
+  std::unique_ptr<DB> db2_init;
   options.create_if_missing = true;
   ASSERT_OK(DB::Open(options, dbname2, &db2_init));
   ColumnFamilyHandle* cf;
   ASSERT_OK(
       db2_init->CreateColumnFamily(ColumnFamilyOptions(), "pikachu", &cf));
   delete cf;
-  delete db2_init;
+  db2_init.reset();
 
-  DB* db2 = nullptr;
+  std::unique_ptr<DB> db2;
   std::vector<ColumnFamilyDescriptor> column_families;
   ColumnFamilyOptions cf_options;
   cf_options.merge_operator = MergeOperators::CreatePutOperator();
@@ -4130,7 +4168,7 @@ TEST_F(DBTest2, TraceAndManualReplay) {
   for (auto handle : handles) {
     delete handle;
   }
-  delete db2;
+  db2.reset();
   ASSERT_OK(DestroyDB(dbname2, options));
 }
 
@@ -4161,16 +4199,16 @@ TEST_F(DBTest2, TraceWithLimit) {
 
   // Using a different name than db2, to pacify infer's use-after-lifetime
   // warnings (http://fbinfer.com).
-  DB* db2_init = nullptr;
+  std::unique_ptr<DB> db2_init;
   options.create_if_missing = true;
   ASSERT_OK(DB::Open(options, dbname2, &db2_init));
   ColumnFamilyHandle* cf;
   ASSERT_OK(
       db2_init->CreateColumnFamily(ColumnFamilyOptions(), "pikachu", &cf));
   delete cf;
-  delete db2_init;
+  db2_init.reset();
 
-  DB* db2 = nullptr;
+  std::unique_ptr<DB> db2;
   std::vector<ColumnFamilyDescriptor> column_families;
   ColumnFamilyOptions cf_options;
   cf_options.merge_operator = MergeOperators::CreatePutOperator();
@@ -4203,7 +4241,7 @@ TEST_F(DBTest2, TraceWithLimit) {
   for (auto handle : handles) {
     delete handle;
   }
-  delete db2;
+  db2.reset();
   ASSERT_OK(DestroyDB(dbname2, options));
 }
 
@@ -4235,16 +4273,16 @@ TEST_F(DBTest2, TraceWithSampling) {
 
   // Using a different name than db2, to pacify infer's use-after-lifetime
   // warnings (http://fbinfer.com).
-  DB* db2_init = nullptr;
+  std::unique_ptr<DB> db2_init;
   options.create_if_missing = true;
   ASSERT_OK(DB::Open(options, dbname2, &db2_init));
   ColumnFamilyHandle* cf;
   ASSERT_OK(
       db2_init->CreateColumnFamily(ColumnFamilyOptions(), "pikachu", &cf));
   delete cf;
-  delete db2_init;
+  db2_init.reset();
 
-  DB* db2 = nullptr;
+  std::unique_ptr<DB> db2;
   std::vector<ColumnFamilyDescriptor> column_families;
   ColumnFamilyOptions cf_options;
   column_families.emplace_back("default", cf_options);
@@ -4279,7 +4317,7 @@ TEST_F(DBTest2, TraceWithSampling) {
   for (auto handle : handles) {
     delete handle;
   }
-  delete db2;
+  db2.reset();
   ASSERT_OK(DestroyDB(dbname2, options));
 }
 
@@ -4339,16 +4377,16 @@ TEST_F(DBTest2, TraceWithFilter) {
 
   // Using a different name than db2, to pacify infer's use-after-lifetime
   // warnings (http://fbinfer.com).
-  DB* db2_init = nullptr;
+  std::unique_ptr<DB> db2_init;
   options.create_if_missing = true;
   ASSERT_OK(DB::Open(options, dbname2, &db2_init));
   ColumnFamilyHandle* cf;
   ASSERT_OK(
       db2_init->CreateColumnFamily(ColumnFamilyOptions(), "pikachu", &cf));
   delete cf;
-  delete db2_init;
+  db2_init.reset();
 
-  DB* db2 = nullptr;
+  std::unique_ptr<DB> db2;
   std::vector<ColumnFamilyDescriptor> column_families;
   ColumnFamilyOptions cf_options;
   cf_options.merge_operator = MergeOperators::CreatePutOperator();
@@ -4384,28 +4422,28 @@ TEST_F(DBTest2, TraceWithFilter) {
   for (auto handle : handles) {
     delete handle;
   }
-  delete db2;
+  db2.reset();
   ASSERT_OK(DestroyDB(dbname2, options));
 
   // Set up a new db.
   std::string dbname3 = test::PerThreadDBPath(env_, "db_not_trace_read");
   ASSERT_OK(DestroyDB(dbname3, options));
 
-  DB* db3_init = nullptr;
+  std::unique_ptr<DB> db3_init;
   options.create_if_missing = true;
   ColumnFamilyHandle* cf3;
   ASSERT_OK(DB::Open(options, dbname3, &db3_init));
   ASSERT_OK(
       db3_init->CreateColumnFamily(ColumnFamilyOptions(), "pikachu", &cf3));
   delete cf3;
-  delete db3_init;
+  db3_init.reset();
 
   column_families.clear();
   column_families.emplace_back("default", cf_options);
   column_families.emplace_back("pikachu", ColumnFamilyOptions());
   handles.clear();
 
-  DB* db3 = nullptr;
+  std::unique_ptr<DB> db3;
   ASSERT_OK(DB::Open(db_opts, dbname3, column_families, &handles, &db3));
 
   env_->SleepForMicroseconds(100);
@@ -4435,7 +4473,7 @@ TEST_F(DBTest2, TraceWithFilter) {
   for (auto handle : handles) {
     delete handle;
   }
-  delete db3;
+  db3.reset();
   ASSERT_OK(DestroyDB(dbname3, options));
 
   std::unique_ptr<TraceReader> trace_reader3;
@@ -4626,7 +4664,7 @@ TEST_F(DBTest2, TestGetColumnFamilyHandleUnlocked) {
   CreateColumnFamilies({"test1", "test2"}, Options());
   ASSERT_EQ(handles_.size(), 2);
 
-  DBImpl* dbi = static_cast_with_check<DBImpl>(db_);
+  DBImpl* dbi = dbfull();
   port::Thread user_thread1([&]() {
     auto cfh = dbi->GetColumnFamilyHandleUnlocked(handles_[0]->GetID());
     ASSERT_EQ(cfh->GetID(), handles_[0]->GetID());
@@ -4830,7 +4868,7 @@ TEST_F(DBTest2, MultiDBParallelOpenTest) {
 
   // Verify empty DBs can be created in parallel
   std::vector<std::thread> open_threads;
-  std::vector<DB*> dbs{static_cast<unsigned int>(kNumDbs), nullptr};
+  std::vector<std::unique_ptr<DB>> dbs(kNumDbs);
   options.create_if_missing = true;
   for (int i = 0; i < kNumDbs; ++i) {
     open_threads.emplace_back(
@@ -4845,7 +4883,7 @@ TEST_F(DBTest2, MultiDBParallelOpenTest) {
   for (int i = 0; i < kNumDbs; ++i) {
     open_threads[i].join();
     ASSERT_OK(dbs[i]->Put(WriteOptions(), "xi", "gua"));
-    delete dbs[i];
+    dbs[i].reset();
   }
 
   // Verify non-empty DBs can be recovered in parallel
@@ -4861,7 +4899,7 @@ TEST_F(DBTest2, MultiDBParallelOpenTest) {
   // Wait and cleanup
   for (int i = 0; i < kNumDbs; ++i) {
     open_threads[i].join();
-    delete dbs[i];
+    dbs[i].reset();
     ASSERT_OK(DestroyDB(dbnames[i], options));
   }
 }
@@ -4922,8 +4960,7 @@ TEST_F(DBTest2, CloseWithUnreleasedSnapshot) {
   ASSERT_NOK(db_->Close());
   db_->ReleaseSnapshot(ss);
   ASSERT_OK(db_->Close());
-  delete db_;
-  db_ = nullptr;
+  db_.reset();
 }
 
 TEST_F(DBTest2, PrefixBloomReseek) {
@@ -6544,6 +6581,9 @@ TEST_F(DBTest2, LastLevelStatistics) {
 
     DestroyAndReopen(options);
 
+    get_iostats_context()->Reset();
+    IOStatsContext* iostats = get_iostats_context();
+
     // generate 1 sst on level 0
     ASSERT_OK(Put("foo1", "bar"));
     ASSERT_OK(Put("bar", "bar"));
@@ -6644,7 +6684,85 @@ TEST_F(DBTest2, LastLevelStatistics) {
     // Control
     ASSERT_NE(options.statistics->getTickerCount(LAST_LEVEL_READ_COUNT),
               options.statistics->getTickerCount(NON_LAST_LEVEL_READ_COUNT));
+
+    // Control: unknown temperature iostats should be zero since files have
+    // explicit temperatures (mapped or written)
+    EXPECT_EQ(
+        iostats->file_io_stats_by_temperature.unknown_non_last_level_bytes_read,
+        0);
+    EXPECT_EQ(
+        iostats->file_io_stats_by_temperature.unknown_non_last_level_read_count,
+        0);
+    EXPECT_EQ(
+        iostats->file_io_stats_by_temperature.unknown_last_level_bytes_read, 0);
+    EXPECT_EQ(
+        iostats->file_io_stats_by_temperature.unknown_last_level_read_count, 0);
   }
+}
+
+// Test the iostats for files with Temperature::kUnknown that is not mapped
+// to another temperature. These stats are used to indicate which non-tiered
+// workloads are most promising for tiering (so this test doesn't set
+// temperatures).
+TEST_F(DBTest2, UnknownLastLevelStatistics) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  BlockBasedTableOptions bbto;
+  bbto.no_block_cache = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+
+  DestroyAndReopen(options);
+
+  get_iostats_context()->Reset();
+  IOStatsContext* iostats = get_iostats_context();
+
+  // Generate 1 sst file on level 0 with kUnknown temperature
+  ASSERT_OK(Put("foo", "bar"));
+  ASSERT_OK(Flush());
+
+  // Read from the kUnknown file on non-last level
+  ASSERT_EQ("bar", Get("foo"));
+
+  // Verify unknown_non_last_level stats are populated
+  EXPECT_GT(
+      iostats->file_io_stats_by_temperature.unknown_non_last_level_bytes_read,
+      0);
+  EXPECT_GT(
+      iostats->file_io_stats_by_temperature.unknown_non_last_level_read_count,
+      0);
+  // No reads from last level yet
+  EXPECT_EQ(iostats->file_io_stats_by_temperature.unknown_last_level_bytes_read,
+            0);
+  EXPECT_EQ(iostats->file_io_stats_by_temperature.unknown_last_level_read_count,
+            0);
+
+  // Compact to the last level (level 6) explicitly using MoveFilesToLevel
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  MoveFilesToLevel(6);
+
+  // Reopen DB to ensure table cache is cleared and files are re-opened
+  // with correct is_last_level flag
+  Reopen(options);
+
+  // Reset iostats to measure only the following reads
+  get_iostats_context()->Reset();
+
+  // Read from the file now on last level (still kUnknown since
+  // last_level_temperature is not set)
+  ASSERT_EQ("bar", Get("foo"));
+
+  // Verify unknown_last_level stats are populated
+  EXPECT_GT(iostats->file_io_stats_by_temperature.unknown_last_level_bytes_read,
+            0);
+  EXPECT_GT(iostats->file_io_stats_by_temperature.unknown_last_level_read_count,
+            0);
+  // No new reads from non-last level
+  EXPECT_EQ(
+      iostats->file_io_stats_by_temperature.unknown_non_last_level_bytes_read,
+      0);
+  EXPECT_EQ(
+      iostats->file_io_stats_by_temperature.unknown_non_last_level_read_count,
+      0);
 }
 
 TEST_F(DBTest2, CheckpointFileTemperature) {
@@ -6693,7 +6811,7 @@ TEST_F(DBTest2, CheckpointFileTemperature) {
 
   test_fs->PopRequestedSstFileTemperatures();
   Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(
       checkpoint->CreateCheckpoint(dbname_ + kFilePathSeparator + "tempcp"));
 
@@ -7455,7 +7573,7 @@ TEST_F(DBTest2, GetFileChecksumsFromCurrentManifest_CRC32) {
   opts.level0_file_num_compaction_trigger = 10;
 
   // Bootstrap the test database.
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::string dbname = test::PerThreadDBPath("file_chksum");
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
@@ -7489,8 +7607,7 @@ TEST_F(DBTest2, GetFileChecksumsFromCurrentManifest_CRC32) {
   db->GetLiveFilesMetaData(&live_files);
 
   ASSERT_OK(db->Close());
-  delete db;
-  db = nullptr;
+  db.reset();
 
   // Process current MANIFEST file and build internal file checksum mappings.
   std::unique_ptr<FileChecksumList> checksum_list(NewFileChecksumList());
