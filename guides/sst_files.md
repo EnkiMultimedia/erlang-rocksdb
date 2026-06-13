@@ -242,7 +242,7 @@ ok = rocksdb:ingest_external_file(Db, ["/tmp/data1.sst", "/tmp/data2.sst"], []),
 ### Ingesting into Column Families
 
 ```erlang
-{ok, Db, [_DefaultCf, DataCf]} = rocksdb:open_with_cf(
+{ok, Db, [_DefaultCf, DataCf]} = rocksdb:open(
     "/tmp/mydb",
     [{create_if_missing, true}, {create_missing_column_families, true}],
     [{"default", []}, {"data", []}]

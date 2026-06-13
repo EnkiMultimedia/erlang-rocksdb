@@ -99,11 +99,11 @@ iterator_with_batch_test() ->
   Db = destroy_reopen("test.db", [{create_if_missing, true}]),
   Db1 = destroy_reopen("test1.db", [{create_if_missing, true}]),
 
-  ok = rocksdb:write(Db, [{put, <<"a">>, <<"v1">>},
+  ok = rocksdb_test_util:write(Db, [{put, <<"a">>, <<"v1">>},
     {put, <<"b">>, <<"v2">>}], []),
   ?assertEqual(2, rocksdb:get_latest_sequence_number(Db)),
 
-  ok = rocksdb:write(Db, [{put, <<"c">>, <<"v3">>}, {delete, <<"a">>}], []),
+  ok = rocksdb_test_util:write(Db, [{put, <<"c">>, <<"v3">>}, {delete, <<"a">>}], []),
 
   ?assertEqual(4, rocksdb:get_latest_sequence_number(Db)),
 
@@ -139,10 +139,10 @@ iterator_with_batch2_test() ->
   W1 = [{put, <<"a">>, <<"v1">>}, {put, <<"b">>, <<"v2">>}, {put, <<"c">>, <<"v3">>}],
   W2 = [{put, <<"d">>, <<"v4">>}, {delete, <<"a">>}, {single_delete, <<"c">>}],
 
-  ok = rocksdb:write(Db, W1, []),
+  ok = rocksdb_test_util:write(Db, W1, []),
   ?assertEqual(3, rocksdb:get_latest_sequence_number(Db)),
 
-  ok = rocksdb:write(Db, W2, []),
+  ok = rocksdb_test_util:write(Db, W2, []),
 
   ?assertEqual(6, rocksdb:get_latest_sequence_number(Db)),
 

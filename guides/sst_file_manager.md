@@ -11,7 +11,7 @@ The SST File Manager provides control over disk space usage and SST file deletio
 
 ```erlang
 %% Create with default options
-{ok, Env} = rocksdb:default_env(),
+{ok, Env} = rocksdb:new_env(default),
 {ok, Mgr} = rocksdb:new_sst_file_manager(Env).
 
 %% Create with options
@@ -28,7 +28,7 @@ Options = [
 Pass the SST File Manager when opening a database:
 
 ```erlang
-{ok, Env} = rocksdb:default_env(),
+{ok, Env} = rocksdb:new_env(default),
 {ok, Mgr} = rocksdb:new_sst_file_manager(Env),
 
 DbOptions = [
@@ -119,7 +119,7 @@ ok = rocksdb:release_sst_file_manager(Mgr).
 
 ```erlang
 disk_space_management() ->
-    {ok, Env} = rocksdb:default_env(),
+    {ok, Env} = rocksdb:new_env(default),
 
     %% Create manager with rate limiting
     {ok, Mgr} = rocksdb:new_sst_file_manager(Env, [

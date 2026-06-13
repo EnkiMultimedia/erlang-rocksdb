@@ -20,7 +20,7 @@
 
 basic_test() ->
     Sz = 64 bsl 20,
-    {ok, Cache} = rocksdb:new_lru_cache(1024*1024*128),
+    {ok, Cache} = rocksdb:new_cache(lru, 1024*1024*128),
     {ok, Mgr} = rocksdb:new_write_buffer_manager(Sz, Cache),
     Sz = rocksdb:write_buffer_manager_info(Mgr, buffer_size),
     true = rocksdb:write_buffer_manager_info(Mgr, enabled),

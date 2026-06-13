@@ -38,7 +38,7 @@ basic_test() ->
     ok = rocksdb:release_sst_file_manager(Mgr2).
 
 simple_options_test() ->
-  {ok, Env} = rocksdb:default_env(),
+  {ok, Env} = rocksdb:new_env(default),
   {ok, Mgr} = rocksdb:new_sst_file_manager(Env),
   Options = [{create_if_missing, true}, {env, Env}, {sst_file_manager, Mgr}],
 
@@ -56,7 +56,7 @@ simple_options_test() ->
   ok.
 
 tracked_files_test() ->
-  {ok, Env} = rocksdb:default_env(),
+  {ok, Env} = rocksdb:new_env(default),
   {ok, Mgr} = rocksdb:new_sst_file_manager(Env),
   Options = [{create_if_missing, true}, {env, Env}, {sst_file_manager, Mgr}],
   {ok, Db} = rocksdb:open("rocksdb_tracked_files.test", Options),

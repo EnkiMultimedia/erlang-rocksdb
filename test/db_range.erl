@@ -26,7 +26,7 @@ delete_range_test() ->
     ok = rocksdb:delete_range(Ref, <<"b">>, <<"e">>, []),
 
     [<<"a">>, <<"e">>] = lists:reverse(
-      rocksdb:fold_keys(
+      rocksdb_test_util:fold_keys(
         Ref,
         fun(K, Acc) -> [K | Acc] end,
         [],
@@ -53,7 +53,7 @@ cf_delete_range_test() ->
     ok = rocksdb:delete_range(Ref, TestH, <<"b">>, <<"e">>, []),
 
     [<<"a">>, <<"e">>] = lists:reverse(
-      rocksdb:fold_keys(
+      rocksdb_test_util:fold_keys(
         Ref,
         TestH,
         fun(K, Acc) -> [K | Acc] end,

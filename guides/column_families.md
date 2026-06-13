@@ -11,29 +11,26 @@ Column Families provide a way to logically partition the database. Some interest
 
 ```erlang
 ColumnFamilies = [{"default", []}],
-{ok, Db, [DefaultH]} = rocksdb:open_with_cf("test.db", [{create_if_missing, true}], ColumnFamilies),
+{ok, Db, [DefaultH]} = rocksdb:open("test.db", [{create_if_missing, true}], ColumnFamilies),
 ok = rocksdb:put(Db, DefaultH, <<"a">>, <<"a1">>, []),
 {ok,  <<"a1">>} = rocksdb:get(Db, DefaultH, <<"a">>, []),
 ok = rocksdb:put(Db, DefaultH, <<"b">>, <<"b1">>, []),
 {ok, <<"b1">>} = rocksdb:get(Db, DefaultH, <<"b">>, []),
-?assertEqual(2, rocksdb:count(Db,DefaultH)),
 
 ok = rocksdb:delete(Db, DefaultH, <<"b">>, []),
 not_found = rocksdb:get(Db, DefaultH, <<"b">>, []),
-?assertEqual(1, rocksdb:count(Db, DefaultH)),
 
 {ok, TestH} = rocksdb:create_column_family(Db, "test", []),
 rocksdb:put(Db, TestH, <<"a">>, <<"a2">>, []),
 {ok,  <<"a1">>} = rocksdb:get(Db, DefaultH, <<"a">>, []),
 {ok,  <<"a2">>} = rocksdb:get(Db, TestH, <<"a">>, []),
-?assertEqual(1, rocksdb:count(Db, TestH)),
 rocksdb:close(Db)
 ```
 
 ## iterator operations
 
 ```erlang
-{ok, Ref, [DefaultH]} = rocksdb:open_with_cf("ltest", [{create_if_missing, true}], [{"default", []}]),
+{ok, Ref, [DefaultH]} = rocksdb:open("ltest", [{create_if_missing, true}], [{"default", []}]),
 {ok, TestH} = rocksdb:create_column_family(Ref, "test", []),
 try
 rocksdb:put(Ref, DefaultH, <<"a">>, <<"x">>, []),

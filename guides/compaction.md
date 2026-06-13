@@ -56,7 +56,17 @@ FIFO compaction deletes oldest files when size limit is reached. Works well with
 
 Best for: Time-series data, logs, or cache-like workloads.
 
+Since RocksDB 11.0 the FIFO options also accept `max_data_files_size` (trim
+based on combined SST and blob file sizes) and `use_kv_ratio_compaction` (a
+capacity-derived intra-L0 strategy, which requires `max_data_files_size > 0`).
+
 ## Manual Compaction
+
+### Aborting compactions
+
+`abort_all_compactions/1` (RocksDB 11.0) actively cancels running and scheduled
+compactions; aborted work reports a `kCompactionAborted` status. Resume with
+`resume_all_compactions/1`, which must be called as many times as it was aborted.
 
 Use `compact_range/4` or `compact_range/5` to trigger compaction manually.
 

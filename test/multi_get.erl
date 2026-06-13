@@ -88,7 +88,7 @@ empty_test() ->
 %% Test multi_get with column family
 column_family_test() ->
   ?rm_rf("test_multi_get_cf"),
-  {ok, Db, [_DefaultCf, Cf1]} = rocksdb:open_with_cf(
+  {ok, Db, [_DefaultCf, Cf1]} = rocksdb:open(
     "test_multi_get_cf",
     [{create_if_missing, true}, {create_missing_column_families, true}],
     [{"default", []}, {"cf1", []}]),

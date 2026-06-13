@@ -273,12 +273,14 @@ bool TickerAtomToEnum(ERL_NIF_TERM atom, rocksdb::Tickers* ticker)
     }
     else if (atom == ATOM_BLOB_DB_WRITE_INLINED)
     {
-        *ticker = rocksdb::BLOB_DB_WRITE_INLINED;
+        // Renamed to *_DEPRECATED in RocksDB 11.x; no longer populated (always 0).
+        *ticker = rocksdb::BLOB_DB_WRITE_INLINED_DEPRECATED;
         return true;
     }
     else if (atom == ATOM_BLOB_DB_WRITE_INLINED_TTL)
     {
-        *ticker = rocksdb::BLOB_DB_WRITE_INLINED_TTL;
+        // Renamed to *_DEPRECATED in RocksDB 11.x; no longer populated (always 0).
+        *ticker = rocksdb::BLOB_DB_WRITE_INLINED_TTL_DEPRECATED;
         return true;
     }
     else if (atom == ATOM_BLOB_DB_WRITE_BLOB)

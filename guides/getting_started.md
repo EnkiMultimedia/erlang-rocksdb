@@ -105,18 +105,15 @@ rocksdb:release_snapshot(Snapshot).
 
 ### Atomic Updates
 
-Note that if the process dies after the Put of key2 but before the delete of key1, the same value may be left stored under multiple keys. Such problems can be avoided by using the function `rocksdb:write/3` class to atomically apply a set of updates:
+Note that if the process dies after the Put of key2 but before the delete of key1, the same value may be left stored under multiple keys. Such problems can be avoided by using the [Batch API](batch_api.md) to atomically apply a set of updates:
 
 ```erlang
-Batch = [
-  {put, <<"key1">>, <<"value1">>},
-  {delete, <<"keytodelete">>},
-  ...
-],
-rocksdb:write(DB, Batch, [])
+{ok, Batch} = rocksdb:batch(),
+ok = rocksdb:batch_put(Batch, <<"key1">>, <<"value1">>),
+ok = rocksdb:batch_delete(Batch, <<"keytodelete">>),
+ok = rocksdb:write_batch(DB, Batch, []),
+ok = rocksdb:release_batch(Batch).
 ```
-
-You can also use the [Batch API](batch_api.md) that gives you more control about the atomic transactions.
 
 ### Synchronous writes
 

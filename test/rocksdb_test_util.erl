@@ -6,6 +6,13 @@
 -export([rm_rf/1,
          sh/2]).
 
+%% Helpers replacing the deprecated rocksdb convenience functions
+%% (count/fold/fold_keys/write) removed in 3.0.0.
+-export([count/1, count/2,
+         fold/4, fold/5,
+         fold_keys/4, fold_keys/5,
+         write/3]).
+
 -define(FAIL, abort()).
 -define(ABORT(Str, Args), abort(Str, Args)).
 
@@ -227,4 +234,90 @@ abort() ->
 abort(String, Args) ->
   ?ERROR(String, Args),
   abort().
+
+%% ===================================================================
+%% Replacements for removed deprecated rocksdb convenience functions
+%% ===================================================================
+
+count(DBHandle) ->
+  count_1(rocksdb:get_property(DBHandle, <<"rocksdb.estimate-num-keys">>)).
+
+count(DBHandle, CFHandle) ->
+  count_1(rocksdb:get_property(DBHandle, CFHandle, <<"rocksdb.estimate-num-keys">>)).
+
+count_1({ok, BinCount}) -> erlang:binary_to_integer(BinCount);
+count_1(Error) -> Error.
+
+fold(DBHandle, Fun, Acc0, ReadOpts) ->
+  {ok, Itr} = rocksdb:iterator(DBHandle, ReadOpts),
+  do_fold(Itr, Fun, Acc0).
+
+fold(DbHandle, CFHandle, Fun, Acc0, ReadOpts) ->
+  {ok, Itr} = rocksdb:iterator(DbHandle, CFHandle, ReadOpts),
+  do_fold(Itr, Fun, Acc0).
+
+fold_keys(DBHandle, UserFun, Acc0, ReadOpts) ->
+  WrapperFun = fun({K, _V}, Acc) -> UserFun(K, Acc);
+                  (Else, Acc) -> UserFun(Else, Acc) end,
+  {ok, Itr} = rocksdb:iterator(DBHandle, ReadOpts),
+  do_fold(Itr, WrapperFun, Acc0).
+
+fold_keys(DBHandle, CFHandle, UserFun, Acc0, ReadOpts) ->
+  WrapperFun = fun({K, _V}, Acc) -> UserFun(K, Acc);
+                  (Else, Acc) -> UserFun(Else, Acc) end,
+  {ok, Itr} = rocksdb:iterator(DBHandle, CFHandle, ReadOpts),
+  do_fold(Itr, WrapperFun, Acc0).
+
+do_fold(Itr, Fun, Acc0) ->
+  try
+    fold_loop(rocksdb:iterator_move(Itr, first), Itr, Fun, Acc0)
+  after
+    rocksdb:iterator_close(Itr)
+  end.
+
+fold_loop({error, iterator_closed}, _Itr, _Fun, Acc0) ->
+  throw({iterator_closed, Acc0});
+fold_loop({error, invalid_iterator}, _Itr, _Fun, Acc0) ->
+  Acc0;
+fold_loop({ok, K}, Itr, Fun, Acc0) ->
+  Acc = Fun(K, Acc0),
+  fold_loop(rocksdb:iterator_move(Itr, next), Itr, Fun, Acc);
+fold_loop({ok, K, V}, Itr, Fun, Acc0) ->
+  Acc = Fun({K, V}, Acc0),
+  fold_loop(rocksdb:iterator_move(Itr, next), Itr, Fun, Acc).
+
+write(DBHandle, WriteOps, WriteOpts) ->
+  {ok, Batch} = rocksdb:batch(),
+  try write_1(WriteOps, Batch, DBHandle, WriteOpts)
+  after rocksdb:release_batch(Batch)
+  end.
+
+write_1([{put, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
+  rocksdb:batch_put(Batch, Key, Value),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{put, CfHandle, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
+  rocksdb:batch_put(Batch, CfHandle, Key, Value),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{merge, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
+  rocksdb:batch_merge(Batch, Key, Value),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{merge, CfHandle, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
+  rocksdb:batch_merge(Batch, CfHandle, Key, Value),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{delete, Key} | Rest], Batch, DbHandle, WriteOpts) ->
+  rocksdb:batch_delete(Batch, Key),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{delete, CfHandle, Key} | Rest], Batch, DbHandle, WriteOpts) ->
+  rocksdb:batch_delete(Batch, CfHandle, Key),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{single_delete, Key} | Rest], Batch, DbHandle, WriteOpts) ->
+  rocksdb:batch_single_delete(Batch, Key),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([{single_delete, CfHandle, Key} | Rest], Batch, DbHandle, WriteOpts) ->
+  rocksdb:batch_single_delete(Batch, CfHandle, Key),
+  write_1(Rest, Batch, DbHandle, WriteOpts);
+write_1([_ | _], _Batch, _DbHandle, _WriteOpts) ->
+  erlang:error(badarg);
+write_1([], Batch, DbHandle, WriteOpts) ->
+  rocksdb:write_batch(DbHandle, Batch, WriteOpts).
 

@@ -341,7 +341,7 @@ When using column families, create one statistics object and share it:
 
 ```erlang
 {ok, Stats} = rocksdb:new_statistics(),
-{ok, Db, [DefaultCf, DataCf, IndexCf]} = rocksdb:open_with_cf(
+{ok, Db, [DefaultCf, DataCf, IndexCf]} = rocksdb:open(
     "my_db",
     [{create_if_missing, true}, {statistics, Stats}],
     [{"default", []}, {"data", []}, {"index", []}]

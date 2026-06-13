@@ -88,6 +88,30 @@ fifo_compaction_options_allow_compaction_settings_2_test() ->
   ?rm_rf(DbName).
 
 
+%% RocksDB 11.0: FIFO trimming based on combined SST + blob file sizes,
+%% plus capacity-derived intra-L0 compaction (use_kv_ratio_compaction, which
+%% requires max_data_files_size > 0).
+fifo_compaction_max_data_files_size_test() ->
+  DbName = "erocksdb.fifo.max_data_files_size",
+  ?rm_rf(DbName),
+  {ok, Db} = rocksdb:open(
+    DbName,
+    [
+        {create_if_missing, true},
+        {compaction_style, fifo},
+        {compaction_options_fifo, [
+            {max_table_files_size, 1048576},
+            {max_data_files_size, 4194304},
+            {use_kv_ratio_compaction, true}
+        ]}
+    ]
+  ),
+  [ok = rocksdb:put(Db, <<I:32>>, <<I:32>>, []) || I <- lists:seq(1, 100)],
+  {ok, <<1:32>>} = rocksdb:get(Db, <<1:32>>, []),
+  ok = rocksdb:close(Db),
+  rocksdb:destroy(DbName, []),
+  ?rm_rf(DbName).
+
 test_with_ttl(TTL) ->
   TTLAsList = integer_to_list(TTL),
   DbName = lists:concat(["erocksdb.fifo",".",TTLAsList]),

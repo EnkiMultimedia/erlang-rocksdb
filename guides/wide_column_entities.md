@@ -142,6 +142,14 @@ Wide-column entities are useful when:
 - Different keys may have different sets of columns
 - You need to update individual columns without rewriting the entire value
 
+## Blob storage
+
+Since RocksDB 11.0, when blob files are enabled (`enable_blob_files` with a
+`min_blob_size`), large wide-column values are stored in blob files instead of
+inline in the SST, reducing SST size and improving read performance. This is
+automatic: set the blob options on the column family and use `put_entity`/
+`get_entity` as usual.
+
 ## API Reference
 
 | Function | Description |
