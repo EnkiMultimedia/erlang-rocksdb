@@ -401,7 +401,13 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
   }
 
   if (result.max_compaction_bytes == 0) {
-    result.max_compaction_bytes = result.target_file_size_base * 25;
+    // For FIFO with use_kv_ratio_compaction, leave max_compaction_bytes as 0
+    // to signal "auto-calculate target from capacity and SST/blob ratio."
+    // When explicitly set by the user, it overrides the auto-calculated target.
+    if (result.compaction_style != kCompactionStyleFIFO ||
+        !result.compaction_options_fifo.use_kv_ratio_compaction) {
+      result.max_compaction_bytes = result.target_file_size_base * 25;
+    }
   }
 
   bool is_block_based_table = (result.table_factory->IsInstanceOf(
@@ -1248,7 +1254,7 @@ Compaction* ColumnFamilyData::PickCompaction(
   auto* result = compaction_picker_->PickCompaction(
       GetName(), mutable_options, mutable_db_options, existing_snapshots,
       snapshot_checker, current_->storage_info(), log_buffer,
-      require_max_output_level);
+      GetFullHistoryTsLow(), require_max_output_level);
   if (result != nullptr) {
     result->FinalizeInputInfo(current_);
   }
@@ -1336,7 +1342,7 @@ Compaction* ColumnFamilyData::CompactRange(
       GetName(), mutable_cf_options, mutable_db_options,
       current_->storage_info(), input_level, output_level,
       compact_range_options, begin, end, compaction_end, conflict,
-      max_file_num_to_ignore, trim_ts);
+      max_file_num_to_ignore, trim_ts, GetFullHistoryTsLow());
   if (result != nullptr) {
     result->FinalizeInputInfo(current_);
   }
@@ -1561,6 +1567,28 @@ Status ColumnFamilyData::ValidateOptions(
       db_options.max_open_files != -1 && cf_options.ttl > 0) {
     return Status::NotSupported(
         "FIFO compaction only supported with max_open_files = -1.");
+  }
+
+  if (db_options.open_files_async) {
+    // FIFO TTL picker relies on reading the files table properties inside a
+    // DB mutex. This can be slow if files are opened asynchronously, so we
+    // disable it.
+    //
+    // TODO: consider blocking fifo compaction until async file open task
+    // completes.
+    if (cf_options.compaction_style == kCompactionStyleFIFO) {
+      return Status::NotSupported(
+          "FIFO compaction is not supported with open_files_async = true.");
+    }
+    // Open files async is not useful if skip_stats_update_on_db_open=true
+    // because DB open will still block on IO.
+    //
+    // TODO: consider moving stats update inside async file open background
+    // task.
+    if (!db_options.skip_stats_update_on_db_open) {
+      return Status::InvalidArgument(
+          "open_files_async requires skip_stats_update_on_db_open = true.");
+    }
   }
 
   std::vector<uint32_t> supported{0, 1, 2, 4, 8};

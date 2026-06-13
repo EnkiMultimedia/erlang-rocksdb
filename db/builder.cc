@@ -56,6 +56,18 @@ TableBuilder* NewTableBuilder(const TableBuilderOptions& tboptions,
   return tboptions.moptions.table_factory->NewTableBuilder(tboptions, file);
 }
 
+void ExtractTimestampFromTableProperties(const TableProperties& tp,
+                                         FileMetaData* meta) {
+  auto min_ts_iter = tp.user_collected_properties.find("rocksdb.timestamp_min");
+  if (min_ts_iter != tp.user_collected_properties.end()) {
+    meta->min_timestamp = min_ts_iter->second;
+  }
+  auto max_ts_iter = tp.user_collected_properties.find("rocksdb.timestamp_max");
+  if (max_ts_iter != tp.user_collected_properties.end()) {
+    meta->max_timestamp = max_ts_iter->second;
+  }
+}
+
 Status BuildTable(
     const std::string& dbname, VersionSet* versions,
     const ImmutableDBOptions& db_options, const TableBuilderOptions& tboptions,
@@ -310,6 +322,8 @@ Status BuildTable(
     }
 
     TEST_SYNC_POINT("BuildTable:BeforeFinishBuildTable");
+    TEST_SYNC_POINT_CALLBACK("BuildTable:BeforeCheckEmpty",
+                             static_cast<TableBuilder*>(builder));
     const bool empty = builder->IsEmpty();
     if (flush_stats) {
       assert(c_iter.HasNumInputEntryScanned());
@@ -318,6 +332,14 @@ Status BuildTable(
     }
     if (!s.ok() || empty) {
       builder->Abandon();
+      // Propagate the builder's error when the builder is empty due to an
+      // internal error (e.g., write fault injection causing all Add() calls to
+      // return early). Without this, `s` would remain OK and the downstream
+      // key count validation in flush_job.cc would produce a misleading
+      // Corruption error instead of the actual builder error.
+      if (s.ok() && !builder->status().ok()) {
+        s = builder->status();
+      }
     } else {
       SeqnoToTimeMapping relevant_mapping;
       if (seqno_to_time_mapping) {
@@ -355,6 +377,7 @@ Status BuildTable(
       assert(meta->fd.GetFileSize() > 0);
       tp = builder
                ->GetTableProperties();  // refresh now that builder is finished
+      ExtractTimestampFromTableProperties(tp, meta);
       if (memtable_payload_bytes != nullptr &&
           memtable_garbage_bytes != nullptr) {
         const CompactionIterationStats& ci_stats = c_iter.iter_stats();

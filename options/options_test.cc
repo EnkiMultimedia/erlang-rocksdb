@@ -1752,6 +1752,19 @@ TEST_F(OptionsTest, MutableCFOptions) {
       config_options, cf_opts, {{"paranoid_file_checks", "false"}}, &cf_opts));
   ASSERT_EQ(cf_opts.paranoid_file_checks, false);
 
+  // Test verify_output_flags with kVerifyFileChecksum (bit 2)
+  // 2052 = 4 (kVerifyFileChecksum) | 2048 (kEnableForRemoteCompaction)
+  ASSERT_OK(GetColumnFamilyOptionsFromString(
+      config_options, cf_opts, "verify_output_flags=2052;", &cf_opts));
+  ASSERT_NE(
+      (cf_opts.verify_output_flags & VerifyOutputFlags::kVerifyFileChecksum),
+      VerifyOutputFlags::kVerifyNone);
+  ASSERT_NE((cf_opts.verify_output_flags &
+             VerifyOutputFlags::kEnableForRemoteCompaction),
+            VerifyOutputFlags::kVerifyNone);
+  ASSERT_EQ(
+      (cf_opts.verify_output_flags & VerifyOutputFlags::kVerifyBlockChecksum),
+      VerifyOutputFlags::kVerifyNone);
   // Should replace the factory with the new setting
   ASSERT_OK(GetColumnFamilyOptionsFromMap(
       config_options, cf_opts,
@@ -2417,6 +2430,7 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
       {"max_compaction_bytes", "21"},
       {"soft_rate_limit", "1.1"},
       {"hard_rate_limit", "2.1"},
+      {"snap_refresh_nanos", "1000000"},
       {"rate_limit_delay_max_milliseconds", "100"},
       {"hard_pending_compaction_bytes_limit", "211"},
       {"arena_block_size", "22"},

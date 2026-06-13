@@ -96,6 +96,7 @@ LIB_SOURCES =                                                   \
   db/version_edit.cc                                            \
   db/version_edit_handler.cc                                    \
   db/version_set.cc                                             \
+  db/version_util.cc                                            \
   db/wal_edit.cc                                                \
   db/wal_manager.cc                                             \
   db/wide/wide_column_serialization.cc                          \
@@ -182,6 +183,7 @@ LIB_SOURCES =                                                   \
   table/block_based/block_based_table_builder.cc                \
   table/block_based/block_based_table_factory.cc                \
   table/block_based/block_based_table_iterator.cc               \
+  table/block_based/multi_scan_index_iterator.cc                \
   table/block_based/block_based_table_reader.cc                 \
   table/block_based/block_builder.cc                            \
   table/block_based/block_cache.cc                              \
@@ -264,6 +266,7 @@ LIB_SOURCES =                                                   \
   util/string_util.cc                                           \
   util/thread_local.cc                                          \
   util/threadpool_imp.cc                                        \
+  util/io_dispatcher_imp.cc                                     \
   util/udt_util.cc                                              \
   util/write_batch_util.cc                                      \
   util/xxhash.cc                                                \
@@ -332,6 +335,9 @@ LIB_SOURCES =                                                   \
   utilities/transactions/write_unprepared_txn.cc                \
   utilities/transactions/write_unprepared_txn_db.cc             \
   utilities/ttl/db_ttl_impl.cc                                  \
+  utilities/trie_index/bitvector.cc                              \
+  utilities/trie_index/louds_trie.cc                             \
+  utilities/trie_index/trie_index_factory.cc                     \
   utilities/types_util.cc                                       \
   utilities/wal_filter.cc                                       \
   utilities/write_batch_with_index/write_batch_with_index.cc    \
@@ -489,6 +495,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/db_basic_test.cc                                                   \
   db/db_block_cache_test.cc                                             \
   db/db_bloom_filter_test.cc                                            \
+  db/db_compaction_abort_test.cc                                        \
   db/db_compaction_filter_test.cc                                       \
   db/db_compaction_test.cc                                              \
   db/db_clip_test.cc                                                    \
@@ -620,6 +627,7 @@ TEST_MAIN_SOURCES =                                                     \
   util/hash_test.cc                                                     \
   util/heap_test.cc                                                     \
   util/interval_test.cc                                                 \
+  util/io_dispatcher_test.cc                                            \
   util/random_test.cc                                                   \
   util/rate_limiter_test.cc                                             \
   util/repeatable_thread_test.cc                                        \
@@ -641,6 +649,7 @@ TEST_MAIN_SOURCES =                                                     \
   utilities/cassandra/cassandra_serialize_test.cc                       \
   utilities/checkpoint/checkpoint_test.cc                               \
   utilities/env_timed_test.cc                                           \
+  utilities/fault_injection_fs_test.cc                                  \
   utilities/memory/memory_test.cc                                       \
   utilities/merge_operators/string_append/stringappend_test.cc          \
   utilities/object_registry_test.cc                                     \
@@ -658,10 +667,13 @@ TEST_MAIN_SOURCES =                                                     \
   utilities/transactions/lock/point/point_lock_manager_test.cc          \
   utilities/transactions/lock/point/point_lock_manager_stress_test.cc   \
   utilities/transactions/write_prepared_transaction_test.cc             \
+  utilities/transactions/write_prepared_transaction_seqno_test.cc       \
   utilities/transactions/write_unprepared_transaction_test.cc           \
   utilities/transactions/write_committed_transaction_ts_test.cc         \
   utilities/transactions/timestamped_snapshot_test.cc                   \
   utilities/ttl/ttl_test.cc                                             \
+  utilities/trie_index/trie_index_db_test.cc                            \
+  utilities/trie_index/trie_index_test.cc                               \
   utilities/types_util_test.cc                                          \
   utilities/util_merge_operators_test.cc                                \
   utilities/write_batch_with_index/write_batch_with_index_test.cc       \

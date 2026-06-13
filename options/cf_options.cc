@@ -30,6 +30,7 @@
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
 #include "util/cast_util.h"
+#include "util/string_util.h"
 
 // NOTE: in this file, many option flags that were deprecated
 // and removed from the rest of the code have to be kept here
@@ -310,6 +311,14 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"trivial_copy_buffer_size",
          {offsetof(struct CompactionOptionsFIFO, trivial_copy_buffer_size),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"max_data_files_size",
+         {offsetof(struct CompactionOptionsFIFO, max_data_files_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"use_kv_ratio_compaction",
+         {offsetof(struct CompactionOptionsFIFO, use_kv_ratio_compaction),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}}};
 
 static std::unordered_map<std::string, OptionTypeInfo>
@@ -910,6 +919,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableCFOptions, cf_allow_ingest_behind),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"memtable_batch_lookup_optimization",
+         {offsetof(struct ImmutableCFOptions,
+                   memtable_batch_lookup_optimization),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
 };
 
 const std::string OptionsHelper::kCFOptionsName = "ColumnFamilyOptions";
@@ -1050,7 +1064,9 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       blob_cache(cf_options.blob_cache),
       persist_user_defined_timestamps(
           cf_options.persist_user_defined_timestamps),
-      cf_allow_ingest_behind(cf_options.cf_allow_ingest_behind) {}
+      cf_allow_ingest_behind(cf_options.cf_allow_ingest_behind),
+      memtable_batch_lookup_optimization(
+          cf_options.memtable_batch_lookup_optimization) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 
@@ -1259,6 +1275,10 @@ void MutableCFOptions::Dump(Logger* log) const {
                  compaction_options_fifo.max_table_files_size);
   ROCKS_LOG_INFO(log, "compaction_options_fifo.allow_compaction : %d",
                  compaction_options_fifo.allow_compaction);
+  ROCKS_LOG_INFO(log, "compaction_options_fifo.max_data_files_size : %" PRIu64,
+                 compaction_options_fifo.max_data_files_size);
+  ROCKS_LOG_INFO(log, "compaction_options_fifo.use_kv_ratio_compaction : %d",
+                 compaction_options_fifo.use_kv_ratio_compaction);
 
   // Blob file related options
   ROCKS_LOG_INFO(log, "                        enable_blob_files: %s",
