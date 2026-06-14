@@ -49,7 +49,8 @@ filter_key_prefix_test() ->
 
     %% Flush and compact with force to ensure filter runs on all data
     ok = rocksdb:flush(Db, []),
-    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+    timer:sleep(100),
+    ok = rocksdb:compact_range(Db, <<"keep_key">>, <<"tmp_key~">>, [{bottommost_level_compaction, force}]),
 
     %% Check results - tmp_ keys should be deleted
     TmpResult = rocksdb:get(Db, <<"tmp_key50">>, []),
@@ -96,7 +97,8 @@ filter_key_suffix_test() ->
 
     %% Flush and compact with force to ensure filter runs on all data
     ok = rocksdb:flush(Db, []),
-    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+    timer:sleep(100),
+    ok = rocksdb:compact_range(Db, <<"key">>, <<"key~">>, [{bottommost_level_compaction, force}]),
 
     %% Verify active keys are kept
     {ok, _} = rocksdb:get(Db, <<"key50_active">>, []),
@@ -196,7 +198,8 @@ filter_multiple_rules_test() ->
 
     %% Flush and compact with force to ensure filter runs on all data
     ok = rocksdb:flush(Db, []),
-    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+    timer:sleep(100),
+    ok = rocksdb:compact_range(Db, <<"keep">>, <<"tmp~">>, [{bottommost_level_compaction, force}]),
 
     %% Verify kept keys are still there
     {ok, _} = rocksdb:get(Db, <<"keep_key50">>, []),
@@ -240,7 +243,8 @@ filter_ttl_from_key_test() ->
 
     %% Flush and force compaction
     ok = rocksdb:flush(Db, []),
-    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+    timer:sleep(100),
+    ok = rocksdb:compact_range(Db, <<ExpiredTs:64/big>>, <<ValidTs:64/big, 255>>, [{bottommost_level_compaction, force}]),
 
     %% ASSERT: Valid keys should remain
     ValidKey1 = <<ValidTs:64/big, "valid_data1">>,
@@ -294,7 +298,8 @@ filter_erlang_handler_test() ->
 
     %% Flush and force compaction
     ok = rocksdb:flush(Db, []),
-    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+    timer:sleep(100),
+    ok = rocksdb:compact_range(Db, <<"delete">>, <<"keep~">>, [{bottommost_level_compaction, force}]),
 
     %% Wait for handler to process and collect total processed count
     TotalProcessed = collect_handler_processed(0, 2000),
@@ -451,7 +456,8 @@ filter_handler_change_value_test() ->
 
     %% Flush and force compaction
     ok = rocksdb:flush(Db, []),
-    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+    timer:sleep(100),
+    ok = rocksdb:compact_range(Db, <<"normal">>, <<"transform~">>, [{bottommost_level_compaction, force}]),
 
     %% Wait for handler to process
     TotalProcessed = collect_handler_processed(0, 2000),
@@ -588,7 +594,8 @@ filter_key_contains_test() ->
 
     %% Flush and force compaction
     ok = rocksdb:flush(Db, []),
-    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+    timer:sleep(100),
+    ok = rocksdb:compact_range(Db, <<"user">>, <<"user~">>, [{bottommost_level_compaction, force}]),
 
     %% ASSERT: keys containing _session_ should be deleted
     not_found = rocksdb:get(Db, <<"user_session_50_data">>, []),
@@ -630,7 +637,8 @@ filter_value_prefix_test() ->
 
     %% Flush and force compaction
     ok = rocksdb:flush(Db, []),
-    ok = rocksdb:compact_range(Db, undefined, undefined, [{bottommost_level_compaction, force}]),
+    timer:sleep(100),
+    ok = rocksdb:compact_range(Db, <<"marked">>, <<"normal~">>, [{bottommost_level_compaction, force}]),
 
     %% ASSERT: keys with DELETED: value prefix should be removed
     not_found = rocksdb:get(Db, <<"marked_key50">>, []),
