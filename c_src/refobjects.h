@@ -328,6 +328,11 @@ public:
     rocksdb::Slice *upper_bound_slice;
     rocksdb::Slice *lower_bound_slice;
 
+    //!< erlang resources (column family, transaction) kept alive with
+    //!< enif_keep_resource so they cannot be garbage collected and freed
+    //!< while this iterator still references them. Released in ~ItrObject.
+    std::list<void *> m_KeptResources;
+
 protected:
     static ErlNifResourceType* m_Itr_RESOURCE;
 
@@ -354,6 +359,10 @@ public:
     void SetUpperBoundSlice(rocksdb::Slice*);
 
     void SetLowerBoundSlice(rocksdb::Slice*);
+
+    //!< Pin an erlang resource (e.g. column family, transaction) for this
+    //!< iterator's lifetime so GC cannot free it while the iterator uses it.
+    void KeepResource(void * Resource);
 };  // class ItrObject
 
 /**
