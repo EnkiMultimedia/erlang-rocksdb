@@ -1,3 +1,14 @@
+## erlang-rocksdb 3.1.0, released on 2026/06/15
+
+### New Features
+
+- add an AES-256-CTR encrypted env: `new_env({encrypted, Key})` or `new_env(#{encrypted => Key})` with a 32-byte key encrypts all on-disk data transparently (requires OpenSSL). See the [Encrypted Env](encrypted_env.html) guide.
+
+### Bug Fixes
+
+- fix a use-after-free in column-family and transaction iterators: iterators now keep the borrowed column family or transaction alive for their lifetime
+- harden compaction filter tests against a compaction race
+
 ## erlang-rocksdb 3.0.0, released on 2026/06/13
 
 ### Breaking Changes
