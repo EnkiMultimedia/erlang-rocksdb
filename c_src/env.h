@@ -18,9 +18,12 @@
 #ifndef INCL_ENV_H
 #define INCL_ENV_H
 
+#include <memory>
+
 #include "erl_nif.h"
 
 #include "rocksdb/env.h"
+#include "rocksdb/env_encryption.h"
 
 
 namespace erocksdb {
@@ -32,18 +35,32 @@ namespace erocksdb {
     public:
       explicit ManagedEnv(rocksdb::Env * Env);
 
+      // Wrapper env that owns its base env (e.g. memenv, encrypted env).
+      // owns == true means the destructor will delete env_; the default env
+      // singleton must NEVER be deleted, so it is created with owns == false.
+      ManagedEnv(rocksdb::Env * Env, bool owns);
+
       ~ManagedEnv();
 
       const rocksdb::Env* env();
+
+      // Keep the encryption provider and cipher alive for the lifetime of the
+      // env. These are empty for non-encrypted envs.
+      void SetEncryption(std::shared_ptr<rocksdb::EncryptionProvider> provider,
+                         std::shared_ptr<rocksdb::BlockCipher> cipher);
 
       static void CreateEnvType(ErlNifEnv * Env);
       static void EnvResourceCleanup(ErlNifEnv *Env, void * Arg);
 
       static ManagedEnv * CreateEnvResource(rocksdb::Env * env);
+      static ManagedEnv * CreateEnvResource(rocksdb::Env * env, bool owns);
       static ManagedEnv * RetrieveEnvResource(ErlNifEnv * Env, const ERL_NIF_TERM & EnvTerm);
 
     private:
-      const rocksdb::Env* env_;
+      rocksdb::Env* env_;
+      bool owns_env_;
+      std::shared_ptr<rocksdb::EncryptionProvider> provider_;
+      std::shared_ptr<rocksdb::BlockCipher> cipher_;
   };
 
 }

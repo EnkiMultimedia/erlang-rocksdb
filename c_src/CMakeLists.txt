@@ -108,6 +108,9 @@ set(CMAKE_THREAD_PREFER_PTHREAD ON)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+# OpenSSL provides the AES-256 block transform used by the encrypted env.
+find_package(OpenSSL REQUIRED)
+
 option(WITH_CCACHE "Build with ccache." OFF)
 if(WITH_CCACHE)
   find_program(CCACHE_FOUND ccache)
@@ -281,6 +284,7 @@ target_sources(${ErlangRocksDBNIF_TARGET}
     ${CMAKE_CURRENT_SOURCE_DIR}/cache.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/statistics.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/counter_merge_operator.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/aes_block_cipher.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/env.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/erlang_merge.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/compaction_filter.cc
@@ -307,6 +311,7 @@ target_include_directories(${ErlangRocksDBNIF_TARGET}
     ${ZSTD_INCLUDE_DIR}
     ${LZ4_INCLUDE_DIR}
     ${SNAPPY_INCLUDE_DIR}
+    ${OPENSSL_INCLUDE_DIR}
     ${PROJECT_BINARY_DIR}
 )
 
@@ -342,6 +347,7 @@ target_link_libraries(
     ${BZIP2_LIBRARIES}
     ${ZLIB_LIBRARY}
     ${TBB_LIBRARIES}
+    OpenSSL::Crypto
     Threads::Threads
 )
 
