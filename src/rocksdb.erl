@@ -402,7 +402,9 @@
 
 -type column_family() :: cf_handle() | default_column_family.
 
--type env_type() :: default | memenv.
+-type env_type() :: default | memenv
+                  | {encrypted, Key :: <<_:256>>}
+                  | #{encrypted := Key :: <<_:256>>}.
 -opaque env() :: env_type() | env_handle().
 -type env_priority() :: priority_high | priority_low.
 
@@ -2272,6 +2274,16 @@ release_rate_limiter(_Limiter) ->
 new_env() -> new_env(default).
 
 %% @doc return a db environment
+%%
+%% `default' returns the shared process-wide environment. `memenv' returns an
+%% in-memory environment.
+%%
+%% `{encrypted, Key}' (or `#{encrypted => Key}') returns an environment that
+%% transparently encrypts all on-disk data with AES-256-CTR. `Key' must be a
+%% 32-byte binary. Pass the returned handle as `{env, Env}' in the open
+%% options. Wrong-key detection is checksum-based, not authenticated: reading
+%% with the wrong key yields garbage that RocksDB block checksums reject as a
+%% corruption error.
 -spec new_env(EnvType :: env_type()) -> {ok, env_handle()}.
 new_env(_EnvType) ->
   ?nif_stub.

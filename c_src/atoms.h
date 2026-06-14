@@ -41,6 +41,7 @@ extern ERL_NIF_TERM ATOM_UNDEFINED;
 // related to envs
 extern ERL_NIF_TERM ATOM_DEFAULT;
 extern ERL_NIF_TERM ATOM_MEMENV;
+extern ERL_NIF_TERM ATOM_ENCRYPTED;
 
 // cache
 extern ERL_NIF_TERM ATOM_LRU;
