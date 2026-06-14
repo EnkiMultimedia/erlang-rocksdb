@@ -165,10 +165,10 @@ Iterator(
 
     ItrObject * itr_ptr;
     rocksdb::Iterator * iterator;
+    ReferencePtr<ColumnFamilyObject> cf_ptr;
 
     if(argc==3)
     {
-        ReferencePtr<ColumnFamilyObject> cf_ptr;
         if(!enif_get_cf(env, argv[1], &cf_ptr))
         {
             delete opts;
@@ -184,6 +184,11 @@ Iterator(
     }
 
     itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterator);
+
+    // pin the column family so GC of its handle cannot free it while this
+    // iterator is still using it
+    if(cf_ptr.get() != nullptr)
+        itr_ptr->KeepResource(cf_ptr.get());
 
     if(bounds.upper_bound_slice != nullptr)
     {

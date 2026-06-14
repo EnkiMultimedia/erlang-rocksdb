@@ -481,9 +481,9 @@ namespace erocksdb {
 
         ItrObject * itr_ptr;
         rocksdb::Iterator * iterator;
+        ReferencePtr<ColumnFamilyObject> cf_ptr;
 
         if (argc == 3) {
-            ReferencePtr<ColumnFamilyObject> cf_ptr;
             if(!enif_get_cf(env, argv[1], &cf_ptr)) {
                 delete bounds.upper_bound_slice;
                 delete bounds.lower_bound_slice;
@@ -496,6 +496,13 @@ namespace erocksdb {
         }
 
         itr_ptr = ItrObject::CreateItrObject(tx_ptr->m_DbPtr.get(), itr_env, iterator);
+
+        // pin the transaction (its write batch backs the iterator's delta) and
+        // the column family so neither can be garbage collected and freed while
+        // this iterator is still using them
+        itr_ptr->KeepResource(tx_ptr.get());
+        if(cf_ptr.get() != nullptr)
+            itr_ptr->KeepResource(cf_ptr.get());
 
         if(bounds.upper_bound_slice != nullptr) {
             itr_ptr->SetUpperBoundSlice(bounds.upper_bound_slice);

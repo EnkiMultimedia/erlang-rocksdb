@@ -859,6 +859,15 @@ ItrObject::SetLowerBoundSlice(rocksdb::Slice *slice) {
 }
 
 
+void
+ItrObject::KeepResource(void *Resource) {
+    if (nullptr != Resource) {
+        enif_keep_resource(Resource);
+        m_KeptResources.push_back(Resource);
+    }
+}
+
+
 
 ItrObject::ItrObject(
         DbObject *DbPtr,
@@ -895,6 +904,13 @@ ItrObject::~ItrObject() {
 
     delete m_Iterator;
     //m_Iterator = nullptr;
+
+    // release any resources (column family, transaction) pinned for this
+    // iterator's lifetime. Done after deleting the iterator, which still
+    // references them.
+    for (void *resource : m_KeptResources)
+        enif_release_resource(resource);
+    m_KeptResources.clear();
 
     return;
 
