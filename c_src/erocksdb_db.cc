@@ -933,7 +933,7 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
         {
           ErlNifUInt64 blob_file_size;
           if (enif_get_uint64(env, option[1], &blob_file_size))
-            opts.min_blob_size = blob_file_size;
+            opts.blob_file_size = blob_file_size;
         }
         else if(option[0] == erocksdb::ATOM_BLOB_COMPRESSION_TYPE)
         {
