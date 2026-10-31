@@ -18,6 +18,8 @@ There are manyoptions added to customize build (all are `OFF` by default):
 
 * `WITH_BUNDLE_ZSTD=OFF` disable bundled zstd fallback. If system zstd is not found, zstd support is disabled.
 
+* `WITH_STATIC_ZSTD=ON` prefer a static system `libzstd.a` so the NIF has no `libzstd.so` runtime dependency (falls back to the shared library). The archive must be built with `-fPIC`; Debian/Ubuntu's is not, so on those systems use the bundled zstd for a fully static NIF.
+
 * `WITH_CCACHE=ON` the driver will use ccache to cache part of the build. you can also set the `CCACHE_DIR` 
 
 * `WITH_TBB=ON` to build with [Threading Building Blocks (TBB)](https://software.intel.com/en-us/intel-tbb)

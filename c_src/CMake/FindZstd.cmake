@@ -6,16 +6,18 @@
 
 find_path(ZSTD_INCLUDE_DIR zstd.h)
 
-# Prefer the static archive so zstd is linked INTO the NIF (portable binary with
-# no libzstd.so runtime dependency). Falls back to shared if no .a is present.
-set(_zstd_saved_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
-set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
-find_library(ZSTD_LIBRARY NAMES zstd)
-if(NOT ZSTD_LIBRARY)
-    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_zstd_saved_suffixes}")
+# WITH_STATIC_ZSTD prefers the static archive so zstd is linked INTO the NIF (no
+# libzstd.so runtime dependency), falling back to shared if no .a is present.
+# Off by default: distro archives such as Debian/Ubuntu's libzstd.a are built
+# without -fPIC and can't be linked into a shared object. For a fully static NIF
+# without a PIC system archive, use the bundled zstd instead.
+if(WITH_STATIC_ZSTD)
+    set(_zstd_saved_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${CMAKE_STATIC_LIBRARY_SUFFIX})
     find_library(ZSTD_LIBRARY NAMES zstd)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_zstd_saved_suffixes}")
 endif()
-set(CMAKE_FIND_LIBRARY_SUFFIXES "${_zstd_saved_suffixes}")
+find_library(ZSTD_LIBRARY NAMES zstd)
 
 if (ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
     set(ZSTD_FOUND TRUE)
