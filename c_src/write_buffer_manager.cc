@@ -83,8 +83,13 @@ WriteBufferManager::~WriteBufferManager()
 }
 
 std::shared_ptr<rocksdb::WriteBufferManager> WriteBufferManager::write_buffer_manager() {
-    auto m = mgr_;
-    return m;
+    std::lock_guard<std::mutex> lock(mutex_);
+    return mgr_;
+}
+
+void WriteBufferManager::Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    mgr_.reset();
 }
 
 
@@ -123,32 +128,29 @@ ERL_NIF_TERM
 ReleaseWriteBufferManager(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
 {
     WriteBufferManager* mgr_ptr;
-    std::shared_ptr<rocksdb::WriteBufferManager> mgr;
 
     mgr_ptr = erocksdb::WriteBufferManager::RetrieveWriteBufferManagerResource(env, argv[0]);
     if(nullptr==mgr_ptr)
         return ATOM_OK;
-    mgr = mgr_ptr->write_buffer_manager();
-    mgr.reset();
-    mgr = nullptr;
-    mgr_ptr = nullptr;
+    // the C++ object is destroyed only by the resource cleanup callback
+    mgr_ptr->Release();
     return ATOM_OK;
 }
 
 ERL_NIF_TERM
 wbf_info(
         ErlNifEnv *env,
-        WriteBufferManager* mgr_ptr,
+        const std::shared_ptr<rocksdb::WriteBufferManager>& mgr,
         ERL_NIF_TERM item)
 {
     if (item == erocksdb::ATOM_MEMORY_USAGE) {
-        return enif_make_uint64(env,mgr_ptr->write_buffer_manager()->memory_usage());
+        return enif_make_uint64(env,mgr->memory_usage());
     } else if (item == erocksdb::ATOM_MUTABLE_MEMTABLE_MEMORY_USAGE) {
-        return enif_make_uint64(env, mgr_ptr->write_buffer_manager()->mutable_memtable_memory_usage());
+        return enif_make_uint64(env, mgr->mutable_memtable_memory_usage());
     } else if (item == erocksdb::ATOM_BUFFER_SIZE) {
-        return enif_make_uint64(env, mgr_ptr->write_buffer_manager()->buffer_size());
+        return enif_make_uint64(env, mgr->buffer_size());
     } else if (item == erocksdb::ATOM_ENABLED) {
-        if(mgr_ptr->write_buffer_manager()->enabled())
+        if(mgr->enabled())
             return ATOM_TRUE;
         return ATOM_FALSE;
 
@@ -165,10 +167,13 @@ WriteBufferManagerInfo(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     mgr_ptr = erocksdb::WriteBufferManager::RetrieveWriteBufferManagerResource(env, argv[0]);
     if(nullptr == mgr_ptr)
         return enif_make_badarg(env);
+    std::shared_ptr<rocksdb::WriteBufferManager> mgr = mgr_ptr->write_buffer_manager();
+    if(!mgr)    // released
+        return enif_make_badarg(env);
 
     if (argc > 1)
     {
-        return wbf_info(env, std::move(mgr_ptr), argv[1]);
+        return wbf_info(env, mgr, argv[1]);
     }
 
     std::array<ERL_NIF_TERM, 4> items = {
@@ -182,7 +187,7 @@ WriteBufferManagerInfo(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     for(const auto& item : items) {
         info = enif_make_list_cell(
                 env,
-                enif_make_tuple2(env, item, wbf_info(env, mgr_ptr, item)),
+                enif_make_tuple2(env, item, wbf_info(env, mgr, item)),
                 info);
     }
 

@@ -163,18 +163,20 @@ shared_iterator_test_() ->
     ?rm_rf(Dir)
   end}.
 
-shared_wal_iterator_test() ->
-  Dir = test_dir("shared_wal_iter"),
-  {ok, Db} = rocksdb:open(filename:join(Dir, "db"), [{create_if_missing, true}]),
-  [ok = rocksdb:put(Db, <<I:32>>, <<I:32>>, []) || I <- lists:seq(1, 2000)],
-  {ok, It} = rocksdb:tlog_iterator(Db, 0),
-  Workers = run_workers(?WORKERS, fun(_) ->
-    [_ = rocksdb:tlog_next_binary_update(It) || _ <- lists:seq(1, 300)]
-  end),
-  wait_workers(Workers),
-  ok = rocksdb:tlog_iterator_close(It),
-  ok = rocksdb:close(Db),
-  ?rm_rf(Dir).
+shared_wal_iterator_test_() ->
+  {timeout, 60, fun() ->
+    Dir = test_dir("shared_wal_iter"),
+    {ok, Db} = rocksdb:open(filename:join(Dir, "db"), [{create_if_missing, true}]),
+    [ok = rocksdb:put(Db, <<I:32>>, <<I:32>>, []) || I <- lists:seq(1, 2000)],
+    {ok, It} = rocksdb:tlog_iterator(Db, 0),
+    Workers = run_workers(?WORKERS, fun(_) ->
+      [_ = rocksdb:tlog_next_binary_update(It) || _ <- lists:seq(1, 300)]
+    end),
+    wait_workers(Workers),
+    ok = rocksdb:tlog_iterator_close(It),
+    ok = rocksdb:close(Db),
+    ?rm_rf(Dir)
+  end}.
 
 %% SstFileWriter is not thread-safe
 shared_sst_writer_test() ->

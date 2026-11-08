@@ -184,7 +184,7 @@ Iterator(
 
     if(argc==3)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr))
+        if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
         {
             delete opts;
             delete bounds.upper_bound_slice;

@@ -82,6 +82,10 @@ SstFileWriterObject::~SstFileWriterObject()
     return;
 }
 
+void SstFileWriterObject::Release() {
+    writer_.reset();
+}
+
 rocksdb::SstFileWriter* SstFileWriterObject::writer() {
     return writer_.get();
 }
@@ -183,6 +187,8 @@ SstFileWriterPut(
         return enif_make_badarg(env);
     }
     std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
+    if (nullptr == writer_ptr->writer())    // released
+        return enif_make_badarg(env);
 
     ErlNifBinary key, value;
     if (!enif_inspect_binary(env, argv[1], &key) ||
@@ -216,6 +222,8 @@ SstFileWriterPutEntity(
         return enif_make_badarg(env);
     }
     std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
+    if (nullptr == writer_ptr->writer())    // released
+        return enif_make_badarg(env);
 
     ErlNifBinary key;
     if (!enif_inspect_binary(env, argv[1], &key)) {
@@ -278,6 +286,8 @@ SstFileWriterMerge(
         return enif_make_badarg(env);
     }
     std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
+    if (nullptr == writer_ptr->writer())    // released
+        return enif_make_badarg(env);
 
     ErlNifBinary key, value;
     if (!enif_inspect_binary(env, argv[1], &key) ||
@@ -310,6 +320,8 @@ SstFileWriterDelete(
         return enif_make_badarg(env);
     }
     std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
+    if (nullptr == writer_ptr->writer())    // released
+        return enif_make_badarg(env);
 
     ErlNifBinary key;
     if (!enif_inspect_binary(env, argv[1], &key)) {
@@ -341,6 +353,8 @@ SstFileWriterDeleteRange(
         return enif_make_badarg(env);
     }
     std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
+    if (nullptr == writer_ptr->writer())    // released
+        return enif_make_badarg(env);
 
     ErlNifBinary begin_key, end_key;
     if (!enif_inspect_binary(env, argv[1], &begin_key) ||
@@ -373,6 +387,8 @@ SstFileWriterFinish(
         return enif_make_badarg(env);
     }
     std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
+    if (nullptr == writer_ptr->writer())    // released
+        return enif_make_badarg(env);
 
     bool with_file_info = false;
     if (argc > 1 && argv[1] == ATOM_WITH_FILE_INFO) {
@@ -453,6 +469,8 @@ SstFileWriterFileSize(
         return enif_make_badarg(env);
     }
     std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
+    if (nullptr == writer_ptr->writer())    // released
+        return enif_make_badarg(env);
 
     uint64_t file_size = writer_ptr->writer()->FileSize();
     return enif_make_uint64(env, file_size);
@@ -468,7 +486,9 @@ ReleaseSstFileWriter(
     if (nullptr == writer_ptr) {
         return ATOM_OK;
     }
-    // Resource will be cleaned up by GC
+    // close the file now, not when the term is garbage collected
+    std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
+    writer_ptr->Release();
     return ATOM_OK;
 }
 

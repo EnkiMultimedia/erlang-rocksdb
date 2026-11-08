@@ -77,7 +77,13 @@ Statistics::~Statistics()
 }
 
 std::shared_ptr<rocksdb::Statistics> Statistics::statistics() {
+    std::lock_guard<std::mutex> lock(mutex_);
     return statistics_;
+}
+
+void Statistics::Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    statistics_.reset();
 }
 
 ERL_NIF_TERM
@@ -100,7 +106,8 @@ ReleaseStatistics(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
     Statistics* statistics_ptr = erocksdb::Statistics::RetrieveStatisticsResource(env, argv[0]);
     if(NULL==statistics_ptr)
         return ATOM_OK;
-    statistics_ptr->~Statistics();
+    // the C++ object is destroyed only by the resource cleanup callback
+    statistics_ptr->Release();
     return ATOM_OK;
 }
 
@@ -186,6 +193,8 @@ SetStatsLevel(
 
     std::lock_guard<std::mutex> guard(statistics_ptr->mu);
     std::shared_ptr<rocksdb::Statistics> statistics = statistics_ptr->statistics();
+    if (!statistics)    // released
+        return enif_make_badarg(env);
 
     rocksdb::StatsLevel stats_level;
     if (StatsLevelAtomToEnum(argv[1], &stats_level)) {
@@ -204,6 +213,8 @@ StatisticsInfo(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     std::lock_guard<std::mutex> guard(statistics_ptr->mu);
     std::shared_ptr<rocksdb::Statistics> statistics = statistics_ptr->statistics();
+    if (!statistics)    // released
+        return enif_make_badarg(env);
 
     ERL_NIF_TERM stats_level = StatsLevelEnumToAtom(statistics->get_stats_level());
 
@@ -644,6 +655,8 @@ StatisticsTicker(ErlNifEnv *env, int /*argc*/, const ERL_NIF_TERM argv[])
 
     std::lock_guard<std::mutex> guard(statistics_ptr->mu);
     std::shared_ptr<rocksdb::Statistics> statistics = statistics_ptr->statistics();
+    if (!statistics)    // released
+        return enif_make_badarg(env);
 
     uint64_t count = statistics->getTickerCount(ticker);
     return enif_make_tuple2(env, ATOM_OK, enif_make_uint64(env, count));
@@ -812,6 +825,8 @@ StatisticsHistogram(ErlNifEnv *env, int /*argc*/, const ERL_NIF_TERM argv[])
 
     std::lock_guard<std::mutex> guard(statistics_ptr->mu);
     std::shared_ptr<rocksdb::Statistics> statistics = statistics_ptr->statistics();
+    if (!statistics)    // released
+        return enif_make_badarg(env);
 
     rocksdb::HistogramData data;
     statistics->histogramData(histogram, &data);

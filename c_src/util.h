@@ -53,6 +53,10 @@ int enif_get_std_string(ErlNifEnv* env, ERL_NIF_TERM term, std::string &val);
 
 int enif_get_db(ErlNifEnv* env, ERL_NIF_TERM dbval, erocksdb::ReferencePtr<erocksdb::DbObject>* db_ptr);
 int enif_get_cf(ErlNifEnv* env, ERL_NIF_TERM dbval, erocksdb::ReferencePtr<erocksdb::ColumnFamilyObject>* cf_ptr);
+// Same, and the column family must belong to db: RocksDB finds column
+// families by id, so a handle of another database would silently read or
+// write the column family with the same id in this one.
+int enif_get_cf_of(ErlNifEnv* env, ERL_NIF_TERM cfval, erocksdb::DbObject* db, erocksdb::ReferencePtr<erocksdb::ColumnFamilyObject>* cf_ptr);
 int enif_get_backup_engine(ErlNifEnv* env, ERL_NIF_TERM bal, erocksdb::ReferencePtr<erocksdb::BackupEngineObject>* backup_engine_ptr);
 int enif_get_transaction(ErlNifEnv* env, ERL_NIF_TERM bal, erocksdb::ReferencePtr<erocksdb::TransactionObject>* tx_ptr);
 

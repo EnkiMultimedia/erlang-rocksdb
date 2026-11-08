@@ -16,6 +16,7 @@
 //
 
 #include <memory>
+#include <mutex>
 
 #include "erl_nif.h"
 
@@ -35,7 +36,12 @@ namespace erocksdb {
 
       ~SstFileManager();
 
+      // NULL once released: callers must check the copy they get
       std::shared_ptr<rocksdb::SstFileManager> sst_file_manager();
+
+      // Drop this handle's reference. Databases using the object keep their
+      // own. Later calls through the handle see NULL and raise badarg.
+      void Release();
 
       static void CreateSstFileManagerType(ErlNifEnv * Env);
       static void SstFileManagerResourceCleanup(ErlNifEnv *Env, void * Arg);
@@ -44,6 +50,7 @@ namespace erocksdb {
       static SstFileManager * RetrieveSstFileManagerResource(ErlNifEnv * Env, const ERL_NIF_TERM & term);
 
     private:
+      std::mutex mutex_;  // guards mgr_ against a concurrent release
       std::shared_ptr<rocksdb::SstFileManager> mgr_;
   };
 

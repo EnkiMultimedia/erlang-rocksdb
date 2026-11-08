@@ -78,8 +78,13 @@ Cache::~Cache()
 }
 
 std::shared_ptr<rocksdb::Cache> Cache::cache() {
-    auto c = cache_;
-    return c;
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cache_;
+}
+
+void Cache::Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cache_.reset();
 }
 
 ERL_NIF_TERM
@@ -119,15 +124,12 @@ ERL_NIF_TERM
 ReleaseCache(ErlNifEnv *env, int /*argc*/, const ERL_NIF_TERM argv[])
 {
     Cache *cache_ptr;
-    std::shared_ptr<rocksdb::Cache> cache;
 
     cache_ptr = erocksdb::Cache::RetrieveCacheResource(env, argv[0]);
     if (nullptr == cache_ptr)
         return ATOM_OK;
-    cache = cache_ptr->cache();
-    cache.reset();
-    cache = nullptr;
-    cache_ptr = nullptr;
+    // the C++ object is destroyed only by the resource cleanup callback
+    cache_ptr->Release();
     return ATOM_OK;
 }
 
@@ -167,6 +169,8 @@ CacheInfo(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     std::lock_guard<std::mutex> guard(cache_ptr->mu);
     cache = cache_ptr->cache();
+    if (!cache)    // released
+        return enif_make_badarg(env);
 
     if (argc > 1)
     {
@@ -206,6 +210,8 @@ SetCapacity(ErlNifEnv * env, int /*argc*/, const ERL_NIF_TERM argv[])
 
     std::lock_guard<std::mutex> guard(cache_ptr->mu);
     cache = cache_ptr->cache();
+    if (!cache)    // released
+        return enif_make_badarg(env);
     cache->SetCapacity(capacity);
     return ATOM_OK;
 }
@@ -222,6 +228,8 @@ SetStrictCapacityLimit(ErlNifEnv * env, int /*argc*/, const ERL_NIF_TERM argv[])
     strict_capacity_limit = (argv[1] == ATOM_TRUE);
     std::lock_guard<std::mutex> guard(cache_ptr->mu);
     cache = cache_ptr->cache();
+    if (!cache)    // released
+        return enif_make_badarg(env);
     cache->SetStrictCapacityLimit(strict_capacity_limit);
     return ATOM_OK;
 }

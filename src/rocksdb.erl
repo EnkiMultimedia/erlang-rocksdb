@@ -2189,7 +2189,7 @@ create_new_backup(_BackupEngine, _DbHandle) ->
   ?nif_stub.
 
 %% @doc Returns info about backups in backup_info
--spec get_backup_info(backup_engine()) -> [backup_info()].
+-spec get_backup_info(backup_engine()) -> {ok, [backup_info()]}.
 get_backup_info(_BackupEngine) ->
   ?nif_stub.
 

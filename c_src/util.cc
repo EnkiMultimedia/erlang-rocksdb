@@ -121,6 +121,20 @@ enif_get_cf(ErlNifEnv* env, ERL_NIF_TERM cfval, erocksdb::ReferencePtr<erocksdb:
     return 1;
 }
 
+int
+enif_get_cf_of(ErlNifEnv* env, ERL_NIF_TERM cfval, erocksdb::DbObject* db,
+               erocksdb::ReferencePtr<erocksdb::ColumnFamilyObject>* cf_ptr)
+{
+    if(!enif_get_cf(env, cfval, cf_ptr))
+        return 0;
+    if((*cf_ptr)->m_DbPtr.get() != db || NULL == (*cf_ptr)->m_ColumnFamily)
+    {
+        cf_ptr->assign(NULL);
+        return 0;
+    }
+    return 1;
+}
+
 
 int
 enif_get_backup_engine(

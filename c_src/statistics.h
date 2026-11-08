@@ -39,7 +39,12 @@ namespace erocksdb {
 
       ~Statistics();
 
+      // NULL once released: callers must check the copy they get
       std::shared_ptr<rocksdb::Statistics> statistics();
+
+      // Drop this handle's reference. Databases using the object keep their
+      // own. Later calls through the handle see NULL and raise badarg.
+      void Release();
 
       static void CreateStatisticsType(ErlNifEnv* Env);
       static void StatisticsResourceCleanup(ErlNifEnv* Env, void* Arg);
@@ -48,6 +53,7 @@ namespace erocksdb {
       static Statistics* RetrieveStatisticsResource(ErlNifEnv* Env, const ERL_NIF_TERM& StatisticsTerm);
 
     private:
+      std::mutex mutex_;  // guards statistics_ against a concurrent release
       std::shared_ptr<rocksdb::Statistics> statistics_;
   };
 

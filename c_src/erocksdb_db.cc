@@ -1593,8 +1593,9 @@ GetProperty(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if(argc  == 3)
     {
       name_ref = argv[2];
-      // we use a column family assign the value
-      cf_ptr.try_assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, argv[1]));
+      // an invalid or closed column family is an error, not the default one
+      if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
+          return enif_make_badarg(env);
     }
     else
     {
@@ -1607,11 +1608,9 @@ GetProperty(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     rocksdb::Slice name(reinterpret_cast<char*>(name_bin.data), name_bin.size);
     std::string value;
-    volatile int v_argc = argc;
-    volatile void* v_cf = (void*)cf_ptr.get();
     bool ok;
 
-    if (v_argc == 3 && v_cf != nullptr)
+    if (argc == 3)
         ok = db_ptr->m_Db->GetProperty(cf_ptr->m_ColumnFamily, name, &value);
     else
         ok = db_ptr->m_Db->GetProperty(name, &value);
@@ -1659,7 +1658,7 @@ Get(
     if(argc==4)
     {
         ReferencePtr<ColumnFamilyObject> cf_ptr;
-        if(!enif_get_cf(env, argv[1], &cf_ptr)) {
+        if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr)) {
             delete opts;
             return enif_make_badarg(env);
         }
@@ -1711,7 +1710,7 @@ MultiGet(
     ReferencePtr<ColumnFamilyObject> cf_ptr;
     if (argc == 4)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr))
+        if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
             return enif_make_badarg(env);
         cfh = cf_ptr->m_ColumnFamily;
     }
@@ -1806,7 +1805,7 @@ Put(
     rocksdb::ColumnFamilyHandle * cfh;
     if (argc > 4)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key) ||
                 !enif_inspect_binary(env, argv[3], &value))
             return enif_make_badarg(env);
@@ -1852,7 +1851,7 @@ Merge(
     rocksdb::ColumnFamilyHandle *cfh;
     if (argc > 4)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key) ||
                 !enif_inspect_binary(env, argv[3], &value))
             return enif_make_badarg(env);
@@ -1892,7 +1891,7 @@ Delete(
     rocksdb::ColumnFamilyHandle *cfh;
     if (argc > 3)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key))
             return enif_make_badarg(env);
         cfh = cf_ptr->m_ColumnFamily;
@@ -1929,7 +1928,7 @@ SingleDelete(
     rocksdb::ColumnFamilyHandle *cfh;
     if (argc > 3)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key))
             return enif_make_badarg(env);
         cfh = cf_ptr->m_ColumnFamily;
@@ -2099,7 +2098,7 @@ DeleteRange(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     if (argc == 5)
     {
-        if (!enif_get_cf(env, argv[1], &cf_ptr))
+        if (!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
             return enif_make_badarg(env);
 
         column_family = cf_ptr->m_ColumnFamily;
@@ -2145,7 +2144,7 @@ GetApproximateSizes(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     if (argc == 5)
     {
-        if (!enif_get_cf(env, argv[1], &cf_ptr))
+        if (!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
             return enif_make_badarg(env);
         column_family = cf_ptr->m_ColumnFamily;
         i = 2;
@@ -2225,7 +2224,7 @@ GetApproximateMemTableStats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     if (argc == 4)
     {
-        if (!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if (!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr) ||
             !binary_to_slice(env, argv[2], &start) ||
             !binary_to_slice(env, argv[3], &limit))
                 return enif_make_badarg(env);
@@ -2267,7 +2266,7 @@ CompactRange(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     if (argc == 5)
     {
-        if (!enif_get_cf(env, argv[1], &cf_ptr))
+        if (!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
             return enif_make_badarg(env);
         column_family = cf_ptr->m_ColumnFamily;
         i = 2;
@@ -2326,7 +2325,7 @@ Flush(
     {
         status = db_ptr->m_Db->Flush(*opts);
     }
-    else if (enif_get_cf(env, argv[1], &cf_ptr))
+    else if (enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
     {
         status = db_ptr->m_Db->Flush(*opts, cf_ptr->m_ColumnFamily);
     }
@@ -2660,7 +2659,7 @@ PutEntity(
     if (argc > 4)
     {
         // With column family: db, cf, key, columns, opts
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key) ||
                 !enif_is_list(env, argv[3]))
             return enif_make_badarg(env);
@@ -2749,7 +2748,7 @@ GetEntity(
     if(argc == 4)
     {
         ReferencePtr<ColumnFamilyObject> cf_ptr;
-        if(!enif_get_cf(env, argv[1], &cf_ptr))
+        if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
             return enif_make_badarg(env);
         status = db_ptr->m_Db->GetEntity(opts, cf_ptr->m_ColumnFamily, key, &columns);
     }
@@ -2934,7 +2933,7 @@ GetColumnFamilyMetaData(
     {
         // With column family handle
         ReferencePtr<ColumnFamilyObject> cf_ptr;
-        if(!enif_get_cf(env, argv[1], &cf_ptr))
+        if(!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
             return enif_make_badarg(env);
         db_ptr->m_Db->GetColumnFamilyMetaData(cf_ptr->m_ColumnFamily, &cf_meta);
     }
@@ -3138,7 +3137,7 @@ IngestExternalFile(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     // Check if column family is provided
     if (argc == 4)
     {
-        if (!enif_get_cf(env, argv[1], &cf_ptr))
+        if (!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
             return enif_make_badarg(env);
         column_family = cf_ptr->m_ColumnFamily;
         i = 2;
@@ -3182,7 +3181,7 @@ PrepareIngestion(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (argc == 4)
     {
         // RocksDB requires a live column family of this database
-        if (!enif_get_cf(env, argv[1], &cf_ptr)
+        if (!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr)
             || NULL == cf_ptr->m_ColumnFamily
             || cf_ptr->m_DbPtr.get() != db_ptr.get())
             return enif_make_badarg(env);
@@ -3321,7 +3320,7 @@ GetTtl(
     if (!db_ptr->m_IsTTL)
         return error_tuple(env, ATOM_ERROR, "not a TTL database");
 
-    if (!enif_get_cf(env, argv[1], &cf_ptr))
+    if (!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
         return enif_make_badarg(env);
 
     rocksdb::DBWithTTL* ttl_db = static_cast<rocksdb::DBWithTTL*>(db_ptr->m_Db);
@@ -3361,7 +3360,7 @@ SetTtl(
     } else {
         // set_ttl(Db, CF, TTL) - set TTL for column family
         ReferencePtr<ColumnFamilyObject> cf_ptr;
-        if (!enif_get_cf(env, argv[1], &cf_ptr))
+        if (!enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
             return enif_make_badarg(env);
 
         if (!enif_get_int(env, argv[2], &ttl))

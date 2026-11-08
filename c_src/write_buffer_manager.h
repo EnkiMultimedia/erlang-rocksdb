@@ -16,6 +16,7 @@
 //
 
 #include <memory>
+#include <mutex>
 
 #include "erl_nif.h"
 
@@ -35,7 +36,12 @@ namespace erocksdb {
 
       ~WriteBufferManager();
 
+      // NULL once released: callers must check the copy they get
       std::shared_ptr<rocksdb::WriteBufferManager> write_buffer_manager();
+
+      // Drop this handle's reference. Databases using the object keep their
+      // own. Later calls through the handle see NULL and raise badarg.
+      void Release();
 
       static void CreateWriteBufferManagerType(ErlNifEnv * Env);
       static void WriteBufferManagerResourceCleanup(ErlNifEnv *Env, void * Arg);
@@ -44,6 +50,7 @@ namespace erocksdb {
       static WriteBufferManager * RetrieveWriteBufferManagerResource(ErlNifEnv * Env, const ERL_NIF_TERM & term);
 
     private:
+      std::mutex mutex_;  // guards mgr_ against a concurrent release
       std::shared_ptr<rocksdb::WriteBufferManager> mgr_;
   };
 

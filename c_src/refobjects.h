@@ -237,6 +237,7 @@ public:
     bool m_IsPessimistic;                          //!< true if opened as PessimisticTransactionDB
     bool m_IsTTL;                                  //!< true if opened as DBWithTTL
     EnvRef m_Env;                                  //!< keeps the env alive until m_Db is deleted
+    const uint64_t m_Id;                           //!< unique per database, see batches
     std::mutex m_ItrMutex;                         //!< mutex protecting m_ItrList
     std::mutex m_SnapshotMutex;                    //!< mutex protecting m_SnapshotList
     std::mutex m_ColumnFamilyMutex;                //!< mutex protecting m_ColumnFamily
