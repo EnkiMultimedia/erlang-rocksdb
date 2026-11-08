@@ -3052,6 +3052,40 @@ parse_ingest_external_file_option(ErlNifEnv* env, ERL_NIF_TERM item,
     return ATOM_OK;
 }
 
+// Parse a non-empty list of file paths (binaries or strings).
+static bool
+parse_external_file_list(ErlNifEnv* env, ERL_NIF_TERM file_list,
+                         std::vector<std::string>& external_files)
+{
+    ERL_NIF_TERM head, tail;
+    unsigned int list_length;
+
+    if (!enif_get_list_length(env, file_list, &list_length) || list_length == 0)
+        return false;
+
+    tail = file_list;
+    while (enif_get_list_cell(env, tail, &head, &tail))
+    {
+        ErlNifBinary path_bin;
+        char path_buffer[4096];
+
+        if (enif_inspect_binary(env, head, &path_bin))
+        {
+            external_files.push_back(
+                std::string(reinterpret_cast<const char*>(path_bin.data), path_bin.size));
+        }
+        else if (enif_get_string(env, head, path_buffer, sizeof(path_buffer), ERL_NIF_LATIN1) > 0)
+        {
+            external_files.push_back(std::string(path_buffer));
+        }
+        else
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 ERL_NIF_TERM
 IngestExternalFile(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
@@ -3077,39 +3111,9 @@ IngestExternalFile(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
 
     // argv[i] is the list of file paths
-    ERL_NIF_TERM file_list = argv[i];
-    ERL_NIF_TERM head, tail;
     std::vector<std::string> external_files;
-
-    // Get the length of the file list
-    unsigned int list_length;
-    if (!enif_get_list_length(env, file_list, &list_length))
+    if (!parse_external_file_list(env, argv[i], external_files))
         return enif_make_badarg(env);
-
-    if (list_length == 0)
-        return enif_make_badarg(env);
-
-    // Parse the list of file paths
-    tail = file_list;
-    while (enif_get_list_cell(env, tail, &head, &tail))
-    {
-        ErlNifBinary path_bin;
-        char path_buffer[4096];
-
-        if (enif_inspect_binary(env, head, &path_bin))
-        {
-            external_files.push_back(
-                std::string(reinterpret_cast<const char*>(path_bin.data), path_bin.size));
-        }
-        else if (enif_get_string(env, head, path_buffer, sizeof(path_buffer), ERL_NIF_LATIN1) > 0)
-        {
-            external_files.push_back(std::string(path_buffer));
-        }
-        else
-        {
-            return enif_make_badarg(env);
-        }
-    }
 
     // Parse ingest options
     rocksdb::IngestExternalFileOptions opts;
@@ -3124,6 +3128,138 @@ IngestExternalFile(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     return ATOM_OK;
 }   // IngestExternalFile
+
+
+ERL_NIF_TERM
+PrepareIngestion(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    ReferencePtr<ColumnFamilyObject> cf_ptr;
+    rocksdb::ColumnFamilyHandle* column_family;
+    int i = 1;
+
+    if (!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    if (argc == 4)
+    {
+        // RocksDB requires a live column family of this database
+        if (!enif_get_cf(env, argv[1], &cf_ptr)
+            || NULL == cf_ptr->m_ColumnFamily
+            || cf_ptr->m_DbPtr.get() != db_ptr.get())
+            return enif_make_badarg(env);
+        column_family = cf_ptr->m_ColumnFamily;
+        i = 2;
+    }
+    else
+    {
+        column_family = db_ptr->m_Db->DefaultColumnFamily();
+    }
+
+    std::vector<std::string> external_files;
+    if (!parse_external_file_list(env, argv[i], external_files))
+        return enif_make_badarg(env);
+
+    rocksdb::IngestExternalFileOptions opts;
+    fold(env, argv[i + 1], parse_ingest_external_file_option, opts);
+
+    std::unique_ptr<rocksdb::FileIngestionHandle> handle;
+    rocksdb::Status status = db_ptr->m_Db->PrepareFileIngestion(
+        column_family, external_files, opts, &handle);
+
+    if (!status.ok())
+        return error_tuple(env, ATOM_ERROR, status);
+
+    IngestionObject* ingestion_ptr =
+        IngestionObject::CreateIngestionObject(db_ptr.get(), std::move(handle));
+    ERL_NIF_TERM result = enif_make_resource(env, ingestion_ptr);
+    enif_release_resource(ingestion_ptr);
+
+    return enif_make_tuple2(env, ATOM_OK, result);
+}   // PrepareIngestion
+
+
+ERL_NIF_TERM
+CommitIngestion(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+
+    if (!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    // a single ingestion or a list of them
+    std::vector<ERL_NIF_TERM> terms;
+    if (enif_is_list(env, argv[1]))
+    {
+        ERL_NIF_TERM head, tail = argv[1];
+        while (enif_get_list_cell(env, tail, &head, &tail))
+            terms.push_back(head);
+        if (terms.empty())
+            return enif_make_badarg(env);
+    }
+    else
+    {
+        terms.push_back(argv[1]);
+    }
+
+    // keep every object alive for the whole call
+    std::vector<ReferencePtr<IngestionObject>> objects(terms.size());
+    for (size_t n = 0; n < terms.size(); n++)
+    {
+        objects[n].assign(IngestionObject::RetrieveIngestionObject(env, terms[n]));
+        if (NULL == objects[n].get() || objects[n]->m_DbPtr.get() != db_ptr.get())
+            return enif_make_badarg(env);
+    }
+
+    // take the handles; an ingestion already consumed (by a concurrent call or
+    // listed twice) rejects the whole batch and the handles go back untouched
+    std::vector<std::unique_ptr<rocksdb::FileIngestionHandle>> handles;
+    for (size_t n = 0; n < objects.size(); n++)
+    {
+        std::unique_ptr<rocksdb::FileIngestionHandle> handle = objects[n]->TakeHandle();
+        if (!handle)
+        {
+            for (size_t m = 0; m < handles.size(); m++)
+                objects[m]->RestoreHandle(std::move(handles[m]));
+            return enif_make_badarg(env);
+        }
+        handles.push_back(std::move(handle));
+    }
+
+    rocksdb::Status status = db_ptr->m_Db->CommitFileIngestionHandles(std::move(handles));
+
+    // the handles are spent whether the commit succeeded or was rolled back
+    for (size_t n = 0; n < objects.size(); n++)
+        ErlRefObject::InitiateCloseRequest(objects[n].get());
+
+    if (!status.ok())
+        return error_tuple(env, ATOM_ERROR, status);
+
+    return ATOM_OK;
+}   // CommitIngestion
+
+
+ERL_NIF_TERM
+AbortIngestion(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<IngestionObject> ingestion_ptr;
+    ingestion_ptr.assign(IngestionObject::RetrieveIngestionObject(env, argv[0]));
+    if (NULL == ingestion_ptr.get())
+        return enif_make_badarg(env);
+
+    std::unique_ptr<rocksdb::FileIngestionHandle> handle = ingestion_ptr->TakeHandle();
+    if (!handle)
+        return enif_make_badarg(env);
+
+    rocksdb::Status status = handle->Abort();
+    handle.reset();
+    ErlRefObject::InitiateCloseRequest(ingestion_ptr.get());
+
+    if (!status.ok())
+        return error_tuple(env, ATOM_ERROR, status);
+
+    return ATOM_OK;
+}   // AbortIngestion
 
 
 // TTL Functions

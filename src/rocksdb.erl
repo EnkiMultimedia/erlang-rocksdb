@@ -130,7 +130,11 @@
 %% ingest external file API
 -export([
   ingest_external_file/3,
-  ingest_external_file/4
+  ingest_external_file/4,
+  prepare_ingestion/3,
+  prepare_ingestion/4,
+  commit_ingestion/2,
+  abort_ingestion/1
 ]).
 
 %% sst file reader API
@@ -306,6 +310,7 @@
   sst_file_reader_itr/0,
   table_properties/0,
   ingest_external_file_option/0,
+  ingestion_handle/0,
   write_buffer_manager/0,
   statistics_handle/0,
   stats_level/0,
@@ -393,6 +398,7 @@
 }.
 -opaque db_handle() :: reference() | binary().
 -opaque cf_handle() :: reference() | binary().
+-opaque ingestion_handle() :: reference() | binary().
 -opaque itr_handle() :: reference() | binary().
 -opaque snapshot_handle() :: reference() | binary().
 -opaque batch_handle() :: reference() | binary().
@@ -2614,6 +2620,58 @@ ingest_external_file(_DbHandle, _Files, _Options) ->
     Options :: [ingest_external_file_option()],
     Result :: ok | {error, any()}.
 ingest_external_file(_DbHandle, _CfHandle, _Files, _Options) ->
+  ?nif_stub.
+
+%% @doc Prepare the ingestion of external SST files without making them
+%% visible (RocksDB 11.5+).
+%%
+%% Does the slow part of `ingest_external_file/3' (validating, reading and
+%% copying or linking the files into the database) without blocking writes.
+%% Make the files visible with `commit_ingestion/2', or cancel with
+%% `abort_ingestion/1'. Options are the same as `ingest_external_file/3'.
+%%
+%% Each handle can be committed or aborted once. A handle that is never
+%% committed is rolled back when it is garbage collected or when the database
+%% is closed.
+-spec prepare_ingestion(DbHandle, Files, Options) -> Result when
+    DbHandle :: db_handle(),
+    Files :: [file:filename_all()],
+    Options :: [ingest_external_file_option()],
+    Result :: {ok, ingestion_handle()} | {error, any()}.
+prepare_ingestion(_DbHandle, _Files, _Options) ->
+  ?nif_stub.
+
+%% @doc Same as `prepare_ingestion/3' for a column family.
+-spec prepare_ingestion(DbHandle, CfHandle, Files, Options) -> Result when
+    DbHandle :: db_handle(),
+    CfHandle :: cf_handle(),
+    Files :: [file:filename_all()],
+    Options :: [ingest_external_file_option()],
+    Result :: {ok, ingestion_handle()} | {error, any()}.
+prepare_ingestion(_DbHandle, _CfHandle, _Files, _Options) ->
+  ?nif_stub.
+
+%% @doc Commit ingestions prepared with `prepare_ingestion/3,4'.
+%%
+%% Given a list, all files become visible together in one atomic step, or
+%% none do. The list can mix column families. Handles for the same column
+%% family must use the same options; when they overlap, a later handle in the
+%% list wins.
+%%
+%% The handles are spent afterwards, even if the commit fails (it is then
+%% rolled back). A handle that was already used, or that belongs to another
+%% database, raises `badarg' and leaves the others in the list untouched.
+-spec commit_ingestion(DbHandle, Ingestions) -> ok | {error, any()} when
+    DbHandle :: db_handle(),
+    Ingestions :: ingestion_handle() | [ingestion_handle()].
+commit_ingestion(_DbHandle, _Ingestions) ->
+  ?nif_stub.
+
+%% @doc Cancel an ingestion prepared with `prepare_ingestion/3,4'. The files
+%% staged in the database are removed and the external files are left as they
+%% were.
+-spec abort_ingestion(ingestion_handle()) -> ok | {error, any()}.
+abort_ingestion(_Ingestion) ->
   ?nif_stub.
 
 

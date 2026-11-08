@@ -258,6 +258,10 @@ static ErlNifFunc nif_funcs[] =
         // Ingest External File
         {"ingest_external_file", 3, erocksdb::IngestExternalFile, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"ingest_external_file", 4, erocksdb::IngestExternalFile, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"prepare_ingestion", 3, erocksdb::PrepareIngestion, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"prepare_ingestion", 4, erocksdb::PrepareIngestion, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"commit_ingestion", 2, erocksdb::CommitIngestion, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"abort_ingestion", 1, erocksdb::AbortIngestion, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
         // SST File Reader
         {"sst_file_reader_open", 2, erocksdb::SstFileReaderOpen, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -964,6 +968,7 @@ try
   erocksdb::CreateBatchType(env);
   erocksdb::TransactionObject::CreateTransactionObjectType(env);
   erocksdb::TLogItrObject::CreateTLogItrObjectType(env);
+  erocksdb::IngestionObject::CreateIngestionObjectType(env);
   erocksdb::BackupEngineObject::CreateBackupEngineObjectType(env);
   erocksdb::Cache::CreateCacheType(env);
   erocksdb::Statistics::CreateStatisticsType(env);
