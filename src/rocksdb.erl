@@ -48,6 +48,8 @@
   enable_manual_compaction/1,
   abort_all_compactions/1,
   resume_all_compactions/1,
+  abort_compactions/2,
+  resume_compactions/2,
   stats/1, stats/2,
   get_property/2, get_property/3,
   get_approximate_sizes/3, get_approximate_sizes/4,
@@ -1516,10 +1518,9 @@ enable_manual_compaction(_DbHandle) ->
   ?nif_stub.
 
 %% @doc Abort all running and scheduled compactions (RocksDB 11.0+).
-%% In-progress compactions are actively cancelled and report a status for which
-%% `rocksdb:is_compaction_aborted/1' (a RocksDB `kCompactionAborted' status) is
-%% true. Call `resume_all_compactions/1' as many times as this was called to
-%% resume.
+%% In-progress compactions are actively cancelled and new ones, including
+%% `compact_range', return an error. Call `resume_all_compactions/1' as many
+%% times as this was called to resume.
 -spec abort_all_compactions(db_handle()) -> ok | {error, term()}.
 abort_all_compactions(_DbHandle) ->
   ?nif_stub.
@@ -1528,6 +1529,25 @@ abort_all_compactions(_DbHandle) ->
 %% (RocksDB 11.0+). Must be called as many times as `abort_all_compactions/1'.
 -spec resume_all_compactions(db_handle()) -> ok | {error, term()}.
 resume_all_compactions(_DbHandle) ->
+  ?nif_stub.
+
+%% @doc Abort running and scheduled compactions of one column family
+%% (RocksDB 11.9+). Automatic and manual compactions of `CFHandle' stop and new
+%% ones are rejected until `resume_compactions/2' is called. Other column
+%% families, and flushes, are not affected. Blocks until the running
+%% compactions of the column family have stopped.
+%%
+%% Calls are counted per column family and combine with
+%% `abort_all_compactions/1': compactions resume only once both counts are back
+%% to zero. Keep `CFHandle' alive until the matching `resume_compactions/2'.
+-spec abort_compactions(db_handle(), cf_handle()) -> ok.
+abort_compactions(_DbHandle, _CFHandle) ->
+  ?nif_stub.
+
+%% @doc Resume compactions of a column family aborted by `abort_compactions/2'
+%% (RocksDB 11.9+). Must be called as many times as `abort_compactions/2'.
+-spec resume_compactions(db_handle(), cf_handle()) -> ok.
+resume_compactions(_DbHandle, _CFHandle) ->
   ?nif_stub.
 
 %% @doc Return the current stats of the default column family

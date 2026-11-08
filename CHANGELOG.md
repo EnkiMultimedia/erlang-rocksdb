@@ -4,6 +4,10 @@
 
 - update vendored RocksDB to 11.13.2 (from 11.1.2)
 
+### New Features
+
+- `abort_compactions/2` and `resume_compactions/2` stop and restart compactions of a single column family, leaving the others running
+
 ### Bug Fixes
 
 - the build no longer downloads anything from the network: the vendored CRoaring build fetched a CMake helper from GitHub at configure time, so offline builds failed

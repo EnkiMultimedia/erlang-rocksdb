@@ -2372,6 +2372,54 @@ ResumeAllCompactions(
     return ATOM_OK;
 } // erocksdb::ResumeAllCompactions
 
+// Resolve a (Db, Cf) pair for the per-column-family compaction calls. RocksDB
+// requires a live handle owned by this DB, anything else is undefined.
+static bool
+get_db_and_live_cf(
+  ErlNifEnv* env,
+  const ERL_NIF_TERM argv[],
+  ReferencePtr<DbObject>* db_ptr,
+  ReferencePtr<ColumnFamilyObject>* cf_ptr)
+{
+    if(!enif_get_db(env, argv[0], db_ptr) || !enif_get_cf(env, argv[1], cf_ptr))
+        return false;
+    if(NULL == (*cf_ptr)->m_ColumnFamily)
+        return false;
+    return (*cf_ptr)->m_DbPtr.get() == db_ptr->get();
+}
+
+ERL_NIF_TERM
+AbortCompactions(
+  ErlNifEnv* env,
+  int /*argc*/,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    ReferencePtr<ColumnFamilyObject> cf_ptr;
+    if(!get_db_and_live_cf(env, argv, &db_ptr, &cf_ptr))
+        return enif_make_badarg(env);
+
+    db_ptr->m_Db->AbortCompactions(cf_ptr->m_ColumnFamily);
+
+    return ATOM_OK;
+} // erocksdb::AbortCompactions
+
+ERL_NIF_TERM
+ResumeCompactions(
+  ErlNifEnv* env,
+  int /*argc*/,
+  const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    ReferencePtr<ColumnFamilyObject> cf_ptr;
+    if(!get_db_and_live_cf(env, argv, &db_ptr, &cf_ptr))
+        return enif_make_badarg(env);
+
+    db_ptr->m_Db->ResumeCompactions(cf_ptr->m_ColumnFamily);
+
+    return ATOM_OK;
+} // erocksdb::ResumeCompactions
+
 ERL_NIF_TERM
 parse_flush_wal_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::FlushWALOptions& opts)
 {

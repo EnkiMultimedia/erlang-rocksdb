@@ -67,6 +67,8 @@ static ErlNifFunc nif_funcs[] =
         {"enable_manual_compaction", 1, erocksdb::EnableManualCompaction, ERL_NIF_REGULAR_BOUND},
         {"abort_all_compactions", 1, erocksdb::AbortAllCompactions, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"resume_all_compactions", 1, erocksdb::ResumeAllCompactions, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"abort_compactions", 2, erocksdb::AbortCompactions, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"resume_compactions", 2, erocksdb::ResumeCompactions, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"set_db_background_threads", 2, erocksdb::SetDBBackgroundThreads, ERL_NIF_REGULAR_BOUND},
 
         {"get_approximate_sizes", 3, erocksdb::GetApproximateSizes, ERL_NIF_DIRTY_JOB_IO_BOUND},

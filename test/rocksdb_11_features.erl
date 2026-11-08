@@ -41,6 +41,53 @@ abort_resume_compactions_test() ->
   ?rm_rf(Dir),
   ok.
 
+%% AbortCompactions / ResumeCompactions (RocksDB 11.9)
+abort_resume_cf_compactions_test() ->
+  Dir = "erocksdb.abort_resume_cf.test",
+  ?rm_rf(Dir),
+  {ok, Ref, [Default, Cf]} =
+    rocksdb:open(Dir, [{create_if_missing, true}, {create_missing_column_families, true}],
+                 [{"default", []}, {"other", []}]),
+  [begin
+     ok = rocksdb:put(Ref, Default, <<I:32>>, <<I:32>>, []),
+     ok = rocksdb:put(Ref, Cf, <<I:32>>, <<I:32>>, [])
+   end || I <- lists:seq(1, 200)],
+
+  ok = rocksdb:abort_compactions(Ref, Cf),
+  %% only the aborted column family rejects compactions
+  ?assertMatch({error, _}, rocksdb:compact_range(Ref, Cf, undefined, undefined, [])),
+  ok = rocksdb:compact_range(Ref, Default, undefined, undefined, []),
+
+  %% calls are counted: two aborts need two resumes
+  ok = rocksdb:abort_compactions(Ref, Cf),
+  ok = rocksdb:resume_compactions(Ref, Cf),
+  ?assertMatch({error, _}, rocksdb:compact_range(Ref, Cf, undefined, undefined, [])),
+  ok = rocksdb:resume_compactions(Ref, Cf),
+  ok = rocksdb:compact_range(Ref, Cf, undefined, undefined, []),
+  {ok, <<200:32>>} = rocksdb:get(Ref, Cf, <<200:32>>, []),
+
+  ok = rocksdb:close(Ref),
+  rocksdb:destroy(Dir, []),
+  ?rm_rf(Dir),
+  ok.
+
+abort_compactions_foreign_cf_test() ->
+  Dir1 = "erocksdb.abort_cf_foreign1.test",
+  Dir2 = "erocksdb.abort_cf_foreign2.test",
+  ?rm_rf(Dir1), ?rm_rf(Dir2),
+  {ok, Ref1} = rocksdb:open(Dir1, [{create_if_missing, true}]),
+  {ok, Ref2, [_, Cf2]} =
+    rocksdb:open(Dir2, [{create_if_missing, true}, {create_missing_column_families, true}],
+                 [{"default", []}, {"other", []}]),
+  %% a column family of another database is rejected, not passed to RocksDB
+  ?assertError(badarg, rocksdb:abort_compactions(Ref1, Cf2)),
+  ?assertError(badarg, rocksdb:resume_compactions(Ref1, Cf2)),
+  ok = rocksdb:close(Ref1),
+  ok = rocksdb:close(Ref2),
+  rocksdb:destroy(Dir1, []), rocksdb:destroy(Dir2, []),
+  ?rm_rf(Dir1), ?rm_rf(Dir2),
+  ok.
+
 %% DB options added in RocksDB 11.1
 db_options_test() ->
   Dir = "erocksdb.db_opts_11.test",
