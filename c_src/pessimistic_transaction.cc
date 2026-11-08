@@ -124,7 +124,7 @@ PessimisticTransactionPut(ErlNifEnv* env,
     if(argc > 3)
     {
         // With column family: tx, cf, key, value
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr) ||
            !enif_inspect_binary(env, argv[2], &key) ||
            !enif_inspect_binary(env, argv[3], &value))
         {
@@ -199,7 +199,7 @@ PessimisticTransactionGet(ErlNifEnv* env,
 
     if(argc == 4)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr))
+        if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr))
             return enif_make_badarg(env);
         // Use Get (not GetForUpdate) - reads without locking
         status = tx_ptr->m_Tx->Get(opts, cf_ptr->m_ColumnFamily, key, &pvalue);
@@ -262,7 +262,7 @@ PessimisticTransactionGetForUpdate(ErlNifEnv* env,
 
     if(argc == 4)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr))
+        if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr))
             return enif_make_badarg(env);
         // Use GetForUpdate - acquires exclusive lock
         status = tx_ptr->m_Tx->GetForUpdate(opts, cf_ptr->m_ColumnFamily, key, &pvalue);
@@ -315,7 +315,7 @@ PessimisticTransactionMultiGet(ErlNifEnv* env,
     rocksdb::ColumnFamilyHandle* cfh = tx_ptr->m_DbPtr->m_Db->DefaultColumnFamily();
     if (argc == 4)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr))
+        if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr))
             return enif_make_badarg(env);
         cfh = cf_ptr->m_ColumnFamily;
     }
@@ -414,7 +414,7 @@ PessimisticTransactionMultiGetForUpdate(ErlNifEnv* env,
     rocksdb::ColumnFamilyHandle* cfh = tx_ptr->m_DbPtr->m_Db->DefaultColumnFamily();
     if (argc == 4)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr))
+        if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr))
             return enif_make_badarg(env);
         cfh = cf_ptr->m_ColumnFamily;
     }
@@ -518,7 +518,7 @@ PessimisticTransactionDelete(ErlNifEnv* env,
     if(argc > 2)
     {
         // With column family: tx, cf, key
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr) ||
            !enif_inspect_binary(env, argv[2], &key))
             return enif_make_badarg(env);
         cfh = cf_ptr->m_ColumnFamily;
@@ -638,7 +638,7 @@ PessimisticTransactionIterator(ErlNifEnv* env,
 
     if(argc == 3)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr))
+        if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr))
         {
             delete bounds.upper_bound_slice;
             delete bounds.lower_bound_slice;

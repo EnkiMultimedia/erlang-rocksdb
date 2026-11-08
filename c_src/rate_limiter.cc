@@ -36,9 +36,10 @@ RateLimiter::CreateRateLimiterType(ErlNifEnv * env)
 
 
 void
-RateLimiter::RateLimiterResourceCleanup(ErlNifEnv * /*env*/, void * /*arg*/)
+RateLimiter::RateLimiterResourceCleanup(ErlNifEnv * /*env*/, void * arg)
 {
-    return;
+    RateLimiter* rate_limiter_ptr = (RateLimiter*)arg;
+    rate_limiter_ptr->~RateLimiter();
 }   // RateLimiter::RateLimiterResourceCleanup
 
 
@@ -75,8 +76,13 @@ RateLimiter::~RateLimiter()
 }
 
 std::shared_ptr<rocksdb::RateLimiter> RateLimiter::rate_limiter() {
-    auto c = rate_limiter_;
-    return c;
+    std::lock_guard<std::mutex> lock(mutex_);
+    return rate_limiter_;
+}
+
+void RateLimiter::Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rate_limiter_.reset();
 }
 
 
@@ -121,7 +127,8 @@ ReleaseRateLimiter(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
     RateLimiter* rate_limiter_ptr = erocksdb::RateLimiter::RetrieveRateLimiterResource(env, argv[0]);
     if(NULL==rate_limiter_ptr)
         return ATOM_OK;
-    rate_limiter_ptr->~RateLimiter();
+    // the C++ object is destroyed only by the resource cleanup callback
+    rate_limiter_ptr->Release();
     return ATOM_OK;
 }
 

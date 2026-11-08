@@ -18,6 +18,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 
 #include "erl_nif.h"
 #include "env.h"
@@ -40,7 +41,18 @@ namespace erocksdb {
 
       ~SstFileReaderObject();
 
+      // NULL once released. Callers hold m_Mutex while they use it.
       rocksdb::SstFileReader* reader();
+
+      // Release the reader. Its iterators read through it, so it is freed
+      // when the last of them is closed. Caller holds m_Mutex.
+      void Release();
+
+      // Iterator bookkeeping for Release. Caller holds m_Mutex.
+      void IteratorOpened() { m_OpenIterators++; }
+      void IteratorClosed();
+
+      std::mutex m_Mutex;
 
       static void CreateSstFileReaderType(ErlNifEnv * Env);
       static void SstFileReaderResourceCleanup(ErlNifEnv *Env, void * Arg);
@@ -50,6 +62,8 @@ namespace erocksdb {
 
     private:
       std::unique_ptr<rocksdb::SstFileReader> reader_;
+      int m_OpenIterators = 0;
+      bool m_Released = false;
   };
 
   // NIF functions

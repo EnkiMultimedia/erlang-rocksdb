@@ -43,7 +43,12 @@ namespace erocksdb {
 
       ~RateLimiter();
 
+      // NULL once released: callers must check the copy they get
       std::shared_ptr<rocksdb::RateLimiter> rate_limiter();
+
+      // Drop this handle's reference. Databases using the object keep their
+      // own. Later calls through the handle see NULL and raise badarg.
+      void Release();
 
       static void CreateRateLimiterType(ErlNifEnv * Env);
       static void RateLimiterResourceCleanup(ErlNifEnv *Env, void * Arg);
@@ -52,6 +57,7 @@ namespace erocksdb {
       static RateLimiter * RetrieveRateLimiterResource(ErlNifEnv * Env, const ERL_NIF_TERM & RateLimiterTerm);
 
     private:
+      std::mutex mutex_;  // guards rate_limiter_ against a concurrent release
       std::shared_ptr<rocksdb::RateLimiter> rate_limiter_;
   };
 

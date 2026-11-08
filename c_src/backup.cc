@@ -131,7 +131,7 @@ GetBackupInfo(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
         ERL_NIF_TERM backup_id = enif_make_uint(env, backup_info.backup_id);
         ERL_NIF_TERM timestamp = enif_make_uint64(env, backup_info.timestamp);
         ERL_NIF_TERM size = enif_make_uint64(env, backup_info.size);
-        ERL_NIF_TERM number_files = enif_make_uint(env, backup_info.backup_id);;
+        ERL_NIF_TERM number_files = enif_make_uint(env, backup_info.number_files);
 
         ERL_NIF_TERM info = enif_make_new_map(env);
         enif_make_map_put(env, info, ATOM_BACKUP_INFO_ID, backup_id, &info);

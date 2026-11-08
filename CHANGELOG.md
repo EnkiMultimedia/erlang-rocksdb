@@ -1,3 +1,18 @@
+## erlang-rocksdb (unreleased)
+
+### Bug Fixes
+
+- using a statistics handle after `release_statistics/1` aborted the VM. Released statistics, rate limiter, cache, SST file manager and write buffer manager handles now raise `badarg`, and releasing twice is fine.
+- `release_rate_limiter/1` destroyed the limiter directly, and a limiter never released was never freed
+- `release_cache/1`, `release_sst_file_manager/1`, `release_write_buffer_manager/1`, `release_sst_file_writer/1` and `release_sst_file_reader/1` did nothing until the handle was garbage collected. They now release it; a database using the cache or manager keeps its own reference, and a reader stays usable by its open iterators.
+- a column family of another database was accepted by every call taking a database and a column family, including transactions and write batches. RocksDB finds column families by id, so the call read or wrote the column family with the same id in the wrong database. It now raises `badarg`, and a write batch can only hold column families of one database.
+- `get_property/3` with an invalid or destroyed column family returned a property of the whole database, it now raises `badarg`
+- `number_files` in `get_backup_info/1` reported the backup id
+
+### Documentation
+
+- the spec of `get_backup_info/1` now says it returns `{ok, Infos}`
+
 ## erlang-rocksdb 3.2.0, released on 2026/11/08
 
 ### Upgrades

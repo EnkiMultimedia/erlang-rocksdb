@@ -40,7 +40,12 @@ namespace erocksdb {
 
       ~Cache();
 
+      // NULL once released: callers must check the copy they get
       std::shared_ptr<rocksdb::Cache> cache();
+
+      // Drop this handle's reference. Databases using the object keep their
+      // own. Later calls through the handle see NULL and raise badarg.
+      void Release();
 
       static void CreateCacheType(ErlNifEnv * Env);
       static void CacheResourceCleanup(ErlNifEnv *Env, void * Arg);
@@ -49,6 +54,7 @@ namespace erocksdb {
       static Cache * RetrieveCacheResource(ErlNifEnv * Env, const ERL_NIF_TERM & CacheTerm);
 
     private:
+      std::mutex mutex_;  // guards cache_ against a concurrent release
       std::shared_ptr<rocksdb::Cache> cache_;
   };
 

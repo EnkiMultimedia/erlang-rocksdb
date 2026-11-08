@@ -260,8 +260,11 @@ DbObject::DbObjectResourceCleanup(
 }   // DbObject::DbObjectResourceCleanup
 
 
+static std::atomic<uint64_t> s_NextDbId(1);
+
 DbObject::DbObject(rocksdb::DB * DbPtr, bool IsPessimistic, bool IsTTL)
-    : m_Db(DbPtr), m_IsPessimistic(IsPessimistic), m_IsTTL(IsTTL)
+    : m_Db(DbPtr), m_IsPessimistic(IsPessimistic), m_IsTTL(IsTTL),
+      m_Id(s_NextDbId.fetch_add(1))
     {}   // DbObject::DbObject
 
 

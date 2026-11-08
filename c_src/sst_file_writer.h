@@ -44,7 +44,11 @@ namespace erocksdb {
 
       ~SstFileWriterObject();
 
+      // NULL once released
       rocksdb::SstFileWriter* writer();
+
+      // Drop the writer (closing its file). Caller holds m_Mutex.
+      void Release();
 
       static void CreateSstFileWriterType(ErlNifEnv * Env);
       static void SstFileWriterResourceCleanup(ErlNifEnv *Env, void * Arg);

@@ -81,8 +81,13 @@ SstFileManager::~SstFileManager()
 }
 
 std::shared_ptr<rocksdb::SstFileManager> SstFileManager::sst_file_manager() {
-    auto m = mgr_;
-    return m;
+    std::lock_guard<std::mutex> lock(mutex_);
+    return mgr_;
+}
+
+void SstFileManager::Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    mgr_.reset();
 }
 
 ERL_NIF_TERM
@@ -152,15 +157,12 @@ ERL_NIF_TERM
 ReleaseSstFileManager(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
 {
     SstFileManager* mgr_ptr;
-    std::shared_ptr<rocksdb::SstFileManager> mgr;
 
     mgr_ptr = erocksdb::SstFileManager::RetrieveSstFileManagerResource(env, argv[0]);
     if(nullptr==mgr_ptr)
         return ATOM_OK;
-    mgr = mgr_ptr->sst_file_manager();
-    mgr.reset();
-    mgr = nullptr;
-    mgr_ptr = nullptr;
+    // the C++ object is destroyed only by the resource cleanup callback
+    mgr_ptr->Release();
     return ATOM_OK;
 }
 
@@ -171,31 +173,34 @@ SstFileManagerFlag(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
     mgr_ptr = erocksdb::SstFileManager::RetrieveSstFileManagerResource(env, argv[0]);
     if(nullptr==mgr_ptr)
         return enif_make_badarg(env);
+    std::shared_ptr<rocksdb::SstFileManager> mgr = mgr_ptr->sst_file_manager();
+    if(!mgr)    // released
+        return enif_make_badarg(env);
     ErlNifUInt64 ival;
     double dval;
     if(argv[1] == erocksdb::ATOM_MAX_ALLOWED_SPACE_USAGE)
     {
         if(!enif_get_uint64(env, argv[2], &ival))
             return enif_make_badarg(env);
-        mgr_ptr->sst_file_manager()->SetMaxAllowedSpaceUsage(ival);
+        mgr->SetMaxAllowedSpaceUsage(ival);
     }
     else if (argv[1] == erocksdb::ATOM_COMPACTION_BUFFER_SIZE)
     {
         if(!enif_get_uint64(env, argv[2], &ival))
             return enif_make_badarg(env);
-        mgr_ptr->sst_file_manager()->SetCompactionBufferSize(ival);
+        mgr->SetCompactionBufferSize(ival);
     }
     else if (argv[1] == erocksdb::ATOM_DELETE_RATE_BYTES_PER_SEC)
     {
         if(!enif_get_uint64(env, argv[2], &ival))
             return enif_make_badarg(env);
-        mgr_ptr->sst_file_manager()->SetDeleteRateBytesPerSecond(ival);
+        mgr->SetDeleteRateBytesPerSecond(ival);
     }
     else if (argv[1] == erocksdb::ATOM_MAX_TRASH_DB_RATIO)
     {
         if(!enif_get_double(env, argv[2], &dval))
             return enif_make_badarg(env);
-        mgr_ptr->sst_file_manager()->SetMaxTrashDBRatio(dval);
+        mgr->SetMaxTrashDBRatio(dval);
     } else {
         return enif_make_badarg(env);
     }
@@ -205,27 +210,27 @@ SstFileManagerFlag(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
 ERL_NIF_TERM
 sst_file_manager_info_1(
         ErlNifEnv *env,
-        SstFileManager* mgr_ptr,
+        const std::shared_ptr<rocksdb::SstFileManager>& mgr,
         ERL_NIF_TERM item) {
 
     if (item == erocksdb::ATOM_TOTAL_SIZE) {
-        return enif_make_uint64(env, mgr_ptr->sst_file_manager()->GetTotalSize());
+        return enif_make_uint64(env, mgr->GetTotalSize());
     }
     else if (item == erocksdb::ATOM_DELETE_RATE_BYTES_PER_SEC) {
-        return enif_make_uint64(env, mgr_ptr->sst_file_manager()->GetDeleteRateBytesPerSecond());
+        return enif_make_uint64(env, mgr->GetDeleteRateBytesPerSecond());
     }
     else if (item == erocksdb::ATOM_MAX_TRASH_DB_RATIO) {
-        return enif_make_double(env, mgr_ptr->sst_file_manager()->GetMaxTrashDBRatio());
+        return enif_make_double(env, mgr->GetMaxTrashDBRatio());
     }
     else if (item == erocksdb::ATOM_TOTAL_TRASH_SIZE) {
-        return enif_make_uint64(env, mgr_ptr->sst_file_manager()->GetTotalTrashSize());
+        return enif_make_uint64(env, mgr->GetTotalTrashSize());
     } else if (item == erocksdb::ATOM_IS_MAX_ALLOWED_SPACE_REACHED) {
-        if(mgr_ptr->sst_file_manager()->IsMaxAllowedSpaceReached())
+        if(mgr->IsMaxAllowedSpaceReached())
             return ATOM_TRUE;
         return ATOM_FALSE;
     }
     else if (item == erocksdb::ATOM_MAX_ALLOWED_SPACE_REACHED_INCLUDING_COMPACTIONS) {
-        if(mgr_ptr->sst_file_manager()->IsMaxAllowedSpaceReachedIncludingCompactions())
+        if(mgr->IsMaxAllowedSpaceReachedIncludingCompactions())
             return ATOM_TRUE;
         return ATOM_FALSE;
     } else {
@@ -241,9 +246,12 @@ SstFileManagerInfo(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     mgr_ptr = erocksdb::SstFileManager::RetrieveSstFileManagerResource(env, argv[0]);
     if(nullptr==mgr_ptr)
         return enif_make_badarg(env);
+    std::shared_ptr<rocksdb::SstFileManager> mgr = mgr_ptr->sst_file_manager();
+    if(!mgr)    // released
+        return enif_make_badarg(env);
 
     if(argc > 1)
-        return sst_file_manager_info_1(env, mgr_ptr, argv[1]);
+        return sst_file_manager_info_1(env, mgr, argv[1]);
 
     std::array<ERL_NIF_TERM, 6> items = {
         erocksdb::ATOM_MAX_ALLOWED_SPACE_REACHED_INCLUDING_COMPACTIONS,
@@ -257,7 +265,7 @@ SstFileManagerInfo(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     for(const auto& item : items) {
         info = enif_make_list_cell(
                 env,
-                enif_make_tuple2(env, item, sst_file_manager_info_1(env, mgr_ptr, item)),
+                enif_make_tuple2(env, item, sst_file_manager_info_1(env, mgr, item)),
                 info);
     }
     return info;
@@ -270,8 +278,11 @@ SstFileManagerTrackedFiles(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv
     mgr_ptr = erocksdb::SstFileManager::RetrieveSstFileManagerResource(env, argv[0]);
     if(nullptr==mgr_ptr)
         return enif_make_badarg(env);
+    std::shared_ptr<rocksdb::SstFileManager> mgr = mgr_ptr->sst_file_manager();
+    if(!mgr)    // released
+        return enif_make_badarg(env);
 
-    auto tracked_files = mgr_ptr->sst_file_manager()->GetTrackedFiles();
+    auto tracked_files = mgr->GetTrackedFiles();
     ERL_NIF_TERM result = enif_make_list(env, 0);
 
     for (const auto& [path, size] : tracked_files) {

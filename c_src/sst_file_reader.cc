@@ -57,6 +57,10 @@ public:
             m_Iterator = nullptr;
         }
         if (m_ReaderRef) {
+            {
+                std::lock_guard<std::mutex> lock(m_ReaderRef->m_Mutex);
+                m_ReaderRef->IteratorClosed();
+            }
             enif_release_resource(m_ReaderRef);
             m_ReaderRef = nullptr;
         }
@@ -143,7 +147,21 @@ SstFileReaderObject::~SstFileReaderObject()
     return;
 }
 
+void SstFileReaderObject::Release() {
+    m_Released = true;
+    if (m_OpenIterators == 0)
+        reader_.reset();
+}
+
+void SstFileReaderObject::IteratorClosed() {
+    m_OpenIterators--;
+    if (m_Released && m_OpenIterators == 0)
+        reader_.reset();
+}
+
 rocksdb::SstFileReader* SstFileReaderObject::reader() {
+    if (m_Released)
+        return nullptr;
     return reader_.get();
 }
 
@@ -237,6 +255,9 @@ SstFileReaderIterator(
     if (nullptr == reader_ptr) {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> reader_lock(reader_ptr->m_Mutex);
+    if (nullptr == reader_ptr->reader())    // released
+        return enif_make_badarg(env);
 
     // Parse read options
     rocksdb::ReadOptions read_options;
@@ -250,6 +271,7 @@ SstFileReaderIterator(
 
     // Keep a reference to the reader to prevent GC while iterator is alive
     enif_keep_resource(reader_ptr);
+    reader_ptr->IteratorOpened();
 
     // Wrap in resource
     auto itr_ptr = SstFileReaderItrObject::CreateSstFileReaderItrResource(iter, reader_ptr);
@@ -271,6 +293,9 @@ SstFileReaderGetTableProperties(
     if (nullptr == reader_ptr) {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> reader_lock(reader_ptr->m_Mutex);
+    if (nullptr == reader_ptr->reader())    // released
+        return enif_make_badarg(env);
 
     std::shared_ptr<const rocksdb::TableProperties> props = reader_ptr->reader()->GetTableProperties();
     if (!props) {
@@ -395,6 +420,9 @@ SstFileReaderVerifyChecksum(
     if (nullptr == reader_ptr) {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> reader_lock(reader_ptr->m_Mutex);
+    if (nullptr == reader_ptr->reader())    // released
+        return enif_make_badarg(env);
 
     rocksdb::ReadOptions read_options;
     if (argc > 1) {
@@ -419,7 +447,8 @@ ReleaseSstFileReader(
     if (nullptr == reader_ptr) {
         return ATOM_OK;
     }
-    // Resource will be cleaned up by GC
+    std::lock_guard<std::mutex> reader_lock(reader_ptr->m_Mutex);
+    reader_ptr->Release();
     return ATOM_OK;
 }
 

@@ -90,7 +90,7 @@ namespace erocksdb {
         rocksdb::Status status;
 
         if( argc > 3 ) { // cf
-            if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+            if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr) ||
                !enif_inspect_binary(env, argv[2], &key) ||
                !enif_inspect_binary(env, argv[3], &value)) {
                 return enif_make_badarg(env);
@@ -153,7 +153,7 @@ namespace erocksdb {
         rocksdb::PinnableSlice pvalue;
 
         if(argc == 4) {
-            if(!enif_get_cf(env, argv[1], &cf_ptr)) {
+            if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr)) {
                 return enif_make_badarg(env);
             }
             status = tx_ptr->m_Tx->GetForUpdate(*opts, cf_ptr->m_ColumnFamily, key, &pvalue);
@@ -214,7 +214,7 @@ namespace erocksdb {
         rocksdb::PinnableSlice pvalue;
 
         if(argc == 4) {
-            if(!enif_get_cf(env, argv[1], &cf_ptr)) {
+            if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr)) {
                 return enif_make_badarg(env);
             }
             status = tx_ptr->m_Tx->GetForUpdate(opts, cf_ptr->m_ColumnFamily, key, &pvalue);
@@ -264,7 +264,7 @@ namespace erocksdb {
         rocksdb::ColumnFamilyHandle* cfh = tx_ptr->m_DbPtr->m_Db->DefaultColumnFamily();
         if (argc == 4)
         {
-            if(!enif_get_cf(env, argv[1], &cf_ptr))
+            if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr))
                 return enif_make_badarg(env);
             cfh = cf_ptr->m_ColumnFamily;
         }
@@ -363,7 +363,7 @@ namespace erocksdb {
         rocksdb::ColumnFamilyHandle* cfh = tx_ptr->m_DbPtr->m_Db->DefaultColumnFamily();
         if (argc == 4)
         {
-            if(!enif_get_cf(env, argv[1], &cf_ptr))
+            if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr))
                 return enif_make_badarg(env);
             cfh = cf_ptr->m_ColumnFamily;
         }
@@ -461,7 +461,7 @@ namespace erocksdb {
         rocksdb::ColumnFamilyHandle *cfh;
         if (argc > 2)
         {
-            if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+            if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr) ||
                !enif_inspect_binary(env, argv[2], &key))
                 return enif_make_badarg(env);
             cfh = cf_ptr->m_ColumnFamily;
@@ -514,7 +514,7 @@ namespace erocksdb {
         ReferencePtr<ColumnFamilyObject> cf_ptr;
 
         if (argc == 3) {
-            if(!enif_get_cf(env, argv[1], &cf_ptr)) {
+            if(!enif_get_cf_of(env, argv[1], tx_ptr->m_DbPtr.get(), &cf_ptr)) {
                 delete bounds.upper_bound_slice;
                 delete bounds.lower_bound_slice;
                 delete opts;

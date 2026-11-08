@@ -43,7 +43,24 @@ struct Batch
     std::mutex mutex;           // serializes all use of wb and env
     rocksdb::WriteBatch* wb;    // NULL once released
     ErlNifEnv* env;
+    // Database of the column families used in the batch, 0 when none.
+    // RocksDB stores column families by id, so a batch must not mix them
+    // across databases nor be written to another one. An id, not a
+    // reference, so a batch never keeps a database open.
+    uint64_t db_id = 0;
 };
+
+// A column family usable in this batch: live, and of the same database as
+// the column families already in it.
+static bool
+batch_cf(ErlNifEnv* env, ERL_NIF_TERM term, Batch* batch,
+         erocksdb::ReferencePtr<erocksdb::ColumnFamilyObject>* cf_ptr)
+{
+    if(!enif_get_cf(env, term, cf_ptr) || NULL == (*cf_ptr)->m_ColumnFamily)
+        return false;
+    uint64_t id = (*cf_ptr)->m_DbPtr->m_Id;
+    return batch->db_id == 0 || batch->db_id == id;
+}
 
 static void cleanup_batch(Batch* batch)
 {
@@ -158,9 +175,16 @@ WriteBatch(
     wb = batch_ptr->wb;
     rocksdb::WriteOptions* opts = new rocksdb::WriteOptions;
     fold(env, argv[2], parse_write_option, *opts);
+    if(batch_ptr->db_id != 0 && batch_ptr->db_id != db_ptr->m_Id)
+    {
+        // column families of another database
+        delete opts;
+        return enif_make_badarg(env);
+    }
     rocksdb::Status status = db_ptr->m_Db->Write(*opts, wb);
     if(batch_ptr->wb) {
         batch_ptr->wb->Clear();
+        batch_ptr->db_id = 0;
     }
     enif_clear_env(batch_ptr->env);
 
@@ -188,7 +212,7 @@ PutBatch(
     wb = batch_ptr->wb;
     if (argc > 3)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!batch_cf(env, argv[1], batch_ptr, &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key) ||
                 !enif_inspect_binary(env, argv[3], &value))
             return enif_make_badarg(env);
@@ -201,6 +225,7 @@ PutBatch(
         rocksdb::Slice value_slice(reinterpret_cast<char*>(value.data), value.size);
         erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
         wb->Put(cf->m_ColumnFamily, key_slice, value_slice);
+        batch_ptr->db_id = cf->m_DbPtr->m_Id;
     }
     else
     {
@@ -237,7 +262,7 @@ MergeBatch(
     wb = batch_ptr->wb;
     if (argc > 3)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!batch_cf(env, argv[1], batch_ptr, &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key) ||
                 !enif_inspect_binary(env, argv[3], &value))
             return enif_make_badarg(env);
@@ -250,6 +275,7 @@ MergeBatch(
         rocksdb::Slice value_slice((const char*)value.data, value.size);
         erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
         wb->Merge(cf->m_ColumnFamily, key_slice, value_slice);
+        batch_ptr->db_id = cf->m_DbPtr->m_Id;
     }
     else
     {
@@ -284,7 +310,7 @@ DeleteBatch(
     wb = batch_ptr->wb;
     if (argc > 2)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!batch_cf(env, argv[1], batch_ptr, &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key))
             return enif_make_badarg(env);
 
@@ -294,6 +320,7 @@ DeleteBatch(
         rocksdb::Slice key_slice(reinterpret_cast<char*>(key.data), key.size);
         erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
         wb->Delete(cf->m_ColumnFamily, key_slice);
+        batch_ptr->db_id = cf->m_DbPtr->m_Id;
     }
     else
     {
@@ -324,7 +351,7 @@ SingleDeleteBatch(
     wb = batch_ptr->wb;
     if (argc > 2)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr) ||
+        if(!batch_cf(env, argv[1], batch_ptr, &cf_ptr) ||
                 !enif_inspect_binary(env, argv[2], &key))
             return enif_make_badarg(env);
         enif_make_copy(batch_ptr->env, argv[1]);
@@ -332,6 +359,7 @@ SingleDeleteBatch(
         rocksdb::Slice key_slice(reinterpret_cast<char*>(key.data), key.size);
         erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
         wb->SingleDelete(cf->m_ColumnFamily, key_slice);
+        batch_ptr->db_id = cf->m_DbPtr->m_Id;
     }
     else
     {
@@ -363,7 +391,7 @@ DeleteRangeBatch(
 
     if (argc > 3)
     {
-        if(!enif_get_cf(env, argv[1], &cf_ptr))
+        if(!batch_cf(env, argv[1], batch_ptr, &cf_ptr))
             return enif_make_badarg(env);
 
         if (!binary_to_slice(env, argv[2], &begin))
@@ -377,6 +405,7 @@ DeleteRangeBatch(
 
         erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
         wb->DeleteRange(cf->m_ColumnFamily, begin, end);
+        batch_ptr->db_id = cf->m_DbPtr->m_Id;
     }
     else
     {
@@ -407,6 +436,7 @@ ClearBatch(
     if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     batch_ptr->wb->Clear();
+    batch_ptr->db_id = 0;
     enif_clear_env(batch_ptr->env);
     return ATOM_OK;
 }
