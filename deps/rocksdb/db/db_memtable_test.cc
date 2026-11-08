@@ -140,7 +140,8 @@ TEST_F(DBMemTableTest, DuplicateSeq) {
   ImmutableOptions ioptions(options);
   WriteBufferManager wb(options.db_write_buffer_size);
   MemTable* mem = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb,
-                               kMaxSequenceNumber, 0 /* column_family_id */);
+                               kMaxSequenceNumber, 0 /* column_family_id */,
+                               nullptr /* flush_initiator */);
 
   // Write some keys and make sure it returns false on duplicates
   ASSERT_OK(
@@ -163,6 +164,10 @@ TEST_F(DBMemTableTest, DuplicateSeq) {
       mem->Add(seq, kTypeSingleDeletion, "key", "", nullptr /* kv_prot_info */)
           .IsTryAgain());
 
+  ASSERT_EQ(mem->NumEntries(), 2u);
+  ASSERT_EQ(mem->NumDeletion(), 0u);
+  ASSERT_EQ(mem->NumRangeDeletion(), 0u);
+
   // Test the duplicate keys under stress
   for (int i = 0; i < 10000; i++) {
     bool insert_dup = i % 10 == 1;
@@ -184,7 +189,8 @@ TEST_F(DBMemTableTest, DuplicateSeq) {
       new TestPrefixExtractor());  // which uses _ to extract the prefix
   ioptions = ImmutableOptions(options);
   mem = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb,
-                     kMaxSequenceNumber, 0 /* column_family_id */);
+                     kMaxSequenceNumber, 0 /* column_family_id */,
+                     nullptr /* flush_initiator */);
   // Insert a duplicate key with _ in it
   ASSERT_OK(
       mem->Add(seq, kTypeValue, "key_1", "value", nullptr /* kv_prot_info */));
@@ -197,13 +203,19 @@ TEST_F(DBMemTableTest, DuplicateSeq) {
   options.allow_concurrent_memtable_write = true;
   ioptions = ImmutableOptions(options);
   mem = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb,
-                     kMaxSequenceNumber, 0 /* column_family_id */);
+                     kMaxSequenceNumber, 0 /* column_family_id */,
+                     nullptr /* flush_initiator */);
   MemTablePostProcessInfo post_process_info;
   ASSERT_OK(mem->Add(seq, kTypeValue, "key", "value",
                      nullptr /* kv_prot_info */, true, &post_process_info));
   ASSERT_TRUE(mem->Add(seq, kTypeValue, "key", "value",
                        nullptr /* kv_prot_info */, true, &post_process_info)
                   .IsTryAgain());
+
+  mem->BatchPostProcess(post_process_info);
+  ASSERT_EQ(mem->NumEntries(), 1u);
+  ASSERT_EQ(mem->NumDeletion(), 0u);
+  ASSERT_EQ(mem->NumRangeDeletion(), 0u);
   delete mem;
 }
 
@@ -225,7 +237,8 @@ TEST_F(DBMemTableTest, ConcurrentMergeWrite) {
   ImmutableOptions ioptions(options);
   WriteBufferManager wb(options.db_write_buffer_size);
   MemTable* mem = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb,
-                               kMaxSequenceNumber, 0 /* column_family_id */);
+                               kMaxSequenceNumber, 0 /* column_family_id */,
+                               nullptr /* flush_initiator */);
 
   // Put 0 as the base
   PutFixed64(&value, static_cast<uint64_t>(0));
@@ -242,6 +255,7 @@ TEST_F(DBMemTableTest, ConcurrentMergeWrite) {
                          true, &post_process_info1));
       v1.clear();
     }
+    mem->BatchPostProcess(post_process_info1);
   });
   ROCKSDB_NAMESPACE::port::Thread write_thread2([&]() {
     MemTablePostProcessInfo post_process_info2;
@@ -252,9 +266,14 @@ TEST_F(DBMemTableTest, ConcurrentMergeWrite) {
                          true, &post_process_info2));
       v2.clear();
     }
+    mem->BatchPostProcess(post_process_info2);
   });
   write_thread1.join();
   write_thread2.join();
+  // 1 non-concurrent Put + (num_ops - 1) concurrent Merges
+  ASSERT_EQ(mem->NumEntries(), static_cast<uint64_t>(num_ops));
+  ASSERT_EQ(mem->NumDeletion(), 0u);
+  ASSERT_EQ(mem->NumRangeDeletion(), 0u);
 
   Status status;
   ReadOptions roptions;
@@ -344,7 +363,7 @@ class DBMemTableTestForSeek : public DBMemTableTest,
 TEST_P(DBMemTableTestForSeek, IntegrityChecks) {
   // Validate key corruption could be detected during seek.
   // We insert many keys into skiplist. Then we corrupt the each key one at a
-  // time. With memtable_veirfy_per_key_checksum_on_seek enabled, when the
+  // time. With memtable_verify_per_key_checksum_on_seek enabled, when the
   // corrupted key is searched, the checksum of every key visited during the
   // seek is validated. It will report data corruption. Otherwise seek returns
   // not found.
@@ -352,7 +371,7 @@ TEST_P(DBMemTableTestForSeek, IntegrityChecks) {
   Options options = CurrentOptions();
   options.allow_data_in_errors = allow_data_in_error;
   options.paranoid_memory_checks = std::get<1>(GetParam());
-  options.memtable_veirfy_per_key_checksum_on_seek = std::get<2>(GetParam());
+  options.memtable_verify_per_key_checksum_on_seek = std::get<2>(GetParam());
   options.memtable_protection_bytes_per_key = 8;
   DestroyAndReopen(options);
 
@@ -395,7 +414,7 @@ TEST_P(DBMemTableTestForSeek, IntegrityChecks) {
   ASSERT_EQ(raw_data_pointer.size(), key_count);
 
   bool enable_key_validation_on_seek =
-      options.memtable_veirfy_per_key_checksum_on_seek;
+      options.memtable_verify_per_key_checksum_on_seek;
 
   // For each key, corrupt it, validate corruption is detected correctly, then
   // revert it.

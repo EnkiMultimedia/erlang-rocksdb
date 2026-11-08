@@ -19,22 +19,43 @@ namespace ROCKSDB_NAMESPACE {
 
 class Comparator;
 
+// Options for SstFileWriter::OpenWithEmbeddedBlobs().
+//
+// Embedded blobs are large values stored in a leading segment of the same
+// block-based SST file. The table entry stores a same-file BlobIndex reference
+// instead of the value bytes. Readers that understand the embedded blob
+// metadata return the original value to callers.
+//
+// This mode is EXPERIMENTAL. It is intended for block-based table files with
+// format_version >= 7 only. Eligible blob records are written before Finish(),
+// so Put() and PutEntity() can surface write or checksum errors that would
+// normally be deferred until Finish().
+struct SstFileWriterEmbeddedBlobOptions {
+  // Minimum value size, in bytes, to store as an embedded blob.
+  //
+  // Put() values with size >= min_blob_size are embedded. For PutEntity(), each
+  // wide-column value is considered independently. Merge operands, deletions,
+  // and range deletions are not embedded. The default embeds eligible values
+  // of at least 2KB.
+  uint64_t min_blob_size = 2048;
+
+  // PLACEHOLDER: Not yet implemented (ignored).
+  CompressionType compression_type = kDisableCompressionOption;
+
+  // PLACEHOLDER: Not yet implemented (ignored).
+  CompressionOptions compression_options;
+};
+
 // ExternalSstFileInfo include information about sst files created
 // using SstFileWriter.
 struct ExternalSstFileInfo {
   ExternalSstFileInfo()
-      : file_path(""),
-        smallest_key(""),
-        largest_key(""),
-        smallest_range_del_key(""),
-        largest_range_del_key(""),
-        file_checksum(""),
-        file_checksum_func_name(""),
-        sequence_number(0),
+      : sequence_number(0),
         file_size(0),
         num_entries(0),
         num_range_del_entries(0),
-        version(0) {}
+        version(0),
+        prepared_file_info(nullptr) {}
 
   ExternalSstFileInfo(const std::string& _file_path,
                       const std::string& _smallest_key,
@@ -44,15 +65,12 @@ struct ExternalSstFileInfo {
       : file_path(_file_path),
         smallest_key(_smallest_key),
         largest_key(_largest_key),
-        smallest_range_del_key(""),
-        largest_range_del_key(""),
-        file_checksum(""),
-        file_checksum_func_name(""),
         sequence_number(_sequence_number),
         file_size(_file_size),
         num_entries(_num_entries),
         num_range_del_entries(0),
-        version(_version) {}
+        version(_version),
+        prepared_file_info(nullptr) {}
 
   std::string file_path;     // external sst file path
   std::string smallest_key;  // smallest user key in file
@@ -67,6 +85,9 @@ struct ExternalSstFileInfo {
   uint64_t num_entries;                 // number of entries in file
   uint64_t num_range_del_entries;  // number of range deletion entries in file
   int32_t version;                 // file version
+  // Opaque metadata that can be passed to IngestExternalFileArg::file_infos to
+  // skip re-opening and scanning the file during ingestion.
+  std::shared_ptr<const PreparedFileInfo> prepared_file_info;
 };
 
 // SstFileWriter is used to create sst files that can be added to database later
@@ -96,11 +117,31 @@ class SstFileWriter {
                 bool invalidate_page_cache = true,
                 Env::IOPriority io_priority = Env::IOPriority::IO_TOTAL);
 
+  // No copying allowed
+  SstFileWriter(const SstFileWriter&) = delete;
+  SstFileWriter& operator=(const SstFileWriter&) = delete;
+  SstFileWriter(SstFileWriter&&) = delete;
+  SstFileWriter& operator=(SstFileWriter&&) = delete;
+
   ~SstFileWriter();
 
   // Prepare SstFileWriter to write into file located at "file_path".
   Status Open(const std::string& file_path,
               Temperature temp = Temperature::kUnknown);
+
+  // EXPERIMENTAL: opens an SST writer mode that stores eligible blob payloads
+  // inside the same block-based SST file and stores same-file BlobIndex
+  // references in table entries. This is a special-purpose mode that doesn't
+  // offer write-amp improvements under compaction like standard blob support
+  // does. Blob records are written inline (interleaved with data blocks) as
+  // eligible values are added.
+  //
+  // Requires the writer to use block-based table format_version >= 7. The
+  // resulting SST can be consumed by RocksDB >= 11.6.0.
+  Status OpenWithEmbeddedBlobs(
+      const std::string& file_path,
+      const SstFileWriterEmbeddedBlobOptions& embedded_blob_options,
+      Temperature temp = Temperature::kUnknown);
 
   // Add a Put key with value to currently opened file
   // REQUIRES: user_key is after any previously added point (Put/Merge/Delete)
@@ -117,7 +158,9 @@ class SstFileWriter {
   Status Put(const Slice& user_key, const Slice& timestamp, const Slice& value);
 
   // Add a PutEntity (key with the wide-column entity defined by "columns") to
-  // the currently opened file
+  // the currently opened file. `columns` is a non-owning view, so the backing
+  // storage for each column name and value must remain valid until this method
+  // returns.
   Status PutEntity(const Slice& user_key, const WideColumns& columns);
 
   // Add a Merge key with value to currently opened file

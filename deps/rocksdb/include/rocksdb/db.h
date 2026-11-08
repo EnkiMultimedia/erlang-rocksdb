@@ -13,6 +13,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,12 +28,12 @@
 #include "rocksdb/snapshot.h"
 #include "rocksdb/sst_file_writer.h"
 #include "rocksdb/thread_status.h"
-#include "rocksdb/transaction_log.h"
 #include "rocksdb/types.h"
 #include "rocksdb/user_write_callback.h"
 #include "rocksdb/utilities/table_properties_collectors.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
 #include "rocksdb/version.h"
+#include "rocksdb/wal_iterator.h"
 #include "rocksdb/wide_columns.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -44,14 +45,19 @@ struct DBOptions;
 struct ExternalSstFileInfo;
 struct FlushOptions;
 struct FlushWALOptions;
+struct IOStatsContext;
 struct Options;
+struct PerfContext;
 struct ReadOptions;
 struct TableProperties;
 struct WriteOptions;
 struct WaitForCompactOptions;
 class Env;
+class CoroDB;
 class EventListener;
 class FileSystem;
+class LazyWideColumns;
+class LazyWideColumnsBatch;
 class MultiScan;
 class Replayer;
 class StatsHistoryIterator;
@@ -71,9 +77,87 @@ struct ColumnFamilyDescriptor {
       : name(_name), options(_options) {}
 };
 
+struct OutputMetadata {
+  // For each field, std::nullopt means the metadata was not requested.
+
+  // If engaged, receives the key timestamp.
+  std::optional<std::string> timestamp;
+
+  OutputMetadata& WantTimestamp(bool want = true) {
+    if (want) {
+      timestamp.emplace();
+    } else {
+      timestamp.reset();
+    }
+    return *this;
+  }
+
+  // If engaged, set to true when an explicit-snapshot read observes a later
+  // write for the same key than the snapshot can return. May be true when the
+  // read returns NotFound because the key was created after the snapshot.
+  //
+  // A "later write" is any committed (visible) point operation of type Put,
+  // Delete, Merge, SingleDelete, BlobIndex, DeletionWithTimestamp,
+  // WideColumnEntity, or ValuePreferredSeqno, as well as a covering range
+  // tombstone (DeleteRange) with sequence number greater than the snapshot.
+  // For ordinary DB reads, a committed write that completes before this read
+  // begins is guaranteed to be reported. A write that races with this read may
+  // or may not be reported. A true result always identifies a committed write
+  // in the sequence-number interval after the snapshot and through the read's
+  // sampled upper bound.
+  //
+  // Caveats:
+  //   * Transaction reads that require a custom visibility callback are not
+  //     supported.
+  //   * `ReadOptions::ignore_range_deletions` does not affect metadata
+  //     tracking: newer covering range tombstones are still reported.
+  //   * Has no effect when `read_options.snapshot` is null; the field is
+  //     always left as false in that case.
+  std::optional<bool> newer_version_present;
+
+  OutputMetadata& WantNewerVersionPresent(bool want = true) {
+    if (want) {
+      newer_version_present.emplace(false);
+    } else {
+      newer_version_present.reset();
+    }
+    return *this;
+  }
+};
+
+struct MultiGetOutputMetadata {
+  // For each field, std::nullopt means the metadata was not requested.
+
+  // If engaged, resized to num_keys and filled with key timestamps.
+  std::optional<std::vector<std::string>> timestamps;
+
+  MultiGetOutputMetadata& WantTimestamps(bool want = true) {
+    if (want) {
+      timestamps.emplace();
+    } else {
+      timestamps.reset();
+    }
+    return *this;
+  }
+
+  // If engaged, resized to num_keys and filled with newer-version metadata.
+  // See OutputMetadata::newer_version_present.
+  // Each entry is 0 for false and 1 for true.
+  std::optional<std::vector<uint8_t>> newer_version_present;
+
+  MultiGetOutputMetadata& WantNewerVersionPresent(bool want = true) {
+    if (want) {
+      newer_version_present.emplace();
+    } else {
+      newer_version_present.reset();
+    }
+    return *this;
+  }
+};
+
 class ColumnFamilyHandle {
  public:
-  virtual ~ColumnFamilyHandle() {}
+  virtual ~ColumnFamilyHandle() = default;
   // Returns the name of the column family associated with the current handle.
   virtual const std::string& GetName() const = 0;
   // Returns the ID of the column family associated with the current handle.
@@ -89,6 +173,32 @@ class ColumnFamilyHandle {
   // Returns the comparator of the column family associated with the
   // current handle.
   virtual const Comparator* GetComparator() const = 0;
+};
+
+// Opaque handle to a prepared-but-not-committed external file ingestion,
+// produced by DB::PrepareFileIngestion(). Pass it to
+// DB::CommitFileIngestionHandle(s)() to make the prepared files visible, or
+// call Abort() (or simply destroy the handle) to roll the ingestion back: that
+// deletes the staged files and releases the reserved internal file numbers.
+//
+// A handle MUST NOT outlive the DB that produced it.
+class FileIngestionHandle {
+ public:
+  virtual ~FileIngestionHandle() = default;
+
+  // Cancel this prepared ingestion: delete the staged files and release the
+  // reserved file numbers, leaving the DB unchanged. The handle is spent
+  // afterwards. Equivalent to simply destroying the handle, but explicit and
+  // returns a Status.
+  virtual Status Abort() = 0;
+
+  FileIngestionHandle(const FileIngestionHandle&) = delete;
+  FileIngestionHandle& operator=(const FileIngestionHandle&) = delete;
+  FileIngestionHandle(FileIngestionHandle&&) = delete;
+  FileIngestionHandle& operator=(FileIngestionHandle&&) = delete;
+
+ protected:
+  FileIngestionHandle() = default;
 };
 
 static const int kMajorVersion = ROCKSDB_MAJOR;
@@ -122,6 +232,15 @@ struct GetMergeOperandsOptions {
 //  value: the table properties object of the given table.
 using TablePropertiesCollection =
     std::unordered_map<std::string, std::shared_ptr<const TableProperties>>;
+
+// Serializes opaque metadata returned through PreparedFileInfo.
+Status SerializePreparedFileInfo(const PreparedFileInfo& prepared_file_info,
+                                 std::string* output);
+
+// Restores opaque metadata serialized by SerializePreparedFileInfo().
+Status DeserializePreparedFileInfo(
+    const Slice& input,
+    std::shared_ptr<const PreparedFileInfo>* prepared_file_info);
 
 // A DB is a persistent, versioned ordered map from keys to values.
 // A DB is safe for concurrent access from multiple threads without
@@ -172,6 +291,10 @@ class DB {
 
   // Open the database for read only.
   //
+  // If error_if_wal_file_exists is true, returns an error when a non-empty
+  // WAL file exists. Empty WAL files can be left behind by features such as
+  // async WAL precreation and are tolerated.
+  //
   static Status OpenForReadOnly(const Options& options, const std::string& name,
                                 std::unique_ptr<DB>* dbptr,
                                 bool error_if_wal_file_exists = false);
@@ -182,6 +305,10 @@ class DB {
   // families in the database that should be opened. However, you always need
   // to specify default column family. The default column family name is
   // 'default' and it's stored in ROCKSDB_NAMESPACE::kDefaultColumnFamilyName
+  //
+  // If error_if_wal_file_exists is true, returns an error when a non-empty
+  // WAL file exists. Empty WAL files can be left behind by features such as
+  // async WAL precreation and are tolerated.
   //
   static Status OpenForReadOnly(
       const DBOptions& db_options, const std::string& name,
@@ -198,6 +325,22 @@ class DB {
   // to Flush/Compaction will return error.
   //
   // Multiple secondary instances can co-exist at the same time.
+  //
+  // The primary can delete obsolete files that a secondary still references.
+  // To keep those files safely accessible, applications must either coordinate
+  // primary deletion with all secondaries, or provide an Env/FileSystem that
+  // delays physical deletion until every instance releases the file. As a
+  // table-files-only workaround when `open_files_async=false`, setting
+  // `max_open_files=-1` makes the secondary eagerly open its current SSTs;
+  // this does not protect other file types.
+  //
+  // With `open_files_async=true`, OpenAsSecondary returns before its current
+  // SSTs have all been opened, so `max_open_files=-1` does not provide that
+  // workaround. A missing file can surface as a background error and/or a read
+  // error. TryCatchUpWithPrimary can resolve a transient, non-latched error if
+  // a newer primary version no longer references the file. A latched
+  // asynchronous-open background error requires closing and reopening the
+  // secondary after fixing the underlying problem.
   //
 
   // Open DB as secondary instance
@@ -289,18 +432,26 @@ class DB {
 
   // Opens a database and runs compaction without modifying the original DB.
   //
-  // This read-only operation outputs compaction results to `output_directory`
-  // instead of installing them back to the source database. Designed primarily
-  // for use with `CompactionService` to process remote compaction jobs.
+  // This read-only operation outputs compaction results to a directory under
+  // the source database instead of installing them. When
+  // `DBOptions::use_session_tmp_dir_for_remote_compaction` is true,
+  // `output_directory` must be a single directory name and the path is
+  // `<name>/session_tmp/<output_directory>`. Otherwise, the path is
+  // `<name>/<output_directory>`. For compatibility, an already DB-rooted
+  // `output_directory` is also accepted when the option is false.
+  // Designed primarily for use with `CompactionService` to process remote
+  // compaction jobs.
   //
   // Parameters:
   // - `options`: Additional controls
+  //   * `max_secondary_open_retries` bounds retries for transient failures
+  //     caused by concurrent CURRENT or MANIFEST replacement.
   //   * When `allow_resumption = false`: The `output_directory` MUST be empty
   //     before calling this function. Any existing files (including resume
   //     state or output files from previous runs) in the directory may
   //     cause correctness errors as the compaction will start from scratch.
   // - `name`: Source database path
-  // - `output_directory`: Where compaction output files are written
+  // - `output_directory`: Client-selected output directory name
   // - `input`: Serialized compaction input information
   // - `output`: Serialized compaction result
   // - `override_options`: Configuration overrides for the operation
@@ -371,6 +522,8 @@ class DB {
   // No copying allowed
   DB(const DB&) = delete;
   void operator=(const DB&) = delete;
+  DB(DB&&) = delete;
+  void operator=(DB&&) = delete;
 
   virtual ~DB();
 
@@ -444,6 +597,8 @@ class DB {
   // Set the database entry for "key" in the column family specified by
   // "column_family" to the wide-column entity defined by "columns". If the key
   // already exists in the column family, it will be overwritten.
+  // `columns` is a non-owning view. The backing storage for each column name
+  // and value must remain valid until this method returns.
   //
   // Returns OK on success, and a non-OK status on error.
   virtual Status PutEntity(const WriteOptions& options,
@@ -554,6 +709,30 @@ class DB {
   // Apply the specified updates atomically to the database.
   // If `updates` contains no update, WAL will still be synced if
   // options.sync=true.
+  //
+  // When the WAL is enabled, an IOError from the WAL write has a fundamentally
+  // indeterminate outcome: storage may have accepted the complete WAL record
+  // before the acknowledgement failed, so RocksDB cannot distinguish an
+  // absent, incomplete, or complete record from the error alone. Normal DB
+  // reads can continue, but the failed write is not made visible to them while
+  // this DB instance remains open.
+  //
+  // However, the persisted DB (what is visible on reopen) is still in an
+  // indeterminate state with respect to these updates until RocksDB reports
+  // successful live resumption (see DB::Resume()) from a supported file-scoped
+  // WAL error without closing or reopening the DB. If the DB is reopened, or
+  // for any other WAL error that does not carry this durable-abandonment
+  // guarantee, the application should rely on its own consistency-resolution
+  // mechanism within the bounds of RocksDB's documented guarantees (see
+  // WALRecoveryMode), such as idempotency, deduplication, or reconciliation.
+  // After such a successful live resumption, RocksDB has durably abandoned the
+  // failed write; retrying it is recommended to preserve one linear logical
+  // history.
+  //
+  // For the lifetime of the open DB after supported file-scoped live
+  // resumption, GetUpdatesSince() reports the reserved sequence range as a gap
+  // and does not return a physically complete but abandoned record.
+  //
   // Returns OK on success, non-OK on failure.
   // Note: consider setting options.sync = true.
   virtual Status Write(const WriteOptions& options, WriteBatch* updates) = 0;
@@ -616,6 +795,28 @@ class DB {
     return s;
   }
 
+  inline Status GetWithMetadata(const ReadOptions& options,
+                                ColumnFamilyHandle* column_family,
+                                const Slice& key, std::string* value,
+                                OutputMetadata* output_metadata) {
+    if (output_metadata != nullptr &&
+        output_metadata->newer_version_present.has_value()) {
+      *output_metadata->newer_version_present = false;
+    }
+    if (value == nullptr) {
+      return Status::InvalidArgument(
+          "Cannot call GetWithMetadata with a null value");
+    }
+    PinnableSlice pinnable_val(value);
+    assert(!pinnable_val.IsPinned());
+    auto s = GetWithMetadata(options, column_family, key, &pinnable_val,
+                             output_metadata);
+    if (s.ok() && pinnable_val.IsPinned()) {
+      value->assign(pinnable_val.data(), pinnable_val.size());
+    }  // else value is already assigned
+    return s;
+  }
+
   // No timestamp, and value is returned in a PinnableSlice
   // NOTE: virtual final => disallow override (was previously allowed)
   virtual Status Get(const ReadOptions& options,
@@ -655,6 +856,12 @@ class DB {
     return Get(options, DefaultColumnFamily(), key, value, timestamp);
   }
 
+  Status GetWithMetadata(const ReadOptions& options, const Slice& key,
+                         std::string* value, OutputMetadata* output_metadata) {
+    return GetWithMetadata(options, DefaultColumnFamily(), key, value,
+                           output_metadata);
+  }
+
   // If the column family specified by "column_family" contains an entry for
   // "key", return it as a wide-column entity in "*columns". If the entry is a
   // wide-column entity, return it as-is; if it is a plain key-value, return it
@@ -679,6 +886,43 @@ class DB {
                            const Slice& /* key */,
                            PinnableAttributeGroups* /* result */) {
     return Status::NotSupported("GetEntity not supported");
+  }
+
+  // EXPERIMENTAL and subject to change
+  //
+  // Lazy variant of GetEntity(). If the column family contains an entry for
+  // "key", returns it in "*result" as a LazyWideColumns: inline columns are
+  // materialized zero-copy, but blob-backed columns are left as *unresolved
+  // references* whose bytes are read only when explicitly pulled (by byte
+  // range) via the LazyWideColumns read APIs (or, across keys,
+  // LazyWideColumnsBatch). Columns that are
+  // never pulled are never read from storage.
+  //
+  // Unlike GetEntity(), "*result" may be used after this call returns: it holds
+  // a pin (like an iterator) so deferred reads stay resolvable. Destroy it
+  // promptly to release that pin.
+  //
+  // Requires the DB's max_open_files == -1 (so table readers are immortal and
+  // same-file/embedded blob references stay resolvable lazily); returns
+  // InvalidArgument otherwise. Returns OK on success, NotFound (with an empty
+  // "*result") if there is no entry for "key", or another non-OK status on
+  // error.
+  //
+  // Limitations (in addition to being a wide-column API):
+  //   * User-defined timestamps: wide-column entities do not support UDT --
+  //     PutEntity() returns InvalidArgument on a column family with a
+  //     user-defined-timestamp comparator, so no entity can exist there. This
+  //     method performs the same read-timestamp validation as GetEntity() (both
+  //     go through the same internal read path), so on such a column family it
+  //     behaves exactly as GetEntity() would.
+  //   * Transactions: there is no Transaction counterpart of this method; the
+  //     lazy read APIs are available only directly on DB. Use GetEntity()
+  //     (which Transaction does provide) for reads within a transaction.
+  virtual Status GetEntityLazy(const ReadOptions& /* options */,
+                               ColumnFamilyHandle* /* column_family */,
+                               const Slice& /* key */,
+                               LazyWideColumns* /* result */) {
+    return Status::NotSupported("GetEntityLazy not supported");
   }
 
   // Populates the `merge_operands` array with all the merge operands in the DB
@@ -756,6 +1000,42 @@ class DB {
     return statuses;
   }
 
+  std::vector<Status> MultiGetWithMetadata(
+      const ReadOptions& options,
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      const std::vector<Slice>& keys, std::vector<std::string>* values,
+      MultiGetOutputMetadata* output_metadata) {
+    size_t num_keys = keys.size();
+    values->resize(num_keys);
+    if (column_families.size() != num_keys) {
+      if (output_metadata != nullptr) {
+        if (output_metadata->timestamps.has_value()) {
+          output_metadata->timestamps->resize(num_keys);
+        }
+        if (output_metadata->newer_version_present.has_value()) {
+          output_metadata->newer_version_present->assign(num_keys, false);
+        }
+      }
+      return std::vector<Status>(
+          num_keys,
+          Status::InvalidArgument("Number of column families does not match "
+                                  "number of keys"));
+    }
+
+    std::vector<Status> statuses(num_keys);
+    std::vector<PinnableSlice> pin_values(num_keys);
+
+    MultiGetWithMetadata(options, num_keys, column_families.data(), keys.data(),
+                         pin_values.data(), statuses.data(), output_metadata,
+                         /*sorted_input=*/false);
+    for (size_t i = 0; i < num_keys; ++i) {
+      if (statuses[i].ok()) {
+        (*values)[i].assign(pin_values[i].data(), pin_values[i].size());
+      }
+    }
+    return statuses;
+  }
+
   // No timestamps are returned
   // NOTE: virtual final => disallow override (was previously allowed)
   virtual std::vector<Status> MultiGet(
@@ -776,6 +1056,17 @@ class DB {
         options,
         std::vector<ColumnFamilyHandle*>(keys.size(), DefaultColumnFamily()),
         keys, values);
+  }
+
+  std::vector<Status> MultiGetWithMetadata(
+      const ReadOptions& options, const std::vector<Slice>& keys,
+      std::vector<std::string>* values,
+      MultiGetOutputMetadata* output_metadata) {
+    values->resize(keys.size());
+    return MultiGetWithMetadata(
+        options,
+        std::vector<ColumnFamilyHandle*>(keys.size(), DefaultColumnFamily()),
+        keys, values, output_metadata);
   }
 
   // MultiGet for default column family
@@ -833,6 +1124,15 @@ class DB {
                         Status* statuses,
                         const bool sorted_input = false) final;
 
+  // MultiGet for single column family with optional output metadata vectors.
+  // Non-null vectors in output_metadata are resized to num_keys entries.
+  void MultiGetWithMetadata(const ReadOptions& options,
+                            ColumnFamilyHandle* column_family,
+                            const size_t num_keys, const Slice* keys,
+                            PinnableSlice* values, Status* statuses,
+                            MultiGetOutputMetadata* output_metadata,
+                            const bool sorted_input = false);
+
   // MultiGet for single column family, no timestamps returned
   // NOTE: virtual final => disallow override (was previously allowed)
   virtual void MultiGet(const ReadOptions& options,
@@ -881,6 +1181,30 @@ class DB {
                               bool /* sorted_input */ = false) {
     for (size_t i = 0; i < num_keys; ++i) {
       statuses[i] = Status::NotSupported("MultiGetEntity not supported");
+    }
+  }
+
+  // EXPERIMENTAL and subject to change
+  //
+  // Lazy, batched peer of MultiGetEntity() (see GetEntityLazy() for the lazy
+  // semantics, the required pin, and the max_open_files == -1 requirement).
+  // "*result" is filled with "num_keys" per-key entities: "(*result)[i]"
+  // is the LazyWideColumns for "keys[i]" (blob-backed columns left as
+  // unresolved references), and "statuses[i]" is set to OK / NotFound / an
+  // error as in MultiGetEntity(). The per-key entities are owned by "*result"
+  // and are valid only while it is. Resolve references across keys together via
+  // LazyWideColumnsBatch::MultiResolve.
+  //
+  // The caller must ensure "keys" and "statuses" point to "num_keys" contiguous
+  // objects.
+  virtual void MultiGetEntityLazy(const ReadOptions& /* options */,
+                                  ColumnFamilyHandle* /* column_family */,
+                                  size_t num_keys, const Slice* /* keys */,
+                                  LazyWideColumnsBatch* /* result */,
+                                  Status* statuses,
+                                  bool /* sorted_input */ = false) {
+    for (size_t i = 0; i < num_keys; ++i) {
+      statuses[i] = Status::NotSupported("MultiGetEntityLazy not supported");
     }
   }
 
@@ -994,11 +1318,34 @@ class DB {
   }
   // Returns iterators from a consistent database state across multiple
   // column families. Iterators are heap allocated and need to be deleted
-  // before the db is destroyed
+  // before the db is destroyed. For a secondary DB, the iterators use one
+  // published read view without waiting for a concurrent catch-up and do not
+  // support Iterator::Refresh(). This does not strengthen secondary recovery's
+  // consistency guarantees; WAL replay can stop before all column families
+  // reach the same sequence.
   virtual Status NewIterators(
       const ReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families,
       std::vector<Iterator*>* iterators) = 0;
+
+  // Returns iterators from a consistent database state across multiple
+  // column families, using the corresponding ReadOptions for each column
+  // family. The two input vectors must have the same size. All snapshots must
+  // be null or point to the same Snapshot, and all tailing settings must be
+  // the same. Other ReadOptions fields may differ between column families.
+  // Iterators are heap allocated and need to be deleted before the db is
+  // destroyed. For a secondary DB, the iterators use one published read view
+  // without waiting for a concurrent catch-up and do not support
+  // Iterator::Refresh(). This does not strengthen secondary recovery's
+  // consistency guarantees; WAL replay can stop before all column families
+  // reach the same sequence.
+  virtual Status NewIterators(
+      const std::vector<ReadOptions>& /*read_options*/,
+      const std::vector<ColumnFamilyHandle*>& /*column_families*/,
+      std::vector<Iterator*>* /*iterators*/) {
+    return Status::NotSupported(
+        "Per-column-family ReadOptions are not supported by this DB");
+  }
 
   // Return a cross-column-family iterator from a consistent database state.
   //
@@ -1059,6 +1406,161 @@ class DB {
     std::unique_ptr<MultiScan> ms_iter = std::make_unique<MultiScan>(
         column_family->GetComparator(), std::move(iter));
     return ms_iter;
+  }
+
+  // EXPERIMENTAL
+  //
+  // RocksDB async read variants of Get and MultiGet. The default implementation
+  // uses the native coroutine capability when exposed and a FileSystem read
+  // executor is available, and otherwise invokes the callback synchronously
+  // before returning.
+  //
+  // Full async file IO requires RocksDB to be built with coroutine support, a
+  // DB implementation that exposes the native coroutine capability, a
+  // configured FileSystem read executor, and an underlying FileSystem that
+  // implements FSRandomAccessFile::SubmitReadAsync(). When the native
+  // coroutine capability and a read executor are available, RocksDB can run an
+  // internal read coroutine on the read executor, suspend while async file IO
+  // is outstanding, and resume when the filesystem signals completion. Without
+  // a native coroutine capability or read executor, the default implementation
+  // delegates to the synchronous Get/MultiGet path and invokes the callback
+  // inline before returning. The callback is invoked after the requested
+  // statuses and output buffers have been populated. Applications can set
+  // `DBOptions::read_io_executor_threads` before opening the DB to configure
+  // executor parallelism for their workload.
+  //
+  // Only selected data-block file reads can be issued asynchronously. Other
+  // work in the read path, including waiting for DB or cache locks, opening
+  // files, reading table metadata or blobs, waiting for caches, and invoking
+  // event listeners or other user callbacks, may block the thread running the
+  // request.
+  //
+  // Callers must keep the DB, callback, inputs, and output buffers alive until
+  // the callback returns. The callback may run inline before the async method
+  // returns, or later from the implementation's completion path. Callbacks must
+  // not invoke another async read.
+  //
+  // STATS:
+  // When enabled through the calling thread's stats configuration,
+  // get_perf_context() and get_iostats_context() contain metrics for this
+  // request only while OnComplete() runs. Copy any needed metrics before the
+  // callback returns. Some scoped CPU metrics may be missing (e.g.
+  // `block_read_cpu_time`).
+  //
+  // Enabling stats for async reads is generally more expensive because each
+  // request needs a separate stats context. Stats configuration (e.g. perf
+  // level) is read when the async call begins.
+  //
+  // Callers must set the desired configuration for each async read instead of
+  // relying on TLS state left by an earlier async read. Disable both perf and
+  // IO stats before a call when no stats are needed. Async reads reset the
+  // calling thread's configuration to disabled.
+  class AsyncCallback {
+   public:
+    virtual ~AsyncCallback() = default;
+    virtual void OnComplete() = 0;
+  };
+
+  virtual void GetAsync(const ReadOptions& options,
+                        ColumnFamilyHandle* column_family, const Slice& key,
+                        PinnableSlice* value, std::string* timestamp,
+                        Status& status, AsyncCallback& callback);
+
+  virtual void GetAsync(const ReadOptions& options,
+                        ColumnFamilyHandle* column_family, const Slice& key,
+                        std::string* value, std::string* timestamp,
+                        Status& status, AsyncCallback& callback) {
+    class CallbackWrapper final : public AsyncCallback {
+     public:
+      CallbackWrapper(std::string* value, Status& status,
+                      AsyncCallback& callback)
+          : value_(value),
+            pinnable_value_(value),
+            status_(status),
+            callback_(callback) {}
+
+      PinnableSlice* value() { return &pinnable_value_; }
+
+      void OnComplete() override {
+        std::unique_ptr<CallbackWrapper> self(this);
+        if (status_.ok() && pinnable_value_.IsPinned()) {
+          value_->assign(pinnable_value_.data(), pinnable_value_.size());
+        }
+        AsyncCallback& callback = callback_;
+        self.reset();
+        callback.OnComplete();
+      }
+
+     private:
+      std::string* value_;
+      PinnableSlice pinnable_value_;
+      Status& status_;
+      AsyncCallback& callback_;
+    };
+
+    assert(value != nullptr);
+    auto* wrapper = new CallbackWrapper(value, status, callback);
+    GetAsync(options, column_family, key, wrapper->value(), timestamp, status,
+             *wrapper);
+  }
+
+  virtual void GetAsync(const ReadOptions& options,
+                        ColumnFamilyHandle* column_family, const Slice& key,
+                        PinnableSlice* value, Status& status,
+                        AsyncCallback& callback) {
+    GetAsync(options, column_family, key, value, nullptr, status, callback);
+  }
+
+  virtual void GetAsync(const ReadOptions& options,
+                        ColumnFamilyHandle* column_family, const Slice& key,
+                        std::string* value, Status& status,
+                        AsyncCallback& callback) {
+    GetAsync(options, column_family, key, value, nullptr, status, callback);
+  }
+
+  virtual void GetAsync(const ReadOptions& options, const Slice& key,
+                        std::string* value, Status& status,
+                        AsyncCallback& callback) {
+    GetAsync(options, DefaultColumnFamily(), key, value, status, callback);
+  }
+
+  virtual void GetAsync(const ReadOptions& options, const Slice& key,
+                        std::string* value, std::string* timestamp,
+                        Status& status, AsyncCallback& callback) {
+    GetAsync(options, DefaultColumnFamily(), key, value, timestamp, status,
+             callback);
+  }
+
+  virtual void MultiGetAsync(const ReadOptions& options, const size_t num_keys,
+                             ColumnFamilyHandle** column_families,
+                             const Slice* keys, PinnableSlice* values,
+                             std::string* timestamps, Status* statuses,
+                             const bool sorted_input, AsyncCallback& callback);
+
+  virtual void MultiGetAsync(const ReadOptions& options, const size_t num_keys,
+                             ColumnFamilyHandle** column_families,
+                             const Slice* keys, PinnableSlice* values,
+                             Status* statuses, const bool sorted_input,
+                             AsyncCallback& callback) {
+    MultiGetAsync(options, num_keys, column_families, keys, values, nullptr,
+                  statuses, sorted_input, callback);
+  }
+
+  virtual void MultiGetAsync(const ReadOptions& options, const size_t num_keys,
+                             ColumnFamilyHandle** column_families,
+                             const Slice* keys, PinnableSlice* values,
+                             std::string* timestamps, Status* statuses,
+                             AsyncCallback& callback) {
+    MultiGetAsync(options, num_keys, column_families, keys, values, timestamps,
+                  statuses, /*sorted_input=*/false, callback);
+  }
+
+  virtual void MultiGetAsync(const ReadOptions& options, const size_t num_keys,
+                             ColumnFamilyHandle** column_families,
+                             const Slice* keys, PinnableSlice* values,
+                             Status* statuses, AsyncCallback& callback) {
+    MultiGetAsync(options, num_keys, column_families, keys, values, nullptr,
+                  statuses, /*sorted_input=*/false, callback);
   }
 
   // Return a handle to the current DB state.  Iterators created with
@@ -1172,6 +1674,17 @@ class DB {
     //      running compactions.
     static const std::string kNumRunningCompactions;
 
+    //  "rocksdb.num-running-remote-compactions" - returns the number of
+    //      compaction service jobs currently waiting in
+    //      `CompactionService::Wait()`. Remote work is scheduled per
+    //      subcompaction, so a single compaction may contribute more than one
+    //      to this count. Always 0 when no `compaction_service` is configured.
+    static const std::string kNumRunningRemoteCompactions;
+
+    //  "rocksdb.num-running-bottom-compactions" - returns the number of
+    //      currently running bottom-priority compactions.
+    static const std::string kNumRunningBottomCompactions;
+
     //  "rocksdb.num-running-compaction-sorted-runs" - returns the number of
     //  sorted runs being processed by currently running compactions.
     static const std::string kNumRunningCompactionSortedRuns;
@@ -1179,6 +1692,12 @@ class DB {
     //  "rocksdb.compaction-abort-count" - returns the current value of the
     //      compaction abort counter.
     static const std::string kCompactionAbortCount;
+
+    //  "rocksdb.num-unscheduled-compactions" - returns the number of
+    //      compactions waiting in the DB's internal compaction queue but not
+    //      yet assigned to a background job. This is a DB-wide value, not
+    //      per-column family.
+    static const std::string kNumUnscheduledCompactions;
 
     //  "rocksdb.background-errors" - returns accumulated number of background
     //      errors.
@@ -1421,7 +1940,10 @@ class DB {
   //  "rocksdb.base-level"
   //  "rocksdb.estimate-pending-compaction-bytes"
   //  "rocksdb.num-running-compactions"
+  //  "rocksdb.num-running-remote-compactions"
+  //  "rocksdb.num-running-bottom-compactions"
   //  "rocksdb.num-running-flushes"
+  //  "rocksdb.num-unscheduled-compactions"
   //  "rocksdb.actual-delayed-write-rate"
   //  "rocksdb.is-write-stopped"
   //  "rocksdb.estimate-oldest-key-time"
@@ -1459,7 +1981,8 @@ class DB {
   enum class SizeApproximationFlags : uint8_t {
     NONE = 0,
     INCLUDE_MEMTABLES = 1 << 0,
-    INCLUDE_FILES = 1 << 1
+    INCLUDE_FILES = 1 << 1,
+    INCLUDE_BLOB_FILES = 1 << 2
   };
 
   // For each i in [0,n-1], store in "sizes[i]", the approximate
@@ -1698,9 +2221,50 @@ class DB {
   // ResumeAllCompactions().
   virtual void ResumeAllCompactions() = 0;
 
+  // Abort compaction work for `column_family`. Running compactions for the
+  // column family are signaled to abort, and new compactions for it are
+  // rejected until ResumeCompactions() is called. Compactions for other column
+  // families are unaffected. This function blocks until the column family's
+  // running compactions complete or abort, or DB shutdown begins.
+  // Unless DB shutdown has begun, `column_family` must be a live handle owned
+  // by this DB.
+  //
+  // This is the per-column-family counterpart to AbortAllCompactions(). The
+  // global and per-column-family abort counts compose: compaction resumes for
+  // this column family only after matching ResumeAllCompactions() and
+  // ResumeCompactions() calls clear both. Unlike DisableManualCompaction(),
+  // this aborts automatic and manual compactions for the column family. Unlike
+  // PauseBackgroundWork(), it does not pause flushes or work for other column
+  // families.
+  //
+  // Calls are reference counted independently for each column family. The
+  // caller must retain the live handle through all matching
+  // ResumeCompactions() calls while the DB is live, even if the column family
+  // is dropped in the meantime. Flushes and external-ingestion reservations
+  // are unaffected. An already-running level refit is neither signaled nor
+  // waited on; new CompactRange() calls are rejected at entry. Remote
+  // compaction-service work is not actively aborted.
+  // If DB shutdown has begun, this is a no-op and does not inspect
+  // `column_family`.
+  virtual void AbortCompactions(ColumnFamilyHandle* column_family) = 0;
+
+  // Resume compactions for `column_family`. This must be called as many times
+  // as AbortCompactions() for the same column family before work is
+  // rescheduled. While the DB is live, `column_family` must be the live handle
+  // passed to AbortCompactions(). Extra calls log a warning and otherwise have
+  // no effect.
+  // If DB shutdown has begun, this is a no-op and does not inspect
+  // `column_family`.
+  virtual void ResumeCompactions(ColumnFamilyHandle* column_family) = 0;
+
   // Wait for all flush and compactions jobs to finish. Jobs to wait include the
   // unscheduled (queued, but not scheduled yet). If the db is shutting down,
   // Status::ShutdownInProgress will be returned.
+  //
+  // Compaction work parked by AbortCompactions() remains pending. Without a
+  // timeout, this function will not return until matching ResumeCompactions()
+  // calls restore that work and it finishes, the column family is dropped, or
+  // the DB starts shutting down.
   //
   // NOTE: This may also never return if there's sufficient ongoing writes that
   // keeps flush and compaction going without stopping. The user would have to
@@ -1791,16 +2355,17 @@ class DB {
   // state, though while the WAL is locked, flushes as part of CreateCheckpoint
   // and simiar are skipped. Other operations allowed on a "read only" DB should
   // work while frozen. Each LockWAL() call that returns OK must eventually be
-  // followed by a corresponding call to UnlockWAL(). Where supported, non-OK
-  // status is generally only possible with some kind of corruption or I/O
-  // error.
+  // followed by a corresponding call to UnlockWAL(). It is also expected that
+  // UnlockWAL() is called on the same thread that called LockWAL(). Where
+  // supported, non-OK status is generally only possible with some kind of
+  // corruption or I/O error.
   virtual Status LockWAL() {
     return Status::NotSupported("LockWAL not implemented");
   }
 
-  // Unfreeze the DB state from a successful LockWAL().
-  // The write stop on the database will be cleared when UnlockWAL() have been
-  // called for each successful LockWAL().
+  // Unfreeze the DB state from a successful LockWAL(). The write stop on the
+  // database will be cleared when UnlockWAL() have been called for each
+  // successful LockWAL(). Must be called from the same thread as LockWAL().
   virtual Status UnlockWAL() {
     return Status::NotSupported("UnlockWAL not implemented");
   }
@@ -1867,24 +2432,51 @@ class DB {
   // and may not have file_creation_time property. In both the cases
   // file_creation_time is considered 0 which means this API will return
   // creation_time = 0 as there wouldn't be a timestamp lower than 0.
+  //
+  // NOTE: When the DB was opened with open_files_async = true, this API may
+  // block to wait for background SST file loading to complete, but only when
+  // necessary (i.e., when a file's manifest does not carry file_creation_time
+  // and the value must come from the SST reader). Modern DBs return the real
+  // value immediately. It is possible to have an incomplete result if the DB
+  // is closed while files are still being opened in the background.
   virtual Status GetCreationTimeOfOldestFile(uint64_t* creation_time) = 0;
 
-  // Note: this API is not yet consistent with WritePrepared transactions.
+  // Sets *iter to a WalIterator over the WriteBatches recorded in the
+  // write-ahead log, starting from the one whose sequence number range
+  // [start_seq, end_seq] covers seq_number.
   //
-  // Sets iter to an iterator that is positioned at a write-batch whose
-  // sequence number range [start_seq, end_seq] covers seq_number. If no such
-  // write-batch exists, then iter is positioned at the next write-batch whose
-  // start_seq > seq_number.
+  // Only writes that reached the WAL are returned. Writes made with
+  // WriteOptions::disableWAL, sequence numbers consumed by
+  // IngestExternalFile(), or sequence ranges reserved after a file-scoped WAL
+  // write error can be absent and leave permanent holes in the sequence
+  // numbers seen here. Set WAL_ttl_seconds and/or WAL_size_limit_MB large
+  // enough to cover how far behind a consumer may fall, or the WAL will be
+  // cleared before the consumer reads it.
   //
-  // Returns Status::OK if iterator is valid
-  // Must set WAL_ttl_seconds or WAL_size_limit_MB to large values to
-  // use this api, else the WAL files will get
-  // cleared aggressively and the iterator might keep getting invalid before
-  // an update is read.
-  virtual Status GetUpdatesSince(
-      SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
-      const TransactionLogIterator::ReadOptions& read_options =
-          TransactionLogIterator::ReadOptions()) = 0;
+  // After successful live resumption from a supported file-scoped WAL write
+  // error, and while that DB instance remains open, iteration stops with
+  // Status::NotFound before the reserved sequence range. This remains true if
+  // the error-returned record is physically complete: the recovered DB
+  // abandoned that record, so returning it would make a WAL consumer diverge
+  // from the DB. A caller can start a new iterator after the reserved range,
+  // but must treat the intervening sequence numbers as a gap.
+  //
+  // Returns Status::NotSupported() for TransactionDB with the WritePrepared
+  // or WriteUnprepared write policies.
+  //
+  // WARNING: if seq_number itself is no longer available, this positions at
+  // the next available write-batch (start_seq > seq_number) and still returns
+  // Status::OK -- data is skipped silently. Since recovering from a spent
+  // iterator means calling this function again, that recovery is where data
+  // loss can slip in unnoticed. Callers resuming a previous iterator should
+  // check that the first batch continues from where that one stopped; see
+  // WalIterator for details.
+  //
+  // Returns Status::OK if the iterator is valid.
+  virtual Status GetUpdatesSince(SequenceNumber seq_number,
+                                 std::unique_ptr<WalIterator>* iter,
+                                 const WalIterator::ReadOptions& read_options =
+                                     WalIterator::ReadOptions()) = 0;
 
   // Obtains a list of all live table (SST) files and how they fit into the
   // LSM-trees, such as column family, level, key range, etc.
@@ -1907,6 +2499,14 @@ class DB {
   virtual Status GetLiveFilesStorageInfo(
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) = 0;
+
+  // Prepares a live DB-generated table file for use with IngestExternalFiles().
+  // See `PreparedFileInfo` for details. The path must exactly match a live
+  // table file owned by this DB. This may open the table file and populate this
+  // DB's table cache if the table reader is not already cached.
+  virtual Status GetPreparedFileInfoForExternalSstIngestion(
+      const std::string& /*file_path*/,
+      std::shared_ptr<const PreparedFileInfo>* /*file_info*/) = 0;
 
   // Obtains the LSM-tree meta data of the specified column family of the DB,
   // including metadata for each live table (SST) file in that column family.
@@ -2040,6 +2640,58 @@ class DB {
   // 0 <= i < j < len(args), args[i].column_family != args[j].column_family.
   virtual Status IngestExternalFiles(
       const std::vector<IngestExternalFileArg>& args) = 0;
+
+  // Two-phase external file ingestion. PrepareFileIngestion() performs all of
+  // the work that does not require the DB mutex (validating the args, reserving
+  // internal file numbers, reading each file's metadata, and
+  // linking/copying/fsyncing the files into the DB), returning an opaque
+  // FileIngestionHandle. DB::CommitFileIngestionHandle(s)() then commits the
+  // external file into the DB.
+  //
+  // The main advantage here is that the application has more flexibility to
+  // "Prepare" the file in advance, which makes the actual Commit phase much
+  // shorter than a typical DB::IngestExternalFiles call.
+  //
+  // `args` has the same requirements as IngestExternalFiles(). On success
+  // *handle holds the prepared ingestion; on failure *handle is reset and no DB
+  // state is changed. PrepareFileIngestion() is safe to call concurrently with
+  // other DB operations and from a background thread.
+  virtual Status PrepareFileIngestion(
+      const std::vector<IngestExternalFileArg>& args,
+      std::unique_ptr<FileIngestionHandle>* handle) = 0;
+
+  // Single-column-family convenience overload of PrepareFileIngestion().
+  virtual Status PrepareFileIngestion(
+      ColumnFamilyHandle* column_family,
+      const std::vector<std::string>& external_files,
+      const IngestExternalFileOptions& options,
+      std::unique_ptr<FileIngestionHandle>* handle) {
+    IngestExternalFileArg arg;
+    arg.column_family = column_family;
+    arg.external_files = external_files;
+    arg.options = options;
+    return PrepareFileIngestion({arg}, handle);
+  }
+
+  // Commits one or more prepared ingestions (from PrepareFileIngestion())
+  // atomically: all of their files become visible together under a single DB
+  // mutex acquisition and a single atomic MANIFEST write, or none do. Consumes
+  // the handles. Multiple handles MAY target the same column family; that
+  // column family's files are committed together as if all of them had been
+  // passed to a single IngestExternalFiles() call, in the order the handles
+  // appear in `handles` (so for overlapping keys a later handle's data wins).
+  // Handles that target the same column family must have been prepared with the
+  // same IngestExternalFileOptions. On failure all handles are rolled back.
+  virtual Status CommitFileIngestionHandles(
+      std::vector<std::unique_ptr<FileIngestionHandle>> handles) = 0;
+
+  // Single-handle convenience for CommitFileIngestionHandles().
+  virtual Status CommitFileIngestionHandle(
+      std::unique_ptr<FileIngestionHandle> handle) {
+    std::vector<std::unique_ptr<FileIngestionHandle>> handles;
+    handles.push_back(std::move(handle));
+    return CommitFileIngestionHandles(std::move(handles));
+  }
 
   // CreateColumnFamilyWithImport() will create a new column family with
   // column_family_name and import external SST files specified in `metadata`
@@ -2187,7 +2839,13 @@ class DB {
     return Status::NotSupported("EndBlockCacheTrace() is not implemented.");
   }
 
-  // Create a default trace replayer.
+  // Create a default trace replayer. `handles` are the column families that
+  // read records (Get, MultiGet, iterator seek) may refer to. The default
+  // column family is always included, so `handles` may be empty for a trace
+  // of the default column family only. A read record on any other column
+  // family fails with Status::Corruption(). Write records do not use
+  // `handles`; they are applied to the column families named in the write
+  // batch.
   virtual Status NewDefaultReplayer(
       const std::vector<ColumnFamilyHandle*>& /*handles*/,
       std::unique_ptr<TraceReader>&& /*reader*/,
@@ -2217,9 +2875,44 @@ class DB {
   // secondary instance does not delete the corresponding column family
   // handles, the data of the column family is still accessible to the
   // secondary.
+  // If the primary has flushed data that this instance cannot read, because the
+  // flushed file is missing or unreadable for example, the memtables holding
+  // that data are kept rather than dropped, so that reads do not lose it. That
+  // memory, which is charged to `write_buffer_manager` when one is configured,
+  // is reclaimed only once those files become readable or this instance is
+  // reopened; `rocksdb.num-immutable-mem-table` reports how many memtables are
+  // being held.
   virtual Status TryCatchUpWithPrimary() {
     return Status::NotSupported("Supported only by secondary instance");
   }
+
+  // Returns the non-owning native coroutine interface, or nullptr when this DB
+  // does not support it. The returned pointer must not outlive this DB.
+  virtual CoroDB* GetCoroDB() { return nullptr; }
+
+  // EXPERIMENTAL, subject to change.
+  // Returns the same value as Get() and populates requested output metadata.
+  // Newer-version tracking is supported for explicit-snapshot reads on the
+  // primary DB implementation. Newer-version tracking is not supported with
+  // kPersistedTier or by transaction reads that require a custom visibility
+  // callback. Read-only and compacted DBs return false because their in-process
+  // views are static. Secondary DBs and subclasses that do not implement
+  // tracking return NotSupported for explicit-snapshot tracking requests.
+  virtual Status GetWithMetadata(const ReadOptions& options,
+                                 ColumnFamilyHandle* column_family,
+                                 const Slice& key, PinnableSlice* value,
+                                 OutputMetadata* output_metadata);
+
+  // EXPERIMENTAL, subject to change.
+  // MultiGet equivalent of GetWithMetadata(). For each requested metadata
+  // field, the corresponding output vector is resized to num_keys entries.
+  virtual void MultiGetWithMetadata(const ReadOptions& options,
+                                    const size_t num_keys,
+                                    ColumnFamilyHandle* const* column_families,
+                                    const Slice* keys, PinnableSlice* values,
+                                    Status* statuses,
+                                    MultiGetOutputMetadata* output_metadata,
+                                    const bool sorted_input = false);
 };
 
 struct WriteStallStatsMapKeys {
@@ -2260,6 +2953,7 @@ inline Status DB::GetApproximateSizes(ColumnFamilyHandle* column_family,
   using enum SizeApproximationFlags;  // Require C++20 support
   options.include_memtables = ((include_flags & INCLUDE_MEMTABLES) != NONE);
   options.include_files = ((include_flags & INCLUDE_FILES) != NONE);
+  options.include_blob_files = ((include_flags & INCLUDE_BLOB_FILES) != NONE);
   return GetApproximateSizes(options, column_family, ranges, n, sizes);
 }
 

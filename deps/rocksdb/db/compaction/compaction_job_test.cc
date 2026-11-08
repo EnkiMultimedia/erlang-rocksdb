@@ -322,8 +322,10 @@ class CompactionJobTestBase : public testing::Test {
     assert(contents.size() > 0);
 
     bool first_key = true;
-    std::string smallest, largest;
-    InternalKey smallest_key, largest_key;
+    std::string smallest;
+    std::string largest;
+    InternalKey smallest_key;
+    InternalKey largest_key;
     SequenceNumber smallest_seqno = kMaxSequenceNumber;
     SequenceNumber largest_seqno = 0;
     uint64_t oldest_blob_file_number = kInvalidBlobFileNumber;
@@ -387,7 +389,7 @@ class CompactionJobTestBase : public testing::Test {
     edit.AddFile(
         level, file_number, 0, file_size, smallest_key, largest_key,
         smallest_seqno, largest_seqno, false, Temperature::kUnknown,
-        oldest_blob_file_number, kUnknownOldestAncesterTime,
+        oldest_blob_file_number, kUnknownOldestAncestorTime,
         kUnknownFileCreationTime,
         versions_->GetColumnFamilySet()->GetDefault()->NewEpochNumber(),
         kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2,
@@ -1572,6 +1574,10 @@ TEST_F(CompactionJobTest, InputSerialization) {
   while (!rnd.OneIn(10)) {
     input.snapshots.emplace_back(rnd64.Uniform(UINT64_MAX));
   }
+  std::sort(input.snapshots.begin(), input.snapshots.end());
+  input.snapshots.erase(
+      std::unique(input.snapshots.begin(), input.snapshots.end()),
+      input.snapshots.end());
   while (!rnd.OneIn(10)) {
     input.input_files.emplace_back(rnd.RandomString(
         rnd.Uniform(kStrMaxLen - 1) +
@@ -1641,6 +1647,25 @@ TEST_F(CompactionJobTest, InputSerialization) {
   ASSERT_TRUE(s.IsNotSupported());
 }
 
+TEST_F(CompactionJobTest, OpenAndCompactRejectsUnorderedSnapshots) {
+  for (const std::vector<SequenceNumber>& snapshots :
+       {std::vector<SequenceNumber>{2, 1}, std::vector<SequenceNumber>{1, 1}}) {
+    CompactionServiceInput input;
+    input.snapshots = snapshots;
+
+    std::string serialized_input;
+    ASSERT_OK(input.Write(&serialized_input));
+
+    std::string serialized_result;
+    Status s =
+        DB::OpenAndCompact("", "output", serialized_input, &serialized_result,
+                           CompactionServiceOptionsOverride());
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_NE(s.ToString().find("snapshots must be strictly increasing"),
+              std::string::npos);
+  }
+}
+
 TEST_F(CompactionJobTest, ResultSerialization) {
   // Setup a random CompactionServiceResult
   CompactionServiceResult result;
@@ -1679,7 +1704,7 @@ TEST_F(CompactionJobTest, ResultSerialization) {
             rnd.Uniform(kStrMaxLen)) /* smallest_internal_key */,
         rnd.RandomBinaryString(
             rnd.Uniform(kStrMaxLen)) /* largest_internal_key */,
-        rnd64.Uniform(UINT64_MAX) /* oldest_ancester_time */,
+        rnd64.Uniform(UINT64_MAX) /* oldest_ancestor_time */,
         rnd64.Uniform(UINT64_MAX) /* file_creation_time */,
         rnd64.Uniform(UINT64_MAX) /* epoch_number */,
         file_checksum /* file_checksum */,

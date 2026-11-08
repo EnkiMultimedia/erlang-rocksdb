@@ -24,7 +24,8 @@ Status DBImpl::SuggestCompactRange(ColumnFamilyHandle* column_family,
                                    const Slice* begin, const Slice* end) {
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
   auto cfd = cfh->cfd();
-  InternalKey start_key, end_key;
+  InternalKey start_key;
+  InternalKey end_key;
   if (begin != nullptr) {
     start_key.SetMinPossibleForUserKey(*begin);
   }
@@ -140,12 +141,12 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
                    f->fd.GetFileSize(), f->smallest, f->largest,
                    f->fd.smallest_seqno, f->fd.largest_seqno,
                    f->marked_for_compaction, f->temperature,
-                   f->oldest_blob_file_number, f->oldest_ancester_time,
+                   f->oldest_blob_file_number, f->oldest_ancestor_time,
                    f->file_creation_time, f->epoch_number, f->file_checksum,
                    f->file_checksum_func_name, f->unique_id,
                    f->compensated_range_deletion_size, f->tail_size,
                    f->user_defined_timestamps_persisted, f->min_timestamp,
-                   f->max_timestamp);
+                   f->max_timestamp, f->file_open_metadata);
     }
 
     status = versions_->LogAndApply(cfd, read_options, write_options, &edit,

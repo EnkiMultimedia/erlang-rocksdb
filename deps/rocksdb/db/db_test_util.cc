@@ -13,6 +13,7 @@
 #include "db/forward_iterator.h"
 #include "env/fs_readonly.h"
 #include "env/mock_env.h"
+#include "file/file_util.h"
 #include "port/lang.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
@@ -22,6 +23,11 @@
 #include "table/format.h"
 #include "util/random.h"
 
+#if USE_COROUTINES
+#include "folly/coro/BlockingWait.h"
+#include "rocksdb/coro_db.h"
+#endif  // USE_COROUTINES
+
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
@@ -30,6 +36,7 @@ int64_t MaybeCurrentTime(Env* env) {
   env->GetCurrentTime(&time).PermitUncheckedError();
   return time;
 }
+
 }  // anonymous namespace
 
 // Special Env used to delay background operations
@@ -90,6 +97,8 @@ DBTestBase::DBTestBase(const std::string path, bool env_do_fsync)
   dbname_ = test::PerThreadDBPath(env_, path);
   alternative_wal_dir_ = dbname_ + "/wal";
   alternative_db_log_dir_ = dbname_ + "/db_log_dir";
+  EXPECT_OK(DestroyDir(env_, alternative_wal_dir_));
+  EXPECT_OK(DestroyDir(env_, alternative_db_log_dir_));
   auto options = CurrentOptions();
   options.env = env_;
   auto delete_options = options;
@@ -117,8 +126,14 @@ DBTestBase::~DBTestBase() {
   if (getenv("KEEP_DB")) {
     printf("DB is still at %s\n", dbname_.c_str());
   } else {
+    EXPECT_OK(DestroyDir(env_, alternative_wal_dir_));
+    EXPECT_OK(DestroyDir(env_, alternative_db_log_dir_));
     EXPECT_OK(DestroyDB(dbname_, options));
   }
+  // Ensure SstFileManager (and its DeleteScheduler background thread) is
+  // destroyed before env_. The bg thread calls env_ virtual methods
+  // (e.g. NewDirectory), so env_ must outlive it.
+  last_options_.sst_file_manager.reset();
   delete env_;
 }
 
@@ -520,7 +535,8 @@ Options DBTestBase::GetOptions(
     }
     case kBlockBasedTableWithLatestFormat: {
       // In case different from default
-      table_options.format_version = kLatestBbtFormatVersion;
+      table_options.format_version =
+          BlockBasedTableOptions::kLatestSupportedFormatVersion;
       break;
     }
     case kOptimizeFiltersForHits: {
@@ -848,12 +864,29 @@ Status DBTestBase::SingleDelete(int cf, const std::string& k) {
   return db_->SingleDelete(WriteOptions(), handles_[cf], k);
 }
 
-std::string DBTestBase::Get(const std::string& k, const Snapshot* snapshot) {
+std::string DBTestBase::Get(const std::string& k, const Snapshot* snapshot,
+                            bool use_coroutine) {
   ReadOptions options;
   options.verify_checksums = true;
   options.snapshot = snapshot;
   std::string result;
-  Status s = db_->Get(options, k, &result);
+  Status s;
+#if USE_COROUTINES
+  if (use_coroutine) {
+    PinnableSlice pinnable_value(&result);
+    s = folly::coro::blockingWait(CoroDB::CoGet(
+        dbfull(), options, dbfull()->DefaultColumnFamily(), k, &pinnable_value,
+        /*timestamp=*/nullptr));
+    if (s.ok() && pinnable_value.IsPinned()) {
+      result.assign(pinnable_value.data(), pinnable_value.size());
+    }
+  } else
+#else
+  (void)use_coroutine;
+#endif  // USE_COROUTINES
+  {
+    s = db_->Get(options, k, &result);
+  }
   if (s.IsNotFound()) {
     result = "NOT_FOUND";
   } else if (!s.ok()) {
@@ -863,12 +896,28 @@ std::string DBTestBase::Get(const std::string& k, const Snapshot* snapshot) {
 }
 
 std::string DBTestBase::Get(int cf, const std::string& k,
-                            const Snapshot* snapshot) {
+                            const Snapshot* snapshot, bool use_coroutine) {
   ReadOptions options;
   options.verify_checksums = true;
   options.snapshot = snapshot;
   std::string result;
-  Status s = db_->Get(options, handles_[cf], k, &result);
+  Status s;
+#if USE_COROUTINES
+  if (use_coroutine) {
+    PinnableSlice pinnable_value(&result);
+    s = folly::coro::blockingWait(CoroDB::CoGet(dbfull(), options, handles_[cf],
+                                                k, &pinnable_value,
+                                                /*timestamp=*/nullptr));
+    if (s.ok() && pinnable_value.IsPinned()) {
+      result.assign(pinnable_value.data(), pinnable_value.size());
+    }
+  } else
+#else
+  (void)use_coroutine;
+#endif  // USE_COROUTINES
+  {
+    s = db_->Get(options, handles_[cf], k, &result);
+  }
   if (s.IsNotFound()) {
     result = "NOT_FOUND";
   } else if (!s.ok()) {
@@ -880,8 +929,8 @@ std::string DBTestBase::Get(int cf, const std::string& k,
 std::vector<std::string> DBTestBase::MultiGet(std::vector<int> cfs,
                                               const std::vector<std::string>& k,
                                               const Snapshot* snapshot,
-                                              const bool batched,
-                                              const bool async) {
+                                              bool batched, bool async,
+                                              bool use_coroutine) {
   ReadOptions options;
   options.verify_checksums = true;
   options.snapshot = snapshot;
@@ -908,8 +957,20 @@ std::vector<std::string> DBTestBase::MultiGet(std::vector<int> cfs,
     std::vector<PinnableSlice> pin_values(cfs.size());
     result.resize(cfs.size());
     s.resize(cfs.size());
-    db_->MultiGet(options, cfs.size(), handles.data(), keys.data(),
-                  pin_values.data(), s.data());
+#if USE_COROUTINES
+    if (use_coroutine) {
+      folly::coro::blockingWait(CoroDB::CoMultiGet(
+          dbfull(), options, cfs.size(), handles.data(), keys.data(),
+          pin_values.data(), /*timestamps=*/nullptr, s.data(),
+          /*sorted_input=*/false));
+    } else
+#else
+    (void)use_coroutine;
+#endif  // USE_COROUTINES
+    {
+      db_->MultiGet(options, cfs.size(), handles.data(), keys.data(),
+                    pin_values.data(), s.data());
+    }
     for (size_t i = 0; i < s.size(); ++i) {
       if (s[i].IsNotFound()) {
         result[i] = "NOT_FOUND";
@@ -928,21 +989,15 @@ std::vector<std::string> DBTestBase::MultiGet(std::vector<int> cfs,
 
 std::vector<std::string> DBTestBase::MultiGet(const std::vector<std::string>& k,
                                               const Snapshot* snapshot,
-                                              const bool async) {
-  ReadOptions options;
-  options.verify_checksums = true;
-  options.snapshot = snapshot;
-  options.async_io = async;
-  std::vector<Slice> keys;
-  std::vector<std::string> result(k.size());
-  std::vector<Status> statuses(k.size());
-  std::vector<PinnableSlice> pin_values(k.size());
+                                              bool async,
+                                              bool optimize_multiget_for_io,
+                                              bool use_coroutine) {
+  std::vector<Status> statuses;
+  std::vector<PinnableSlice> pin_values;
+  MultiGet(k, snapshot, async, optimize_multiget_for_io, use_coroutine,
+           pin_values, statuses);
 
-  for (size_t i = 0; i < k.size(); ++i) {
-    keys.emplace_back(k[i]);
-  }
-  db_->MultiGet(options, dbfull()->DefaultColumnFamily(), keys.size(),
-                keys.data(), pin_values.data(), statuses.data());
+  std::vector<std::string> result(k.size());
   for (size_t i = 0; i < statuses.size(); ++i) {
     if (statuses[i].IsNotFound()) {
       result[i] = "NOT_FOUND";
@@ -958,11 +1013,56 @@ std::vector<std::string> DBTestBase::MultiGet(const std::vector<std::string>& k,
   return result;
 }
 
-Status DBTestBase::Get(const std::string& k, PinnableSlice* v) {
+void DBTestBase::MultiGet(const std::vector<std::string>& k,
+                          const Snapshot* snapshot, bool async,
+                          bool optimize_multiget_for_io, bool use_coroutine,
+                          std::vector<PinnableSlice>& values,
+                          std::vector<Status>& statuses) {
   ReadOptions options;
   options.verify_checksums = true;
-  Status s = dbfull()->Get(options, dbfull()->DefaultColumnFamily(), k, v);
-  return s;
+  options.snapshot = snapshot;
+  options.async_io = async;
+  options.optimize_multiget_for_io = optimize_multiget_for_io;
+  std::vector<Slice> keys;
+  values.clear();
+  statuses.resize(k.size());
+  values.resize(k.size());
+
+  for (size_t i = 0; i < k.size(); ++i) {
+    keys.emplace_back(k[i]);
+  }
+#if USE_COROUTINES
+  if (use_coroutine) {
+    std::vector<ColumnFamilyHandle*> cfs(keys.size(),
+                                         dbfull()->DefaultColumnFamily());
+    folly::coro::blockingWait(CoroDB::CoMultiGet(
+        dbfull(), options, keys.size(), cfs.data(), keys.data(), values.data(),
+        /*timestamps=*/nullptr, statuses.data(),
+        /*sorted_input=*/false));
+  } else
+#else
+  (void)use_coroutine;
+#endif  // USE_COROUTINES
+  {
+    db_->MultiGet(options, dbfull()->DefaultColumnFamily(), keys.size(),
+                  keys.data(), values.data(), statuses.data());
+  }
+}
+
+Status DBTestBase::Get(const std::string& k, PinnableSlice* v,
+                       bool use_coroutine) {
+  ReadOptions options;
+  options.verify_checksums = true;
+#if USE_COROUTINES
+  if (use_coroutine) {
+    return folly::coro::blockingWait(
+        CoroDB::CoGet(dbfull(), options, dbfull()->DefaultColumnFamily(), k, v,
+                      /*timestamp=*/nullptr));
+  }
+#else
+  (void)use_coroutine;
+#endif  // USE_COROUTINES
+  return dbfull()->Get(options, dbfull()->DefaultColumnFamily(), k, v);
 }
 
 Status DBTestBase::CompactRange(const CompactRangeOptions& options,

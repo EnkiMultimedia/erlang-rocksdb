@@ -51,7 +51,9 @@ class PlainTableIterator : public InternalIterator {
   explicit PlainTableIterator(PlainTableReader* table, bool use_prefix_seek);
   // No copying allowed
   PlainTableIterator(const PlainTableIterator&) = delete;
-  void operator=(const Iterator&) = delete;
+  void operator=(const PlainTableIterator&) = delete;
+  PlainTableIterator(PlainTableIterator&&) = delete;
+  void operator=(PlainTableIterator&&) = delete;
 
   ~PlainTableIterator() override;
 
@@ -286,9 +288,9 @@ void PlainTableReader::FillBloom(const std::vector<uint32_t>& prefix_hashes) {
 Status PlainTableReader::MmapDataIfNeeded() {
   if (file_info_.is_mmap_mode) {
     // Get mmapped memory.
-    return file_info_.file->Read(IOOptions(), 0,
-                                 static_cast<size_t>(file_size_),
-                                 &file_info_.file_data, nullptr, nullptr);
+    return file_info_.file->Read(0, static_cast<size_t>(file_size_),
+                                 IOOptions(), &file_info_.file_data, nullptr,
+                                 nullptr);
   }
   return Status::OK();
 }

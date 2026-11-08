@@ -32,6 +32,18 @@
 
 namespace ROCKSDB_NAMESPACE::blob_db {
 
+OutputMetadata NewerVersionOutputMetadata() {
+  OutputMetadata output_metadata;
+  output_metadata.WantNewerVersionPresent();
+  return output_metadata;
+}
+
+MultiGetOutputMetadata NewerVersionMultiGetOutputMetadata() {
+  MultiGetOutputMetadata output_metadata;
+  output_metadata.WantNewerVersionPresent();
+  return output_metadata;
+}
+
 class BlobDBTest : public testing::Test {
  public:
   const int kMaxBlobSize = 1 << 14;
@@ -354,6 +366,59 @@ TEST_F(BlobDBTest, StackableDBGet) {
     ASSERT_EQ(string_value, pinnable_value.ToString());
     ASSERT_EQ(string_value, data[key]);
   }
+}
+
+TEST_F(BlobDBTest, GetWithMetadataResolvesBlobValue) {
+  // BlobDB reports newer blob values while returning the snapshot-visible blob.
+  BlobDBOptions bdb_options;
+  bdb_options.disable_background_tasks = true;
+  Open(bdb_options);
+  assert(blob_db_ != nullptr);
+
+  ASSERT_OK(Put("key", "old_blob_value"));
+  const Snapshot* snapshot = blob_db_->GetSnapshot();
+  ASSERT_OK(Put("key", "new_blob_value"));
+
+  ReadOptions read_options;
+  read_options.snapshot = snapshot;
+  std::string value;
+  OutputMetadata output_metadata = NewerVersionOutputMetadata();
+  ASSERT_OK(
+      blob_db_->GetWithMetadata(read_options, "key", &value, &output_metadata));
+  ASSERT_EQ("old_blob_value", value);
+  ASSERT_TRUE(*output_metadata.newer_version_present);
+
+  blob_db_->ReleaseSnapshot(snapshot);
+}
+
+TEST_F(BlobDBTest, MultiGetWithMetadataResolvesBlobValues) {
+  // BlobDB MultiGet preserves per-key newer-version metadata while resolving
+  // blob indexes to values.
+  BlobDBOptions bdb_options;
+  bdb_options.disable_background_tasks = true;
+  Open(bdb_options);
+  assert(blob_db_ != nullptr);
+
+  ASSERT_OK(Put("key", "old_blob_value"));
+  const Snapshot* snapshot = blob_db_->GetSnapshot();
+  ASSERT_OK(Put("key", "new_blob_value"));
+
+  ReadOptions read_options;
+  read_options.snapshot = snapshot;
+  std::vector<Slice> keys{"key", "missing"};
+  std::vector<std::string> values;
+  MultiGetOutputMetadata output_metadata = NewerVersionMultiGetOutputMetadata();
+  std::vector<Status> statuses = blob_db_->MultiGetWithMetadata(
+      read_options, keys, &values, &output_metadata);
+
+  ASSERT_EQ(keys.size(), statuses.size());
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ("old_blob_value", values[0]);
+  ASSERT_TRUE((*output_metadata.newer_version_present)[0]);
+  ASSERT_TRUE(statuses[1].IsNotFound());
+  ASSERT_FALSE((*output_metadata.newer_version_present)[1]);
+
+  blob_db_->ReleaseSnapshot(snapshot);
 }
 
 TEST_F(BlobDBTest, GetExpiration) {
@@ -780,13 +845,13 @@ TEST_F(BlobDBTest, GetLiveFilesMetaData) {
   const std::string filename1("/blob_dir/000001.blob");
   ASSERT_EQ(filename1, metadata[0].name);
   ASSERT_EQ(1, metadata[0].file_number);
-  ASSERT_EQ(0, metadata[0].oldest_ancester_time);
+  ASSERT_EQ(0, metadata[0].oldest_ancestor_time);
   ASSERT_EQ(kDefaultColumnFamilyName, metadata[0].column_family_name);
 
   const std::string filename2("/blob_dir/000002.blob");
   ASSERT_EQ(filename2, metadata[1].name);
   ASSERT_EQ(2, metadata[1].file_number);
-  ASSERT_EQ(ttl, metadata[1].oldest_ancester_time);
+  ASSERT_EQ(ttl, metadata[1].oldest_ancestor_time);
   ASSERT_EQ(kDefaultColumnFamilyName, metadata[1].column_family_name);
 
   std::vector<std::string> livefile;
@@ -796,7 +861,8 @@ TEST_F(BlobDBTest, GetLiveFilesMetaData) {
   ASSERT_EQ(filename1, livefile[3]);
   ASSERT_EQ(filename2, livefile[4]);
 
-  std::vector<LiveFileStorageInfo> all_files, blob_files;
+  std::vector<LiveFileStorageInfo> all_files;
+  std::vector<LiveFileStorageInfo> blob_files;
   ASSERT_OK(blob_db_->GetLiveFilesStorageInfo(LiveFilesStorageInfoOptions(),
                                               &all_files));
   for (size_t i = 0; i < all_files.size(); i++) {

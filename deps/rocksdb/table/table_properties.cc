@@ -13,6 +13,7 @@
 #include "rocksdb/utilities/options_type.h"
 #include "table/table_properties_internal.h"
 #include "table/unique_id_impl.h"
+#include "util/compression.h"
 #include "util/random.h"
 #include "util/string_util.h"
 
@@ -20,6 +21,10 @@ namespace ROCKSDB_NAMESPACE {
 
 const uint32_t TablePropertiesCollectorFactory::Context::kUnknownColumnFamily =
     std::numeric_limits<int32_t>::max();
+// Out-of-line definitions for these in-class-initialized constants, needed
+// because they are ODR-used (e.g. bound to a const reference).
+const int TablePropertiesCollectorFactory::Context::kUnknownLevelAtCreation;
+const int TablePropertiesCollectorFactory::Context::kUnknownNumLevels;
 
 namespace {
 void AppendProperty(std::string& props, const std::string& key,
@@ -37,7 +42,117 @@ void AppendProperty(std::string& props, const std::string& key,
                     const std::string& kv_delim) {
   AppendProperty(props, key, std::to_string(value), prop_delim, kv_delim);
 }
+
+std::shared_ptr<CompressionManager> ResolveCompressionManagerForDisplay(
+    Slice compatibility_name,
+    const std::shared_ptr<CompressionManager>& compression_manager) {
+  std::shared_ptr<CompressionManager> mgr_to_use;
+  if (compression_manager) {
+    mgr_to_use = compression_manager->FindCompatibleCompressionManager(
+        compatibility_name);
+  }
+  if (mgr_to_use == nullptr) {
+    ConfigOptions strict;
+    strict.ignore_unknown_options = false;
+    strict.ignore_unsupported_options = false;
+    Status s = CompressionManager::CreateFromString(
+        strict, compatibility_name.ToString(), &mgr_to_use);
+    if (!s.ok()) {
+      mgr_to_use.reset();
+    }
+  }
+  return mgr_to_use;
+}
+
+std::string CompressionTypeDisplayName(
+    CompressionType compression_type,
+    const std::shared_ptr<CompressionManager>& compression_manager) {
+  if (compression_manager) {
+    std::string name =
+        compression_manager->CompressionTypeToString(compression_type);
+    if (!name.empty()) {
+      return name;
+    }
+  }
+  return CompressionTypeToString(compression_type);
+}
+
+// lsm_info_at_creation bit layout (see LsmInfoAtCreation / TableProperties::
+// lsm_info_at_creation). LSB first; low bits are kept stable so the encoding
+// can be extended by defining currently-reserved higher bits, and readers
+// ignore bits they do not recognize.
+//   bits [0..7]  level_at_creation natural value (0..254) when applicable;
+//                0xff means "applicable but level unknown" (e.g. DB repairer)
+//   bits [8..9]  0 = unknown, 1 = applicable & not bottommost,
+//                2 = applicable & bottommost, 3 = not applicable
+//   bits [10..]  reserved for future informational fields
+constexpr int kLsmLevelBits = 8;
+constexpr uint64_t kLsmLevelMask = (uint64_t{1} << kLsmLevelBits) - 1;
+// Sentinel level value (0xff) meaning "applicable but level unknown".
+constexpr uint64_t kLsmLevelUnknown = kLsmLevelMask;
+constexpr int kLsmStateShift = kLsmLevelBits;
+constexpr uint64_t kLsmStateMask = uint64_t{3} << kLsmStateShift;
+// Values for the 2-bit state field (bits [8..9]).
+constexpr uint64_t kLsmStateUnknown = 0;
+constexpr uint64_t kLsmStateNotBottommost = 1;
+constexpr uint64_t kLsmStateBottommost = 2;
+constexpr uint64_t kLsmStateNotApplicable = 3;
 }  // namespace
+
+LsmInfoAtCreation LsmInfoAtCreation::Applicable(int level_at_creation,
+                                                bool is_bottommost) {
+  LsmInfoAtCreation info;
+  info.applicability = Applicability::kApplicable;
+  info.level_at_creation = level_at_creation;
+  info.is_bottommost = is_bottommost;
+  return info;
+}
+
+LsmInfoAtCreation LsmInfoAtCreation::NotApplicable() {
+  LsmInfoAtCreation info;
+  info.applicability = Applicability::kNotApplicable;
+  return info;
+}
+
+uint64_t LsmInfoAtCreation::Encode() const {
+  switch (applicability) {
+    case Applicability::kUnknown:
+      return kLsmStateUnknown << kLsmStateShift;
+    case Applicability::kNotApplicable:
+      return kLsmStateNotApplicable << kLsmStateShift;
+    case Applicability::kApplicable: {
+      // Store the level as its natural value; kLsmLevelUnknown (0xff) encodes
+      // an unknown or out-of-range level.
+      uint64_t level_field =
+          (level_at_creation >= 0 &&
+           static_cast<uint64_t>(level_at_creation) < kLsmLevelUnknown)
+              ? static_cast<uint64_t>(level_at_creation)
+              : kLsmLevelUnknown;
+      uint64_t state =
+          is_bottommost ? kLsmStateBottommost : kLsmStateNotBottommost;
+      return level_field | (state << kLsmStateShift);
+    }
+  }
+  return 0;
+}
+
+LsmInfoAtCreation LsmInfoAtCreation::DecodeFrom(uint64_t encoded) {
+  uint64_t state = (encoded & kLsmStateMask) >> kLsmStateShift;
+  switch (state) {
+    case kLsmStateNotBottommost:
+    case kLsmStateBottommost: {
+      uint64_t level_field = encoded & kLsmLevelMask;
+      int level = level_field == kLsmLevelUnknown
+                      ? kUnknownLevel
+                      : static_cast<int>(level_field);
+      return Applicable(level, state == kLsmStateBottommost);
+    }
+    case kLsmStateNotApplicable:
+      return NotApplicable();
+    default:
+      return LsmInfoAtCreation{};
+  }
+}
 
 std::string TableProperties::ToString(const std::string& prop_delim,
                                       const std::string& kv_delim) const {
@@ -46,6 +161,12 @@ std::string TableProperties::ToString(const std::string& prop_delim,
 
   // Basic Info
   AppendProperty(result, "# data blocks", num_data_blocks, prop_delim,
+                 kv_delim);
+  AppendProperty(result, "# data blocks compression rejected",
+                 num_data_blocks_compression_rejected, prop_delim, kv_delim);
+  AppendProperty(result, "# data blocks compression bypassed",
+                 num_data_blocks_compression_bypassed, prop_delim, kv_delim);
+  AppendProperty(result, "# uniform blocks", num_uniform_blocks, prop_delim,
                  kv_delim);
   AppendProperty(result, "# entries", num_entries, prop_delim, kv_delim);
   AppendProperty(result, "# deletions", num_deletions, prop_delim, kv_delim);
@@ -141,7 +262,8 @@ std::string TableProperties::ToString(const std::string& prop_delim,
       compression_options.empty() ? std::string("N/A") : compression_options,
       prop_delim, kv_delim);
 
-  AppendProperty(result, "creation time", creation_time, prop_delim, kv_delim);
+  AppendProperty(result, "creation time", oldest_ancestor_time, prop_delim,
+                 kv_delim);
 
   AppendProperty(result, "time stamp of earliest key", oldest_key_time,
                  prop_delim, kv_delim);
@@ -150,6 +272,35 @@ std::string TableProperties::ToString(const std::string& prop_delim,
 
   AppendProperty(result, "file creation time", file_creation_time, prop_delim,
                  kv_delim);
+
+  {
+    LsmInfoAtCreation lsm_info =
+        LsmInfoAtCreation::DecodeFrom(lsm_info_at_creation);
+    std::string level_str;
+    std::string bottommost_str;
+    switch (lsm_info.applicability) {
+      case LsmInfoAtCreation::Applicability::kUnknown:
+        level_str = "unknown";
+        bottommost_str = "unknown";
+        break;
+      case LsmInfoAtCreation::Applicability::kNotApplicable:
+        level_str = "N/A";
+        bottommost_str = "N/A";
+        break;
+      case LsmInfoAtCreation::Applicability::kApplicable:
+        level_str =
+            lsm_info.level_at_creation == LsmInfoAtCreation::kUnknownLevel
+                ? std::string("unknown")
+                : std::to_string(lsm_info.level_at_creation);
+        bottommost_str =
+            lsm_info.is_bottommost ? std::string("true") : std::string("false");
+        break;
+    }
+    AppendProperty(result, "level at creation", level_str, prop_delim,
+                   kv_delim);
+    AppendProperty(result, "bottommost at creation", bottommost_str, prop_delim,
+                   kv_delim);
+  }
 
   AppendProperty(result, "slow compression estimated data size",
                  slow_compression_estimated_data_size, prop_delim, kv_delim);
@@ -192,6 +343,11 @@ void TableProperties::Add(const TableProperties& tp) {
   raw_key_size += tp.raw_key_size;
   raw_value_size += tp.raw_value_size;
   num_data_blocks += tp.num_data_blocks;
+  num_data_blocks_compression_rejected +=
+      tp.num_data_blocks_compression_rejected;
+  num_data_blocks_compression_bypassed +=
+      tp.num_data_blocks_compression_bypassed;
+  num_uniform_blocks += tp.num_uniform_blocks;
   num_entries += tp.num_entries;
   num_filter_entries += tp.num_filter_entries;
   num_deletions += tp.num_deletions;
@@ -215,6 +371,11 @@ TableProperties::GetAggregatablePropertiesAsMap() const {
   rv["raw_key_size"] = raw_key_size;
   rv["raw_value_size"] = raw_value_size;
   rv["num_data_blocks"] = num_data_blocks;
+  rv["num_data_blocks_compression_rejected"] =
+      num_data_blocks_compression_rejected;
+  rv["num_data_blocks_compression_bypassed"] =
+      num_data_blocks_compression_bypassed;
+  rv["num_uniform_blocks"] = num_uniform_blocks;
   rv["num_entries"] = num_entries;
   rv["num_filter_entries"] = num_filter_entries;
   rv["num_deletions"] = num_deletions;
@@ -274,12 +435,20 @@ const std::string TablePropertiesNames::kIndexKeyIsUserKey =
     "rocksdb.index.key.is.user.key";
 const std::string TablePropertiesNames::kIndexValueIsDeltaEncoded =
     "rocksdb.index.value.is.delta.encoded";
+const std::string TablePropertiesNames::kUDIIsPrimaryIndex =
+    "rocksdb.udi.is.primary.index";
 const std::string TablePropertiesNames::kFilterSize = "rocksdb.filter.size";
 const std::string TablePropertiesNames::kRawKeySize = "rocksdb.raw.key.size";
 const std::string TablePropertiesNames::kRawValueSize =
     "rocksdb.raw.value.size";
 const std::string TablePropertiesNames::kNumDataBlocks =
     "rocksdb.num.data.blocks";
+const std::string TablePropertiesNames::kNumDataBlocksCompressionRejected =
+    "rocksdb.num.data.blocks.compression.rejected";
+const std::string TablePropertiesNames::kNumDataBlocksCompressionBypassed =
+    "rocksdb.num.data.blocks.compression.bypassed";
+const std::string TablePropertiesNames::kNumUniformBlocks =
+    "rocksdb.num.uniform.blocks";
 const std::string TablePropertiesNames::kNumEntries = "rocksdb.num.entries";
 const std::string TablePropertiesNames::kNumFilterEntries =
     "rocksdb.num.filter_entries";
@@ -307,7 +476,10 @@ const std::string TablePropertiesNames::kPropertyCollectors =
 const std::string TablePropertiesNames::kCompression = "rocksdb.compression";
 const std::string TablePropertiesNames::kCompressionOptions =
     "rocksdb.compression_options";
-const std::string TablePropertiesNames::kCreationTime = "rocksdb.creation.time";
+const std::string TablePropertiesNames::kOldestAncestorTime =
+    "rocksdb.creation.time";
+const std::string& TablePropertiesNames::kCreationTime =
+    TablePropertiesNames::kOldestAncestorTime;
 const std::string TablePropertiesNames::kOldestKeyTime =
     "rocksdb.oldest.key.time";
 const std::string TablePropertiesNames::kNewestKeyTime =
@@ -334,6 +506,10 @@ const std::string TablePropertiesNames::kIndexBlockRestartInterval =
     "rocksdb.index.block.restart.interval";
 const std::string TablePropertiesNames::kSeparateKeyValueInDataBlock =
     "rocksdb.separate.key.value.in.data.block";
+const std::string TablePropertiesNames::kUncompressedDataSize =
+    "rocksdb.uncompressed.data.size";
+const std::string TablePropertiesNames::kLsmInfoAtCreation =
+    "rocksdb.lsm.info.at.creation";
 
 static std::unordered_map<std::string, OptionTypeInfo>
     table_properties_type_info = {
@@ -367,6 +543,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct TableProperties, index_value_is_delta_encoded),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"udi_is_primary_index",
+         {offsetof(struct TableProperties, udi_is_primary_index),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"filter_size",
          {offsetof(struct TableProperties, filter_size), OptionType::kUInt64T,
           OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
@@ -379,6 +559,20 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionTypeFlags::kNone}},
         {"num_data_blocks",
          {offsetof(struct TableProperties, num_data_blocks),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_data_blocks_compression_rejected",
+         {offsetof(struct TableProperties,
+                   num_data_blocks_compression_rejected),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_data_blocks_compression_bypassed",
+         {offsetof(struct TableProperties,
+                   num_data_blocks_compression_bypassed),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_uniform_blocks",
+         {offsetof(struct TableProperties, num_uniform_blocks),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"num_entries",
@@ -410,9 +604,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct TableProperties, column_family_id),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        // Key retains the old field name for serialization compatibility
         {"creation_time",
-         {offsetof(struct TableProperties, creation_time), OptionType::kUInt64T,
-          OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+         {offsetof(struct TableProperties, oldest_ancestor_time),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"oldest_key_time",
          {offsetof(struct TableProperties, oldest_key_time),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -433,11 +629,6 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"fast_compression_estimated_data_size",
          {offsetof(struct TableProperties,
                    fast_compression_estimated_data_size),
-          OptionType::kUInt64T, OptionVerificationType::kNormal,
-          OptionTypeFlags::kNone}},
-        {"external_sst_file_global_seqno_offset",
-         {offsetof(struct TableProperties,
-                   external_sst_file_global_seqno_offset),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"tail_start_offset",
@@ -466,6 +657,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionTypeFlags::kNone}},
         {"separate_key_value_in_data_block",
          {offsetof(struct TableProperties, separate_key_value_in_data_block),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"lsm_info_at_creation",
+         {offsetof(struct TableProperties, lsm_info_at_creation),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"db_id",
@@ -572,5 +767,81 @@ void TEST_SetRandomTableProperties(TableProperties* props) {
   }
 }
 #endif
+
+std::string ParseCompressionNameForDisplay(
+    const std::string& compression_name) {
+  // The single-argument overload intentionally consults globally registered
+  // CompressionManagers, keyed by the encoded compatibility name, so custom
+  // managers can contribute display names without an explicit manager handle.
+  return ParseCompressionNameForDisplay(compression_name, nullptr);
+}
+
+std::string ParseCompressionNameForDisplay(
+    const std::string& compression_name,
+    std::shared_ptr<CompressionManager> compression_manager) {
+  // Empty = no compression
+  if (compression_name.empty()) {
+    return "NoCompression";
+  }
+
+  // Check for format_version 7 format (contains ';')
+  size_t first_semicolon = compression_name.find(';');
+  if (first_semicolon == std::string::npos) {
+    // Old format - return as-is
+    return compression_name;
+  }
+
+  // New format: "<compatibility_name>;<hex_codes>;"
+  size_t second_semicolon = compression_name.find(';', first_semicolon + 1);
+  if (second_semicolon == std::string::npos) {
+    // Malformed - missing second field
+    return "Unknown";
+  }
+
+  Slice compatibility_name(compression_name.data(), first_semicolon);
+  auto mgr_to_use = ResolveCompressionManagerForDisplay(compatibility_name,
+                                                        compression_manager);
+
+  // Extract hex codes
+  std::string hex_codes = compression_name.substr(
+      first_semicolon + 1, second_semicolon - first_semicolon - 1);
+
+  // Validate hex string length (must be even)
+  if (hex_codes.size() % 2 != 0) {
+    return "Unknown";
+  }
+
+  // Parse each 2-char hex code to CompressionType.
+  // Note: This intentionally mirrors GetDecompressor()'s decoding shape but
+  // differs in error semantics. GetDecompressor() treats kNoCompression
+  // (0x00) and values >= kDisableCompressionOption (0xFF) as corruption. For
+  // display purposes, we silently filter these out and return "NoCompression"
+  // if no valid types remain.
+  std::vector<std::string> types;
+  for (size_t i = 0; i < hex_codes.size(); i += 2) {
+    const char* ptr = hex_codes.data() + i;
+    uint64_t val = 0;
+    if (!ParseBaseChars<16>(&ptr, 2, &val)) {
+      return "Unknown";
+    }
+    auto ct = static_cast<CompressionType>(val);
+    if (ct != kNoCompression && ct != kDisableCompressionOption) {
+      types.push_back(CompressionTypeDisplayName(ct, mgr_to_use));
+    }
+  }
+
+  if (types.empty()) {
+    return "NoCompression";
+  } else if (types.size() == 1) {
+    return types[0];
+  } else {
+    // Multiple types - join with commas
+    std::string result = types[0];
+    for (size_t i = 1; i < types.size(); ++i) {
+      result += "," + types[i];
+    }
+    return result;
+  }
+}
 
 }  // namespace ROCKSDB_NAMESPACE

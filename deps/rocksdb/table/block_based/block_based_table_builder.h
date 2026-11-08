@@ -12,6 +12,7 @@
 
 #include <array>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,9 +49,17 @@ class BlockBasedTableBuilder : public TableBuilder {
   // No copying allowed
   BlockBasedTableBuilder(const BlockBasedTableBuilder&) = delete;
   BlockBasedTableBuilder& operator=(const BlockBasedTableBuilder&) = delete;
+  BlockBasedTableBuilder(BlockBasedTableBuilder&&) = delete;
+  BlockBasedTableBuilder& operator=(BlockBasedTableBuilder&&) = delete;
 
   // REQUIRES: Either Finish() or Abandon() has been called.
-  ~BlockBasedTableBuilder();
+  ~BlockBasedTableBuilder() override;
+
+  // Resets this thread's AutoSkip inter-file estimate carryover (see
+  // CompressionOptions::auto_skip). Tools that build many independent files on
+  // a single thread (e.g. sst_dump --command=recompress) call this between
+  // files so each is measured without inheriting the previous file's estimate.
+  static void ResetThreadLocalAutoSkipCarryover();
 
   // Add key,value to the table being constructed.
   // REQUIRES: Unless key has type kTypeRangeDeletion, key is after any
@@ -58,6 +67,13 @@ class BlockBasedTableBuilder : public TableBuilder {
   //           comparator.
   // REQUIRES: Finish(), Abandon() have not been called
   void Add(const Slice& key, const Slice& value) override;
+
+  // Keeps block-based builders behind the retry-capable TableBuilder contract
+  // even though the current format accepts every row. Future format-specific
+  // boundary policies can then ask callers to cut the file without changing
+  // compaction's Add() assumptions.
+  TableBuilderAddResult TryAdd(const Slice& key, const Slice& value,
+                               TableBuilderAddContext* context) override;
 
   // Return non-ok iff some error has been detected.
   Status status() const override;
@@ -147,14 +163,16 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WriteBlock(const Slice& block_contents, BlockHandle* handle,
                   BlockType block_type, bool* skip_delta_encoding = nullptr);
   // Directly write data to the file.
-  void WriteMaybeCompressedBlock(const Slice& block_contents, CompressionType,
-                                 BlockHandle* handle, BlockType block_type,
-                                 const Slice* uncompressed_block_data = nullptr,
-                                 bool* skip_delta_encoding = nullptr);
+  void WriteMaybeCompressedBlock(
+      const Slice& block_contents, CompressionType, BlockHandle* handle,
+      BlockType block_type, const Slice* uncompressed_block_data = nullptr,
+      bool* skip_delta_encoding = nullptr,
+      const uint32_t* precomputed_block_contents_crc32c = nullptr);
   IOStatus WriteMaybeCompressedBlockImpl(
       const Slice& block_contents, CompressionType, BlockHandle* handle,
       BlockType block_type, const Slice* uncompressed_block_data = nullptr,
-      bool* skip_delta_encoding = nullptr);
+      bool* skip_delta_encoding = nullptr,
+      const uint32_t* precomputed_block_contents_crc32c = nullptr);
 
   void SetupCacheKeyPrefix(const TableBuilderOptions& tbo);
 
@@ -179,6 +197,31 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WriteFooter(BlockHandle& metaindex_block_handle,
                    BlockHandle& index_block_handle);
 
+  // Embedded-blob SST support. These are only exercised when the builder is in
+  // embedded mode (rep_->embedded_blob_options is set), in which delta encoding
+  // of index values is disabled so blob records can be written inline as values
+  // are added (possibly interleaved with data blocks).
+
+  // For an embedded-mode value entry, possibly extracts large value payload(s)
+  // into inline same-file blob records and rewrites *key / *value to reference
+  // them (a kTypeBlobIndex entry for whole values, or a rebuilt wide-column
+  // entity with per-column BlobIndex refs). On no-op, *key / *value are left
+  // unchanged. Returns false and records a failed status on error.
+  bool MaybeExtractEmbeddedBlobs(SequenceNumber seq, ValueType value_type,
+                                 Slice* key, Slice* value);
+
+  // Rewrites eligible wide-column values as inline same-file blob records,
+  // building the rebuilt entity into rep_->embedded_blob_state->entity_buf.
+  // Sets *rewritten when at least one column was extracted (otherwise the
+  // original value should be used as-is).
+  Status BuildEmbeddedWideColumnEntity(const Slice& value, bool* rewritten);
+
+  // Appends one uncompressed same-file blob record for `payload` at the current
+  // table offset, advances the offset, lazily allocates and updates the
+  // embedded-blob state (counters), and encodes a same-file BlobIndex into
+  // rep_->embedded_blob_state->blob_index_buf.
+  Status WriteEmbeddedBlobRecord(const Slice& payload);
+
   struct Rep;
   class BlockBasedTablePropertiesCollectorFactory;
   class BlockBasedTablePropertiesCollector;
@@ -202,12 +245,14 @@ class BlockBasedTableBuilder : public TableBuilder {
   void BGWorker(WorkingAreaPair& working_area);
 
   // Given uncompressed block content, try to compress it and return result and
-  // compression type
+  // compression type. Only ever called to attempt compression; the auto-skip
+  // skip/bypass decision is made by the caller (emit thread).
   Status CompressAndVerifyBlock(const Slice& uncompressed_block_data,
                                 bool is_data_block,
                                 WorkingAreaPair& working_area,
                                 GrowableBuffer* compressed_output,
-                                CompressionType* result_compression_type);
+                                CompressionType* result_compression_type,
+                                uint32_t* result_checksum);
 
   // If configured, start worker threads for parallel compression
   void MaybeStartParallelCompression();

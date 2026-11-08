@@ -23,11 +23,13 @@
 #include "port/port.h"
 #include "rocksdb/env.h"
 #include "rocksdb/status.h"
-#include "rocksdb/transaction_log.h"
 #include "rocksdb/types.h"
+#include "rocksdb/wal_iterator.h"
 #include "util/atomic.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class WalRecoverySequenceTracker;
 
 // WAL manager provides the abstraction for reading the WAL files as a single
 // unit. Internally, it opens and reads the files using Reader or Writer
@@ -37,26 +39,25 @@ class WalManager {
   WalManager(const ImmutableDBOptions& db_options,
              const FileOptions& file_options,
              const std::shared_ptr<IOTracer>& io_tracer,
-             const bool seq_per_batch = false)
-      : db_options_(db_options),
-        file_options_(file_options),
-        env_(db_options.env),
-        fs_(db_options.fs, io_tracer),
-        purge_wal_files_last_run_(0),
-        seq_per_batch_(seq_per_batch),
-        wal_dir_(db_options_.GetWalDir()),
-        wal_in_db_path_(db_options_.IsWalDirSameAsDBPath()),
-        io_tracer_(io_tracer) {}
+             const bool seq_per_batch = false);
 
   Status GetSortedWalFiles(VectorWalPtr& files, bool need_seqnos = true,
                            bool include_archived = true);
 
-  // Allow user to tail transaction log to find all recent changes to the
+  // Allow user to tail the WAL to find all recent changes to the
   // database that are newer than `seq_number`.
-  Status GetUpdatesSince(
-      SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
-      const TransactionLogIterator::ReadOptions& read_options,
-      VersionSet* version_set);
+  Status GetUpdatesSince(SequenceNumber seq_number,
+                         std::unique_ptr<WalIterator>* iter,
+                         const WalIterator::ReadOptions& read_options,
+                         VersionSet* version_set);
+
+  // Record the end of a write group's sequence range when its WAL append has
+  // an indeterminate outcome. TransactionLogIterator uses this process-lifetime
+  // fence to avoid returning a physically complete record that successful
+  // in-process recovery deliberately abandoned.
+  void RecordIndeterminateWriteSequence(uint64_t wal_number,
+                                        SequenceNumber start_sequence,
+                                        SequenceNumber end_sequence);
 
   void PurgeObsoleteWALFiles();
 
@@ -132,6 +133,8 @@ class WalManager {
   static constexpr uint64_t kDefaultIntervalToDeleteObsoleteWAL = 600;
 
   std::shared_ptr<IOTracer> io_tracer_;
+
+  std::shared_ptr<WalRecoverySequenceTracker> recovery_sequence_tracker_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

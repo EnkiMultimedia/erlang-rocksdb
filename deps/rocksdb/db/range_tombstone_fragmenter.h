@@ -17,6 +17,9 @@
 #include "table/internal_iterator.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class ReadCallback;
+
 struct FragmentedRangeTombstoneList {
  public:
   // A compact representation of a "stack" of range tombstone fragments, which
@@ -199,7 +202,9 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
 
   RangeTombstone Tombstone() const {
     assert(Valid());
-    if (icmp_->user_comparator()->timestamp_size()) {
+    // Use ucmp_ (long-lived; see the icmp_ note below) rather than
+    // icmp_->user_comparator(). They are equal for all constructors.
+    if (ucmp_->timestamp_size()) {
       return RangeTombstone(start_key(), end_key(), seq(), timestamp());
     }
     return RangeTombstone(start_key(), end_key(), seq());
@@ -233,6 +238,12 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
   // the given user key.
   // If there is no covering tombstone, then 0 is returned.
   SequenceNumber MaxCoveringTombstoneSeqnum(const Slice& user_key);
+
+  // Return the max sequence number of a covering range tombstone that should
+  // be reported as newer-version metadata. If there is no such tombstone, then
+  // 0 is returned.
+  SequenceNumber MaxCoveringTombstoneSeqnum(const Slice& user_key,
+                                            ReadCallback* callback);
 
   // Splits the iterator into n+1 iterators (where n is the number of
   // snapshots), each providing a view over a "stripe" of sequence numbers. The
@@ -316,6 +327,12 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
 
   const RangeTombstoneStackStartComparator tombstone_start_cmp_;
   const RangeTombstoneStackEndComparator tombstone_end_cmp_;
+  // icmp_ is a borrowed pointer and is not guaranteed to outlive this iterator:
+  // it may be built from a comparator with a shorter lifetime than an iterator
+  // some owner keeps alive. Only dereference it during construction-time work
+  // (e.g. SplitBySnapshot), when the referent is known alive. Post-construction
+  // navigation must use ucmp_ (the long-lived user comparator) and tombstones_;
+  // do not add new icmp_ dereferences in Next()/Seek()/Tombstone().
   const InternalKeyComparator* icmp_;
   const Comparator* ucmp_;
   std::shared_ptr<FragmentedRangeTombstoneList> tombstones_ref_;

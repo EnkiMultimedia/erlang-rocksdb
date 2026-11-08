@@ -71,6 +71,8 @@ class Reader {
   // No copying allowed
   Reader(const Reader&) = delete;
   void operator=(const Reader&) = delete;
+  Reader(Reader&&) = delete;
+  void operator=(Reader&&) = delete;
 
   virtual ~Reader();
 
@@ -175,7 +177,7 @@ class Reader {
   CompressionType compression_type_;
   // Track whether the compression type record has been read or not.
   bool compression_type_record_read_;
-  StreamingUncompress* uncompress_;
+  std::unique_ptr<StreamingUncompress> uncompress_;
   // Reusable uncompressed output buffer
   std::unique_ptr<char[]> uncompressed_buffer_;
   // Reusable uncompressed record
@@ -266,8 +268,10 @@ class FragmentBufferedReader : public Reader {
   bool TryReadMore(size_t* drop_size, uint8_t* error);
 
   // No copy allowed
-  FragmentBufferedReader(const FragmentBufferedReader&);
-  void operator=(const FragmentBufferedReader&);
+  FragmentBufferedReader(const FragmentBufferedReader&) = delete;
+  void operator=(const FragmentBufferedReader&) = delete;
+  FragmentBufferedReader(FragmentBufferedReader&&) = delete;
+  void operator=(FragmentBufferedReader&&) = delete;
 };
 
 }  // namespace log

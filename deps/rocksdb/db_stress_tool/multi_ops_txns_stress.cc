@@ -40,7 +40,7 @@ DEFINE_int32(clear_wp_commit_cache_one_in, 0,
              "write-unprepared transactions.");
 
 extern "C" bool rocksdb_write_prepared_TEST_ShouldClearCommitCache(void) {
-  static Random rand(static_cast<uint32_t>(db_stress_env->NowMicros()));
+  static Random rand(static_cast<uint32_t>(raw_env->NowMicros()));
   return FLAGS_clear_wp_commit_cache_one_in > 0 &&
          rand.OneIn(FLAGS_clear_wp_commit_cache_one_in);
 }
@@ -772,6 +772,7 @@ Status MultiOpsTxnsStressTest::SecondaryKeyUpdateTxn(ThreadState* thread,
   std::string old_sk_prefix = Record::EncodeSecondaryKey(old_c);
   std::string iter_ub_str = Record::EncodeSecondaryKey(old_c + 1);
   Slice iter_ub = iter_ub_str;
+  std::function<bool(const TableProperties&)> table_filter;
   ReadOptions ropts;
   ropts.snapshot = txn->GetSnapshot();
   ropts.auto_refresh_iterator_with_snapshot =
@@ -781,8 +782,9 @@ Status MultiOpsTxnsStressTest::SecondaryKeyUpdateTxn(ThreadState* thread,
   ropts.rate_limiter_priority =
       FLAGS_rate_limit_user_ops ? Env::IO_USER : Env::IO_TOTAL;
   if (FLAGS_use_sqfc_for_range_queries) {
-    ropts.table_filter =
+    table_filter =
         sqfc_factory_->GetTableFilterForRangeQuery(old_sk_prefix, iter_ub);
+    ropts.table_filter = &table_filter;
   }
   it = txn->GetIterator(ropts);
 
@@ -1149,9 +1151,11 @@ void MultiOpsTxnsStressTest::VerifyDb(ThreadState* thread) const {
         FLAGS_auto_refresh_iterator_with_snapshot;
     ropts.total_order_seek = true;
     ropts.iterate_upper_bound = &iter_ub;
+    std::function<bool(const TableProperties&)> table_filter;
     if (FLAGS_use_sqfc_for_range_queries) {
-      ropts.table_filter =
+      table_filter =
           sqfc_factory_->GetTableFilterForRangeQuery(start_key, iter_ub);
+      ropts.table_filter = &table_filter;
     }
 
     std::unique_ptr<Iterator> it(db_->NewIterator(ropts));
@@ -1180,7 +1184,7 @@ void MultiOpsTxnsStressTest::VerifyDb(ThreadState* thread) const {
       std::reverse(sk_buf + 2 * sizeof(uint32_t), sk_buf + sizeof(sk_buf));
       Slice sk(sk_buf, sizeof(sk_buf));
       std::string value;
-      s = db_->Get(ropts, sk, &value);
+      s = DbStressGet(db_, ropts, sk, &value);
       if (!s.ok()) {
         oss << "Cannot find secondary index entry " << sk.ToString(true)
             << ". Status is " << s.ToString();
@@ -1225,7 +1229,7 @@ void MultiOpsTxnsStressTest::VerifyDb(ThreadState* thread) const {
       // Form a primary key and search in the primary index.
       std::string pk = Record::EncodePrimaryKey(record.a_value());
       std::string value;
-      s = db_->Get(ropts, pk, &value);
+      s = DbStressGet(db_, ropts, pk, &value);
       if (!s.ok()) {
         oss << "Error searching pk " << Slice(pk).ToString(true) << ". "
             << s.ToString() << ". sk " << it->key().ToString(true);
@@ -1269,6 +1273,8 @@ void MultiOpsTxnsStressTest::VerifyDb(ThreadState* thread) const {
 // which can be called before TransactionDB::Open() returns to caller.
 // Therefore, at that time, db_ and txn_db_  may still be nullptr.
 // Caller has to make sure that the race condition does not happen.
+// We use the atomically loaded `db` pointer throughout this function to avoid
+// racing with destruction of the underlying DB.
 void MultiOpsTxnsStressTest::VerifyPkSkFast(const ReadOptions& read_options,
                                             int job_id) {
   DB* const db = db_aptr_.load(std::memory_order_acquire);
@@ -1276,19 +1282,16 @@ void MultiOpsTxnsStressTest::VerifyPkSkFast(const ReadOptions& read_options,
     return;
   }
 
-  assert(db_ == db);
-  assert(db_ != nullptr);
-
   ThreadStatus::OperationType cur_op_type =
       ThreadStatusUtil::GetThreadOperation();
   ThreadStatusUtil::SetThreadOperation(ThreadStatus::OperationType::OP_UNKNOWN);
-  const Snapshot* const snapshot = db_->GetSnapshot();
+  const Snapshot* const snapshot = db->GetSnapshot();
   ThreadStatusUtil::SetThreadOperation(cur_op_type);
   assert(snapshot);
-  ManagedSnapshot snapshot_guard(db_, snapshot);
+  ManagedSnapshot snapshot_guard(db, snapshot);
 
   std::ostringstream oss;
-  auto* dbimpl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+  auto* dbimpl = static_cast_with_check<DBImpl>(db->GetRootDB());
   assert(dbimpl);
 
   oss << "Job " << job_id << ": [" << snapshot->GetSequenceNumber() << ","
@@ -1307,7 +1310,7 @@ void MultiOpsTxnsStressTest::VerifyPkSkFast(const ReadOptions& read_options,
   ropts.total_order_seek = true;
   ropts.io_activity = read_options.io_activity;
 
-  std::unique_ptr<Iterator> it(db_->NewIterator(ropts));
+  std::unique_ptr<Iterator> it(db->NewIterator(ropts));
   for (it->Seek(start_key); it->Valid(); it->Next()) {
     Record record;
     Status s = record.DecodeSecondaryIndexEntry(it->key(), it->value());
@@ -1324,7 +1327,7 @@ void MultiOpsTxnsStressTest::VerifyPkSkFast(const ReadOptions& read_options,
     // Form a primary key and search in the primary index.
     std::string pk = Record::EncodePrimaryKey(record.a_value());
     std::string value;
-    s = db_->Get(ropts, pk, &value);
+    s = DbStressGet(db, ropts, pk, &value);
     if (!s.ok()) {
       oss << "Error searching pk " << Slice(pk).ToString(true) << ". "
           << s.ToString() << ". sk " << it->key().ToString(true);
@@ -1413,7 +1416,7 @@ Status MultiOpsTxnsStressTest::CommitAndCreateTimestampedSnapshotIfNeeded(
   Status s;
   if (FLAGS_create_timestamped_snapshot_one_in > 0 &&
       thread->rand.OneInOpt(FLAGS_create_timestamped_snapshot_one_in)) {
-    uint64_t ts = db_stress_env->NowNanos();
+    uint64_t ts = raw_env->NowNanos();
     std::shared_ptr<const Snapshot> snapshot;
     s = txn.CommitAndTryCreateSnapshot(/*notifier=*/nullptr, ts, &snapshot);
   } else {
@@ -1428,7 +1431,7 @@ Status MultiOpsTxnsStressTest::CommitAndCreateTimestampedSnapshotIfNeeded(
   assert(txn_db_);
   if (FLAGS_create_timestamped_snapshot_one_in > 0 &&
       thread->rand.OneInOpt(50000)) {
-    uint64_t now = db_stress_env->NowNanos();
+    uint64_t now = raw_env->NowNanos();
     constexpr uint64_t time_diff = static_cast<uint64_t>(1000) * 1000 * 1000;
     txn_db_->ReleaseTimestampedSnapshotsOlderThan(now - time_diff);
   }
@@ -1476,10 +1479,10 @@ void MultiOpsTxnsStressTest::PersistKeySpacesDesc(
   std::unique_ptr<WritableFile> wfile;
   Status s1 =
       Env::Default()->NewWritableFile(key_spaces_path, &wfile, EnvOptions());
-  assert(s1.ok());
+  DB_STRESS_ASSERT_OK(s1);
   assert(wfile);
   s1 = wfile->Append(key_spaces_rep);
-  assert(s1.ok());
+  DB_STRESS_ASSERT_OK(s1);
 }
 
 MultiOpsTxnsStressTest::KeySpaces MultiOpsTxnsStressTest::ReadKeySpacesDesc(
@@ -1488,12 +1491,12 @@ MultiOpsTxnsStressTest::KeySpaces MultiOpsTxnsStressTest::ReadKeySpacesDesc(
   std::unique_ptr<SequentialFile> sfile;
   Status s1 =
       Env::Default()->NewSequentialFile(key_spaces_path, &sfile, EnvOptions());
-  assert(s1.ok());
+  DB_STRESS_ASSERT_OK(s1);
   assert(sfile);
   char buf[16];
   Slice result;
   s1 = sfile->Read(sizeof(buf), &result, buf);
-  assert(s1.ok());
+  DB_STRESS_ASSERT_OK(s1);
   if (!key_spaces.DecodeFrom(result)) {
     assert(false);
   }
@@ -1582,7 +1585,7 @@ void MultiOpsTxnsStressTest::PreloadDb(SharedState* shared, int threads,
     ProcessStatus(shared, "PreloadDB", s, /*ignore_injected_error=*/false);
 
     s = txn_db_->Write(wopts, &wb);
-    assert(s.ok());
+    DB_STRESS_ASSERT_OK(s);
     ProcessStatus(shared, "PreloadDB", s, /*ignore_injected_error=*/false);
 
     // TODO (yanqin): make the following check optional, especially when data
@@ -1675,24 +1678,22 @@ void MultiOpsTxnsStressTest::ScanExistingDb(SharedState* shared, int threads) {
         Record::EncodePrimaryKey(std::numeric_limits<uint32_t>::max());
     Slice pk_lb = pk_lb_str;
     Slice pk_ub = pk_ub_str;
+    std::function<bool(const TableProperties&)> table_filter;
     ropts.iterate_lower_bound = &pk_lb;
     ropts.iterate_upper_bound = &pk_ub;
     ropts.total_order_seek = true;
     if (FLAGS_use_sqfc_for_range_queries) {
-      ropts.table_filter =
-          sqfc_factory_->GetTableFilterForRangeQuery(pk_lb, pk_ub);
+      table_filter = sqfc_factory_->GetTableFilterForRangeQuery(pk_lb, pk_ub);
+      ropts.table_filter = &table_filter;
     }
     std::unique_ptr<Iterator> it(db_->NewIterator(ropts));
 
     for (it->SeekToFirst(); it->Valid(); it->Next()) {
       Record record;
       Status s = record.DecodePrimaryIndexEntry(it->key(), it->value());
-      if (!s.ok()) {
-        fprintf(stderr, "Cannot decode primary index entry (%s => %s): %s\n",
-                it->key().ToString(true).c_str(),
-                it->value().ToString(true).c_str(), s.ToString().c_str());
-        assert(false);
-      }
+      DB_STRESS_ASSERT_OK_MSG(s, "Cannot decode primary index entry (%s => %s)",
+                              it->key().ToString(true).c_str(),
+                              it->value().ToString(true).c_str());
       uint32_t a = record.a_value();
       assert(a >= lb_a);
       assert(a < ub_a);
@@ -1767,8 +1768,11 @@ void MultiOpsTxnsStressTest::ScanExistingDb(SharedState* shared, int threads) {
   }
 }
 
-StressTest* CreateMultiOpsTxnsStressTest() {
-  return new MultiOpsTxnsStressTest();
+StressTest* CreateMultiOpsTxnsStressTest(int db_index,
+                                         const std::string& db_path,
+                                         const std::string& ev_path,
+                                         const std::string& sec_path) {
+  return new MultiOpsTxnsStressTest(db_index, db_path, ev_path, sec_path);
 }
 
 void CheckAndSetOptionsForMultiOpsTxnStressTest() {

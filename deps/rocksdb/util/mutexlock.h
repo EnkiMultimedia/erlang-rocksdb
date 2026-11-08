@@ -38,6 +38,8 @@ class MutexLock {
   // No copying allowed
   MutexLock(const MutexLock&) = delete;
   void operator=(const MutexLock&) = delete;
+  MutexLock(MutexLock&&) = delete;
+  void operator=(MutexLock&&) = delete;
 
   ~MutexLock() { this->mu_->Unlock(); }
 
@@ -56,11 +58,39 @@ class ReadLock {
   // No copying allowed
   ReadLock(const ReadLock&) = delete;
   void operator=(const ReadLock&) = delete;
+  ReadLock(ReadLock&&) = delete;
+  void operator=(ReadLock&&) = delete;
 
   ~ReadLock() { this->mu_->ReadUnlock(); }
 
  private:
   port::RWMutex* const mu_;
+};
+
+//
+// Try to acquire a ReadLock on the specified RWMutex without blocking.
+//
+class TryReadLock {
+ public:
+  explicit TryReadLock(port::RWMutex* mu)
+      : mu_(mu), owns_(mu_->TryReadLock()) {}
+  // No copying allowed
+  TryReadLock(const TryReadLock&) = delete;
+  void operator=(const TryReadLock&) = delete;
+  TryReadLock(TryReadLock&&) = delete;
+  void operator=(TryReadLock&&) = delete;
+
+  ~TryReadLock() {
+    if (owns_) {
+      mu_->ReadUnlock();
+    }
+  }
+
+  bool OwnsLock() const { return owns_; }
+
+ private:
+  port::RWMutex* const mu_;
+  const bool owns_;
 };
 
 //
@@ -72,6 +102,8 @@ class ReadUnlock {
   // No copying allowed
   ReadUnlock(const ReadUnlock&) = delete;
   ReadUnlock& operator=(const ReadUnlock&) = delete;
+  ReadUnlock(ReadUnlock&&) = delete;
+  ReadUnlock& operator=(ReadUnlock&&) = delete;
 
   ~ReadUnlock() { mu_->ReadUnlock(); }
 
@@ -90,11 +122,42 @@ class WriteLock {
   // No copying allowed
   WriteLock(const WriteLock&) = delete;
   void operator=(const WriteLock&) = delete;
+  WriteLock(WriteLock&&) = delete;
+  void operator=(WriteLock&&) = delete;
 
   ~WriteLock() { this->mu_->WriteUnlock(); }
 
  private:
   port::RWMutex* const mu_;
+};
+
+//
+// Try to acquire a WriteLock on the specified RWMutex without blocking.
+// If acquired, the lock is released when the object goes out of scope.
+// If not acquired, the destructor is a no-op. Use OwnsLock() to check
+// whether the lock was acquired.
+//
+class TryWriteLock {
+ public:
+  explicit TryWriteLock(port::RWMutex* mu)
+      : mu_(mu), owns_(mu_->TryWriteLock()) {}
+  // No copying allowed
+  TryWriteLock(const TryWriteLock&) = delete;
+  void operator=(const TryWriteLock&) = delete;
+  TryWriteLock(TryWriteLock&&) = delete;
+  void operator=(TryWriteLock&&) = delete;
+
+  ~TryWriteLock() {
+    if (owns_) {
+      mu_->WriteUnlock();
+    }
+  }
+
+  bool OwnsLock() const { return owns_; }
+
+ private:
+  port::RWMutex* const mu_;
+  const bool owns_;
 };
 
 //

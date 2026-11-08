@@ -6,27 +6,35 @@
 //
 #include "rocksdb/utilities/ldb_cmd.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include "db/blob/blob_index.h"
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
 #include "db/log_reader.h"
+#include "db/manifest_ops.h"
+#include "db/version_set.h"
 #include "db/version_util.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
 #include "db/write_batch_internal.h"
 #include "db_stress_tool/db_stress_compression_manager.h"
 #include "file/filename.h"
+#include "options/options_parser.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/experimental.h"
@@ -44,6 +52,7 @@
 #include "tools/ldb_cmd_impl.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
+#include "util/defer.h"
 #include "util/file_checksum_helper.h"
 #include "util/simple_mixed_compressor.h"
 #include "util/stderr_logger.h"
@@ -432,6 +441,14 @@ LDBCommand* LDBCommand::SelectCommand(const ParsedParams& parsed_params) {
                                      parsed_params.flags);
   } else if (parsed_params.cmd == CompactionProgressDumpCommand::Name()) {
     return new CompactionProgressDumpCommand(parsed_params.cmd_params,
+                                             parsed_params.option_map,
+                                             parsed_params.flags);
+  } else if (parsed_params.cmd == RemoteCompactionPrimaryCommand::Name()) {
+    return new RemoteCompactionPrimaryCommand(parsed_params.cmd_params,
+                                              parsed_params.option_map,
+                                              parsed_params.flags);
+  } else if (parsed_params.cmd == RemoteCompactionWorkerCommand::Name()) {
+    return new RemoteCompactionWorkerCommand(parsed_params.cmd_params,
                                              parsed_params.option_map,
                                              parsed_params.flags);
   }
@@ -2242,10 +2259,14 @@ void InternalDumpCommand::DoCommand() {
     exec_state_ = LDBCommandExecuteResult::Failed(st.ToString());
     return;
   }
-  std::string rtype1, rtype2, row, val;
+  std::string rtype1;
+  std::string rtype2;
+  std::string row;
+  std::string val;
   rtype2 = "";
   uint64_t c = 0;
-  uint64_t s1 = 0, s2 = 0;
+  uint64_t s1 = 0;
+  uint64_t s2 = 0;
 
   long long count = 0;
   for (auto& key_version : key_versions) {
@@ -2552,10 +2573,14 @@ void DBDumperCommand::DoDumpCommand() {
     bucket_size = time_range;  // Will have just 1 bucket by default
   }
   // cretaing variables for row count of each type
-  std::string rtype1, rtype2, row, val;
+  std::string rtype1;
+  std::string rtype2;
+  std::string row;
+  std::string val;
   rtype2 = "";
   uint64_t c = 0;
-  uint64_t s1 = 0, s2 = 0;
+  uint64_t s1 = 0;
+  uint64_t s2 = 0;
 
   // At this point, bucket_size=0 => time_range=0
   int num_buckets = (bucket_size >= time_range)
@@ -4956,8 +4981,6 @@ void DBLiveFilesMetadataDumperCommand::DoCommand() {
     assert(GetExecuteState().IsFailed());
     return;
   }
-  Status s;
-
   std::vector<ColumnFamilyMetaData> metadata;
   db_->GetAllColumnFamilyMetaData(&metadata);
   if (sort_by_filename_) {
@@ -5146,8 +5169,6 @@ const std::string IngestExternalSstFilesCommand::ARG_ALLOW_BLOCKING_FLUSH =
     "allow_blocking_flush";
 const std::string IngestExternalSstFilesCommand::ARG_INGEST_BEHIND =
     "ingest_behind";
-const std::string IngestExternalSstFilesCommand::ARG_WRITE_GLOBAL_SEQNO =
-    "write_global_seqno";
 
 void IngestExternalSstFilesCommand::Help(std::string& ret) {
   ret.append("  ");
@@ -5158,7 +5179,6 @@ void IngestExternalSstFilesCommand::Help(std::string& ret) {
   ret.append(" [--" + ARG_ALLOW_GLOBAL_SEQNO + "] ");
   ret.append(" [--" + ARG_ALLOW_BLOCKING_FLUSH + "] ");
   ret.append(" [--" + ARG_INGEST_BEHIND + "] ");
-  ret.append(" [--" + ARG_WRITE_GLOBAL_SEQNO + "] ");
   ret.append("\n");
 }
 
@@ -5170,14 +5190,12 @@ IngestExternalSstFilesCommand::IngestExternalSstFilesCommand(
           options, flags, false /* is_read_only */,
           BuildCmdLineOptions({ARG_MOVE_FILES, ARG_SNAPSHOT_CONSISTENCY,
                                ARG_ALLOW_GLOBAL_SEQNO, ARG_CREATE_IF_MISSING,
-                               ARG_ALLOW_BLOCKING_FLUSH, ARG_INGEST_BEHIND,
-                               ARG_WRITE_GLOBAL_SEQNO})),
+                               ARG_ALLOW_BLOCKING_FLUSH, ARG_INGEST_BEHIND})),
       move_files_(false),
       snapshot_consistency_(true),
       allow_global_seqno_(true),
       allow_blocking_flush_(true),
-      ingest_behind_(false),
-      write_global_seqno_(true) {
+      ingest_behind_(false) {
   create_if_missing_ =
       IsFlagPresent(flags, ARG_CREATE_IF_MISSING) ||
       ParseBooleanOption(options, ARG_CREATE_IF_MISSING, false);
@@ -5194,23 +5212,6 @@ IngestExternalSstFilesCommand::IngestExternalSstFilesCommand(
       ParseBooleanOption(options, ARG_ALLOW_BLOCKING_FLUSH, true);
   ingest_behind_ = IsFlagPresent(flags, ARG_INGEST_BEHIND) ||
                    ParseBooleanOption(options, ARG_INGEST_BEHIND, false);
-  write_global_seqno_ =
-      IsFlagPresent(flags, ARG_WRITE_GLOBAL_SEQNO) ||
-      ParseBooleanOption(options, ARG_WRITE_GLOBAL_SEQNO, true);
-
-  if (allow_global_seqno_) {
-    if (!write_global_seqno_) {
-      fprintf(stderr,
-              "Warning: not writing global_seqno to the ingested SST can\n"
-              "prevent older versions of RocksDB from being able to open it\n");
-    }
-  } else {
-    if (write_global_seqno_) {
-      exec_state_ = LDBCommandExecuteResult::Failed(
-          "ldb cannot write global_seqno to the ingested SST when global_seqno "
-          "is not allowed");
-    }
-  }
 
   if (params.size() != 1) {
     exec_state_ =
@@ -5235,7 +5236,6 @@ void IngestExternalSstFilesCommand::DoCommand() {
   ifo.allow_global_seqno = allow_global_seqno_;
   ifo.allow_blocking_flush = allow_blocking_flush_;
   ifo.ingest_behind = ingest_behind_;
-  ifo.write_global_seqno = write_global_seqno_;
   Status status = db_->IngestExternalFile(cfh, {input_sst_path_}, ifo);
   if (!status.ok()) {
     exec_state_ = LDBCommandExecuteResult::Failed(
@@ -5372,11 +5372,20 @@ void UnsafeRemoveSstFileCommand::DoCommand() {
 const std::string UpdateManifestCommand::ARG_VERBOSE = "verbose";
 const std::string UpdateManifestCommand::ARG_UPDATE_TEMPERATURES =
     "update_temperatures";
+const std::string UpdateManifestCommand::ARG_REBIND_OPTIONS_FILE =  // NOLINT
+    "rebind_options_file";
+const std::string UpdateManifestCommand::ARG_OPTIONS_FILE =  // NOLINT
+    "options_file";
+const std::string UpdateManifestCommand::ARG_FILE_NUMBER_PATHS =  // NOLINT
+    "file_number_paths";
 
 void UpdateManifestCommand::Help(std::string& ret) {
   ret.append("  ");
   ret.append(UpdateManifestCommand::Name());
   ret.append(" [--update_temperatures]");
+  ret.append(" [--rebind_options_file]");
+  ret.append(" [--options_file=OPTIONS-<number>]");
+  ret.append(" [--file_number_paths=<path1>,<path2>,...]");
   ret.append("  ");
   ret.append("    MUST NOT be used on a live DB.");
   ret.append("\n");
@@ -5387,37 +5396,378 @@ UpdateManifestCommand::UpdateManifestCommand(
     const std::map<std::string, std::string>& options,
     const std::vector<std::string>& flags)
     : LDBCommand(options, flags, false /* is_read_only */,
-                 BuildCmdLineOptions({ARG_VERBOSE, ARG_UPDATE_TEMPERATURES})) {
+                 BuildCmdLineOptions({ARG_VERBOSE, ARG_UPDATE_TEMPERATURES,
+                                      ARG_REBIND_OPTIONS_FILE, ARG_OPTIONS_FILE,
+                                      ARG_FILE_NUMBER_PATHS})) {
   verbose_ = IsFlagPresent(flags, ARG_VERBOSE) ||
              ParseBooleanOption(options, ARG_VERBOSE, false);
   update_temperatures_ =
       IsFlagPresent(flags, ARG_UPDATE_TEMPERATURES) ||
       ParseBooleanOption(options, ARG_UPDATE_TEMPERATURES, false);
+  rebind_options_file_ =
+      IsFlagPresent(flags, ARG_REBIND_OPTIONS_FILE) ||
+      ParseBooleanOption(options, ARG_REBIND_OPTIONS_FILE, false);
+  auto options_file_iter = options.find(ARG_OPTIONS_FILE);
+  if (options_file_iter != options.end()) {
+    options_file_ = options_file_iter->second;
+  }
+  auto file_number_paths_iter = options.find(ARG_FILE_NUMBER_PATHS);
+  if (file_number_paths_iter != options.end()) {
+    file_number_paths_ = StringSplit(file_number_paths_iter->second, ',');
+  }
 
-  if (!update_temperatures_) {
+  if (rebind_options_file_) {
+    // The repair must be able to inspect an explicitly selected OPTIONS file
+    // even when the currently bound file is missing or corrupt.
+    try_load_options_ = false;
+  }
+  if (!update_temperatures_ && !rebind_options_file_) {
     exec_state_ = LDBCommandExecuteResult::Failed(
-        "No action like --update_temperatures specified for update_manifest");
+        "No action like --update_temperatures or --rebind_options_file "
+        "specified for update_manifest");
+  } else if (rebind_options_file_ && options_file_.empty()) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--rebind_options_file requires an explicit trusted "
+        "--options_file=OPTIONS-<number>");
+  } else if (!rebind_options_file_ && !options_file_.empty()) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--options_file requires --rebind_options_file");
+  } else if (!rebind_options_file_ && !file_number_paths_.empty()) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--file_number_paths requires --rebind_options_file");
+  } else if (std::any_of(
+                 file_number_paths_.begin(), file_number_paths_.end(),
+                 [](const std::string& path) { return path.empty(); })) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--file_number_paths cannot contain an empty path");
+  } else if (rebind_options_file_ && update_temperatures_) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--rebind_options_file and --update_temperatures cannot be combined");
   }
 }
 
+namespace {
+Status RebindManifestToSelectedOptions(
+    const Options& base_options, const std::string& db_path,
+    const std::string& selected_options_name,
+    const std::vector<std::string>& file_number_paths) {
+  assert(base_options.env != nullptr);
+  Env& env = *base_options.env;
+  const auto& fs = env.GetFileSystem();
+  FileLock* db_lock = nullptr;
+  Status s = env.LockFile(LockFileName(db_path), &db_lock);
+  if (!s.ok()) {
+    return s;
+  }
+  assert(db_lock != nullptr);
+  Defer unlock_db([&]() { env.UnlockFile(db_lock).PermitUncheckedError(); });
+
+  OptionsFileManifestState recovered_manifest_state;
+  uint64_t manifest_next_file_number = 0;
+  uint64_t manifest_append_boundary = 0;
+  s = VersionSet::GetOptionsFileManifestState(
+      db_path, fs.get(), &recovered_manifest_state, &manifest_next_file_number,
+      &manifest_append_boundary);
+  if (!s.ok()) {
+    return s;
+  }
+  if (manifest_append_boundary == 0) {
+    return Status::Corruption("MANIFEST has no complete record to repair");
+  }
+
+  [[maybe_unused]] uint64_t selected_options_number = 0;
+  FileType selected_type;
+  if (selected_options_name.find_first_of("/\\") != std::string::npos ||
+      !ParseFileName(selected_options_name, &selected_options_number,
+                     &selected_type) ||
+      selected_type != kOptionsFile) {
+    return Status::InvalidArgument(
+        "--options_file must be a basename in OPTIONS-<number> format");
+  }
+
+  ConfigOptions config_options;
+  config_options.env = &env;
+  config_options.ignore_unknown_options = true;
+  DBOptions loaded_db_options;
+  std::vector<ColumnFamilyDescriptor> loaded_cfs;
+  s = LoadOptionsFromFile(config_options, db_path + "/" + selected_options_name,
+                          &loaded_db_options, &loaded_cfs);
+  if (!s.ok()) {
+    return s;
+  }
+  if (loaded_cfs.empty()) {
+    return Status::Corruption("OPTIONS file has no column families");
+  }
+  if (!loaded_db_options.track_options_file_number_in_manifest) {
+    return Status::InvalidArgument(
+        "Selected OPTIONS file does not enable MANIFEST tracking");
+  }
+
+  // OPTIONS does not persist DBOptions::db_paths or
+  // ColumnFamilyOptions::cf_paths. Callers using either must supply those
+  // roots through --file_number_paths. wal_dir is persisted and is included
+  // automatically. Failing closed on an unavailable root prevents the repair
+  // from allocating a number that is already in use outside the DB directory.
+  const std::string wal_dir =
+      loaded_db_options.wal_dir.empty() ? db_path : loaded_db_options.wal_dir;
+  std::set<std::string> allocation_roots = {db_path, wal_dir};
+  for (const DbPath& db_root : loaded_db_options.db_paths) {
+    if (!db_root.path.empty()) {
+      allocation_roots.insert(db_root.path);
+    }
+  }
+  for (const ColumnFamilyDescriptor& cf : loaded_cfs) {
+    for (const DbPath& cf_root : cf.options.cf_paths) {
+      if (!cf_root.path.empty()) {
+        allocation_roots.insert(cf_root.path);
+      }
+    }
+  }
+  allocation_roots.insert(file_number_paths.begin(), file_number_paths.end());
+  uint64_t highest_file_number =
+      recovered_manifest_state.has_committed_options_file_number
+          ? recovered_manifest_state.committed_options_file_number
+          : 0;
+  auto scan_file_numbers = [&](const std::string& path,
+                               bool allow_missing) -> Status {
+    std::vector<std::string> children;
+    Status scan_s = env.GetChildren(path, &children);
+    if (allow_missing && (scan_s.IsNotFound() || scan_s.IsPathNotFound())) {
+      return Status::OK();
+    }
+    if (!scan_s.ok()) {
+      return scan_s;
+    }
+    for (const auto& child : children) {
+      uint64_t number = 0;
+      FileType type;
+      if (ParseFileName(child, &number, &type)) {
+        highest_file_number = std::max(highest_file_number, number);
+      }
+    }
+    return Status::OK();
+  };
+  for (const std::string& path : allocation_roots) {
+    s = scan_file_numbers(path, /*allow_missing=*/false);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  s = scan_file_numbers(ArchivalDirectory(wal_dir), /*allow_missing=*/true);
+  if (!s.ok()) {
+    return s;
+  }
+  if (highest_file_number >= kFileNumberMask ||
+      manifest_next_file_number > kFileNumberMask) {
+    return Status::InvalidArgument("File number space exhausted");
+  }
+
+  std::vector<std::string> manifest_cfs;
+  s = VersionSet::ListColumnFamilies(&manifest_cfs, db_path, fs.get());
+  if (!s.ok()) {
+    return s;
+  }
+  std::vector<std::string> options_cfs;
+  options_cfs.reserve(loaded_cfs.size());
+  for (const auto& cf : loaded_cfs) {
+    options_cfs.push_back(cf.name);
+  }
+  std::sort(manifest_cfs.begin(), manifest_cfs.end());
+  std::sort(options_cfs.begin(), options_cfs.end());
+  if (!std::includes(options_cfs.begin(), options_cfs.end(),
+                     manifest_cfs.begin(), manifest_cfs.end())) {
+    return Status::InvalidArgument(
+        "Selected OPTIONS file is missing a MANIFEST column family");
+  }
+
+  // Bound recovery-created data files from the WAL contents. Every recovery
+  // L0 output contains at least one WriteBatch entry, and each blob-file
+  // output contains at least one blob entry, so twice the total entry count is
+  // a conservative upper bound for both kinds together. Count all live and
+  // archived WALs; including obsolete records only makes the repair safer.
+  struct WalCountReporter : public log::Reader::Reporter {
+    Status status;
+    void Corruption(size_t /*bytes*/, const Status& corruption,
+                    uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+      status.UpdateIfOk(corruption);
+    }
+  };
+  uint64_t wal_entry_count = 0;
+  for (const std::string& dir : {wal_dir, ArchivalDirectory(wal_dir)}) {
+    std::vector<std::string> wal_children;
+    s = env.GetChildren(dir, &wal_children);
+    if (s.IsNotFound() || s.IsPathNotFound()) {
+      s = Status::OK();
+      continue;
+    }
+    if (!s.ok()) {
+      return s;
+    }
+    for (const auto& child : wal_children) {
+      uint64_t wal_number = 0;
+      FileType type;
+      if (!ParseFileName(child, &wal_number, &type) || type != kWalFile) {
+        continue;
+      }
+      std::string wal_path = dir;
+      wal_path.push_back('/');
+      wal_path.append(child);
+      std::unique_ptr<SequentialFileReader> wal_file_reader;
+      s = SequentialFileReader::Create(
+          fs, wal_path, FileOptions(), &wal_file_reader,
+          /*dbg=*/nullptr, /*rate_limiter=*/nullptr);
+      if (!s.ok()) {
+        return s;
+      }
+      WalCountReporter reporter;
+      log::Reader reader(nullptr, std::move(wal_file_reader), &reporter,
+                         /*checksum=*/true, wal_number);
+      Slice record;
+      std::string scratch;
+      WriteBatch batch;
+      while (reader.ReadRecord(&record, &scratch)) {
+        if (record.size() < WriteBatchInternal::kHeader) {
+          return Status::Corruption("WAL record too small to bound recovery");
+        }
+        s = WriteBatchInternal::SetContents(&batch, record);
+        if (!s.ok()) {
+          return s;
+        }
+        const uint64_t count = WriteBatchInternal::Count(&batch);
+        if (count > kFileNumberMask - wal_entry_count) {
+          return Status::InvalidArgument("File number space exhausted");
+        }
+        wal_entry_count += count;
+      }
+      if (!reporter.status.ok()) {
+        return reporter.status;
+      }
+    }
+  }
+
+  const uint64_t new_options_number =
+      std::max(highest_file_number + 1, manifest_next_file_number);
+  // Repair cannot know the DBOptions or column-family descriptors that the
+  // next writable opener will supply. In addition to the two recovery/scan
+  // advances, reserve a WAL, fresh MANIFEST, persistent-stats recreation,
+  // final OPTIONS publication, asynchronous WAL precreation, and an initial
+  // flush. Also reserve a temporary/canonical OPTIONS pair plus a possible
+  // MANIFEST rollover for every column family that one open could create.
+  // Column-family IDs bound that count to uint32.
+  constexpr uint64_t kMaxMissingColumnFamilies =
+      std::numeric_limits<uint32_t>::max();
+  constexpr uint64_t kFileNumbersPerMissingColumnFamily = 3;
+  // Two recovery/scan advances, open WAL, recovery MANIFEST, up to six for
+  // persistent-stats drop/recreate, three for final OPTIONS publication,
+  // asynchronous WAL precreation, and table plus MANIFEST for an initial
+  // flush.
+  constexpr uint64_t kFixedWritableOpenFileNumberHeadroom = 16;
+  constexpr uint64_t kWritableOpenFileNumberHeadroom =
+      kFileNumbersPerMissingColumnFamily * kMaxMissingColumnFamilies +
+      kFixedWritableOpenFileNumberHeadroom;
+  static_assert(kWritableOpenFileNumberHeadroom < kFileNumberMask);
+  if (new_options_number > kFileNumberMask - kWritableOpenFileNumberHeadroom ||
+      wal_entry_count > (kFileNumberMask - new_options_number -
+                         kWritableOpenFileNumberHeadroom) /
+                            2) {
+    return Status::InvalidArgument("File number space exhausted");
+  }
+  const std::string temp_options =
+      TempOptionsFileName(db_path, new_options_number);
+  const std::string final_options =
+      OptionsFileName(db_path, new_options_number);
+  env.DeleteFile(temp_options).PermitUncheckedError();
+
+  std::string manifest_path;
+  [[maybe_unused]] uint64_t manifest_number = 0;
+  s = GetCurrentManifestPath(db_path, fs.get(), /*is_retry=*/false,
+                             &manifest_path, &manifest_number);
+  if (!s.ok()) {
+    return s;
+  }
+  Options loaded_options(loaded_db_options, loaded_cfs.front().options);
+  loaded_options.env = &env;
+  if (loaded_options.db_paths.empty()) {
+    loaded_options.db_paths.emplace_back(db_path, 0);
+  }
+  ImmutableDBOptions immutable_options(loaded_options);
+  MutableDBOptions mutable_options(loaded_options);
+  FileOptions file_options;
+  std::shared_ptr<Cache> table_cache = NewLRUCache(8 * 1024 * 1024);
+  WriteController write_controller(loaded_options.delayed_write_rate);
+  WriteBufferManager write_buffer_manager(loaded_options.db_write_buffer_size);
+  VersionSet versions(
+      db_path, &immutable_options, mutable_options, file_options,
+      table_cache.get(), &write_buffer_manager, &write_controller,
+      /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr, /*db_id=*/"",
+      /*db_session_id=*/"", loaded_options.daily_offpeak_time_utc,
+      /*error_handler=*/nullptr, /*unchanging=*/false);
+  // Parsing above verifies every live MANIFEST CF has options. Extra CFs are a
+  // safe partial-batch superset and are filtered by persisted-options APIs.
+  // Copy byte-for-byte so an older ldb does not discard option fields
+  // introduced by a newer binary.
+  s = CopyFile(fs.get(), db_path + "/" + selected_options_name,
+               Temperature::kUnknown, temp_options, Temperature::kUnknown,
+               /*size=*/0, loaded_db_options.use_fsync,
+               /*io_tracer=*/nullptr);
+  if (s.ok()) {
+    s = env.RenameFile(temp_options, final_options);
+  }
+  if (!s.ok()) {
+    env.DeleteFile(temp_options).PermitUncheckedError();
+    return s;
+  }
+  std::unique_ptr<FSDirectory> db_dir;
+  IOStatus io_s = fs->NewDirectory(db_path, IOOptions(), &db_dir, nullptr);
+  if (io_s.ok()) {
+    assert(db_dir != nullptr);
+    io_s = db_dir->FsyncWithDirOptions(IOOptions(), nullptr,
+                                       DirFsyncOptions(final_options));
+  }
+  if (!io_s.ok()) {
+    return io_s;
+  }
+
+  return versions.AppendColumnFamilyDropsToManifest(
+      manifest_path, manifest_append_boundary, /*cf_ids=*/{}, WriteOptions(),
+      loaded_options.manifest_preallocation_size, new_options_number);
+}
+}  // namespace
+
 void UpdateManifestCommand::DoCommand() {
   PrepareOptions();
+  if (!exec_state_.IsNotStarted()) {
+    return;
+  }
 
   auto level = verbose_ ? InfoLogLevel::INFO_LEVEL : InfoLogLevel::WARN_LEVEL;
-  options_.info_log.reset(new StderrLogger(level));
+  options_.info_log = std::make_shared<StderrLogger>(level);
 
-  experimental::UpdateManifestForFilesStateOptions opts;
-  opts.update_temperatures = update_temperatures_;
-  if (column_families_.empty()) {
-    column_families_.emplace_back(kDefaultColumnFamilyName, options_);
+  Status s;
+  if (rebind_options_file_) {
+    s = RebindManifestToSelectedOptions(options_, db_path_, options_file_,
+                                        file_number_paths_);
   }
-  Status s = experimental::UpdateManifestForFilesState(options_, db_path_,
-                                                       column_families_);
+  if (s.ok() && update_temperatures_) {
+    if (column_families_.empty()) {
+      column_families_.emplace_back(kDefaultColumnFamilyName, options_);
+    }
+    s = experimental::UpdateManifestForFilesState(options_, db_path_,
+                                                  column_families_);
+  }
 
   if (!s.ok()) {
-    exec_state_ = LDBCommandExecuteResult::Failed(
-        "failed to update manifest: " + s.ToString());
+    std::string error = "failed to update manifest: ";
+    error.append(s.ToString());
+    exec_state_ = LDBCommandExecuteResult::Failed(std::move(error));
+  } else if (rebind_options_file_) {
+    // Rebind is also exercised through ldb's stdout-oriented CLI test helper.
+    fprintf(stdout, "Manifest updates successful\n");
+    exec_state_ = LDBCommandExecuteResult::Succeed("");
   } else {
+    // Preserve the existing update_temperatures result contract. The command
+    // runner renders this nonempty result through its normal result channel,
+    // and programmatic callers can inspect it through GetExecuteState().
     exec_state_ =
         LDBCommandExecuteResult::Succeed("Manifest updates successful");
   }
@@ -5452,6 +5802,185 @@ void CompactionProgressDumpCommand::Help(std::string& ret) {
 
 void CompactionProgressDumpCommand::DoCommand() {
   DumpCompactionProgressFile(path_);
+}
+
+namespace {
+
+const std::string kInputFile = "input.bin";
+const std::string kResultFile = "result.bin";
+constexpr int kPollIntervalMs = 100;
+constexpr int kPollTimeoutMs = 120000;
+constexpr int kPollMaxAttempts = kPollTimeoutMs / kPollIntervalMs;
+
+// Atomic write via tmp+rename so the polling reader never sees partial data.
+bool AtomicWriteStringToFile(const std::string& path, const std::string& data) {
+  std::string tmp_path = path + ".tmp";
+  std::ofstream ofs(tmp_path, std::ios::binary);
+  if (!ofs) {
+    return false;
+  }
+  ofs.write(data.data(), data.size());
+  if (!ofs.good()) {
+    return false;
+  }
+  ofs.close();
+  return std::rename(tmp_path.c_str(), path.c_str()) == 0;
+}
+
+bool PollForFile(Env* env, const std::string& path, std::string* data) {
+  for (int i = 0; i < kPollMaxAttempts; i++) {
+    Status s = ROCKSDB_NAMESPACE::ReadFileToString(env, path, data);
+    if (s.ok() && !data->empty()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+  }
+  return false;
+}
+
+class LocalFileCompactionService : public CompactionService {
+ public:
+  explicit LocalFileCompactionService(const std::string& job_dir)
+      : job_dir_(job_dir) {}
+
+  const char* Name() const override { return "LocalFileCompactionService"; }
+
+  CompactionServiceScheduleResponse Schedule(
+      const CompactionServiceJobInfo& /*info*/,
+      const std::string& compaction_service_input) override {
+    assert(!scheduled_);
+    scheduled_ = true;
+    if (!AtomicWriteStringToFile(job_dir_ + "/" + kInputFile,
+                                 compaction_service_input)) {
+      return CompactionServiceScheduleResponse(
+          CompactionServiceJobStatus::kFailure);
+    }
+    return CompactionServiceScheduleResponse(
+        "job_0001", CompactionServiceJobStatus::kSuccess);
+  }
+
+  CompactionServiceJobStatus Wait(const std::string& /*scheduled_job_id*/,
+                                  std::string* result) override {
+    if (!PollForFile(Env::Default(), job_dir_ + "/" + kResultFile, result)) {
+      return CompactionServiceJobStatus::kFailure;
+    }
+    return CompactionServiceJobStatus::kSuccess;
+  }
+
+ private:
+  std::string job_dir_;
+  bool scheduled_ = false;
+};
+
+}  // namespace
+
+const std::string RemoteCompactionPrimaryCommand::ARG_JOB_DIR =
+    "job_dir";  // NOLINT(cert-err58-cpp)
+
+RemoteCompactionPrimaryCommand::RemoteCompactionPrimaryCommand(
+    const std::vector<std::string>& /*params*/,
+    const std::map<std::string, std::string>& options,
+    const std::vector<std::string>& flags)
+    : LDBCommand(options, flags, false, BuildCmdLineOptions({ARG_JOB_DIR})) {
+  auto it = options.find(ARG_JOB_DIR);
+  if (it != options.end()) {
+    job_dir_ = it->second;
+  } else {
+    exec_state_ = LDBCommandExecuteResult::Failed("--job_dir is required");
+  }
+}
+
+void RemoteCompactionPrimaryCommand::Help(std::string& ret) {
+  ret.append("  ");
+  ret.append(Name());
+  ret.append(" --db=<db_path> --job_dir=<dir>");
+  ret.append("\n    Open an existing DB and run CompactRange() through ");
+  ret.append("LocalFileCompactionService.\n");
+  ret.append("    Schedule() writes job_dir/input.bin (once). ");
+  ret.append("Wait() polls for job_dir/result.bin.\n");
+  ret.append("    Must run with remote_compaction_worker in background on ");
+  ret.append("the same --db and --job_dir,\n");
+  ret.append("    otherwise Wait() will hang until timeout.\n");
+}
+
+void RemoteCompactionPrimaryCommand::DoCommand() {
+  auto cs = std::make_shared<LocalFileCompactionService>(job_dir_);
+
+  Options options;
+  options.compaction_service = cs;
+  options.disable_auto_compactions = true;
+
+  std::unique_ptr<DB> db;
+  Status s = DB::Open(options, db_path_, &db);
+  if (!s.ok()) {
+    exec_state_ = LDBCommandExecuteResult::Failed("Open: " + s.ToString());
+    return;
+  }
+
+  s = db->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  if (!s.ok()) {
+    exec_state_ =
+        LDBCommandExecuteResult::Failed("CompactRange: " + s.ToString());
+    return;
+  }
+
+  fprintf(stdout, "remote_compaction_primary: OK\n");
+}
+
+const std::string RemoteCompactionWorkerCommand::ARG_JOB_DIR =
+    "job_dir";  // NOLINT(cert-err58-cpp)
+
+RemoteCompactionWorkerCommand::RemoteCompactionWorkerCommand(
+    const std::vector<std::string>& /*params*/,
+    const std::map<std::string, std::string>& options,
+    const std::vector<std::string>& flags)
+    : LDBCommand(options, flags, false, BuildCmdLineOptions({ARG_JOB_DIR})) {
+  auto it = options.find(ARG_JOB_DIR);
+  if (it != options.end()) {
+    job_dir_ = it->second;
+  } else {
+    exec_state_ = LDBCommandExecuteResult::Failed("--job_dir is required");
+  }
+}
+
+void RemoteCompactionWorkerCommand::Help(std::string& ret) {
+  ret.append("  ");
+  ret.append(Name());
+  ret.append(" --db=<db_path> --job_dir=<dir>");
+  ret.append("\n    Read job_dir/input.bin, run DB::OpenAndCompact(), ");
+  ret.append("write job_dir/result.bin.\n");
+}
+
+void RemoteCompactionWorkerCommand::DoCommand() {
+  std::string input_path = job_dir_ + "/" + kInputFile;
+  std::string input;
+  if (!PollForFile(Env::Default(), input_path, &input)) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "Timed out (" + std::to_string(kPollTimeoutMs / 1000) +
+        "s) waiting for " + input_path);
+    return;
+  }
+
+  std::string result;
+  CompactionServiceOptionsOverride override_options;
+  override_options.table_factory.reset(NewBlockBasedTableFactory());
+  Status s = DB::OpenAndCompact(OpenAndCompactOptions(), db_path_, "job_0001",
+                                input, &result, override_options);
+  if (!s.ok()) {
+    exec_state_ =
+        LDBCommandExecuteResult::Failed("OpenAndCompact: " + s.ToString());
+    return;
+  }
+
+  std::string result_path = job_dir_ + "/" + kResultFile;
+  if (!AtomicWriteStringToFile(result_path, result)) {
+    exec_state_ =
+        LDBCommandExecuteResult::Failed("Failed to write " + result_path);
+    return;
+  }
+
+  fprintf(stdout, "remote_compaction_worker: OK (%zu bytes result)\n",
+          result.size());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

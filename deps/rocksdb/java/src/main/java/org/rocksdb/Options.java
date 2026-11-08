@@ -781,6 +781,20 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setMaxCompactionTriggerWakeupSeconds(
+      final long maxCompactionTriggerWakeupSeconds) {
+    assert (isOwningHandle());
+    setMaxCompactionTriggerWakeupSeconds(nativeHandle_, maxCompactionTriggerWakeupSeconds);
+    return this;
+  }
+
+  @Override
+  public long maxCompactionTriggerWakeupSeconds() {
+    assert (isOwningHandle());
+    return maxCompactionTriggerWakeupSeconds(nativeHandle_);
+  }
+
+  @Override
   public Options setStatsPersistPeriodSec(
       final int statsPersistPeriodSec) {
     assert(isOwningHandle());
@@ -1894,6 +1908,18 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setTrackOptionsFileNumberInManifest(final boolean track) {
+    setTrackOptionsFileNumberInManifest(nativeHandle_, track);
+    return this;
+  }
+
+  @Override
+  public boolean trackOptionsFileNumberInManifest() {
+    assert (isOwningHandle());
+    return trackOptionsFileNumberInManifest(nativeHandle_);
+  }
+
+  @Override
   public Options setLogReadaheadSize(final long logReadaheadSize) {
     setLogReadaheadSize(nativeHandle_, logReadaheadSize);
     return this;
@@ -1962,6 +1988,17 @@ public class Options extends RocksObject
   @Override
   public int memtableMaxRangeDeletions() {
     return memtableMaxRangeDeletions(nativeHandle_);
+  }
+
+  @Override
+  public Options setMinTombstonesForRangeConversion(final int minTombstonesForRangeConversion) {
+    setMinTombstonesForRangeConversion(nativeHandle_, minTombstonesForRangeConversion);
+    return this;
+  }
+
+  @Override
+  public int minTombstonesForRangeConversion() {
+    return minTombstonesForRangeConversion(nativeHandle_);
   }
 
   @Override
@@ -2057,6 +2094,18 @@ public class Options extends RocksObject
   @Override
   public double blobGarbageCollectionForceThreshold() {
     return blobGarbageCollectionForceThreshold(nativeHandle_);
+  }
+
+  @Override
+  public Options setReadTriggeredCompactionThreshold(
+      final double readTriggeredCompactionThreshold) {
+    setReadTriggeredCompactionThreshold(nativeHandle_, readTriggeredCompactionThreshold);
+    return this;
+  }
+
+  @Override
+  public double readTriggeredCompactionThreshold() {
+    return readTriggeredCompactionThreshold(nativeHandle_);
   }
 
   @Override
@@ -2230,6 +2279,9 @@ public class Options extends RocksObject
   private static native boolean isFdCloseOnExec(long handle);
   private static native void setStatsDumpPeriodSec(long handle, int statsDumpPeriodSec);
   private static native int statsDumpPeriodSec(long handle);
+  private static native void setMaxCompactionTriggerWakeupSeconds(
+      long handle, long maxCompactionTriggerWakeupSeconds);
+  private static native long maxCompactionTriggerWakeupSeconds(long handle);
   private static native void setStatsPersistPeriodSec(
       final long handle, final int statsPersistPeriodSec);
   private static native int statsPersistPeriodSec(final long handle);
@@ -2451,6 +2503,9 @@ public class Options extends RocksObject
   private static native void setSstPartitionerFactory(long nativeHandle_, long newFactoryHandle);
   private static native void setMemtableMaxRangeDeletions(final long handle, final int count);
   private static native int memtableMaxRangeDeletions(final long handle);
+  private static native void setMinTombstonesForRangeConversion(
+      final long handle, final int minTombstonesForRangeConversion);
+  private static native int minTombstonesForRangeConversion(final long handle);
   private static native void setCompactionThreadLimiter(
       final long nativeHandle_, final long newLimiterHandle);
   private static native void setAvoidUnnecessaryBlockingIO(
@@ -2462,6 +2517,9 @@ public class Options extends RocksObject
   private static native void setWriteDbidToManifest(
       final long handle, final boolean writeDbidToManifest);
   private static native boolean writeDbidToManifest(final long handle);
+  private static native void setTrackOptionsFileNumberInManifest(
+      final long handle, final boolean track);
+  private static native boolean trackOptionsFileNumberInManifest(final long handle);
   private static native void setLogReadaheadSize(final long handle, final long logReadaheadSize);
   private static native long logReadaheadSize(final long handle);
   private static native void setBestEffortsRecovery(
@@ -2493,6 +2551,9 @@ public class Options extends RocksObject
   private static native void setBlobGarbageCollectionForceThreshold(
       final long nativeHandle_, final double blobGarbageCollectionForceThreshold);
   private static native double blobGarbageCollectionForceThreshold(final long nativeHandle_);
+  private static native void setReadTriggeredCompactionThreshold(
+      final long nativeHandle_, final double readTriggeredCompactionThreshold);
+  private static native double readTriggeredCompactionThreshold(final long nativeHandle_);
   private static native void setBlobCompactionReadaheadSize(
       final long nativeHandle_, final long blobCompactionReadaheadSize);
   private static native long blobCompactionReadaheadSize(final long nativeHandle_);

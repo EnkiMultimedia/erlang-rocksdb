@@ -74,6 +74,8 @@ enum Tag : uint32_t {
   kWalDeletion2,
   kPersistUserDefinedTimestamps,
   kSubcompactionProgress,
+  kLastCompactedManifestFileSize,
+  kCommittedOptionsFileNumber,
 };
 
 enum SubcompactionProgressPerLevelCustomTag : uint32_t {
@@ -100,7 +102,7 @@ enum NewFileCustomTag : uint32_t {
   // when manifest becomes forward-compatible.
   kMinLogNumberToKeepHack = 3,
   kOldestBlobFileNumber = 4,
-  kOldestAncesterTime = 5,
+  kOldestAncestorTime = 5,
   kFileCreationTime = 6,
   kFileChecksum = 7,
   kFileChecksumFuncName = 8,
@@ -112,6 +114,7 @@ enum NewFileCustomTag : uint32_t {
   kCompensatedRangeDeletionSize = 14,
   kTailSize = 15,
   kUserDefinedTimestampsPersisted = 16,
+  kFileOpenMetadata = 17,
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -124,7 +127,7 @@ enum NewFileCustomTag : uint32_t {
 class VersionSet;
 
 constexpr uint64_t kFileNumberMask = 0x3FFFFFFFFFFFFFFF;
-constexpr uint64_t kUnknownOldestAncesterTime = 0;
+constexpr uint64_t kUnknownOldestAncestorTime = 0;
 constexpr uint64_t kUnknownNewestKeyTime = 0;
 constexpr uint64_t kUnknownFileCreationTime = 0;
 constexpr uint64_t kUnknownEpochNumber = 0;
@@ -203,17 +206,6 @@ struct FileDescriptor {
         smallest_seqno(_smallest_seqno),
         largest_seqno(_largest_seqno) {}
 
-  FileDescriptor(const FileDescriptor& fd) { *this = fd; }
-
-  FileDescriptor& operator=(const FileDescriptor& fd) {
-    pinned_reader = fd.pinned_reader;
-    packed_number_and_path_id = fd.packed_number_and_path_id;
-    file_size = fd.file_size;
-    smallest_seqno = fd.smallest_seqno;
-    largest_seqno = fd.largest_seqno;
-    return *this;
-  }
-
   uint64_t GetNumber() const {
     return packed_number_and_path_id & kFileNumberMask;
   }
@@ -227,11 +219,19 @@ struct FileDescriptor {
 struct FileSampledStats {
   FileSampledStats()
       : num_reads_sampled(0), num_collapsible_entry_reads_sampled(0) {}
+  ~FileSampledStats() = default;
   FileSampledStats(const FileSampledStats& other) { *this = other; }
   FileSampledStats& operator=(const FileSampledStats& other) {
     num_reads_sampled = other.num_reads_sampled.load();
     num_collapsible_entry_reads_sampled =
         other.num_collapsible_entry_reads_sampled.load();
+    return *this;
+  }
+  // std::atomic is not movable, so moving copies. Don't `= delete` these: that
+  // would delete FileMetaData's implicit move, making it copy every member.
+  FileSampledStats(FileSampledStats&& other) noexcept { *this = other; }
+  FileSampledStats& operator=(FileSampledStats&& other) noexcept {
+    *this = other;
     return *this;
   }
 
@@ -293,7 +293,7 @@ struct FileMetaData {
   // compaction output file is used.
   //
   // 0 means the information is not available.
-  uint64_t oldest_ancester_time = kUnknownOldestAncesterTime;
+  uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
 
   // Unix time when the SST file is created.
   uint64_t file_creation_time = kUnknownFileCreationTime;
@@ -330,6 +330,16 @@ struct FileMetaData {
   // This is populated from the table properties "rocksdb.timestamp_max".
   std::string max_timestamp;
 
+  // Opaque file system metadata that can be used to accelerate file opening.
+  // Retrieved via FSRandomAccessFile::GetFileOpenMetadata() and passed back
+  // via FileOptions::file_metadata on subsequent opens. Empty if not available.
+  std::string file_open_metadata;
+
+  // Skips prefetching index and filter blocks into block cache on file open,
+  // not persisted in MANIFEST. NOTE: false does not guarantee prefetching
+  // either (e.g. when index and filter blocks are not cached in block cache).
+  bool skip_index_and_filter_blocks_prefetch = false;
+
   FileMetaData() = default;
 
   FileMetaData(uint64_t file, uint32_t file_path_id, uint64_t file_size,
@@ -337,7 +347,7 @@ struct FileMetaData {
                const SequenceNumber& smallest_seq,
                const SequenceNumber& largest_seq, bool marked_for_compact,
                Temperature _temperature, uint64_t oldest_blob_file,
-               uint64_t _oldest_ancester_time, uint64_t _file_creation_time,
+               uint64_t _oldest_ancestor_time, uint64_t _file_creation_time,
                uint64_t _epoch_number, const std::string& _file_checksum,
                const std::string& _file_checksum_func_name,
                UniqueId64x2 _unique_id,
@@ -352,7 +362,7 @@ struct FileMetaData {
         marked_for_compaction(marked_for_compact),
         temperature(_temperature),
         oldest_blob_file_number(oldest_blob_file),
-        oldest_ancester_time(_oldest_ancester_time),
+        oldest_ancestor_time(_oldest_ancestor_time),
         file_creation_time(_file_creation_time),
         epoch_number(_epoch_number),
         file_checksum(_file_checksum),
@@ -386,18 +396,18 @@ struct FileMetaData {
     fd.largest_seqno = std::max(fd.largest_seqno, seqno);
   }
 
-  // Try to get oldest ancester time from the class itself or table properties
+  // Try to get oldest ancestor time from the class itself or table properties
   // if table reader is already pinned.
   // 0 means the information is not available.
-  uint64_t TryGetOldestAncesterTime() {
-    if (oldest_ancester_time != kUnknownOldestAncesterTime) {
-      return oldest_ancester_time;
+  uint64_t TryGetOldestAncestorTime() {
+    if (oldest_ancestor_time != kUnknownOldestAncestorTime) {
+      return oldest_ancestor_time;
     }
     TableReader* reader = fd.pinned_reader.Get();
     if (reader != nullptr && reader->GetTableProperties() != nullptr) {
-      return reader->GetTableProperties()->creation_time;
+      return reader->GetTableProperties()->oldest_ancestor_time;
     }
-    return kUnknownOldestAncesterTime;
+    return kUnknownOldestAncestorTime;
   }
 
   uint64_t TryGetFileCreationTime() {
@@ -423,8 +433,8 @@ struct FileMetaData {
     }
     if (prev_file != nullptr) {
       uint64_t prev_oldest_ancestor_time =
-          prev_file->TryGetOldestAncesterTime();
-      if (prev_oldest_ancestor_time != kUnknownOldestAncesterTime) {
+          prev_file->TryGetOldestAncestorTime();
+      if (prev_oldest_ancestor_time != kUnknownOldestAncestorTime) {
         return prev_oldest_ancestor_time;
       }
     }
@@ -446,7 +456,7 @@ struct FileMetaData {
 #endif  // ROCKSDB_MALLOC_USABLE_SIZE
     usage += smallest.size() + largest.size() + file_checksum.size() +
              file_checksum_func_name.size() + min_timestamp.size() +
-             max_timestamp.size();
+             max_timestamp.size() + file_open_metadata.size();
     return usage;
   }
 
@@ -792,24 +802,28 @@ class VersionEdit {
                const InternalKey& largest, const SequenceNumber& smallest_seqno,
                const SequenceNumber& largest_seqno, bool marked_for_compaction,
                Temperature temperature, uint64_t oldest_blob_file_number,
-               uint64_t oldest_ancester_time, uint64_t file_creation_time,
+               uint64_t oldest_ancestor_time, uint64_t file_creation_time,
                uint64_t epoch_number, const std::string& file_checksum,
                const std::string& file_checksum_func_name,
                const UniqueId64x2& unique_id,
                const uint64_t compensated_range_deletion_size,
                uint64_t tail_size, bool user_defined_timestamps_persisted,
                const std::string& min_timestamp = "",
-               const std::string& max_timestamp = "") {
+               const std::string& max_timestamp = "",
+               const std::string& file_open_metadata = "") {
     assert(smallest_seqno <= largest_seqno);
     new_files_.emplace_back(
         level,
         FileMetaData(
             file, file_path_id, file_size, smallest, largest, smallest_seqno,
             largest_seqno, marked_for_compaction, temperature,
-            oldest_blob_file_number, oldest_ancester_time, file_creation_time,
+            oldest_blob_file_number, oldest_ancestor_time, file_creation_time,
             epoch_number, file_checksum, file_checksum_func_name, unique_id,
             compensated_range_deletion_size, tail_size,
             user_defined_timestamps_persisted, min_timestamp, max_timestamp));
+    if (!file_open_metadata.empty()) {
+      new_files_.back().second.file_open_metadata = file_open_metadata;
+    }
     files_to_quarantine_.push_back(file);
     if (!HasLastSequence() || largest_seqno > GetLastSequence()) {
       SetLastSequence(largest_seqno);
@@ -971,6 +985,11 @@ class VersionEdit {
 
   bool IsColumnFamilyDrop() const { return is_column_family_drop_; }
 
+  void MarkForegroundOperation() { is_foreground_operation_ = true; }
+  bool IsForegroundOperation() const {
+    return is_foreground_operation_ || IsColumnFamilyManipulation();
+  }
+
   void MarkNoManifestWriteDummy() { is_no_manifest_write_dummy_ = true; }
   bool IsNoManifestWriteDummy() const { return is_no_manifest_write_dummy_; }
 
@@ -1009,6 +1028,48 @@ class VersionEdit {
     has_subcompaction_progress_ = false;
     subcompaction_progress_.Clear();
   }
+
+  void SetLastCompactedManifestFileSize(uint64_t size) {
+    has_last_compacted_manifest_file_size_ = true;
+    last_compacted_manifest_file_size_ = size;
+  }
+  bool HasLastCompactedManifestFileSize() const {
+    return has_last_compacted_manifest_file_size_;
+  }
+  uint64_t GetLastCompactedManifestFileSize() const {
+    return last_compacted_manifest_file_size_;
+  }
+
+  // Records the exact OPTIONS file that describes the DB state after this
+  // edit. This tag is safely ignorable so older RocksDB binaries retain their
+  // legacy behavior of selecting the newest OPTIONS file by file number.
+  void SetCommittedOptionsFileNumber(uint64_t number) {
+    has_committed_options_file_number_ = true;
+    committed_options_file_number_ = number;
+  }
+  bool HasCommittedOptionsFileNumber() const {
+    return has_committed_options_file_number_;
+  }
+  uint64_t GetCommittedOptionsFileNumber() const {
+    return committed_options_file_number_;
+  }
+
+  // Marks a live OPTIONS-only MANIFEST write as DB-wide metadata that does not
+  // change an LSM Version. This is intentionally not encoded; recovery applies
+  // the persisted fields through VersionEditHandler instead.
+  void MarkOptionsFileManipulation() {
+    assert(NumEntries() == 0);
+    assert(!IsColumnFamilyManipulation());
+    assert(HasCommittedOptionsFileNumber());
+    is_options_file_manipulation_ = true;
+  }
+  bool IsOptionsFileManipulation() const {
+    return is_options_file_manipulation_;
+  }
+
+  // Recovery-time per-column-family edits only need to be written when they
+  // advance the CF's log number or carry some other manifest state.
+  bool ShouldEmitPerColumnFamilyRecoveryEdit(uint64_t current_log_number) const;
 
   // return true on success.
   // `ts_sz` is the size in bytes for the user-defined timestamp contained in
@@ -1049,57 +1110,29 @@ class VersionEdit {
   static void EncodeFileBoundaries(std::string* dst, const FileMetaData& meta,
                                    size_t ts_sz);
 
-  int max_level_ = 0;
-  std::string db_id_;
-  std::string comparator_;
   uint64_t log_number_ = 0;
   uint64_t prev_log_number_ = 0;
   uint64_t next_file_number_ = 0;
-  uint32_t max_column_family_ = 0;
   // The most recent WAL log number that is deleted
   uint64_t min_log_number_to_keep_ = 0;
   SequenceNumber last_sequence_ = 0;
-  bool has_db_id_ = false;
-  bool has_comparator_ = false;
-  bool has_log_number_ = false;
-  bool has_prev_log_number_ = false;
-  bool has_next_file_number_ = false;
-  bool has_max_column_family_ = false;
-  bool has_min_log_number_to_keep_ = false;
-  bool has_last_sequence_ = false;
-  bool has_persist_user_defined_timestamps_ = false;
+  WalDeletion wal_deletion_;
+  uint64_t last_compacted_manifest_file_size_ = 0;
+  uint64_t committed_options_file_number_ = 0;
 
   // Compaction cursors for round-robin compaction policy
   CompactCursors compact_cursors_;
-
-  DeletedFiles deleted_files_;
   NewFiles new_files_;
-
   BlobFileAdditions blob_file_additions_;
   BlobFileGarbages blob_file_garbages_;
-
   WalAdditions wal_additions_;
-  WalDeletion wal_deletion_;
 
-  // Each version edit record should have column_family_ set
-  // If it's not set, it is default (0)
-  uint32_t column_family_ = 0;
-  // a version edit can be either column_family add or
-  // column_family drop. If it's column family add,
-  // it also includes column family name.
-  bool is_column_family_drop_ = false;
-  bool is_column_family_add_ = false;
+  std::string db_id_;
+  std::string comparator_;
   std::string column_family_name_;
-
-  uint32_t remaining_entries_ = 0;
-  bool is_in_atomic_group_ = false;
-  bool is_no_manifest_write_dummy_ = false;
-
   std::string full_history_ts_low_;
-  bool persist_user_defined_timestamps_ = true;
 
-  bool has_subcompaction_progress_ = false;
-  SubcompactionProgress subcompaction_progress_;
+  DeletedFiles deleted_files_;
 
   // Newly created table files and blob files are eligible for deletion if they
   // are not registered as live files after the background jobs creating them
@@ -1110,6 +1143,38 @@ class VersionEdit {
   // Since table files and blob files share the same file number space, we just
   // record the file number here.
   autovector<uint64_t> files_to_quarantine_;
+
+  SubcompactionProgress subcompaction_progress_;
+
+  int max_level_ = 0;
+  uint32_t max_column_family_ = 0;
+
+  // Each version edit record should have column_family_ set
+  // If it's not set, it is default (0)
+  uint32_t column_family_ = 0;
+  uint32_t remaining_entries_ = 0;
+
+  bool has_db_id_ = false;
+  bool has_comparator_ = false;
+  bool has_log_number_ = false;
+  bool has_prev_log_number_ = false;
+  bool has_next_file_number_ = false;
+  bool has_max_column_family_ = false;
+  bool has_min_log_number_to_keep_ = false;
+  bool has_last_sequence_ = false;
+  bool has_persist_user_defined_timestamps_ = false;
+  bool is_column_family_drop_ = false;
+  bool is_column_family_add_ = false;
+  bool is_foreground_operation_ = false;
+  bool is_in_atomic_group_ = false;
+  bool is_no_manifest_write_dummy_ = false;
+  bool persist_user_defined_timestamps_ = true;
+  bool has_subcompaction_progress_ = false;
+  bool has_last_compacted_manifest_file_size_ = false;
+  bool has_committed_options_file_number_ = false;
+
+  // Non-persisted marker for the live MANIFEST writer fast path.
+  bool is_options_file_manipulation_ = false;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

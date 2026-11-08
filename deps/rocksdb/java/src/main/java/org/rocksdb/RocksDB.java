@@ -404,7 +404,7 @@ public class RocksDB extends RocksObject {
    * @param options {@link Options} instance.
    * @param path the path to the RocksDB.
    * @param errorIfWalFileExists true to raise an error when opening the db
-   *            if a Write Ahead Log file exists, false otherwise.
+   *            if a non-empty Write Ahead Log file exists, false otherwise.
    * @return a {@link RocksDB} instance on success, null if the specified
    *     {@link RocksDB} can not be opened.
    *
@@ -493,7 +493,7 @@ public class RocksDB extends RocksObject {
    * @param columnFamilyHandles will be filled with ColumnFamilyHandle instances
    *     on open.
    * @param errorIfWalFileExists true to raise an error when opening the db
-   *            if a Write Ahead Log file exists, false otherwise.
+   *            if a non-empty Write Ahead Log file exists, false otherwise.
    * @return a {@link RocksDB} instance on success, null if the specified
    *     {@link RocksDB} can not be opened.
    *
@@ -2276,6 +2276,35 @@ public class RocksDB extends RocksObject {
   }
 
   /**
+   * Returns the snapshot-visible value together with timestamp and
+   * newer-version metadata.
+   *
+   * @param opt read options
+   * @param key key to read
+   * @return metadata result; its value is null when the key is not found
+   * @throws RocksDBException if the native read fails
+   */
+  public GetWithMetadataResult getWithMetadata(final ReadOptions opt, final byte[] key)
+      throws RocksDBException {
+    return getWithMetadata(nativeHandle_, opt.nativeHandle_, key, 0, key.length, 0);
+  }
+
+  /**
+   * Returns metadata for a key in the specified column family.
+   *
+   * @param columnFamilyHandle column family containing the key
+   * @param opt read options
+   * @param key key to read
+   * @return metadata result; its value is null when the key is not found
+   * @throws RocksDBException if the native read fails
+   */
+  public GetWithMetadataResult getWithMetadata(final ColumnFamilyHandle columnFamilyHandle,
+      final ReadOptions opt, final byte[] key) throws RocksDBException {
+    return getWithMetadata(
+        nativeHandle_, opt.nativeHandle_, key, 0, key.length, columnFamilyHandle.nativeHandle_);
+  }
+
+  /**
    * Takes a list of keys, and returns a list of values for the given list of
    * keys. List will contain null for keys which could not be found.
    *
@@ -2372,6 +2401,56 @@ public class RocksDB extends RocksObject {
 
     return Arrays.asList(multiGet(nativeHandle_, opt.nativeHandle_,
         keysArray, keyOffsets, keyLengths));
+  }
+
+  /**
+   * Returns values and metadata for the supplied keys.
+   *
+   * @param opt read options
+   * @param keys keys to read
+   * @return results in input order
+   * @throws RocksDBException if a native read fails
+   */
+  public List<GetWithMetadataResult> multiGetWithMetadata(
+      final ReadOptions opt, final List<byte[]> keys) throws RocksDBException {
+    assert (!keys.isEmpty());
+    final byte[][] keysArray = keys.toArray(new byte[keys.size()][]);
+    final int[] keyOffsets = new int[keysArray.length];
+    final int[] keyLengths = new int[keysArray.length];
+    for (int i = 0; i < keyLengths.length; i++) {
+      keyLengths[i] = keysArray[i].length;
+    }
+    return Arrays.asList(multiGetWithMetadata(
+        nativeHandle_, opt.nativeHandle_, keysArray, keyOffsets, keyLengths, null));
+  }
+
+  /**
+   * Returns values and metadata for keys in the supplied column families.
+   *
+   * @param opt read options
+   * @param columnFamilyHandles one column family for each key
+   * @param keys keys to read
+   * @return results in input order
+   * @throws RocksDBException if a native read fails
+   */
+  public List<GetWithMetadataResult> multiGetWithMetadata(final ReadOptions opt,
+      final List<ColumnFamilyHandle> columnFamilyHandles, final List<byte[]> keys)
+      throws RocksDBException {
+    if (keys.size() != columnFamilyHandles.size()) {
+      throw new IllegalArgumentException("For each key there must be a ColumnFamilyHandle.");
+    }
+    final long[] cfHandles = new long[columnFamilyHandles.size()];
+    for (int i = 0; i < columnFamilyHandles.size(); i++) {
+      cfHandles[i] = columnFamilyHandles.get(i).nativeHandle_;
+    }
+    final byte[][] keysArray = keys.toArray(new byte[keys.size()][]);
+    final int[] keyOffsets = new int[keysArray.length];
+    final int[] keyLengths = new int[keysArray.length];
+    for (int i = 0; i < keyLengths.length; i++) {
+      keyLengths[i] = keysArray[i].length;
+    }
+    return Arrays.asList(multiGetWithMetadata(
+        nativeHandle_, opt.nativeHandle_, keysArray, keyOffsets, keyLengths, cfHandles));
   }
 
   /**
@@ -4425,18 +4504,30 @@ public class RocksDB extends RocksObject {
   }
 
   /**
-   * <p>Returns an iterator that is positioned at a write-batch containing
-   * seq_number. If the sequence number is non existent, it returns an iterator
-   * at the first available seq_no after the requested seq_no.</p>
+   * <p>Returns a {@link WalIterator} over the WriteBatches recorded in the
+   * write-ahead log, starting from the one containing
+   * {@code sequenceNumber}.</p>
    *
-   * <p>Must set WAL_ttl_seconds or WAL_size_limit_MB to large values to
-   * use this api, else the WAL files will get
-   * cleared aggressively and the iterator might keep getting invalid before
-   * an update is read.</p>
+   * <p>Only writes that reached the WAL are returned. Writes made with
+   * {@link WriteOptions#setDisableWAL(boolean)}, and sequence numbers consumed
+   * by {@code ingestExternalFile}, are absent and leave permanent holes in the
+   * sequence numbers seen here. Set {@code WAL_ttl_seconds} and/or
+   * {@code WAL_size_limit_MB} large enough to cover how far behind a consumer
+   * may fall, or the WAL will be cleared before the consumer reads it.</p>
+   *
+   * <p><strong>WARNING:</strong> if {@code sequenceNumber} itself is no longer
+   * available, this returns an iterator positioned at the next available
+   * write-batch and reports no error -- data is skipped silently. Since
+   * recovering from a spent iterator means calling this method again, that
+   * recovery is where data loss can slip in unnoticed. Callers resuming a
+   * previous iterator should check that the first batch continues from where
+   * that one stopped; see {@link WalIterator}.</p>
    *
    * @param sequenceNumber sequence number offset
    *
-   * @return {@link org.rocksdb.TransactionLogIterator} instance.
+   * @return {@link org.rocksdb.WalIterator} instance. The declared type is the
+   *     old name, retained so existing callers still compile; declare
+   *     {@link WalIterator} in new code.
    *
    * @throws org.rocksdb.RocksDBException if iterator cannot be retrieved
    *     from native-side.
@@ -4973,6 +5064,9 @@ public class RocksDB extends RocksObject {
       final int keyOffset, final int keyLength) throws RocksDBException;
   private static native byte[] get(final long handle, final long readOptHandle, final byte[] key,
       final int keyOffset, final int keyLength, final long cfHandle) throws RocksDBException;
+  private static native GetWithMetadataResult getWithMetadata(final long handle,
+      final long readOptHandle, final byte[] key, final int keyOffset, final int keyLength,
+      final long cfHandle) throws RocksDBException;
   private static native byte[][] multiGet(
       final long dbHandle, final byte[][] keys, final int[] keyOffsets, final int[] keyLengths);
   private static native byte[][] multiGet(final long dbHandle, final byte[][] keys,
@@ -4981,6 +5075,9 @@ public class RocksDB extends RocksObject {
       final byte[][] keys, final int[] keyOffsets, final int[] keyLengths);
   private static native byte[][] multiGet(final long dbHandle, final long rOptHandle,
       final byte[][] keys, final int[] keyOffsets, final int[] keyLengths,
+      final long[] columnFamilyHandles);
+  private static native GetWithMetadataResult[] multiGetWithMetadata(final long dbHandle,
+      final long rOptHandle, final byte[][] keys, final int[] keyOffsets, final int[] keyLengths,
       final long[] columnFamilyHandles);
 
   private static native void multiGet(final long dbHandle, final long rOptHandle,

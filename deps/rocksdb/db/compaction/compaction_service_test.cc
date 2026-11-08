@@ -3,14 +3,164 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <atomic>
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "db/db_test_util.h"
 #include "file/file_util.h"
+#include "file/filename.h"
 #include "port/stack_trace.h"
+#include "rocksdb/advanced_compression.h"
+#include "rocksdb/filter_policy.h"
+#include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_util.h"
 #include "table/unique_id_impl.h"
 #include "utilities/merge_operators/string_append/stringappend.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+// Append ":extra_value" to every "counts=...;" field in a serialized
+// CompactionServiceResult string to simulate a worker with more
+// CompactionReason enums than the reader. Loops because the serialized
+// result contains multiple CompactionStats structs (output_level_stats,
+// proximal_level_stats), each with its own "counts=" field.
+void AppendToCountsFields(std::string* s, const std::string& extra_value) {
+  const std::string prefix = "counts=";
+  size_t pos = s->find(prefix);
+  while (pos != std::string::npos) {
+    // Find the semicolon that terminates this field's value.
+    size_t semi = s->find(';', pos + prefix.size());
+    assert(semi != std::string::npos);
+    // Insert ":extra_value" just before the semicolon.
+    s->insert(semi, ":" + extra_value);
+    // Advance past the inserted text to find the next occurrence.
+    pos = s->find(prefix, semi + extra_value.size() + 2);
+  }
+}
+
+// Remove the last colon-separated element from every "counts=...;" field
+// to simulate a worker with fewer CompactionReason enums than the reader.
+// Loops for the same reason as AppendToCountsFields (multiple counts fields).
+void RemoveLastFromCountsFields(std::string* s) {
+  const std::string prefix = "counts=";
+  size_t pos = s->find(prefix);
+  while (pos != std::string::npos) {
+    size_t val_begin = pos + prefix.size();
+    size_t semi = s->find(';', val_begin);
+    assert(semi != std::string::npos);
+    // Find the last ':' separator within the value.
+    size_t last_sep = s->rfind(':', semi - 1);
+    assert(last_sep != std::string::npos && last_sep >= val_begin);
+    // Erase from the last ':' up to (not including) the ';'.
+    // e.g. "counts=0:3:5;" -> erase ":5" -> "counts=0:3;"
+    s->erase(last_sep, semi - last_sep);
+    pos = s->find(prefix, last_sep);
+  }
+}
+
+// Count the colon-separated elements in the first "counts=...;" field of a
+// serialized CompactionServiceResult. Used to assert the serialized width
+// (how many CompactionReason counts this binary writes).
+size_t CountFirstCountsFieldElements(const std::string& s) {
+  const std::string prefix = "counts=";
+  size_t pos = s.find(prefix);
+  assert(pos != std::string::npos);
+  size_t val_begin = pos + prefix.size();
+  size_t semi = s.find(';', val_begin);
+  assert(semi != std::string::npos);
+  if (semi == val_begin) {
+    return 0;
+  }
+  size_t count = 1;
+  for (size_t i = val_begin; i < semi; ++i) {
+    if (s[i] == ':') {
+      ++count;
+    }
+  }
+  return count;
+}
+
+// Simulates a filesystem without POSIX read-after-unlink semantics (a remote
+// or object store): once the primary renames a freshly written CURRENT over
+// the old one, a reader that already opened the previous CURRENT object can no
+// longer read it and the filesystem reports the path as gone rather than
+// serving the unlinked object. Fails the first `fail_times` reads of a CURRENT
+// file that way; later reads succeed, as they do once the reader picks up the
+// replacement.
+class VanishingCurrentFileFS : public FileSystemWrapper {
+ public:
+  explicit VanishingCurrentFileFS(const std::shared_ptr<FileSystem>& base)
+      : FileSystemWrapper(base) {}
+
+  static const char* kClassName() { return "VanishingCurrentFileFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus NewSequentialFile(const std::string& fname, const FileOptions& opts,
+                             std::unique_ptr<FSSequentialFile>* result,
+                             IODebugContext* dbg) override {
+    IOStatus io_s = target()->NewSequentialFile(fname, opts, result, dbg);
+    if (io_s.ok() && IsCurrentFileName(fname)) {
+      *result = std::make_unique<MaybeVanishedFile>(std::move(*result), this);
+    }
+    return io_s;
+  }
+
+  void SetFailuresToInject(int failures) {
+    failures_to_inject_.store(failures);
+  }
+
+  int injected_failures() const { return injected_failures_.load(); }
+
+ private:
+  static bool IsCurrentFileName(const std::string& fname) {
+    const std::string suffix = "/" + kCurrentFileName;
+    return fname.size() > suffix.size() &&
+           fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) ==
+               0;
+  }
+
+  // Returns true (consuming one injection) while failures remain.
+  bool ConsumeFailure() {
+    int remaining = failures_to_inject_.load();
+    while (remaining > 0) {
+      if (failures_to_inject_.compare_exchange_weak(remaining, remaining - 1)) {
+        injected_failures_.fetch_add(1);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  class MaybeVanishedFile : public FSSequentialFileOwnerWrapper {
+   public:
+    MaybeVanishedFile(std::unique_ptr<FSSequentialFile>&& target,
+                      VanishingCurrentFileFS* fs)
+        : FSSequentialFileOwnerWrapper(std::move(target)), fs_(fs) {}
+
+    IOStatus Read(size_t n, const IOOptions& options, Slice* result,
+                  char* scratch, IODebugContext* dbg) override {
+      if (fs_->ConsumeFailure()) {
+        return IOStatus::PathNotFound(
+            "Failed to read CURRENT: the object was replaced and is no longer "
+            "readable");
+      }
+      return FSSequentialFileOwnerWrapper::Read(n, options, result, scratch,
+                                                dbg);
+    }
+
+   private:
+    VanishingCurrentFileFS* fs_;
+  };
+
+  std::atomic<int> failures_to_inject_{0};
+  std::atomic<int> injected_failures_{0};
+};
+
+}  // namespace
 
 class MyTestCompactionService : public CompactionService {
  public:
@@ -42,6 +192,7 @@ class MyTestCompactionService : public CompactionService {
     start_info_ = info;
     assert(info.db_name == db_path_);
     std::string unique_id = Env::Default()->GenerateUniqueId();
+    last_output_directory_name_ = unique_id;
     jobs_.emplace(unique_id, compaction_service_input);
     infos_.emplace(unique_id, info);
     CompactionServiceScheduleResponse response(
@@ -78,10 +229,10 @@ class MyTestCompactionService : public CompactionService {
 
     OpenAndCompactOptions options;
     options.canceled = &canceled_;
+    options.max_secondary_open_retries = max_secondary_open_retries_;
 
-    Status s =
-        DB::OpenAndCompact(options, db_path_, GetOutputPath(scheduled_job_id),
-                           compaction_input, result, options_override);
+    Status s = DB::OpenAndCompact(options, db_path_, scheduled_job_id,
+                                  compaction_input, result, options_override);
     {
       InstrumentedMutexLock l(&mutex_);
       if (is_override_wait_result_) {
@@ -92,6 +243,14 @@ class MyTestCompactionService : public CompactionService {
     compaction_num_.fetch_add(1);
     if (s.ok()) {
       return CompactionServiceJobStatus::kSuccess;
+    } else if (s.IsIncomplete() && !s.IsManualCompactionPaused()) {
+      // The remote worker declined the job (e.g. the MANIFEST floor check
+      // rejected an older/stale filesystem view). Mapping that decline to
+      // kUseLocal (retry locally) vs. kFailure (surface it) is the integrator's
+      // choice; this example picks kUseLocal to exercise the fallback path,
+      // while DbStressCompactionService deliberately picks kFailure. Real
+      // cancellation (kManualCompactionPaused) is handled as a failure.
+      return CompactionServiceJobStatus::kUseLocal;
     } else {
       return CompactionServiceJobStatus::kFailure;
     }
@@ -127,10 +286,16 @@ class MyTestCompactionService : public CompactionService {
 
   void OnInstallation(const std::string& /*scheduled_job_id*/,
                       CompactionServiceJobStatus status) override {
+    installation_callback_count_.fetch_add(1);
     final_updated_status_ = status;
   }
 
   int GetCompactionNum() { return compaction_num_.load(); }
+
+  std::string GetLastOutputDirectoryName() {
+    InstrumentedMutexLock l(&mutex_);
+    return last_output_directory_name_;
+  }
 
   CompactionServiceJobInfo GetCompactionInfoForStart() { return start_info_; }
   CompactionServiceJobInfo GetCompactionInfoForWait() { return wait_info_; }
@@ -159,6 +324,10 @@ class MyTestCompactionService : public CompactionService {
   void SetCanceled(bool canceled) { canceled_ = canceled; }
   bool GetCanceled() { return canceled_; }
 
+  void SetMaxSecondaryOpenRetries(uint32_t retries) {
+    max_secondary_open_retries_ = retries;
+  }
+
   void GetResult(CompactionServiceResult* deserialized) {
     CompactionServiceResult::Read(result_, deserialized).PermitUncheckedError();
   }
@@ -167,6 +336,8 @@ class MyTestCompactionService : public CompactionService {
     return final_updated_status_.load();
   }
 
+  int GetOnInstallationCount() { return installation_callback_count_.load(); }
+
  protected:
   InstrumentedMutex mutex_;
   const std::string db_path_;
@@ -174,9 +345,12 @@ class MyTestCompactionService : public CompactionService {
   std::map<std::string, std::string> jobs_;
   std::map<std::string, CompactionServiceJobInfo> infos_;
   std::string result_;
+  std::string last_output_directory_name_;
 
   std::string GetOutputPath(const std::string& scheduled_job_id) {
-    return db_path_ + "/" + scheduled_job_id;
+    return RemoteCompactionJobDir(
+        db_path_, options_.use_session_tmp_dir_for_remote_compaction,
+        scheduled_job_id);
   }
 
  private:
@@ -195,8 +369,11 @@ class MyTestCompactionService : public CompactionService {
   std::vector<std::shared_ptr<EventListener>> listeners_;
   std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>
       table_properties_collector_factories_;
+  std::atomic_int installation_callback_count_{0};
   std::atomic<CompactionServiceJobStatus> final_updated_status_{
       CompactionServiceJobStatus::kUseLocal};
+  uint32_t max_secondary_open_retries_ =
+      OpenAndCompactOptions().max_secondary_open_retries;
 
  protected:
   std::atomic_bool canceled_{false};
@@ -289,6 +466,7 @@ class CompactionServiceTest : public DBTestBase {
 
 TEST_F(CompactionServiceTest, BasicCompactions) {
   Options options = CurrentOptions();
+  options.max_open_files = -1;
   ReopenWithCompactionService(&options);
 
   Statistics* primary_statistics = GetPrimaryStatistics();
@@ -323,8 +501,12 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   ASSERT_EQ(primary_statistics->getTickerCount(REMOTE_COMPACT_WRITE_BYTES),
             compactor_statistics->getTickerCount(COMPACT_WRITE_BYTES));
   ASSERT_GE(primary_statistics->getTickerCount(REMOTE_COMPACT_READ_BYTES), 1);
-  ASSERT_GT(primary_statistics->getTickerCount(COMPACT_READ_BYTES),
-            primary_statistics->getTickerCount(REMOTE_COMPACT_READ_BYTES));
+  // The remote worker reads the full compaction inputs on demand, while the
+  // primary only re-reads the (smaller) output files for verify_table(), so
+  // remote read bytes dominate. (The worker no longer eagerly opens every file
+  // during secondary recovery, so its input reads are attributed accurately.)
+  ASSERT_GT(primary_statistics->getTickerCount(REMOTE_COMPACT_READ_BYTES),
+            primary_statistics->getTickerCount(COMPACT_READ_BYTES));
   // compactor is already the remote side, which doesn't have remote
   ASSERT_EQ(compactor_statistics->getTickerCount(REMOTE_COMPACT_READ_BYTES), 0);
   ASSERT_EQ(compactor_statistics->getTickerCount(REMOTE_COMPACT_WRITE_BYTES),
@@ -362,6 +544,27 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   }
   ASSERT_TRUE(s.IsAborted());
 
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_NOK(result.status);
+
+  // The aborted job's output files were never installed, so they are still in
+  // the job's staging directory. Size them before reopening: the reopen starts
+  // a new DB session, and DB::Open() deletes staging directories belonging to
+  // any other session.
+  uint64_t total_size = 0;
+  Env* const env = options.env;
+  ASSERT_TRUE(options.env != nullptr);
+  for (const auto& output_file : result.output_files) {
+    std::string file_name = result.output_path + "/" + output_file.file_name;
+
+    uint64_t file_size = 0;
+    ASSERT_OK(env->GetFileSize(file_name, &file_size));
+    ASSERT_GT(file_size, 0);
+    total_size += file_size;
+  }
+  ASSERT_EQ(total_size, result.internal_stats.TotalBytesWritten());
+
   // Test re-open and successful unique id verification
   std::atomic_int verify_passed{0};
   SyncPoint::GetInstance()->SetCallBack(
@@ -376,13 +579,6 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   ReopenWithColumnFamilies({kDefaultColumnFamilyName, "cf_1", "cf_2", "cf_3"},
                            options);
   ASSERT_GT(verify_passed, 0);
-  CompactionServiceResult result;
-  my_cs->GetResult(&result);
-  if (s.IsAborted()) {
-    ASSERT_NOK(result.status);
-  } else {
-    ASSERT_OK(result.status);
-  }
   ASSERT_GE(result.internal_stats.output_level_stats.micros, 1);
   ASSERT_GE(result.internal_stats.output_level_stats.cpu_micros, 1);
 
@@ -390,23 +586,119 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   ASSERT_EQ(result.output_files.size(),
             result.internal_stats.output_level_stats.num_output_files);
 
-  uint64_t total_size = 0;
-  for (auto output_file : result.output_files) {
-    std::string file_name = result.output_path + "/" + output_file.file_name;
-
-    uint64_t file_size = 0;
-    ASSERT_OK(options.env->GetFileSize(file_name, &file_size));
-    ASSERT_GT(file_size, 0);
-    total_size += file_size;
-  }
-  ASSERT_EQ(total_size, result.internal_stats.TotalBytesWritten());
-
   ASSERT_TRUE(result.stats.is_remote_compaction);
   ASSERT_TRUE(result.stats.is_manual_compaction);
   ASSERT_FALSE(result.stats.is_full_compaction);
 
   Close();
   SyncPoint::GetInstance()->DisableProcessing();
+}
+
+namespace {
+
+// A CompressionManager that records, per GetCompressorForSST() call, whether
+// the FilterBuildingContext reports the SST as being built by a remote
+// (offloaded) compaction worker. Observations go into process-global counters
+// because the remote worker reconstructs its own manager instance from the
+// persisted OPTIONS file (same process in this test).
+struct RemoteAwareObservations {
+  std::atomic<int> num_remote{0};
+  std::atomic<int> num_non_remote{0};
+  void Reset() {
+    num_remote.store(0);
+    num_non_remote.store(0);
+  }
+};
+
+RemoteAwareObservations& GetRemoteAwareObservations() {
+  static RemoteAwareObservations obs;
+  return obs;
+}
+
+class RemoteAwareCompressionManager : public CompressionManagerWrapper {
+ public:
+  RemoteAwareCompressionManager()
+      : CompressionManagerWrapper(GetBuiltinV2CompressionManager()) {}
+
+  static const char* kClassName() { return "RemoteAwareCompressionManager"; }
+  const char* Name() const override { return kClassName(); }
+
+  std::unique_ptr<Compressor> GetCompressorForSST(
+      const FilterBuildingContext& context, const CompressionOptions& opts,
+      CompressionType preferred) override {
+    if (context.is_remote_compaction) {
+      GetRemoteAwareObservations().num_remote.fetch_add(1);
+    } else {
+      GetRemoteAwareObservations().num_non_remote.fetch_add(1);
+    }
+    return CompressionManagerWrapper::GetCompressorForSST(context, opts,
+                                                          preferred);
+  }
+};
+
+}  // namespace
+
+TEST_F(CompactionServiceTest, IsRemoteCompactionInCompressorContext) {
+  // Register so the remote worker's DB::OpenAndCompact can reconstruct the
+  // custom CompressionManager from the persisted OPTIONS file
+  // (CompactionServiceOptionsOverride does not carry a compression_manager).
+  ObjectLibrary::Default()->AddFactory<CompressionManager>(
+      RemoteAwareCompressionManager::kClassName(),
+      [](const std::string& /*uri*/, std::unique_ptr<CompressionManager>* guard,
+         std::string* /*errmsg*/) {
+        *guard = std::make_unique<RemoteAwareCompressionManager>();
+        return guard->get();
+      });
+
+  auto& obs = GetRemoteAwareObservations();
+  obs.Reset();
+
+  Options options = CurrentOptions();
+  options.compression_manager =
+      std::make_shared<RemoteAwareCompressionManager>();
+  ReopenWithCompactionService(&options);
+
+  GenerateTestData();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  VerifyTestData();
+
+  auto my_cs = GetCompactionService();
+  ASSERT_GE(my_cs->GetCompactionNum(), 1);
+
+  // The offloaded worker built the compaction output SSTs and therefore must
+  // have observed is_remote_compaction == true in GetCompressorForSST().
+  ASSERT_GT(obs.num_remote.load(), 0);
+  // The primary's own flushes, seen by the same manager, must report false
+  ASSERT_GT(obs.num_non_remote.load(), 0);
+
+  Close();
+}
+
+TEST_F(CompactionServiceTest, IsRemoteCompactionFalseForLocalCompaction) {
+  // Same custom manager, but no compaction_service: everything runs locally,
+  // so GetCompressorForSST() must never see is_remote_compaction == true.
+  auto& obs = GetRemoteAwareObservations();
+  obs.Reset();
+
+  Options options = CurrentOptions();
+  options.compression_manager =
+      std::make_shared<RemoteAwareCompressionManager>();
+  DestroyAndReopen(options);
+
+  Random rnd(301);
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 100; j++) {
+      ASSERT_OK(Put(Key(i * 100 + j), rnd.RandomString(64)));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  // Local flushes and compactions must all report not-remote.
+  ASSERT_GT(obs.num_non_remote.load(), 0);
+  ASSERT_EQ(obs.num_remote.load(), 0);
+
+  Close();
 }
 
 TEST_F(CompactionServiceTest, SkipWALRecoveryInOpenAndCompact) {
@@ -605,6 +897,101 @@ TEST_F(CompactionServiceTest, StandaloneDeleteRangeTombstoneOptimization) {
   }
 
   SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(CompactionServiceTest,
+       StandaloneDeleteRangeTombstoneMakesInputCountInaccurate) {
+  Options options = CurrentOptions();
+  options.compaction_style = CompactionStyle::kCompactionStyleUniversal;
+  options.compaction_verify_record_count = true;
+  ReopenWithCompactionService(&options);
+
+  std::vector<std::string> files;
+  {
+    SstFileWriter sst_file_writer(EnvOptions(), options);
+    std::string file1 = dbname_ + "file1.sst";
+    ASSERT_OK(sst_file_writer.Open(file1));
+    ASSERT_OK(sst_file_writer.Put("a", "a1"));
+    ASSERT_OK(sst_file_writer.Put("b", "b1"));
+    ExternalSstFileInfo file1_info;
+    ASSERT_OK(sst_file_writer.Finish(&file1_info));
+    files.push_back(std::move(file1));
+
+    std::string file2 = dbname_ + "file2.sst";
+    ASSERT_OK(sst_file_writer.Open(file2));
+    ASSERT_OK(sst_file_writer.Put("x", "x1"));
+    ASSERT_OK(sst_file_writer.Put("y", "y1"));
+    ExternalSstFileInfo file2_info;
+    ASSERT_OK(sst_file_writer.Finish(&file2_info));
+    files.push_back(std::move(file2));
+  }
+
+  IngestExternalFileOptions ifo;
+  ASSERT_OK(db_->IngestExternalFile(files, ifo));
+  ASSERT_EQ(Get("a"), "a1");
+  ASSERT_EQ(Get("b"), "b1");
+  ASSERT_EQ(Get("x"), "x1");
+  ASSERT_EQ(Get("y"), "y1");
+  ASSERT_EQ(2, NumTableFilesAtLevel(6));
+
+  auto my_cs = GetCompactionService();
+  uint64_t comp_num = my_cs->GetCompactionNum();
+
+  size_t num_files_after_filtered = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::MakeInputIterator:NewCompactionMergingIterator",
+      [&](void* arg) {
+        num_files_after_filtered = *static_cast<size_t*>(arg);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  {
+    // The standalone range tombstone can fully cover the old versioned files,
+    // so universal compaction may filter those files before iteration.
+    files.clear();
+    SstFileWriter sst_file_writer(EnvOptions(), options);
+    std::string file2 = dbname_ + "file2.sst";
+    ASSERT_OK(sst_file_writer.Open(file2));
+    ASSERT_OK(sst_file_writer.DeleteRange("a", "z"));
+    ExternalSstFileInfo file2_info;
+    ASSERT_OK(sst_file_writer.Finish(&file2_info));
+    files.push_back(std::move(file2));
+
+    std::string file3 = dbname_ + "file3.sst";
+    ASSERT_OK(sst_file_writer.Open(file3));
+    ASSERT_OK(sst_file_writer.Put("a", "a2"));
+    ASSERT_OK(sst_file_writer.Put("b", "b2"));
+    ExternalSstFileInfo file3_info;
+    ASSERT_OK(sst_file_writer.Finish(&file3_info));
+    files.push_back(std::move(file3));
+
+    std::string file4 = dbname_ + "file4.sst";
+    ASSERT_OK(sst_file_writer.Open(file4));
+    ASSERT_OK(sst_file_writer.Put("x", "x2"));
+    ASSERT_OK(sst_file_writer.Put("y", "y2"));
+    ExternalSstFileInfo file4_info;
+    ASSERT_OK(sst_file_writer.Finish(&file4_info));
+    files.push_back(std::move(file4));
+  }
+
+  ASSERT_OK(db_->IngestExternalFile(files, ifo));
+  ASSERT_OK(db_->WaitForCompact(WaitForCompactOptions()));
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+  ASSERT_FALSE(result.stats.has_accurate_num_input_records);
+  ASSERT_EQ(1, num_files_after_filtered);
+
+  ASSERT_EQ(Get("a"), "a2");
+  ASSERT_EQ(Get("b"), "b2");
+  ASSERT_EQ(Get("x"), "x2");
+  ASSERT_EQ(Get("y"), "y2");
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_F(CompactionServiceTest, CompactionOutputFileIOError) {
@@ -933,6 +1320,37 @@ TEST_F(CompactionServiceTest, VerifyInputRecordCount) {
       "processed.";
   ASSERT_TRUE(std::strstr(s.getState(), expected_message));
 
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(CompactionServiceTest, InaccurateInputRecordCount) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceCompactionJob::Run:0", [&](void* arg) {
+        CompactionServiceResult* compaction_result =
+            *(static_cast<CompactionServiceResult**>(arg));
+        ASSERT_TRUE(compaction_result != nullptr);
+        compaction_result->stats.has_accurate_num_input_records = false;
+        compaction_result->stats.num_input_records = 0;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
   ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
 
   SyncPoint::GetInstance()->DisableProcessing();
@@ -1281,6 +1699,10 @@ TEST_F(CompactionServiceTest, TruncatedOutput) {
 
 TEST_F(CompactionServiceTest, CustomFileChecksum) {
   Options options = CurrentOptions();
+  // Pin compression so the auto-compacted LSM shape (and thus whether the
+  // manual CompactRange below schedules a remote compaction) doesn't depend on
+  // the default compression type. kNoCompression is always available.
+  options.compression = kNoCompression;
   options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
   ReopenWithCompactionService(&options);
   GenerateTestData();
@@ -1448,7 +1870,7 @@ TEST_F(CompactionServiceTest, FailedToStart) {
   ASSERT_TRUE(s.IsIncomplete());
 }
 
-TEST_F(CompactionServiceTest, InvalidResult) {
+TEST_F(CompactionServiceTest, InvalidResultFallsBackToLocal) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;
   ReopenWithCompactionService(&options);
@@ -1456,16 +1878,85 @@ TEST_F(CompactionServiceTest, InvalidResult) {
   GenerateTestData();
 
   auto my_cs = GetCompactionService();
+  ASSERT_EQ(0, my_cs->GetOnInstallationCount());
   my_cs->OverrideWaitResult("Invalid Str");
+  int compaction_num_before = my_cs->GetCompactionNum();
 
   std::string start_str = Key(15);
   std::string end_str = Key(45);
   Slice start(start_str);
   Slice end(end_str);
+  // The remote result is malformed before any installation starts, so the
+  // primary should recover by rerunning the compaction locally for this job.
   Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
-  ASSERT_FALSE(s.ok());
-  ASSERT_EQ(CompactionServiceJobStatus::kFailure,
+  ASSERT_OK(s);
+  ASSERT_GE(my_cs->GetCompactionNum(), compaction_num_before + 1);
+  VerifyTestData();
+  ASSERT_EQ(1, my_cs->GetOnInstallationCount());
+  ASSERT_EQ(CompactionServiceJobStatus::kUseLocal,
             my_cs->GetFinalCompactionServiceJobStatus());
+}
+
+TEST_F(CompactionServiceTest, CompatCheckCountsWidthTolerance) {
+  // Number of per-CompactionReason counts this binary serializes and expects.
+  constexpr size_t kExpected =
+      static_cast<size_t>(CompactionReason::kNumOfReasons);
+  constexpr size_t kLastIndex = kExpected - 1;
+  constexpr int kFirstCount = 3;
+  constexpr int kLastCount = 5;
+
+  CompactionServiceResult result;
+  result.status = Status::OK();
+  result.output_level = 2;
+  result.output_path = "/tmp/output";
+  result.internal_stats.output_level_stats.counts[0] = kFirstCount;
+  result.internal_stats.output_level_stats.counts[kLastIndex] = kLastCount;
+  std::string serialized;
+  ASSERT_OK(result.Write(&serialized));
+
+  // Guard the produced format: this binary writes exactly kExpected counts.
+  // That element count is what a remote worker hands to the primary to read,
+  // so pinning it catches an accidental change to what is written.
+  ASSERT_EQ(CountFirstCountsFieldElements(serialized), kExpected);
+
+  // Peer agrees on kNumOfReasons: every written count is read back unchanged.
+  {
+    CompactionServiceResult parsed;
+    ASSERT_OK(CompactionServiceResult::Read(serialized, &parsed));
+    ASSERT_OK(parsed.status);
+    const auto& counts = parsed.internal_stats.output_level_stats.counts;
+    ASSERT_EQ(counts[0], kFirstCount);
+    ASSERT_EQ(counts[kLastIndex], kLastCount);
+  }
+
+  // Peer serialized one more count than this binary knows (a worker with an
+  // extra CompactionReason): the surplus trailing count is ignored, and the
+  // counts this binary understands are read unchanged.
+  {
+    std::string from_wider_peer = serialized;
+    AppendToCountsFields(&from_wider_peer, "7");
+    ASSERT_EQ(CountFirstCountsFieldElements(from_wider_peer), kExpected + 1);
+    CompactionServiceResult parsed;
+    ASSERT_OK(CompactionServiceResult::Read(from_wider_peer, &parsed));
+    ASSERT_OK(parsed.status);
+    const auto& counts = parsed.internal_stats.output_level_stats.counts;
+    ASSERT_EQ(counts[0], kFirstCount);
+    ASSERT_EQ(counts[kLastIndex], kLastCount);
+  }
+
+  // Peer serialized one fewer count than this binary knows (a worker missing
+  // the newest CompactionReason): the absent trailing count reads as zero.
+  {
+    std::string from_narrower_peer = serialized;
+    RemoveLastFromCountsFields(&from_narrower_peer);
+    ASSERT_EQ(CountFirstCountsFieldElements(from_narrower_peer), kExpected - 1);
+    CompactionServiceResult parsed;
+    ASSERT_OK(CompactionServiceResult::Read(from_narrower_peer, &parsed));
+    ASSERT_OK(parsed.status);
+    const auto& counts = parsed.internal_stats.output_level_stats.counts;
+    ASSERT_EQ(counts[0], kFirstCount);
+    ASSERT_EQ(counts[kLastIndex], 0);
+  }
 }
 
 TEST_F(CompactionServiceTest, SubCompaction) {
@@ -1491,6 +1982,109 @@ TEST_F(CompactionServiceTest, SubCompaction) {
   ASSERT_GE(compaction_num, 2);
 }
 
+class PropertySamplingCompactionService : public MyTestCompactionService {
+ public:
+  using MyTestCompactionService::MyTestCompactionService;
+
+  void SetPrimaryDB(DB* db) { db_ = db; }
+
+  CompactionServiceJobStatus Wait(const std::string& scheduled_job_id,
+                                  std::string* result) override {
+    EXPECT_TRUE(
+        db_->GetIntProperty(DB::Properties::kNumRunningRemoteCompactions,
+                            &num_running_while_waiting_));
+    return MyTestCompactionService::Wait(scheduled_job_id, result);
+  }
+
+  uint64_t GetNumRunningWhileWaiting() const {
+    return num_running_while_waiting_;
+  }
+
+ private:
+  DB* db_ = nullptr;
+  uint64_t num_running_while_waiting_ = 0;
+};
+
+TEST_F(CompactionServiceTest, NumRunningRemoteCompactionsProperty) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.env = env_;
+  auto statistics = CreateDBStatistics();
+  auto compaction_service = std::make_shared<PropertySamplingCompactionService>(
+      dbname_, options, statistics,
+      std::vector<std::shared_ptr<EventListener>>{},
+      std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>{});
+  options.compaction_service = compaction_service;
+  DestroyAndReopen(options);
+  compaction_service->SetPrimaryDB(db_.get());
+
+  // Overlapping key ranges across files so the compaction is not a trivial
+  // move, which would bypass the compaction service entirely.
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 10; j++) {
+      ASSERT_OK(Put(Key(j), "value" + std::to_string(i * 10 + j)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  // No remote compaction is in flight yet.
+  uint64_t num_running = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningRemoteCompactions,
+                                  &num_running));
+  ASSERT_EQ(num_running, 0U);
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_GE(compaction_service->GetCompactionNum(), 1);
+  ASSERT_GE(compaction_service->GetNumRunningWhileWaiting(), 1U);
+
+  // The counter is back to 0 once the remote jobs are installed.
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningRemoteCompactions,
+                                  &num_running));
+  ASSERT_EQ(num_running, 0U);
+}
+
+TEST_F(CompactionServiceTest, NumRunningRemoteCompactionsPropertyLocalOnly) {
+  // Without a compaction_service configured, the property stays 0.
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  // Overlapping key ranges across files so the compaction is not a trivial
+  // move, which would bypass the compaction service entirely.
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 10; j++) {
+      ASSERT_OK(Put(Key(j), "value" + std::to_string(i * 10 + j)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  std::atomic<int> property_samples{0};
+  std::atomic_bool observed_non_zero{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompaction()::Processing",
+      [&](void* /*arg*/) {
+        uint64_t num_running = 0;
+        EXPECT_TRUE(db_->GetIntProperty(
+            DB::Properties::kNumRunningRemoteCompactions, &num_running));
+        property_samples.fetch_add(1);
+        if (num_running != 0) {
+          observed_non_zero.store(true);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_GT(property_samples.load(), 0);
+  ASSERT_FALSE(observed_non_zero.load());
+
+  uint64_t num_running = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningRemoteCompactions,
+                                  &num_running));
+  ASSERT_EQ(num_running, 0U);
+}
+
 class PartialDeleteCompactionFilter : public CompactionFilter {
  public:
   CompactionFilter::Decision FilterV2(
@@ -1509,6 +2103,7 @@ class PartialDeleteCompactionFilter : public CompactionFilter {
 
 TEST_F(CompactionServiceTest, CompactionFilter) {
   Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
   std::unique_ptr<CompactionFilter> delete_comp_filter(
       new PartialDeleteCompactionFilter());
   options.compaction_filter = delete_comp_filter.get();
@@ -1683,6 +2278,498 @@ TEST_F(CompactionServiceTest, ConcurrentCompaction) {
   ASSERT_EQ(FilesPerLevel(), "0,0,10");
 }
 
+TEST_F(CompactionServiceTest, RemoteCompactionMissingLowerFileTrustsManifest) {
+  // A remote compaction reconstructs its view of the LSM (which files sit below
+  // the output level) from the secondary's recovered MANIFEST version. That
+  // view drives correctness-critical decisions like whether a deletion
+  // tombstone can be dropped (Compaction::KeyNotExistsBeyondOutputLevel /
+  // IsBottommostLevel, which read input_version_'s VersionStorageInfo).
+  //
+  // If a non-input file that is still referenced by the MANIFEST is momentarily
+  // missing (as on a live primary), the OLD point-in-time recovery rolls back
+  // to an earlier version. Here that rollback drops the (later, whole-DB)
+  // manifest record entirely, so the remote worker can no longer find the
+  // compaction input and the job fails ("cannot find matched SST files") --
+  // i.e. it fails safe rather than mis-compacting. The fix makes recovery TRUST
+  // the manifest: it keeps the current version, the job completes, and the
+  // deleted key correctly stays deleted (the below-output tombstone is
+  // retained).
+  Options options = CurrentOptions();
+  options.num_levels = 7;
+  // -1 keeps the primary's descriptor for the (unlinked) lower file valid, so
+  // the final read below is served from the primary regardless of the deletion.
+  options.max_open_files = -1;
+  options.level0_file_num_compaction_trigger = 100;  // no auto compaction
+  ReopenWithCompactionService(&options);
+
+  // Old value for "k", pushed down to L2 (below the compaction output level).
+  ASSERT_OK(Put("k", "OLD"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);  // L2 file contains k=OLD
+
+  // Newer tombstone for "k" at L0 (the compaction input).
+  ASSERT_OK(Delete("k"));
+  ASSERT_OK(Flush());  // L0 file contains Delete(k)
+
+  // Reopen so the MANIFEST is rewritten as current state before we perturb it.
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "cf_1", "cf_2", "cf_3"},
+                           options);
+  // Closing on reopen cancels pending remote jobs; re-arm the service.
+  GetCompactionService()->SetCanceled(false);
+
+  ColumnFamilyMetaData meta;
+  db_->GetColumnFamilyMetaData(&meta);  // default CF
+  ASSERT_EQ(meta.levels[0].files.size(), 1);
+  ASSERT_EQ(meta.levels[2].files.size(), 1);
+  const auto& f_del = meta.levels[0].files[0];
+  const auto& f_old = meta.levels[2].files[0];
+
+  // Make the lower (L2) file momentarily unavailable to a fresh open, as a live
+  // primary would if it had compacted it away. It is NOT a compaction input.
+  ASSERT_OK(env_->DeleteFile(f_old.db_path + "/" + f_old.name));
+
+  // Remote-compact the L0 tombstone into L1. L2 (with k=OLD) is below the
+  // output level, so a correct compaction must retain the tombstone. Without
+  // the fix, recovery rolls back and this job fails; with the fix it completes.
+  std::string fname = f_del.db_path + "/" + f_del.name;
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), {fname}, 1));
+
+  // Deleted key stays deleted (tombstone retained above the still-present L2
+  // value, which the primary can still read via its open descriptor).
+  ASSERT_EQ("NOT_FOUND", Get("k"));
+}
+
+TEST_F(CompactionServiceTest, RemoteCompactionManifestFloorSendsPosition) {
+  // By default (remote_compaction_manifest_floor=true), the primary attaches a
+  // non-zero MANIFEST floor to every remote compaction request, and the worker
+  // runs its floor check. Here the worker recovers the same-or-later MANIFEST
+  // position the primary scheduled from, so the check accepts (the
+  // later-manifest positive case).
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  ASSERT_TRUE(db_->GetDBOptions().remote_compaction_manifest_floor);
+  GenerateTestData();
+
+  uint64_t floor_number = 0;
+  uint64_t floor_size = 0;
+  int floor_check_count = 0;
+  bool floor_check_rejected = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
+      [&](void* arg) {
+        auto* input = static_cast<CompactionServiceInput*>(arg);
+        floor_number = input->min_manifest_file_number;
+        floor_size = input->min_manifest_file_size;
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImplSecondary::OpenAndCompact::ManifestFloorCheck", [&](void* arg) {
+        floor_check_count++;
+        if (*static_cast<bool*>(arg)) {
+          floor_check_rejected = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // A floor was populated and the worker accepted its (later-or-equal) view.
+  ASSERT_GT(floor_number, 0U);
+  ASSERT_GT(floor_size, 0U);
+  ASSERT_GE(floor_check_count, 1);
+  ASSERT_FALSE(floor_check_rejected);
+  VerifyTestData();
+}
+
+TEST_F(CompactionServiceTest, RemoteCompactionManifestFloorRejectsStaleView) {
+  // If the worker recovers an OLDER MANIFEST view than the primary scheduled
+  // from (simulated here by inflating the floor above the real position), the
+  // floor check rejects the job and the primary falls back to a correct local
+  // compaction rather than compacting against a stale/older LSM shape.
+  Options options = CurrentOptions();
+  options.num_levels = 7;
+  options.level0_file_num_compaction_trigger = 100;  // no auto compaction
+  ReopenWithCompactionService(&options);
+
+  // Old value for "k", pushed down to L2 (below the compaction output level).
+  ASSERT_OK(Put("k", "OLD"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);  // L2: k=OLD
+
+  // Newer tombstone for "k" at L0 (the compaction input).
+  ASSERT_OK(Delete("k"));
+  ASSERT_OK(Flush());  // L0: Delete(k)
+
+  int floor_check_rejected = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
+      [&](void* arg) {
+        auto* input = static_cast<CompactionServiceInput*>(arg);
+        // Simulate the worker seeing an older MANIFEST than the primary
+        // scheduled from by raising the floor above the real position.
+        input->min_manifest_file_number += 1000000;
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImplSecondary::OpenAndCompact::ManifestFloorCheck", [&](void* arg) {
+        if (*static_cast<bool*>(arg)) {
+          floor_check_rejected++;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ColumnFamilyMetaData meta;
+  db_->GetColumnFamilyMetaData(&meta);  // default CF
+  ASSERT_EQ(meta.levels[0].files.size(), 1);
+  const auto& f_del = meta.levels[0].files[0];
+  std::string fname = f_del.db_path + "/" + f_del.name;
+
+  // The worker rejects the stale view -> local fallback -> the compaction still
+  // completes correctly (CompactFiles returns OK).
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), {fname}, 1));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_GE(floor_check_rejected, 1);
+  // Deleted key stays deleted: the local fallback retained the below-output
+  // tombstone. A silent mis-compaction against the older view would resurrect
+  // "OLD".
+  ASSERT_EQ("NOT_FOUND", Get("k"));
+}
+
+TEST_F(CompactionServiceTest, RemoteCompactionManifestFloorKillSwitchOff) {
+  // With the kill switch off, the primary sends no floor, so the worker uses
+  // the original point-in-time recovery (no trust-manifest, no floor check). A
+  // transiently-missing non-input file then rolls recovery back and fails the
+  // job -- confirming the escape hatch reverts to the pre-fix behavior.
+  Options options = CurrentOptions();
+  options.num_levels = 7;
+  options.max_open_files = -1;
+  options.open_files_async = true;
+  options.skip_stats_update_on_db_open = true;
+  options.level0_file_num_compaction_trigger = 100;  // no auto compaction
+  options.remote_compaction_manifest_floor = false;  // kill switch OFF
+  ReopenWithCompactionService(&options);
+
+  ASSERT_OK(Put("k", "OLD"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);  // L2: k=OLD
+
+  ASSERT_OK(Delete("k"));
+  ASSERT_OK(Flush());  // L0: Delete(k)
+
+  // Reopen so the MANIFEST is rewritten as current state before we perturb it.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BGWorkAsyncFileOpen:Done",
+        "CompactionServiceTest::ManifestFloorKillSwitchOff:OpenDone"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "cf_1", "cf_2", "cf_3"},
+                           options);
+  TEST_SYNC_POINT("CompactionServiceTest::ManifestFloorKillSwitchOff:OpenDone");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  GetCompactionService()->SetCanceled(false);
+
+  bool floor_provided_seen = true;
+  int floor_check_count = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
+      [&](void* arg) {
+        auto* input = static_cast<CompactionServiceInput*>(arg);
+        floor_provided_seen = (input->min_manifest_file_number != 0);
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImplSecondary::OpenAndCompact::ManifestFloorCheck",
+      [&](void* /*arg*/) { floor_check_count++; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ColumnFamilyMetaData meta;
+  db_->GetColumnFamilyMetaData(&meta);
+  ASSERT_EQ(meta.levels[0].files.size(), 1);
+  ASSERT_EQ(meta.levels[2].files.size(), 1);
+  const auto& f_del = meta.levels[0].files[0];
+  const auto& f_old = meta.levels[2].files[0];
+
+  // Make the lower (L2) non-input file momentarily unavailable, as a live
+  // primary would if it had compacted it away.
+  ASSERT_OK(env_->DeleteFile(f_old.db_path + "/" + f_old.name));
+
+  std::string fname = f_del.db_path + "/" + f_del.name;
+  Status s = db_->CompactFiles(CompactionOptions(), {fname}, 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // No floor was sent and the worker skipped the floor check; the original
+  // recovery rolled back and failed the job (reverted behavior).
+  ASSERT_FALSE(floor_provided_seen);
+  ASSERT_EQ(0, floor_check_count);
+  ASSERT_NOK(s);
+}
+
+TEST_F(CompactionServiceTest, RemoteCompactionManifestFloorMutable) {
+  // remote_compaction_manifest_floor is a mutable DB option: flipping it via
+  // SetDBOptions changes whether the primary attaches a floor to subsequent
+  // remote compaction requests (and thus whether the worker runs the floor
+  // check).
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  bool floor_provided = false;
+  int floor_check_count = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
+      [&](void* arg) {
+        auto* input = static_cast<CompactionServiceInput*>(arg);
+        floor_provided = (input->min_manifest_file_number != 0);
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImplSecondary::OpenAndCompact::ManifestFloorCheck",
+      [&](void* /*arg*/) { floor_check_count++; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+
+  // Default on: floor attached, floor check runs.
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
+  ASSERT_TRUE(floor_provided);
+  ASSERT_GE(floor_check_count, 1);
+
+  // Turn the kill switch off dynamically.
+  ASSERT_OK(db_->SetDBOptions({{"remote_compaction_manifest_floor", "false"}}));
+  ASSERT_FALSE(db_->GetDBOptions().remote_compaction_manifest_floor);
+
+  floor_provided = true;
+  floor_check_count = 0;
+
+  // Create a fresh compaction target overlapping the range and re-compact.
+  ASSERT_OK(Put(Key(20), "v"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Now no floor is attached and the worker skips the floor check.
+  ASSERT_FALSE(floor_provided);
+  ASSERT_EQ(0, floor_check_count);
+}
+
+namespace {
+// A remote compaction service whose output directory already contains an SST
+// left behind by a previously interrupted (canceled) fresh attempt, then runs
+// OpenAndCompact with allow_resumption=true. Used to verify that when
+// resumption is internally disabled, the output directory is cleaned before the
+// fresh compaction starts.
+class LeftoverOutputCompactionService : public MyTestCompactionService {
+ public:
+  using MyTestCompactionService::MyTestCompactionService;
+
+  CompactionServiceJobStatus Wait(const std::string& scheduled_job_id,
+                                  std::string* result) override {
+    std::string compaction_input;
+    {
+      InstrumentedMutexLock l(&mutex_);
+      auto it = jobs_.find(scheduled_job_id);
+      if (it == jobs_.end()) {
+        return CompactionServiceJobStatus::kFailure;
+      }
+      compaction_input = it->second;
+      jobs_.erase(it);
+    }
+
+    CompactionServiceOptionsOverride options_override = GetOptionsOverride();
+    Env* env = options_override.env;
+    const std::string output_dir = GetOutputPath(scheduled_job_id);
+    EXPECT_OK(env->CreateDirIfMissing(output_dir));
+
+    // An output SST left behind by a previously interrupted fresh attempt. Uses
+    // a high file number the fresh compaction will not reuse, so whether it is
+    // cleaned up is directly observable.
+    leftover_file_ = MakeTableFileName(output_dir, 999999);
+    {
+      std::unique_ptr<WritableFile> f;
+      EXPECT_OK(env->NewWritableFile(leftover_file_, &f, EnvOptions()));
+      EXPECT_OK(f->Append("leftover"));
+      EXPECT_OK(f->Close());
+    }
+
+    OpenAndCompactOptions open_options;
+    open_options.allow_resumption = true;
+    Status s = DB::OpenAndCompact(open_options, db_path_, scheduled_job_id,
+                                  compaction_input, result, options_override);
+    {
+      InstrumentedMutexLock l(&mutex_);
+      result_ = *result;
+    }
+    if (!s.ok()) {
+      return CompactionServiceJobStatus::kFailure;
+    }
+    leftover_cleaned_ = env->FileExists(leftover_file_).IsNotFound();
+    return CompactionServiceJobStatus::kSuccess;
+  }
+
+  bool leftover_cleaned() const { return leftover_cleaned_; }
+
+ private:
+  std::string leftover_file_;
+  bool leftover_cleaned_ = false;
+};
+}  // namespace
+
+TEST_F(CompactionServiceTest, CleansOutputDirWhenResumptionDisabled) {
+  // Regression test: allow_resumption=true is requested, but resumption is
+  // internally disabled because paranoid_file_checks=true is incompatible with
+  // the resumption path's output-hash verification. OpenAndCompact then starts
+  // a fresh compaction, which must clean the output directory first (honoring
+  // the documented OpenAndCompactOptions::allow_resumption fallback contract),
+  // so an output file left by a previously interrupted attempt does not collide
+  // with the file numbers the fresh compaction reuses. Before the fix the
+  // leftover file was kept, which under a no-reopen filesystem (as in the crash
+  // test) fails the fresh compaction's NewWritableFile with a
+  // "no-reopen-for-write contract" violation.
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.paranoid_file_checks = true;  // disables resumption on the worker
+  options.use_session_tmp_dir_for_remote_compaction = true;
+  options.env = env_;
+  auto statistics = CreateDBStatistics();
+
+  auto cs = std::make_shared<LeftoverOutputCompactionService>(
+      dbname_, options, statistics,
+      std::vector<std::shared_ptr<EventListener>>{},
+      std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>{});
+  options.compaction_service = cs;
+  DestroyAndReopen(options);
+
+  // Two overlapping flushed files so the manual compaction has real work.
+  ASSERT_OK(Put(Key(1), "v1"));
+  ASSERT_OK(Put(Key(3), "v3"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put(Key(2), "v2"));
+  ASSERT_OK(Put(Key(3), "v3new"));
+  ASSERT_OK(Flush());
+
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+
+  // The fresh compaction cleaned the leftover output before starting.
+  ASSERT_TRUE(cs->leftover_cleaned());
+  ASSERT_EQ(Get(Key(1)), "v1");
+  ASSERT_EQ(Get(Key(2)), "v2");
+  ASSERT_EQ(Get(Key(3)), "v3new");
+}
+
+TEST_F(CompactionServiceTest, RetriesSecondaryOpenWhenCurrentFileVanishes) {
+  // The remote compaction worker opens the live primary's DB directory
+  // read-only inside OpenAndCompact. The primary replaces CURRENT on every
+  // MANIFEST rotation, and on a filesystem without POSIX read-after-unlink
+  // semantics the CURRENT object the worker already opened becomes unreadable.
+  // That is a transient race, so the secondary open must be retried; otherwise
+  // a CompactionService that does not fall back to a local compaction
+  // (db_stress with remote_compaction_failure_fall_back_to_local=false) turns
+  // it into a primary background error that fails every later flush.
+  auto fs = std::make_shared<VanishingCurrentFileFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> vanishing_env(NewCompositeEnv(fs));
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.env = vanishing_env.get();
+  auto statistics = CreateDBStatistics();
+
+  auto cs = std::make_shared<MyTestCompactionService>(
+      dbname_, options, statistics,
+      std::vector<std::shared_ptr<EventListener>>{},
+      std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>{});
+  cs->SetMaxSecondaryOpenRetries(3);
+  options.compaction_service = cs;
+  DestroyAndReopen(options);
+
+  // Two overlapping flushed files so the manual compaction has real work.
+  ASSERT_OK(Put(Key(1), "v1"));
+  ASSERT_OK(Put(Key(3), "v3"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put(Key(2), "v2"));
+  ASSERT_OK(Put(Key(3), "v3new"));
+  ASSERT_OK(Flush());
+
+  // Arm the injection only now: the primary is done opening, so the failed
+  // CURRENT reads below happen in the worker's secondary open. Three failures
+  // exercise a non-default retry limit and require the fourth attempt.
+  fs->SetFailuresToInject(3);
+
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  const Status compact_s = db_->CompactRange(cro, nullptr, nullptr);
+
+  // Collect everything before closing: the DB must be closed while the
+  // injecting Env is still alive, so no assertion may return early above it.
+  const int injected_failures = fs->injected_failures();
+  const int compactions = cs->GetCompactionNum();
+  const std::string v1 = Get(Key(1));
+  const std::string v2 = Get(Key(2));
+  const std::string v3 = Get(Key(3));
+  Close();
+
+  ASSERT_OK(compact_s);
+  ASSERT_EQ(3, injected_failures);
+  ASSERT_GE(compactions, 1);
+  ASSERT_EQ(v1, "v1");
+  ASSERT_EQ(v2, "v2");
+  ASSERT_EQ(v3, "v3new");
+}
+
+TEST_F(CompactionServiceTest, CanDisableSecondaryOpenRetry) {
+  auto fs = std::make_shared<VanishingCurrentFileFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> vanishing_env(NewCompositeEnv(fs));
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.env = vanishing_env.get();
+  auto statistics = CreateDBStatistics();
+
+  auto cs = std::make_shared<MyTestCompactionService>(
+      dbname_, options, statistics,
+      std::vector<std::shared_ptr<EventListener>>{},
+      std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>{});
+  cs->SetMaxSecondaryOpenRetries(0);
+  options.compaction_service = cs;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put(Key(1), "v1"));
+  ASSERT_OK(Put(Key(3), "v3"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put(Key(2), "v2"));
+  ASSERT_OK(Put(Key(3), "v3new"));
+  ASSERT_OK(Flush());
+
+  fs->SetFailuresToInject(1);
+
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  const Status compact_s = db_->CompactRange(cro, nullptr, nullptr);
+  const int injected_failures = fs->injected_failures();
+  const int compactions = cs->GetCompactionNum();
+  Close();
+
+  ASSERT_TRUE(compact_s.IsIncomplete());
+  ASSERT_EQ(1, injected_failures);
+  ASSERT_EQ(1, compactions);
+}
+
 TEST_F(CompactionServiceTest, CompactionInfo) {
   Options options = CurrentOptions();
   ReopenWithCompactionService(&options);
@@ -1696,7 +2783,8 @@ TEST_F(CompactionServiceTest, CompactionInfo) {
 
   CompactionServiceJobInfo info = my_cs->GetCompactionInfoForStart();
   ASSERT_EQ(dbname_, info.db_name);
-  std::string db_id, db_session_id;
+  std::string db_id;
+  std::string db_session_id;
   ASSERT_OK(db_->GetDbIdentity(db_id));
   ASSERT_EQ(db_id, info.db_id);
   ASSERT_OK(db_->GetDbSessionId(db_session_id));
@@ -2368,7 +3456,7 @@ class ResumableCompactionService : public MyTestCompactionService {
     EXPECT_OK(statistics_->Reset());
 
     Status s =
-        DB::OpenAndCompact(options, db_path_, GetOutputPath(scheduled_job_id),
+        DB::OpenAndCompact(options, db_path_, scheduled_job_id,
                            compaction_input, &temp_result, override_options);
 
     EXPECT_TRUE(s.IsManualCompactionPaused());
@@ -2385,9 +3473,8 @@ class ResumableCompactionService : public MyTestCompactionService {
       std::string* result) {
     EXPECT_OK(statistics_->Reset());
 
-    Status s =
-        DB::OpenAndCompact(options, db_path_, GetOutputPath(scheduled_job_id),
-                           compaction_input, result, override_options);
+    Status s = DB::OpenAndCompact(options, db_path_, scheduled_job_id,
+                                  compaction_input, result, override_options);
 
     EXPECT_TRUE(s.ok());
 
@@ -2892,6 +3979,182 @@ TEST_F(ResumableCompactionKeyTypeTest, CancelAndResumeWithTimedPut) {
 
   VerifyResumeBytes();
 }
+
+// Covers the DB session temporary directory lifecycle when remote compaction
+// opts in to using it.
+class SessionTmpDirTest : public DBTestBase {
+ public:
+  SessionTmpDirTest()
+      : DBTestBase("session_tmp_dir_test",
+                   /*env_do_fsync=*/true) {}
+
+ protected:
+  // Opens with a CompactionService opted in to the session temporary directory.
+  Options OptionsWithCompactionService() {
+    Options options = CurrentOptions();
+    options.env = env_;
+    options.use_session_tmp_dir_for_remote_compaction = true;
+    worker_statistics_ = CreateDBStatistics();
+    compaction_service_ = std::make_shared<MyTestCompactionService>(
+        dbname_, options, worker_statistics_,
+        std::vector<std::shared_ptr<EventListener>>{},
+        std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>{});
+    options.compaction_service = compaction_service_;
+    return options;
+  }
+
+  std::string SessionTmpPath() { return SessionTmpDir(dbname_); }
+
+  // Creates and closes a DB session before planting temporary output for the
+  // next session to delete.
+  void CreateDbAndQuiesce(const Options& options) {
+    DestroyAndReopen(options);
+    ASSERT_TRUE(Exists(SessionTmpPath()));
+    Close();
+  }
+
+  // Creates `parent/name/` holding one file, mimicking a leaked job directory.
+  void PlantDir(const std::string& parent, const std::string& name) {
+    SpecialEnv* const env = env_;
+    if (env == nullptr) {
+      ADD_FAILURE() << "Test environment is not initialized";
+      return;
+    }
+    ASSERT_OK(env->CreateDirIfMissing(parent));
+    const std::string dir = parent + "/" + name;
+    ASSERT_OK(env->CreateDirIfMissing(dir));
+    ASSERT_OK(WriteStringToFile(env, "leftover", dir + "/000123.sst"));
+  }
+
+  bool Exists(const std::string& path) {
+    return env_ != nullptr && env_->FileExists(path).ok();
+  }
+
+  // Reopens after planting stale output. Cleanup completes before DB::Open()
+  // schedules compactions or returns.
+  void ReopenAndDeleteStaleOutput(const Options& options) { Reopen(options); }
+
+  std::shared_ptr<Statistics> worker_statistics_;
+  std::shared_ptr<CompactionService> compaction_service_;
+};
+
+TEST_F(SessionTmpDirTest, ResolvesJobDirectory) {
+  const std::string job_dir_name = "SESSION01_4294967296";
+  const std::string legacy_output_path = dbname_ + "/" + job_dir_name;
+
+  ASSERT_EQ(RemoteCompactionJobDir(dbname_, false, job_dir_name),
+            legacy_output_path);
+  ASSERT_EQ(RemoteCompactionJobDir(dbname_, false, legacy_output_path),
+            legacy_output_path);
+  ASSERT_EQ(RemoteCompactionJobDir(dbname_, true, job_dir_name),
+            SessionTmpPath() + "/" + job_dir_name);
+}
+
+TEST_F(SessionTmpDirTest, DeletesDirsFromPreviousSessions) {
+  Options options = OptionsWithCompactionService();
+  CreateDbAndQuiesce(options);
+
+  // Two leaked job directories, one of them with a nested subdirectory to prove
+  // the removal is recursive.
+  PlantDir(SessionTmpPath(), "SESSIONFROMDEADHOST01_4294967296");
+  PlantDir(SessionTmpPath() + "/SESSIONFROMDEADHOST01_4294967296", "nested");
+  PlantDir(SessionTmpPath(), "ANOTHERDEADSESSION02_8589934592");
+
+  ReopenAndDeleteStaleOutput(options);
+
+  ASSERT_TRUE(Exists(SessionTmpPath()));
+  ASSERT_FALSE(Exists(SessionTmpPath() + "/SESSIONFROMDEADHOST01_4294967296"));
+  ASSERT_FALSE(Exists(SessionTmpPath() + "/ANOTHERDEADSESSION02_8589934592"));
+}
+
+TEST_F(SessionTmpDirTest, IgnoresDirsOutsideSessionTmpDir) {
+  Options options = OptionsWithCompactionService();
+  CreateDbAndQuiesce(options);
+
+  // A CompactionService that stages output outside the configured root owns
+  // cleaning it up; the DB must not touch it.
+  const std::string elsewhere = "service_owned_staging_dir";
+  PlantDir(dbname_, elsewhere);
+  PlantDir(SessionTmpPath(), "SESSIONFROMDEADHOST01_4294967296");
+
+  ReopenAndDeleteStaleOutput(options);
+
+  ASSERT_TRUE(Exists(dbname_ + "/" + elsewhere));
+  ASSERT_FALSE(Exists(SessionTmpPath() + "/SESSIONFROMDEADHOST01_4294967296"));
+
+  // Nothing in RocksDB owns this directory, so nothing else will remove it --
+  // including the DestroyDB that the next test's setup runs against the shared
+  // per-thread DB path.
+  ASSERT_OK(DestroyDir(env_, dbname_ + "/" + elsewhere));
+}
+
+TEST_F(SessionTmpDirTest, DisabledOptionSkipsCleanup) {
+  if (Exists(SessionTmpPath())) {
+    ASSERT_OK(DestroyDir(env_, SessionTmpPath()));
+  }
+
+  Options options = CurrentOptions();
+  options.env = env_;
+  DestroyAndReopen(options);
+  ASSERT_FALSE(Exists(SessionTmpPath()));
+
+  PlantDir(SessionTmpPath(), "SESSIONFROMDEADHOST01_4294967296");
+
+  Reopen(options);
+  Close();
+
+  ASSERT_TRUE(Exists(SessionTmpPath() + "/SESSIONFROMDEADHOST01_4294967296"));
+  ASSERT_OK(DestroyDir(env_, SessionTmpPath()));
+}
+
+TEST_F(SessionTmpDirTest, EnabledSessionTmpDirIsCreated) {
+  Options options = CurrentOptions();
+  options.use_session_tmp_dir_for_remote_compaction = true;
+  DestroyAndReopen(options);
+  ASSERT_TRUE(Exists(SessionTmpPath()));
+}
+
+TEST_F(SessionTmpDirTest, DestroyDBRemovesSessionTmpDir) {
+  Options options = OptionsWithCompactionService();
+  CreateDbAndQuiesce(options);
+  PlantDir(SessionTmpPath(), "SESSIONFROMDEADHOST01_4294967296");
+
+  // DestroyDB's final DeleteDir(dbname) is non-recursive, so it can only remove
+  // the DB directory if the session temporary directory is gone first.
+  ASSERT_OK(DestroyDB(dbname_, options));
+  ASSERT_FALSE(Exists(dbname_));
+}
+
+TEST_F(SessionTmpDirTest, CompactionUsesSessionTmpDir) {
+  Options options = OptionsWithCompactionService();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 20; i++) {
+    ASSERT_OK(Put(Key(i), "value" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 20; i += 2) {
+    ASSERT_OK(Put(Key(i), "value_new" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  auto* my_cs = static_cast_with_check<MyTestCompactionService>(
+      compaction_service_.get());
+  ASSERT_GE(my_cs->GetCompactionNum(), 1);
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_EQ(result.output_path,
+            RemoteCompactionJobDir(dbname_, true,
+                                   my_cs->GetLastOutputDirectoryName()));
+
+  for (int i = 0; i < 20; i++) {
+    ASSERT_EQ(Get(Key(i)), (i % 2 ? "value" : "value_new") + std::to_string(i));
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

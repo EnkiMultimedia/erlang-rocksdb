@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <atomic>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -20,7 +21,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
-#include "rocksdb/transaction_log.h"
+#include "rocksdb/wal_iterator.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -103,7 +104,9 @@ class DeleteFileTest : public DBTestBase {
     std::vector<std::string> filenames;
     ASSERT_OK(env_->GetChildren(dir, &filenames));
 
-    int log_cnt = 0, sst_cnt = 0, manifest_cnt = 0;
+    int log_cnt = 0;
+    int sst_cnt = 0;
+    int manifest_cnt = 0;
     for (const auto& file : filenames) {
       uint64_t number;
       FileType type;
@@ -148,11 +151,13 @@ TEST_F(DeleteFileTest, PurgeObsoleteFilesTest) {
   CheckFileTypeCounts(wal_dir_, 1, 0, 0);
   // 2 ssts, 1 manifest
   CheckFileTypeCounts(dbname_, 0, 2, 1);
-  std::string first("0"), last("999999");
+  std::string first("0");
+  std::string last("999999");
   CompactRangeOptions compact_options;
   compact_options.change_level = true;
   compact_options.target_level = 2;
-  Slice first_slice(first), last_slice(last);
+  Slice first_slice(first);
+  Slice last_slice(last);
   ASSERT_OK(db_->CompactRange(compact_options, &first_slice, &last_slice));
   // 1 sst after compaction
   CheckFileTypeCounts(dbname_, 0, 1, 1);
@@ -179,11 +184,13 @@ TEST_F(DeleteFileTest, WaitForCompactWithWaitForPurgeOptionTest) {
   options.create_if_missing = true;
   Reopen(options);
 
-  std::string first("0"), last("999999");
+  std::string first("0");
+  std::string last("999999");
   CompactRangeOptions compact_options;
   compact_options.change_level = true;
   compact_options.target_level = 2;
-  Slice first_slice(first), last_slice(last);
+  Slice first_slice(first);
+  Slice last_slice(last);
 
   CreateTwoLevels();
   Iterator* itr = nullptr;
@@ -222,11 +229,13 @@ TEST_F(DeleteFileTest, BackgroundPurgeIteratorTest) {
   options.create_if_missing = true;
   Reopen(options);
 
-  std::string first("0"), last("999999");
+  std::string first("0");
+  std::string last("999999");
   CompactRangeOptions compact_options;
   compact_options.change_level = true;
   compact_options.target_level = 2;
-  Slice first_slice(first), last_slice(last);
+  Slice first_slice(first);
+  Slice last_slice(last);
 
   // We keep an iterator alive
   Iterator* itr = nullptr;
@@ -256,6 +265,108 @@ TEST_F(DeleteFileTest, BackgroundPurgeIteratorTest) {
   sleeping_task_after.WaitUntilDone();
   // 1 sst after iterator deletion
   CheckFileTypeCounts(dbname_, 0, 1, 1);
+}
+
+// Regression test for a use-after-free where an obsolete-file purge started
+// DURING DB close -- after CloseHelper's early purge drain -- continued using
+// DBImpl after ~DBImpl destroyed mutex_. Seen as a vhost-user-blk SIGABRT when
+// many RocksDB instances closed concurrently under a remote file-system fault
+// while using avoid_unnecessary_blocking_io=true on a shared, process-wide Env.
+//
+// Here we make the straggler deterministic: keep a dropped column family handle
+// alive, delete it only after CloseHelper has passed its early purge drain,
+// then park that cleanup after FindObsoleteFiles() has incremented
+// pending_purge_obsolete_files_ but before PurgeObsoleteFiles(..., true)
+// schedules BGWorkPurge. Without the fix, the final drain sees
+// bg_purge_scheduled_ == 0 and can destroy DBImpl while the pending cleanup is
+// still about to lock/use it. With the fix, CloseHelper waits through the
+// pending handoff and then through the scheduled purge.
+TEST_F(DeleteFileTest, CloseWaitsForPurgeScheduledDuringClose) {
+  Options options = CurrentOptions();
+  SetOptions(&options);
+  Destroy(options);
+  options.create_if_missing = true;
+  // Route obsolete-file deletion through the background purge queue, matching
+  // the production config that hit the bug.
+  options.avoid_unnecessary_blocking_io = true;
+  Reopen(options);
+
+  // A dropped CF whose handle we keep alive: deleting the handle schedules a
+  // *background* purge (the dropped-CF teardown path).
+  ColumnFamilyHandle* cfh = nullptr;
+  ASSERT_OK(db_->CreateColumnFamily(ColumnFamilyOptions(), "dropme", &cfh));
+  ASSERT_OK(db_->Put(WriteOptions(), cfh, "key", "value"));
+  ASSERT_OK(db_->Flush(FlushOptions(), cfh));
+  ASSERT_OK(db_->DropColumnFamily(cfh));
+  ASSERT_OK(dbfull()->TEST_WaitForPurge());  // settle setup purges
+
+  std::atomic<bool> block_pending_handoff{false};
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::PurgeObsoleteFiles:BeforePendingPurgeFinished", [&](void*) {
+        if (!block_pending_handoff.exchange(false)) {
+          return;
+        }
+        TEST_SYNC_POINT(
+            "DeleteFileTest::CloseWaitsForPurge:PendingHandoffReady");
+        TEST_SYNC_POINT(
+            "DeleteFileTest::CloseWaitsForPurge:PendingHandoffBlocked");
+      });
+  SyncPoint::GetInstance()->LoadDependency({
+      // Delete the dropped CF handle only after CloseHelper has passed its
+      // early purge drain and entered a mutex-unlocked close window.
+      {"DBImpl::CloseHelper:CFHandleCleanupUnlocked",
+       "DeleteFileTest::CloseWaitsForPurge:DropDuringCloseUnlock"},
+      // Let the test thread observe that the deleter is parked in the pending
+      // handoff window.
+      {"DeleteFileTest::CloseWaitsForPurge:PendingHandoffReady",
+       "DeleteFileTest::CloseWaitsForPurge:WaitForPendingHandoff"},
+      // Keep CloseHelper in the mutex-unlocked close window until the
+      // dropped-CF cleanup reaches the pending-to-scheduled handoff.
+      {"DeleteFileTest::CloseWaitsForPurge:PendingHandoffReady",
+       "DBImpl::CloseHelper:CFHandleCleanupAllowed"},
+      // Observe that CloseHelper is actually waiting in the final purge drain
+      // while the dropped-CF cleanup is still parked in the pending handoff.
+      {"DBImpl::CloseHelper:FinalPurgeDrainWait",
+       "DeleteFileTest::CloseWaitsForPurge:WaitForFinalPurgeDrain"},
+      // Keep the dropped-CF cleanup parked in the pending handoff window until
+      // the test releases it.
+      {"DeleteFileTest::CloseWaitsForPurge:ReleasePendingHandoff",
+       "DeleteFileTest::CloseWaitsForPurge:PendingHandoffBlocked"},
+      // Park the scheduled BGWorkPurge before it locks mutex_ until we release
+      // it, so CloseHelper also has to wait for bg_purge_scheduled_.
+      {"DeleteFileTest::CloseWaitsForPurge:ReleaseBackgroundPurge",
+       "DBImpl::BackgroundCallPurge:beforeMutexLock"},
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  port::Thread closer([&]() { db_.reset(); });
+
+  // Unblocks once CloseHelper is in a mutex-unlocked close window; then
+  // deleting the dropped CF handle starts purge work the early drain missed.
+  TEST_SYNC_POINT("DeleteFileTest::CloseWaitsForPurge:DropDuringCloseUnlock");
+  block_pending_handoff.store(true);
+  ColumnFamilyHandle* dropped_cfh = cfh;
+  cfh = nullptr;
+  port::Thread dropped_cf_deleter([dropped_cfh]() { delete dropped_cfh; });
+
+  TEST_SYNC_POINT("DeleteFileTest::CloseWaitsForPurge:WaitForPendingHandoff");
+
+  // Wait until CloseHelper is blocked in the final drain with no scheduled
+  // purge yet. Without the fix, it would proceed while the dropped-CF cleanup
+  // is still pending. With the fix, it waits for pending_purge_obsolete_files_.
+  TEST_SYNC_POINT("DeleteFileTest::CloseWaitsForPurge:WaitForFinalPurgeDrain");
+
+  // Release the pending cleanup, then the BGWorkPurge it schedules. With the
+  // fix, the closer waits for both transitions and completes cleanly.
+  TEST_SYNC_POINT("DeleteFileTest::CloseWaitsForPurge:ReleasePendingHandoff");
+  dropped_cf_deleter.join();
+  TEST_SYNC_POINT("DeleteFileTest::CloseWaitsForPurge:ReleaseBackgroundPurge");
+  closer.join();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_F(DeleteFileTest, PurgeDuringOpen) {
@@ -315,6 +426,15 @@ TEST_F(DeleteFileTest, BackgroundPurgeCFDropTest) {
     // Expect 1 sst file.
     CheckFileTypeCounts(dbname_, 0, 1, 1);
 
+    if (bg_purge) {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      SyncPoint::GetInstance()->LoadDependency(
+          {{"DeleteFileTest::BackgroundPurgeCFDropTest:1",
+            "DBImpl::BGWorkPurge:start"}});
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
+
     ASSERT_OK(db_->DropColumnFamily(cfh));
     // Still 1 file, it won't be deleted while ColumnFamilyHandle is alive.
     CheckFileTypeCounts(dbname_, 0, 1, 1);
@@ -344,13 +464,6 @@ TEST_F(DeleteFileTest, BackgroundPurgeCFDropTest) {
   Reopen(options);
   ASSERT_OK(dbfull()->TEST_WaitForPurge());
 
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
-  SyncPoint::GetInstance()->LoadDependency(
-      {{"DeleteFileTest::BackgroundPurgeCFDropTest:1",
-        "DBImpl::BGWorkPurge:start"}});
-  SyncPoint::GetInstance()->EnableProcessing();
-
   {
     SCOPED_TRACE("avoid_unnecessary_blocking_io = true");
     do_test(true);
@@ -366,11 +479,13 @@ TEST_F(DeleteFileTest, BackgroundPurgeCopyOptions) {
   options.create_if_missing = true;
   Reopen(options);
 
-  std::string first("0"), last("999999");
+  std::string first("0");
+  std::string last("999999");
   CompactRangeOptions compact_options;
   compact_options.change_level = true;
   compact_options.target_level = 2;
-  Slice first_slice(first), last_slice(last);
+  Slice first_slice(first);
+  Slice last_slice(last);
 
   // We keep an iterator alive
   Iterator* itr = nullptr;
@@ -407,11 +522,13 @@ TEST_F(DeleteFileTest, BackgroundPurgeTestMultipleJobs) {
   options.create_if_missing = true;
   Reopen(options);
 
-  std::string first("0"), last("999999");
+  std::string first("0");
+  std::string last("999999");
   CompactRangeOptions compact_options;
   compact_options.change_level = true;
   compact_options.target_level = 2;
-  Slice first_slice(first), last_slice(last);
+  Slice first_slice(first);
+  Slice last_slice(last);
 
   // We keep an iterator alive
   CreateTwoLevels();

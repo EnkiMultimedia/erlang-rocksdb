@@ -7,16 +7,19 @@
 #include <string>
 
 #include "db/read_callback.h"
+#include "rocksdb/status.h"
 #include "rocksdb/types.h"
 
 namespace ROCKSDB_NAMESPACE {
 class BlobFetcher;
+class Cleanable;
 class Comparator;
 class Logger;
 class MergeContext;
 class MergeOperator;
 class PinnableWideColumns;
 class PinnedIteratorsManager;
+class SameFileBlobReader;
 class Statistics;
 class SystemClock;
 struct ParsedInternalKey;
@@ -99,26 +102,43 @@ class GetContext {
   // and false if all the merge operands associated with user_key has to be
   // returned. Id do_merge=false then all the merge operands are stored in
   // merge_context and they are never merged. The value pointer is untouched.
-  GetContext(const Comparator* ucmp, const MergeOperator* merge_operator,
-             Logger* logger, Statistics* statistics, GetState init_state,
-             const Slice& user_key, PinnableSlice* value,
-             PinnableWideColumns* columns, bool* value_found,
-             MergeContext* merge_context, bool do_merge,
-             SequenceNumber* max_covering_tombstone_seq, SystemClock* clock,
-             SequenceNumber* seq = nullptr,
-             PinnedIteratorsManager* _pinned_iters_mgr = nullptr,
-             ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
-             uint64_t tracing_get_id = 0, BlobFetcher* blob_fetcher = nullptr);
-  GetContext(const Comparator* ucmp, const MergeOperator* merge_operator,
-             Logger* logger, Statistics* statistics, GetState init_state,
-             const Slice& user_key, PinnableSlice* value,
-             PinnableWideColumns* columns, std::string* timestamp,
-             bool* value_found, MergeContext* merge_context, bool do_merge,
-             SequenceNumber* max_covering_tombstone_seq, SystemClock* clock,
-             SequenceNumber* seq = nullptr,
-             PinnedIteratorsManager* _pinned_iters_mgr = nullptr,
-             ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
-             uint64_t tracing_get_id = 0, BlobFetcher* blob_fetcher = nullptr);
+  //
+  // TODO(get-context-args-struct): these telescoping positional constructors
+  // (two overloads that differ only by `timestamp`, plus a growing tail of
+  // defaulted params) require a multi-site edit for every new read-path input
+  // -- e.g. adding `lazy_columns_same_file_reader` here also touched both
+  // definitions, the delegation between them, and a ~20-argument positional
+  // call site whose correctness depends on counting commas. Replace them with a
+  // single constructor taking a defaulted parameter struct (as GetImplOptions
+  // already does one layer up), so future inputs are a one-field addition and
+  // call sites become self-documenting.
+  GetContext(
+      const Comparator* ucmp, const MergeOperator* merge_operator,
+      Logger* logger, Statistics* statistics, GetState init_state,
+      const Slice& user_key, PinnableSlice* value, PinnableWideColumns* columns,
+      bool* value_found, MergeContext* merge_context, bool do_merge,
+      SequenceNumber* max_covering_tombstone_seq, SystemClock* clock,
+      SequenceNumber* seq = nullptr,
+      PinnedIteratorsManager* _pinned_iters_mgr = nullptr,
+      ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
+      uint64_t tracing_get_id = 0, BlobFetcher* blob_fetcher = nullptr,
+      const SameFileBlobReader** lazy_columns_same_file_reader = nullptr);
+  GetContext(
+      const Comparator* ucmp, const MergeOperator* merge_operator,
+      Logger* logger, Statistics* statistics, GetState init_state,
+      const Slice& user_key, PinnableSlice* value, PinnableWideColumns* columns,
+      std::string* timestamp, bool* value_found, MergeContext* merge_context,
+      bool do_merge, SequenceNumber* max_covering_tombstone_seq,
+      SystemClock* clock, SequenceNumber* seq = nullptr,
+      PinnedIteratorsManager* _pinned_iters_mgr = nullptr,
+      ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
+      uint64_t tracing_get_id = 0, BlobFetcher* blob_fetcher = nullptr,
+      const SameFileBlobReader** lazy_columns_same_file_reader = nullptr);
+  // emplace-only; default construction and move assignment are intentionally
+  // disabled.
+  GetContext(GetContext&&) noexcept = default;
+  GetContext& operator=(GetContext&&) noexcept = delete;
+  ~GetContext() = default;
 
   GetContext() = delete;
 
@@ -134,13 +154,23 @@ class GetContext {
   //
   // Returns True if more keys need to be read (due to merges) or
   //         False if the complete value has been found.
+  //
+  // same_file_reader: when non-null (embedded-blob SST on the Get()/MultiGet()
+  // path), same-file blob columns of a wide-column entity are resolved
+  // zero-copy through an EmbeddedAwareBlobFetcher composed over blob_fetcher_.
   bool SaveValue(const ParsedInternalKey& parsed_key, const Slice& value,
                  bool* matched, Status* read_status,
-                 Cleanable* value_pinner = nullptr);
+                 Cleanable* value_pinner = nullptr,
+                 const SameFileBlobReader* same_file_reader = nullptr);
 
   // Simplified version of the previous function. Should only be used when we
-  // know that the operation is a Put.
-  void SaveValue(const Slice& value, SequenceNumber seq);
+  // know that the operation is a Put and the column family has no
+  // user-defined timestamps.
+  //
+  // value_pinner: if non-null, ownership of the underlying buffer is
+  // transferred via PinSlice (no copy). If null, value is copied via PinSelf.
+  void SaveValue(const Slice& value, SequenceNumber seq,
+                 Cleanable* value_pinner = nullptr);
 
   GetState State() const { return state_; }
 
@@ -165,8 +195,37 @@ class GetContext {
   // another GetContext with replayGetContextLog.
   void SetReplayLog(std::string* replay_log) { replay_log_ = replay_log; }
 
+  // True if SaveValue calls are being logged for the row cache. When set, the
+  // logged (and hence row-cached) entity must be fully resolved, so the
+  // Get()/MultiGet() path does not defer same-file wide-column blob resolution.
+  bool HasReplayLog() const { return replay_log_ != nullptr; }
+
   // Do we need to fetch the SequenceNumber for this key?
   bool NeedToReadSequence() const { return (seq_ != nullptr); }
+
+  // Do we need to track point versions skipped by the read visibility
+  // callback?
+  bool NeedToTrackNewerVersions() const {
+    const bool* per_key_result =
+        has_newer_version_result_ ? newer_version_present_ : nullptr;
+    return callback_ != nullptr &&
+           callback_->NeedToTrackNewerVersions(per_key_result);
+  }
+
+  void SetNewerVersionResult(bool* newer_version_present) {
+    assert(!has_newer_version_result_);
+    assert(lazy_columns_same_file_reader_ == nullptr);
+    newer_version_present_ = newer_version_present;
+    has_newer_version_result_ = true;
+  }
+
+  const MetadataReadBounds* metadata_read_bounds() const {
+    return callback_ != nullptr ? callback_->GetMetadataReadBounds() : nullptr;
+  }
+
+  ReadCallback* read_callback() const { return callback_; }
+
+  void RecordNewerVersionIfNeeded(SequenceNumber seq, ValueType type);
 
   bool sample() const { return sample_; }
 
@@ -194,15 +253,26 @@ class GetContext {
   void push_operand(const Slice& value, Cleanable* value_pinner);
 
  private:
+  Status SaveWideColumnEntityToPinnable(
+      const Slice& user_key, const Slice& entity, Cleanable* value_pinner,
+      const SameFileBlobReader* same_file_reader);
+  Status SaveWideColumnEntityToColumns(
+      const Slice& user_key, const Slice& entity, Cleanable* value_pinner,
+      const SameFileBlobReader* same_file_reader);
+  Status PushWideColumnEntityDefaultOperand(
+      const Slice& user_key, const Slice& entity, Cleanable* value_pinner,
+      const SameFileBlobReader* same_file_reader);
+
   // Helper method that postprocesses the results of merge operations, e.g. it
   // sets the state correctly upon merge errors.
-  void PostprocessMerge(const Status& merge_status);
+  Status PostprocessMerge(const Status& merge_status);
 
   // The following methods perform the actual merge operation for the
   // no base value/plain base value/wide-column base value cases.
-  void MergeWithNoBaseValue();
-  void MergeWithPlainBaseValue(const Slice& value);
-  void MergeWithWideColumnBaseValue(const Slice& entity);
+  Status MergeWithNoBaseValue();
+  Status MergeWithPlainBaseValue(const Slice& value);
+  Status MergeWithWideColumnBaseValue(
+      const Slice& entity, const SameFileBlobReader* same_file_reader);
 
   bool GetBlobValue(const Slice& user_key, const Slice& blob_index,
                     PinnableSlice* blob_value, Status* read_status);
@@ -241,11 +311,23 @@ class GetContext {
   // called as part of DB GetMergeOperands API. When it's false merge operators
   // are never merged.
   bool do_merge_;
+  bool has_newer_version_result_ = false;
   bool* is_blob_index_;
   // Used for block cache tracing only. A tracing get id uniquely identifies a
   // Get or a MultiGet.
   const uint64_t tracing_get_id_;
   BlobFetcher* blob_fetcher_;
+  // Non-null => "lazy columns" mode (GetEntityLazy): a wide-column entity saved
+  // to columns_ is left with its blob references unresolved, and the
+  // SameFileBlobReader for the SST that held it (if any) is stored here so the
+  // caller can resolve same-file/embedded references on demand later. Only the
+  // SST read path (Version::Get) sets this; memtable hits are unaffected.
+  // Lazy-column and metadata reads are mutually exclusive. Reuse the pointer
+  // slot so ordinary reads do not pay an object-size cost for metadata output.
+  union {
+    const SameFileBlobReader** lazy_columns_same_file_reader_;
+    bool* newer_version_present_;
+  };
 };
 
 // Call this to replay a log and bring the get_context up to date. The replay

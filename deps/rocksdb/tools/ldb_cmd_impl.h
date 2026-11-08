@@ -215,10 +215,16 @@ class UpdateManifestCommand : public LDBCommand {
  private:
   bool verbose_;
   bool update_temperatures_;
+  bool rebind_options_file_;
+  std::string options_file_;
+  std::vector<std::string> file_number_paths_;
   // TODO future: checksum_func for populating checksums
 
   static const std::string ARG_VERBOSE;
   static const std::string ARG_UPDATE_TEMPERATURES;
+  static const std::string ARG_REBIND_OPTIONS_FILE;
+  static const std::string ARG_OPTIONS_FILE;
+  static const std::string ARG_FILE_NUMBER_PATHS;
 };
 
 class FileChecksumDumpCommand : public LDBCommand {
@@ -769,14 +775,12 @@ class IngestExternalSstFilesCommand : public LDBCommand {
   bool allow_global_seqno_;
   bool allow_blocking_flush_;
   bool ingest_behind_;
-  bool write_global_seqno_;
 
   static const std::string ARG_MOVE_FILES;
   static const std::string ARG_SNAPSHOT_CONSISTENCY;
   static const std::string ARG_ALLOW_GLOBAL_SEQNO;
   static const std::string ARG_ALLOW_BLOCKING_FLUSH;
   static const std::string ARG_INGEST_BEHIND;
-  static const std::string ARG_WRITE_GLOBAL_SEQNO;
 };
 
 // Command that prints out range delete tombstones in SST files.
@@ -833,6 +837,38 @@ class CompactionProgressDumpCommand : public LDBCommand {
   std::string path_;
 
   static const std::string ARG_PATH;
+};
+
+class RemoteCompactionPrimaryCommand : public LDBCommand {
+ public:
+  static std::string Name() { return "remote_compaction_primary"; }
+  RemoteCompactionPrimaryCommand(
+      const std::vector<std::string>& params,
+      const std::map<std::string, std::string>& options,
+      const std::vector<std::string>& flags);
+  void DoCommand() override;
+  bool NoDBOpen() override { return true; }
+  static void Help(std::string& ret);
+
+ private:
+  std::string job_dir_;
+  static const std::string ARG_JOB_DIR;
+};
+
+class RemoteCompactionWorkerCommand : public LDBCommand {
+ public:
+  static std::string Name() { return "remote_compaction_worker"; }
+  RemoteCompactionWorkerCommand(
+      const std::vector<std::string>& params,
+      const std::map<std::string, std::string>& options,
+      const std::vector<std::string>& flags);
+  void DoCommand() override;
+  bool NoDBOpen() override { return true; }
+  static void Help(std::string& ret);
+
+ private:
+  std::string job_dir_;
+  static const std::string ARG_JOB_DIR;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

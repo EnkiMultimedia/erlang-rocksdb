@@ -8,13 +8,23 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #ifdef GFLAGS
+#include <algorithm>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "db/wide/wide_columns_helper.h"
 #include "db_stress_tool/db_stress_common.h"
 #include "file/file_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 class CfConsistencyStressTest : public StressTest {
  public:
-  CfConsistencyStressTest() : batch_id_(0) {}
+  CfConsistencyStressTest(int db_index, const std::string& db_path,
+                          const std::string& ev_path,
+                          const std::string& sec_path)
+      : StressTest(db_index, db_path, ev_path, sec_path), batch_id_(0) {}
 
   ~CfConsistencyStressTest() override = default;
 
@@ -33,12 +43,15 @@ class CfConsistencyStressTest : public StressTest {
     const uint32_t value_base = batch_id_.fetch_add(1);
     const size_t sz = GenerateValue(value_base, value, sizeof(value));
     const Slice v(value, sz);
+    DebugOpKind debug_op = DebugOpKind::kPut;
+    uint64_t write_unix_time = 0;
 
     WriteBatch batch;
 
     Status status;
     if (FLAGS_use_attribute_group && FLAGS_use_put_entity_one_in > 0 &&
         (value_base % FLAGS_use_put_entity_one_in) == 0) {
+      debug_op = DebugOpKind::kAttributeGroupPutEntity;
       std::vector<ColumnFamilyHandle*> cfhs;
       cfhs.reserve(rand_column_families.size());
       for (auto cf : rand_column_families) {
@@ -52,13 +65,16 @@ class CfConsistencyStressTest : public StressTest {
 
         if (FLAGS_use_put_entity_one_in > 0 &&
             (value_base % FLAGS_use_put_entity_one_in) == 0) {
+          debug_op = DebugOpKind::kPutEntity;
           status = batch.PutEntity(cfh, k, GenerateWideColumns(value_base, v));
         } else if (FLAGS_use_timed_put_one_in > 0 &&
                    ((value_base + kLargePrimeForCommonFactorSkew) %
                     FLAGS_use_timed_put_one_in) == 0) {
-          uint64_t write_unix_time = GetWriteUnixTime(thread);
+          debug_op = DebugOpKind::kTimedPut;
+          write_unix_time = GetWriteUnixTime(thread);
           status = batch.TimedPut(cfh, k, v, write_unix_time);
         } else if (FLAGS_use_merge) {
+          debug_op = DebugOpKind::kMerge;
           status = batch.Merge(cfh, k, v);
         } else {
           status = batch.Put(cfh, k, v);
@@ -69,8 +85,25 @@ class CfConsistencyStressTest : public StressTest {
       }
     }
 
+    const SequenceNumber latest_seq_before = db_->GetLatestSequenceNumber();
+    const uint32_t batch_count = batch.Count();
+
     if (status.ok()) {
       status = db_->Write(write_opts, &batch);
+    }
+
+    if (status.ok()) {
+      const SequenceNumber latest_seq_after = db_->GetLatestSequenceNumber();
+      RecordDebugEvent({debug_op, k,
+                        /* end_key */ "", latest_seq_before, latest_seq_after,
+                        batch_count, value_base, write_unix_time,
+                        rand_column_families});
+      if (latest_seq_after <
+          latest_seq_before + static_cast<SequenceNumber>(batch_count)) {
+        ReportInvalidWriteSequenceBounds(thread, k, latest_seq_before,
+                                         latest_seq_after, batch_count,
+                                         value_base);
+      }
     }
 
     if (status.ok()) {
@@ -95,8 +128,21 @@ class CfConsistencyStressTest : public StressTest {
       ColumnFamilyHandle* cfh = column_families_[cf];
       batch.Delete(cfh, key);
     }
+    const SequenceNumber latest_seq_before = db_->GetLatestSequenceNumber();
     Status s = db_->Write(write_opts, &batch);
     if (s.ok()) {
+      const SequenceNumber latest_seq_after = db_->GetLatestSequenceNumber();
+      RecordDebugEvent({DebugOpKind::kDelete, key_str,
+                        /* end_key */ "", latest_seq_before, latest_seq_after,
+                        batch.Count(),
+                        /* value_base */ 0,
+                        /* write_unix_time */ 0, rand_column_families});
+      if (latest_seq_after <
+          latest_seq_before + static_cast<SequenceNumber>(batch.Count())) {
+        ReportInvalidWriteSequenceBounds(thread, key_str, latest_seq_before,
+                                         latest_seq_after, batch.Count(),
+                                         /* value_base */ 0);
+      }
       thread->stats.AddDeletes(static_cast<long>(rand_column_families.size()));
     } else if (!IsErrorInjectedAndRetryable(s)) {
       fprintf(stderr, "multidel error: %s\n", s.ToString().c_str());
@@ -124,8 +170,20 @@ class CfConsistencyStressTest : public StressTest {
       ColumnFamilyHandle* cfh = column_families_[rand_column_families[cf]];
       batch.DeleteRange(cfh, key, end_key);
     }
+    const SequenceNumber latest_seq_before = db_->GetLatestSequenceNumber();
     Status s = db_->Write(write_opts, &batch);
     if (s.ok()) {
+      const SequenceNumber latest_seq_after = db_->GetLatestSequenceNumber();
+      RecordDebugEvent({DebugOpKind::kDeleteRange, key_str, end_key_str,
+                        latest_seq_before, latest_seq_after, batch.Count(),
+                        /* value_base */ 0,
+                        /* write_unix_time */ 0, rand_column_families});
+      if (latest_seq_after <
+          latest_seq_before + static_cast<SequenceNumber>(batch.Count())) {
+        ReportInvalidWriteSequenceBounds(thread, key_str, latest_seq_before,
+                                         latest_seq_after, batch.Count(),
+                                         /* value_base */ 0);
+      }
       thread->stats.AddRangeDeletions(
           static_cast<long>(rand_column_families.size()));
     } else if (!IsErrorInjectedAndRetryable(s)) {
@@ -160,7 +218,7 @@ class CfConsistencyStressTest : public StressTest {
           column_families_[rand_column_families[thread->rand.Next() %
                                                 rand_column_families.size()]];
       std::string from_db;
-      s = db_->Get(readoptions, cfh, key, &from_db);
+      s = DbStressGet(db_, readoptions, cfh, key, &from_db);
     } else {
       // 1/2 chance, comparing one key is the same across all CFs
       const Snapshot* snapshot = db_->GetSnapshot();
@@ -168,14 +226,14 @@ class CfConsistencyStressTest : public StressTest {
       readoptionscopy.snapshot = snapshot;
 
       std::string value0;
-      s = db_->Get(readoptionscopy, column_families_[rand_column_families[0]],
-                   key, &value0);
+      s = DbStressGet(db_, readoptionscopy,
+                      column_families_[rand_column_families[0]], key, &value0);
 
       // Temporarily disable error injection for verification
-      if (fault_fs_guard) {
-        fault_fs_guard->DisableThreadLocalErrorInjection(
+      if (db_fault_injection_fs_) {
+        db_fault_injection_fs_->DisableThreadLocalErrorInjection(
             FaultInjectionIOType::kRead);
-        fault_fs_guard->DisableThreadLocalErrorInjection(
+        db_fault_injection_fs_->DisableThreadLocalErrorInjection(
             FaultInjectionIOType::kMetadataRead);
       }
 
@@ -183,8 +241,9 @@ class CfConsistencyStressTest : public StressTest {
         bool found = s.ok();
         for (size_t i = 1; i < rand_column_families.size(); i++) {
           std::string value1;
-          s = db_->Get(readoptionscopy,
-                       column_families_[rand_column_families[i]], key, &value1);
+          s = DbStressGet(db_, readoptionscopy,
+                          column_families_[rand_column_families[i]], key,
+                          &value1);
           if (!s.ok() && !s.IsNotFound()) {
             break;
           }
@@ -224,10 +283,10 @@ class CfConsistencyStressTest : public StressTest {
       }
 
       //  Enable back error injection disabled for verification
-      if (fault_fs_guard) {
-        fault_fs_guard->EnableThreadLocalErrorInjection(
+      if (db_fault_injection_fs_) {
+        db_fault_injection_fs_->EnableThreadLocalErrorInjection(
             FaultInjectionIOType::kRead);
-        fault_fs_guard->EnableThreadLocalErrorInjection(
+        db_fault_injection_fs_->EnableThreadLocalErrorInjection(
             FaultInjectionIOType::kMetadataRead);
       }
       db_->ReleaseSnapshot(snapshot);
@@ -268,8 +327,8 @@ class CfConsistencyStressTest : public StressTest {
       key_str.emplace_back(Key(rand_keys[i]));
       keys.emplace_back(key_str.back());
     }
-    db_->MultiGet(readoptionscopy, cfh, num_keys, keys.data(), values.data(),
-                  statuses.data());
+    DbStressMultiGet(db_, readoptionscopy, cfh, num_keys, keys.data(),
+                     values.data(), statuses.data());
     for (const auto& s : statuses) {
       if (s.ok()) {
         // found case
@@ -323,9 +382,15 @@ class CfConsistencyStressTest : public StressTest {
           is_consistent = false;
         }
       }
+
+      // Random single-CF read: no pinned snapshot to share with a reference, so
+      // run a self-contained lazy read (it pins its own snapshot).
+      MaybeTestGetEntityLazy(thread, read_opts, cfh, key);
     } else {
       // With a 1/2 chance, compare one key across all CFs
       ManagedSnapshot snapshot_guard(db_);
+      const SequenceNumber snapshot_seq =
+          snapshot_guard.snapshot()->GetSequenceNumber();
 
       ReadOptions read_opts_copy = read_opts;
       read_opts_copy.snapshot = snapshot_guard.snapshot();
@@ -340,10 +405,10 @@ class CfConsistencyStressTest : public StressTest {
                          &cmp_result);
 
       //  Temporarily disable error injection for verification
-      if (fault_fs_guard) {
-        fault_fs_guard->DisableThreadLocalErrorInjection(
+      if (db_fault_injection_fs_) {
+        db_fault_injection_fs_->DisableThreadLocalErrorInjection(
             FaultInjectionIOType::kRead);
-        fault_fs_guard->DisableThreadLocalErrorInjection(
+        db_fault_injection_fs_->DisableThreadLocalErrorInjection(
             FaultInjectionIOType::kMetadataRead);
       }
 
@@ -359,6 +424,15 @@ class CfConsistencyStressTest : public StressTest {
                     WideColumnsToHex(cmp_result.columns()).c_str());
             is_consistent = false;
           }
+        }
+
+        // Reuse the CF[0] entity we just read (under read_opts_copy's snapshot,
+        // and verified above) as the lazy read's reference for that CF.
+        if (cmp_found && is_consistent) {
+          const WideColumns& eager_ref = cmp_result.columns();
+          MaybeTestGetEntityLazy(thread, read_opts_copy,
+                                 column_families_[rand_column_families[0]], key,
+                                 &eager_ref);
         }
 
         if (is_consistent) {
@@ -445,11 +519,17 @@ class CfConsistencyStressTest : public StressTest {
               if (!cmp_found && found) {
                 fprintf(stderr,
                         "GetEntity returns different results for key %s: CF %s "
-                        "returns not found, CF %s returns entity %s\n",
+                        "returns not found, CF %s returns entity %s"
+                        " [snapshot_seq=%" PRIu64 " latest_seq=%" PRIu64 "]\n",
                         StringToHex(key).c_str(),
                         column_family_names_[0].c_str(),
                         column_family_names_[i].c_str(),
-                        WideColumnsToHex(result.columns()).c_str());
+                        WideColumnsToHex(result.columns()).c_str(),
+                        snapshot_seq, db_->GetLatestSequenceNumber());
+                DumpGetEntityMismatchDebug(key, read_opts_copy, snapshot_seq,
+                                           rand_column_families,
+                                           /* cmp_cf_idx */ 0,
+                                           /* mismatch_cf_idx */ i);
                 is_consistent = false;
                 break;
               }
@@ -457,11 +537,17 @@ class CfConsistencyStressTest : public StressTest {
               if (cmp_found && !found) {
                 fprintf(stderr,
                         "GetEntity returns different results for key %s: CF %s "
-                        "returns entity %s, CF %s returns not found\n",
+                        "returns entity %s, CF %s returns not found"
+                        " [snapshot_seq=%" PRIu64 " latest_seq=%" PRIu64 "]\n",
                         StringToHex(key).c_str(),
                         column_family_names_[0].c_str(),
                         WideColumnsToHex(cmp_result.columns()).c_str(),
-                        column_family_names_[i].c_str());
+                        column_family_names_[i].c_str(), snapshot_seq,
+                        db_->GetLatestSequenceNumber());
+                DumpGetEntityMismatchDebug(key, read_opts_copy, snapshot_seq,
+                                           rand_column_families,
+                                           /* cmp_cf_idx */ 0,
+                                           /* mismatch_cf_idx */ i);
                 is_consistent = false;
                 break;
               }
@@ -469,12 +555,18 @@ class CfConsistencyStressTest : public StressTest {
               if (found && result != cmp_result) {
                 fprintf(stderr,
                         "GetEntity returns different results for key %s: CF %s "
-                        "returns entity %s, CF %s returns entity %s\n",
+                        "returns entity %s, CF %s returns entity %s"
+                        " [snapshot_seq=%" PRIu64 " latest_seq=%" PRIu64 "]\n",
                         StringToHex(key).c_str(),
                         column_family_names_[0].c_str(),
                         WideColumnsToHex(cmp_result.columns()).c_str(),
                         column_family_names_[i].c_str(),
-                        WideColumnsToHex(result.columns()).c_str());
+                        WideColumnsToHex(result.columns()).c_str(),
+                        snapshot_seq, db_->GetLatestSequenceNumber());
+                DumpGetEntityMismatchDebug(key, read_opts_copy, snapshot_seq,
+                                           rand_column_families,
+                                           /* cmp_cf_idx */ 0,
+                                           /* mismatch_cf_idx */ i);
                 is_consistent = false;
                 break;
               }
@@ -484,10 +576,10 @@ class CfConsistencyStressTest : public StressTest {
       }
 
       //  Enable back error injection disabled for verification
-      if (fault_fs_guard) {
-        fault_fs_guard->EnableThreadLocalErrorInjection(
+      if (db_fault_injection_fs_) {
+        db_fault_injection_fs_->EnableThreadLocalErrorInjection(
             FaultInjectionIOType::kRead);
-        fault_fs_guard->EnableThreadLocalErrorInjection(
+        db_fault_injection_fs_->EnableThreadLocalErrorInjection(
             FaultInjectionIOType::kMetadataRead);
       }
     }
@@ -601,7 +693,7 @@ class CfConsistencyStressTest : public StressTest {
             continue;
           }
 
-          assert(s.ok());
+          DB_STRESS_ASSERT_OK(s);
           if (cmp_s.IsNotFound()) {
             fprintf(stderr,
                     "MultiGetEntity (AttributeGroup) returns different results "
@@ -657,6 +749,16 @@ class CfConsistencyStressTest : public StressTest {
         }
       }
 
+      std::vector<EagerEntityRef> eager_refs(num_keys);
+      for (size_t i = 0; i < num_keys; ++i) {
+        eager_refs[i].status = results[i][0].status();
+        if (eager_refs[i].status.ok()) {
+          eager_refs[i].columns = &results[i][0].columns();
+        }
+      }
+      MaybeTestMultiGetEntityLazy(thread, read_opts_copy, cfhs[0], num_keys,
+                                  key_slices.data(), &eager_refs);
+
     } else {
       // Non-AttributeGroup MultiGetEntity verification
 
@@ -695,10 +797,18 @@ class CfConsistencyStressTest : public StressTest {
               fprintf(
                   stderr,
                   "MultiGetEntity returns different results for key %s: CF %s "
-                  "returns entity %s, CF %s returns not found\n",
+                  "returns entity %s, CF %s returns not found"
+                  " [snapshot_seq=%" PRIu64 " latest_seq=%" PRIu64 "]\n",
                   StringToHex(key).c_str(), column_family_names_[0].c_str(),
                   WideColumnsToHex(cmp_columns).c_str(),
-                  column_family_names_[j].c_str());
+                  column_family_names_[j].c_str(),
+                  snapshot_guard.snapshot()->GetSequenceNumber(),
+                  db_->GetLatestSequenceNumber());
+              DumpGetEntityMismatchDebug(
+                  key, read_opts_copy,
+                  snapshot_guard.snapshot()->GetSequenceNumber(),
+                  rand_column_families, /* cmp_cf_idx */ 0,
+                  /* mismatch_cf_idx */ j);
               is_consistent = false;
               break;
             }
@@ -706,15 +816,23 @@ class CfConsistencyStressTest : public StressTest {
             continue;
           }
 
-          assert(s.ok());
+          DB_STRESS_ASSERT_OK(s);
           if (cmp_s.IsNotFound()) {
             fprintf(
                 stderr,
                 "MultiGetEntity returns different results for key %s: CF %s "
-                "returns not found, CF %s returns entity %s\n",
+                "returns not found, CF %s returns entity %s"
+                " [snapshot_seq=%" PRIu64 " latest_seq=%" PRIu64 "]\n",
                 StringToHex(key).c_str(), column_family_names_[0].c_str(),
                 column_family_names_[j].c_str(),
-                WideColumnsToHex(columns).c_str());
+                WideColumnsToHex(columns).c_str(),
+                snapshot_guard.snapshot()->GetSequenceNumber(),
+                db_->GetLatestSequenceNumber());
+            DumpGetEntityMismatchDebug(
+                key, read_opts_copy,
+                snapshot_guard.snapshot()->GetSequenceNumber(),
+                rand_column_families, /* cmp_cf_idx */ 0,
+                /* mismatch_cf_idx */ j);
             is_consistent = false;
             break;
           }
@@ -723,11 +841,19 @@ class CfConsistencyStressTest : public StressTest {
             fprintf(
                 stderr,
                 "MultiGetEntity returns different results for key %s: CF %s "
-                "returns entity %s, CF %s returns entity %s\n",
+                "returns entity %s, CF %s returns entity %s"
+                " [snapshot_seq=%" PRIu64 " latest_seq=%" PRIu64 "]\n",
                 StringToHex(key).c_str(), column_family_names_[0].c_str(),
                 WideColumnsToHex(cmp_columns).c_str(),
                 column_family_names_[j].c_str(),
-                WideColumnsToHex(columns).c_str());
+                WideColumnsToHex(columns).c_str(),
+                snapshot_guard.snapshot()->GetSequenceNumber(),
+                db_->GetLatestSequenceNumber());
+            DumpGetEntityMismatchDebug(
+                key, read_opts_copy,
+                snapshot_guard.snapshot()->GetSequenceNumber(),
+                rand_column_families, /* cmp_cf_idx */ 0,
+                /* mismatch_cf_idx */ j);
             is_consistent = false;
             break;
           }
@@ -757,6 +883,26 @@ class CfConsistencyStressTest : public StressTest {
         }
       }
     }
+
+    // Cross-CF note: the lazy read API has no cross-column-family (`CF**`)
+    // overload yet -- MultiGetEntityLazy is single-CF -- so we exercise it on
+    // just cfhs[0] (a cross-CF lazy overload is a planned follow-up; see the
+    // lazy blob resolution plan). The attribute-group branch above reuses its
+    // already-read cfhs[0] columns as the reference; the non-attribute branch
+    // reads each key across CFs one at a time and so holds no batch of cfhs[0]
+    // results to reuse -- fall back to a self-contained lazy read there.
+    if (!FLAGS_use_attribute_group && LazyEntityReadEnabled()) {
+      std::vector<std::string> lazy_key_strs;
+      std::vector<Slice> lazy_key_slices;
+      lazy_key_strs.reserve(num_keys);
+      lazy_key_slices.reserve(num_keys);
+      for (size_t i = 0; i < num_keys; ++i) {
+        lazy_key_strs.emplace_back(Key(rand_keys[i]));
+        lazy_key_slices.emplace_back(lazy_key_strs.back());
+      }
+      MaybeTestMultiGetEntityLazy(thread, read_opts_copy, cfhs[0], num_keys,
+                                  lazy_key_slices.data());
+    }
   }
 
   Status TestPrefixScan(ThreadState* thread, const ReadOptions& readoptions,
@@ -772,8 +918,11 @@ class CfConsistencyStressTest : public StressTest {
 
     const Slice prefix(key.data(), prefix_to_use);
 
+    ScanWitnessLog witness(thread, "prefix_scan_cf_consistency");
+
     std::string upper_bound;
     Slice ub_slice;
+    std::function<bool(const TableProperties&)> table_filter;
 
     ReadOptions ro_copy = readoptions;
     std::unique_ptr<ManagedSnapshot> snapshot = nullptr;
@@ -788,8 +937,9 @@ class CfConsistencyStressTest : public StressTest {
       ub_slice = Slice(upper_bound);
       ro_copy.iterate_upper_bound = &ub_slice;
       if (FLAGS_use_sqfc_for_range_queries) {
-        ro_copy.table_filter =
+        table_filter =
             sqfc_factory_->GetTableFilterForRangeQuery(prefix, ub_slice);
+        ro_copy.table_filter = &table_filter;
       }
     }
 
@@ -800,35 +950,79 @@ class CfConsistencyStressTest : public StressTest {
 
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro_copy, cfh));
 
+    if (witness.Enabled()) {
+      std::ostringstream start_oss;
+      start_oss << "action=start cf=" << cfh->GetName() << " key={"
+                << FormatDiagnosticSlice(Slice(key)) << "} prefix={"
+                << FormatDiagnosticSlice(prefix) << "} upper_bound={"
+                << (upper_bound.empty()
+                        ? "none"
+                        : FormatDiagnosticSlice(Slice(upper_bound)))
+                << "} read_options={"
+                << FormatReadOptionsForDiagnostics(ro_copy) << "}";
+      witness.Add(start_oss.str());
+    }
+
     uint64_t count = 0;
     Status s;
 
-    for (iter->Seek(prefix); iter->Valid() && iter->key().starts_with(prefix);
-         iter->Next()) {
+    iter->Seek(prefix);
+    witness.AddIteratorState("Seek", "prefix_scan", *iter,
+                             !ro_copy.allow_unprepared_value);
+    while (iter->Valid() && iter->key().starts_with(prefix)) {
       ++count;
 
       if (ro_copy.allow_unprepared_value) {
+        witness.AddIteratorState("PrepareValueBefore", "prefix_scan", *iter,
+                                 false);
         if (!iter->PrepareValue()) {
           s = iter->status();
+          witness.AddIteratorState("PrepareValueFailed", "prefix_scan", *iter,
+                                   false);
           break;
         }
+        witness.AddIteratorState("PrepareValue", "prefix_scan", *iter, true);
       }
 
       if (!VerifyWideColumns(iter->value(), iter->columns())) {
         s = Status::Corruption("Value and columns inconsistent",
                                DebugString(iter->value(), iter->columns()));
+        witness.Add("failure=wide_columns_inconsistent key={" +
+                    FormatDiagnosticSlice(iter->key()) +
+                    "} value_size=" + std::to_string(iter->value().size()) +
+                    " status=" + SanitizeDiagnosticValue(s.ToString()));
         break;
       }
+      iter->Next();
+      witness.AddIteratorState("Next", "prefix_scan", *iter,
+                               !ro_copy.allow_unprepared_value);
     }
 
-    assert(prefix_to_use == 0 ||
-           count <= GetPrefixKeyCount(prefix.ToString(), upper_bound));
+    if (prefix_to_use != 0) {
+      if (witness.Enabled()) {
+        const uint64_t expected_count =
+            GetPrefixKeyCount(prefix.ToString(), upper_bound);
+        if (count > expected_count) {
+          std::ostringstream failure_oss;
+          failure_oss << "failure=prefix_count_exceeded count=" << count
+                      << " expected_count=" << expected_count;
+          witness.Add(failure_oss.str());
+          witness.Flush("prefix_scan_cf_consistency_count");
+        }
+        assert(count <= expected_count);
+      } else {
+        assert(count <= GetPrefixKeyCount(prefix.ToString(), upper_bound));
+      }
+    }
 
     if (s.ok()) {
       s = iter->status();
     }
 
     if (!s.ok() && !IsErrorInjectedAndRetryable(s)) {
+      witness.Add("failure=prefix_scan_status status=" +
+                  SanitizeDiagnosticValue(s.ToString()));
+      witness.Flush("prefix_scan_cf_consistency_status");
       fprintf(stderr, "TestPrefixScan error: %s\n", s.ToString().c_str());
       thread->stats.AddErrors(1);
 
@@ -1056,17 +1250,6 @@ class CfConsistencyStressTest : public StressTest {
     SharedState* shared = thread->shared;
     assert(shared);
 
-    if (secondary_db_) {
-      status = secondary_db_->TryCatchUpWithPrimary();
-      if (!status.ok()) {
-        fprintf(stderr, "TryCatchUpWithPrimary: %s\n",
-                status.ToString().c_str());
-        shared->SetShouldStopTest();
-        assert(false);
-        return;
-      }
-    }
-
     const auto checksum_column_family = [](Iterator* iter,
                                            uint32_t* checksum) -> Status {
       assert(nullptr != checksum);
@@ -1090,46 +1273,78 @@ class CfConsistencyStressTest : public StressTest {
     // `FLAGS_rate_limit_user_ops` to avoid slowing any validation.
     ReadOptions ropts(FLAGS_verify_checksum, true);
     ropts.total_order_seek = true;
-    if (nullptr == secondary_db_ || FLAGS_auto_refresh_iterator_with_snapshot) {
+    if (nullptr == secondary_db_) {
       ropts.snapshot = snapshot_guard.snapshot();
       ropts.auto_refresh_iterator_with_snapshot = true;
     }
-    uint32_t crc = 0;
-    {
-      // Compute crc for all key-values of default column family.
-      std::unique_ptr<Iterator> it(db_ptr->NewIterator(ropts));
-      status = checksum_column_family(it.get(), &crc);
-      if (!status.ok()) {
-        fprintf(stderr, "Computing checksum of default cf: %s\n",
-                status.ToString().c_str());
-        assert(false);
-      }
+
+    std::vector<Iterator*> raw_iterators;
+    Status catch_up_status;
+    if (secondary_db_) {
+      // The separate thread intentionally overlaps catch-up with
+      // NewIterators(). Fault injection is disabled separately because its
+      // state is thread-local.
+      port::Thread catch_up_thread([&]() {
+        if (db_fault_injection_fs_) {
+          db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+        }
+        catch_up_status = secondary_db_->TryCatchUpWithPrimary();
+        if (db_fault_injection_fs_) {
+          db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+        }
+      });
+      status = db_ptr->NewIterators(ropts, cfhs, &raw_iterators);
+      catch_up_thread.join();
+    } else {
+      status = db_ptr->NewIterators(ropts, cfhs, &raw_iterators);
     }
-    // Since we currently intentionally disallow reading from the secondary
-    // instance with snapshot, we cannot achieve cross-cf consistency if WAL is
-    // enabled because there is no guarantee that secondary instance replays
-    // the primary's WAL to a consistent point where all cfs have the same
-    // data.
-    if (status.ok() && FLAGS_disable_wal) {
-      uint32_t tmp_crc = 0;
-      for (ColumnFamilyHandle* cfh : cfhs) {
-        if (cfh == db_ptr->DefaultColumnFamily()) {
-          continue;
-        }
-        std::unique_ptr<Iterator> it(db_ptr->NewIterator(ropts, cfh));
-        status = checksum_column_family(it.get(), &tmp_crc);
-        if (!status.ok() || tmp_crc != crc) {
-          break;
-        }
-      }
+
+    std::vector<std::unique_ptr<Iterator>> iterators;
+    iterators.reserve(raw_iterators.size());
+    for (Iterator* iterator : raw_iterators) {
+      iterators.emplace_back(iterator);
+    }
+
+    if (secondary_db_ && !catch_up_status.ok()) {
+      fprintf(stderr, "TryCatchUpWithPrimary: %s\n",
+              catch_up_status.ToString().c_str());
+      shared->SetShouldStopTest();
+      assert(false);
+      return;
+    }
+    if (!status.ok()) {
+      fprintf(stderr, "NewIterators: %s\n", status.ToString().c_str());
+      shared->SetShouldStopTest();
+      assert(false);
+      return;
+    }
+
+    // With WAL enabled, secondary MANIFEST recovery can expose flushed state
+    // beyond the point reached by WAL replay. NewIterators() keeps one
+    // published view but cannot make those column families logically
+    // consistent.
+    const size_t num_cfs_to_verify =
+        FLAGS_disable_wal ? iterators.size()
+                          : std::min<size_t>(1, iterators.size());
+    uint32_t expected_crc = 0;
+    for (size_t i = 0; i < num_cfs_to_verify; ++i) {
+      uint32_t crc = 0;
+      status = checksum_column_family(iterators[i].get(), &crc);
       if (!status.ok()) {
-        fprintf(stderr, "status: %s\n", status.ToString().c_str());
+        fprintf(stderr, "Computing checksum of cf %zu: %s\n", i,
+                status.ToString().c_str());
         shared->SetShouldStopTest();
         assert(false);
-      } else if (tmp_crc != crc) {
-        fprintf(stderr, "tmp_crc=%" PRIu32 " crc=%" PRIu32 "\n", tmp_crc, crc);
+        return;
+      }
+      if (i == 0) {
+        expected_crc = crc;
+      } else if (FLAGS_disable_wal && crc != expected_crc) {
+        fprintf(stderr, "cf %zu crc=%" PRIu32 " expected=%" PRIu32 "\n", i, crc,
+                expected_crc);
         shared->SetShouldStopTest();
         assert(false);
+        return;
       }
     }
   }
@@ -1145,11 +1360,310 @@ class CfConsistencyStressTest : public StressTest {
   }
 
  private:
+  enum class DebugOpKind : uint8_t {
+    kPut,
+    kPutEntity,
+    kAttributeGroupPutEntity,
+    kTimedPut,
+    kMerge,
+    kDelete,
+    kDeleteRange,
+  };
+
+  struct DebugEvent {
+    DebugOpKind op;
+    std::string key;
+    std::string end_key;
+    // [seq_before, seq_after] is the observed latest-sequence window around
+    // the write. Exact per-CF sequence mapping is only available when
+    // seq_after == seq_before + batch_count.
+    SequenceNumber seq_before;
+    SequenceNumber seq_after;
+    uint32_t batch_count;
+    uint32_t value_base;
+    uint64_t write_unix_time;
+    std::vector<int> cfs;
+  };
+
+  static constexpr size_t kMaxRecentDebugEvents = 512;
+  static const char* DebugOpKindName(DebugOpKind op) {
+    switch (op) {
+      case DebugOpKind::kPut:
+        return "Put";
+      case DebugOpKind::kPutEntity:
+        return "PutEntity";
+      case DebugOpKind::kAttributeGroupPutEntity:
+        return "AttributeGroupPutEntity";
+      case DebugOpKind::kTimedPut:
+        return "TimedPut";
+      case DebugOpKind::kMerge:
+        return "Merge";
+      case DebugOpKind::kDelete:
+        return "Delete";
+      case DebugOpKind::kDeleteRange:
+        return "DeleteRange";
+    }
+    return "Unknown";
+  }
+
+  std::string DebugCfName(int cf) const {
+    if (cf >= 0 && static_cast<size_t>(cf) < column_family_names_.size()) {
+      return column_family_names_[cf] + "#" + std::to_string(cf);
+    }
+    return "cf#" + std::to_string(cf);
+  }
+
+  void RecordDebugEvent(DebugEvent event) {
+    std::lock_guard<std::mutex> lock(debug_mu_);
+    recent_debug_events_.emplace_back(std::move(event));
+    if (recent_debug_events_.size() > kMaxRecentDebugEvents) {
+      recent_debug_events_.pop_front();
+    }
+  }
+
+  static bool EventTouchesKey(const DebugEvent& event, const std::string& key) {
+    if (event.op == DebugOpKind::kDeleteRange) {
+      return event.key <= key && key < event.end_key;
+    }
+    return event.key == key;
+  }
+
+  void ReportInvalidWriteSequenceBounds(ThreadState* thread,
+                                        const std::string& key,
+                                        SequenceNumber latest_seq_before,
+                                        SequenceNumber latest_seq_after,
+                                        uint32_t batch_count,
+                                        uint32_t value_base) {
+    fprintf(stderr,
+            "Write sequence bounds invalid for key %s: latest_before=%" PRIu64
+            " batch_count=%u latest_after=%" PRIu64 " value_base=%u\n",
+            Slice(key).ToString(true).c_str(), latest_seq_before, batch_count,
+            latest_seq_after, value_base);
+    thread->stats.AddErrors(1);
+    thread->shared->SetVerificationFailure();
+  }
+
+  static bool HasExactCfSequenceMapping(const DebugEvent& event) {
+    return event.seq_after ==
+           event.seq_before + static_cast<SequenceNumber>(event.batch_count);
+  }
+
+  bool TryGetEventSequenceForCf(const DebugEvent& event, int cf,
+                                SequenceNumber* seq) const {
+    if (!HasExactCfSequenceMapping(event)) {
+      return false;
+    }
+    const size_t count =
+        std::min(event.cfs.size(), static_cast<size_t>(event.batch_count));
+    for (size_t i = 0; i < count; ++i) {
+      if (event.cfs[i] == cf) {
+        *seq = event.seq_before + static_cast<SequenceNumber>(i + 1);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::string FormatCfSequenceSummary(const DebugEvent& event,
+                                      SequenceNumber snapshot_seq) const {
+    if (!HasExactCfSequenceMapping(event)) {
+      return "interleaved-with-other-writes";
+    }
+    const size_t count =
+        std::min(event.cfs.size(), static_cast<size_t>(event.batch_count));
+    std::string summary;
+    for (size_t i = 0; i < count; ++i) {
+      if (!summary.empty()) {
+        summary.append(", ");
+      }
+      const SequenceNumber seq =
+          event.seq_before + static_cast<SequenceNumber>(i + 1);
+      summary.append(DebugCfName(event.cfs[i]));
+      summary.push_back('@');
+      summary.append(std::to_string(seq));
+      summary.append(seq <= snapshot_seq ? ":visible" : ":hidden");
+    }
+    if (event.batch_count != event.cfs.size()) {
+      if (!summary.empty()) {
+        summary.push_back(' ');
+      }
+      summary.append("(batch_count=");
+      summary.append(std::to_string(event.batch_count));
+      summary.append(", cf_count=");
+      summary.append(std::to_string(event.cfs.size()));
+      summary.push_back(')');
+    }
+    return summary;
+  }
+
+  static std::string FormatValueResult(const Status& status,
+                                       const std::string& value) {
+    if (status.ok()) {
+      return Slice(value).ToString(true);
+    }
+    if (status.IsNotFound()) {
+      return "not found";
+    }
+    return status.ToString();
+  }
+
+  static std::string FormatEntityResult(const Status& status,
+                                        const PinnableWideColumns& columns) {
+    if (status.ok()) {
+      return WideColumnsToHex(columns.columns());
+    }
+    if (status.IsNotFound()) {
+      return "not found";
+    }
+    return status.ToString();
+  }
+
+  void DumpRecentDebugEvents(const std::string& key,
+                             SequenceNumber snapshot_seq, int cmp_cf,
+                             int mismatch_cf) const {
+    std::vector<DebugEvent> matched_events;
+    {
+      std::lock_guard<std::mutex> lock(debug_mu_);
+      for (const auto& event : recent_debug_events_) {
+        if (EventTouchesKey(event, key)) {
+          matched_events.push_back(event);
+        }
+      }
+    }
+
+    fprintf(stdout,
+            "[cf_consistency_debug] recent_events key=%s snapshot_seq=%" PRIu64
+            " matched_events=%" ROCKSDB_PRIszt "\n",
+            StringToHex(key).c_str(), snapshot_seq, matched_events.size());
+
+    for (const auto& event : matched_events) {
+      SequenceNumber cmp_seq = 0;
+      SequenceNumber mismatch_seq = 0;
+      const bool has_cmp_seq =
+          TryGetEventSequenceForCf(event, cmp_cf, &cmp_seq);
+      const bool has_mismatch_seq =
+          TryGetEventSequenceForCf(event, mismatch_cf, &mismatch_seq);
+      const bool snapshot_splits_focus_cfs = has_cmp_seq && has_mismatch_seq &&
+                                             cmp_seq <= snapshot_seq &&
+                                             snapshot_seq < mismatch_seq;
+
+      fprintf(stdout,
+              "[cf_consistency_debug] event op=%s key=%s end_key=%s "
+              "seq_before=%" PRIu64 " seq_after=%" PRIu64
+              " batch_count=%u exact_mapping=%s value_base=%u "
+              "write_unix_time=%" PRIu64
+              " focus_split=%s focus_cmp_seq=%s "
+              "focus_mismatch_seq=%s per_cf=%s\n",
+              DebugOpKindName(event.op), StringToHex(event.key).c_str(),
+              event.end_key.empty() ? "-" : StringToHex(event.end_key).c_str(),
+              event.seq_before, event.seq_after, event.batch_count,
+              HasExactCfSequenceMapping(event) ? "true" : "false",
+              event.value_base, event.write_unix_time,
+              snapshot_splits_focus_cfs ? "true" : "false",
+              has_cmp_seq ? std::to_string(cmp_seq).c_str() : "-",
+              has_mismatch_seq ? std::to_string(mismatch_seq).c_str() : "-",
+              FormatCfSequenceSummary(event, snapshot_seq).c_str());
+    }
+  }
+
+  void DumpGetEntityMismatchDebug(const std::string& key,
+                                  const ReadOptions& snapshot_read_opts,
+                                  SequenceNumber snapshot_seq,
+                                  const std::vector<int>& rand_column_families,
+                                  size_t cmp_cf_idx, size_t mismatch_cf_idx) {
+    fprintf(stdout,
+            "[cf_consistency_debug] begin key=%s snapshot_seq=%" PRIu64
+            " latest_seq=%" PRIu64 " cmp_cf=%s mismatch_cf=%s\n",
+            StringToHex(key).c_str(), snapshot_seq,
+            db_->GetLatestSequenceNumber(),
+            DebugCfName(rand_column_families[cmp_cf_idx]).c_str(),
+            DebugCfName(rand_column_families[mismatch_cf_idx]).c_str());
+
+    ReadOptions latest_read_opts(snapshot_read_opts);
+    latest_read_opts.snapshot = nullptr;
+
+    for (int cf : rand_column_families) {
+      ColumnFamilyHandle* const cfh = column_families_[cf];
+
+      PinnableWideColumns snapshot_entity;
+      const Status snapshot_entity_status =
+          db_->GetEntity(snapshot_read_opts, cfh, key, &snapshot_entity);
+      std::string snapshot_value;
+      const Status snapshot_value_status =
+          DbStressGet(db_, snapshot_read_opts, cfh, key, &snapshot_value);
+
+      PinnableWideColumns latest_entity;
+      const Status latest_entity_status =
+          db_->GetEntity(latest_read_opts, cfh, key, &latest_entity);
+      std::string latest_value;
+      const Status latest_value_status =
+          DbStressGet(db_, latest_read_opts, cfh, key, &latest_value);
+
+      std::string snapshot_verify = "n/a";
+      if (snapshot_entity_status.ok()) {
+        snapshot_verify =
+            VerifyWideColumns(snapshot_entity.columns()) ? "true" : "false";
+      }
+
+      std::string latest_verify = "n/a";
+      if (latest_entity_status.ok()) {
+        latest_verify =
+            VerifyWideColumns(latest_entity.columns()) ? "true" : "false";
+      }
+
+      std::string snapshot_default_matches_get = "n/a";
+      if (snapshot_entity_status.ok() && snapshot_value_status.ok()) {
+        snapshot_default_matches_get =
+            WideColumnsHelper::GetDefaultColumn(snapshot_entity.columns()) ==
+                    Slice(snapshot_value)
+                ? "true"
+                : "false";
+      }
+
+      std::string latest_default_matches_get = "n/a";
+      if (latest_entity_status.ok() && latest_value_status.ok()) {
+        latest_default_matches_get =
+            WideColumnsHelper::GetDefaultColumn(latest_entity.columns()) ==
+                    Slice(latest_value)
+                ? "true"
+                : "false";
+      }
+
+      fprintf(
+          stdout,
+          "[cf_consistency_debug] cf=%s snapshot_get_entity=%s "
+          "snapshot_entity_verify=%s snapshot_get=%s "
+          "snapshot_default_matches_get=%s latest_get_entity=%s "
+          "latest_entity_verify=%s latest_get=%s "
+          "latest_default_matches_get=%s\n",
+          DebugCfName(cf).c_str(),
+          FormatEntityResult(snapshot_entity_status, snapshot_entity).c_str(),
+          snapshot_verify.c_str(),
+          FormatValueResult(snapshot_value_status, snapshot_value).c_str(),
+          snapshot_default_matches_get.c_str(),
+          FormatEntityResult(latest_entity_status, latest_entity).c_str(),
+          latest_verify.c_str(),
+          FormatValueResult(latest_value_status, latest_value).c_str(),
+          latest_default_matches_get.c_str());
+    }
+
+    DumpRecentDebugEvents(key, snapshot_seq, rand_column_families[cmp_cf_idx],
+                          rand_column_families[mismatch_cf_idx]);
+    fprintf(stdout, "[cf_consistency_debug] end key=%s\n",
+            StringToHex(key).c_str());
+    fflush(stdout);
+  }
+
   std::atomic<uint32_t> batch_id_;
+  mutable std::mutex debug_mu_;
+  std::deque<DebugEvent> recent_debug_events_;
 };
 
-StressTest* CreateCfConsistencyStressTest() {
-  return new CfConsistencyStressTest();
+StressTest* CreateCfConsistencyStressTest(int db_index,
+                                          const std::string& db_path,
+                                          const std::string& ev_path,
+                                          const std::string& sec_path) {
+  return new CfConsistencyStressTest(db_index, db_path, ev_path, sec_path);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

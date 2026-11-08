@@ -66,7 +66,8 @@ Status RangeTreeLockManager::TryLock(PessimisticTransaction* txn,
                                      bool exclusive) {
   toku::lock_request request;
   request.create(mutex_factory_);
-  DBT start_key_dbt, end_key_dbt;
+  DBT start_key_dbt;
+  DBT end_key_dbt;
 
   TEST_SYNC_POINT("RangeTreeLockManager::TryRangeLock:enter");
   std::string start_key;
@@ -87,9 +88,16 @@ Status RangeTreeLockManager::TryLock(PessimisticTransaction* txn,
               exclusive ? toku::lock_request::WRITE : toku::lock_request::READ,
               false /* not a big txn */, &wait_key);
 
-  // This is for "periodically wake up and check if the wait is killed" feature
-  // which we are not using.
+  // Poll for kill only when an embedder installed a kill-check callback;
+  // otherwise IsKilledThunk can never fire and the 100ms wakeups are pure
+  // overhead.
+  constexpr uint64_t kKillPollMs = 100;
   uint64_t killed_time_msec = 0;
+  int (*killed_thunk)(void*) = nullptr;
+  if (killed_callback_) {
+    killed_time_msec = kKillPollMs;
+    killed_thunk = &IsKilledThunk;
+  }
   uint64_t wait_time_msec = txn->GetLockTimeout();
 
   if (wait_time_msec == static_cast<uint64_t>(-1)) {
@@ -116,9 +124,8 @@ Status RangeTreeLockManager::TryLock(PessimisticTransaction* txn,
 
   request.start();
 
-  const int r = request.wait(wait_time_msec, killed_time_msec,
-                             nullptr,  // killed_callback
-                             wait_callback_for_locktree, nullptr);
+  const int r = request.wait(wait_time_msec, killed_time_msec, killed_thunk,
+                             this, wait_callback_for_locktree, nullptr);
 
   // Inform the txn that we are no longer waiting:
   txn->ClearWaitingTxn();
@@ -129,6 +136,8 @@ Status RangeTreeLockManager::TryLock(PessimisticTransaction* txn,
       break;  // fall through
     case DB_LOCK_NOTGRANTED:
       return Status::TimedOut(Status::SubCode::kLockTimeout);
+    case DB_LOCK_INTERRUPTED:
+      return Status::Aborted();
     case TOKUDB_OUT_OF_LOCKS:
       return Status::LockLimit();
     case DB_LOCK_DEADLOCK: {
@@ -143,6 +152,10 @@ Status RangeTreeLockManager::TryLock(PessimisticTransaction* txn,
   }
 
   return Status::OK();
+}
+
+int RangeTreeLockManager::IsKilledThunk(void* extra) {
+  return static_cast<RangeTreeLockManager*>(extra)->killed_callback_() ? 1 : 0;
 }
 
 // Wait callback that locktree library will call to inform us about
@@ -201,6 +214,20 @@ void RangeTreeLockManager::UnLock(PessimisticTransaction* txn,
   ((RangeTreeLockTracker*)range_tracker)->ReleaseLocks(this, txn, all_keys);
 }
 
+// Comparator for range-lock endpoints. This is intentionally
+// direction-AGNOSTIC: it orders the user-key bytes with the column family's own
+// comparator, then breaks ties on the endpoint-type suffix byte (infimum before
+// supremum), which is a positional marker independent of the CF's sort
+// direction.
+//
+// CALLER REQUIREMENT: it is the caller's responsibility to pass in a flipped
+// (swapped start/end, with negated infimum/supremum flags) range for RangeLock
+// to work on a REVERSE-ORDERED column family. The locktree requires every range
+// to satisfy left <= right, and this comparator does NOT compensate for reverse
+// ordering on the caller's behalf. MyRocks does this flip today in
+// ha_rocksdb::set_range_lock() (see its "RangeFlagsShouldBeFlippedForRevCF"
+// comment). Do not re-add reverse-awareness here (that double-corrects callers
+// like MyRocks that already flip).
 int RangeTreeLockManager::CompareDbtEndpoints(void* arg, const DBT* a_key,
                                               const DBT* b_key) {
   const char* a = (const char*)a_key->data;
@@ -214,26 +241,21 @@ int RangeTreeLockManager::CompareDbtEndpoints(void* arg, const DBT* a_key,
   // Compare the values. The first byte encodes the endpoint type, its value
   // is either SUFFIX_INFIMUM or SUFFIX_SUPREMUM.
   Comparator* cmp = (Comparator*)arg;
-  int res = cmp->Compare(Slice(a + 1, min_len - 1), Slice(b + 1, min_len - 1));
+  int res = cmp->CompareWithoutTimestamp(
+      Slice(a + 1, min_len - 1), /*a_has_ts=*/false, Slice(b + 1, min_len - 1),
+      /*b_has_ts=*/false);
   if (!res) {
+    // The user keys compared equal above, so order by the endpoint-type suffix
+    // byte (a positional boundary marker: infimum before the key, supremum
+    // after) -- direction-independent; see the function-level comment.
     if (b_len > min_len) {
-      // a is shorter;
-      if (a[0] == SUFFIX_INFIMUM) {
-        return -1;  //"a is smaller"
-      } else {
-        // a is considered padded with 0xFF:FF:FF:FF...
-        return 1;  // "a" is bigger
-      }
+      // a's user key is a prefix of b's; a is shorter.
+      return a[0] == SUFFIX_INFIMUM ? -1 : 1;
     } else if (a_len > min_len) {
-      // the opposite of the above: b is shorter.
-      if (b[0] == SUFFIX_INFIMUM) {
-        return 1;  //"b is smaller"
-      } else {
-        // b is considered padded with 0xFF:FF:FF:FF...
-        return -1;  // "b" is bigger
-      }
+      // b's user key is a prefix of a's; b is shorter.
+      return b[0] == SUFFIX_INFIMUM ? 1 : -1;
     } else {
-      // the lengths are equal (and the key values, too)
+      // Same user key: infimum sorts before supremum.
       if (a[0] < b[0]) {
         return -1;
       } else if (a[0] > b[0]) {
@@ -273,7 +295,8 @@ int RangeTreeLockManager::on_create(toku::locktree* lt, void* arg) {
 
 bool RangeTreeLockManager::OnEscalationBarrierCheck(const DBT* a, const DBT* b,
                                                     void* extra) {
-  Endpoint a_endp, b_endp;
+  Endpoint a_endp;
+  Endpoint b_endp;
   deserialize_endpoint(a, &a_endp);
   deserialize_endpoint(b, &b_endp);
   auto self = static_cast<RangeTreeLockManager*>(extra);

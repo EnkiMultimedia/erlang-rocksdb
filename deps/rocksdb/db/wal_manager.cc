@@ -16,7 +16,7 @@
 
 #include "db/log_reader.h"
 #include "db/log_writer.h"
-#include "db/transaction_log_impl.h"
+#include "db/wal_iterator_impl.h"
 #include "db/write_batch_internal.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -33,6 +33,22 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+WalManager::WalManager(const ImmutableDBOptions& db_options,
+                       const FileOptions& file_options,
+                       const std::shared_ptr<IOTracer>& io_tracer,
+                       const bool seq_per_batch)
+    : db_options_(db_options),
+      file_options_(file_options),
+      env_(db_options.env),
+      fs_(db_options.fs, io_tracer),
+      purge_wal_files_last_run_(0),
+      seq_per_batch_(seq_per_batch),
+      wal_dir_(db_options_.GetWalDir()),
+      wal_in_db_path_(db_options_.IsWalDirSameAsDBPath()),
+      io_tracer_(io_tracer),
+      recovery_sequence_tracker_(
+          std::make_shared<WalRecoverySequenceTracker>()) {}
 
 Status WalManager::DeleteFile(const std::string& fname, uint64_t number) {
   auto s = env_->DeleteFile(wal_dir_ + "/" + fname);
@@ -58,7 +74,7 @@ Status WalManager::GetSortedWalFiles(VectorWalPtr& files, bool need_seqnos,
 
   // Reproduce the race condition where a log file is moved
   // to archived dir, between these two sync points, used in
-  // (DBTest,TransactionLogIteratorRace)
+  // (DBWalIteratorTest,Race)
   TEST_SYNC_POINT("WalManager::GetSortedWalFiles:1");
   TEST_SYNC_POINT("WalManager::GetSortedWalFiles:2");
 
@@ -100,10 +116,10 @@ Status WalManager::GetSortedWalFiles(VectorWalPtr& files, bool need_seqnos,
   return s;
 }
 
-Status WalManager::GetUpdatesSince(
-    SequenceNumber seq, std::unique_ptr<TransactionLogIterator>* iter,
-    const TransactionLogIterator::ReadOptions& read_options,
-    VersionSet* version_set) {
+Status WalManager::GetUpdatesSince(SequenceNumber seq,
+                                   std::unique_ptr<WalIterator>* iter,
+                                   const WalIterator::ReadOptions& read_options,
+                                   VersionSet* version_set) {
   if (seq_per_batch_) {
     return Status::NotSupported();
   }
@@ -113,6 +129,8 @@ Status WalManager::GetUpdatesSince(
   //  Get all sorted Wal Files.
   //  Do binary search and open files and find the seq number.
 
+  const uint64_t recovery_sequence_generation =
+      recovery_sequence_tracker_->CurrentGeneration();
   std::unique_ptr<VectorWalPtr> wal_files(new VectorWalPtr);
   Status s = GetSortedWalFiles(*wal_files);
   if (!s.ok()) {
@@ -123,10 +141,17 @@ Status WalManager::GetUpdatesSince(
   if (!s.ok()) {
     return s;
   }
-  iter->reset(new TransactionLogIteratorImpl(
+  iter->reset(new WalIteratorImpl(
       wal_dir_, &db_options_, read_options, file_options_, seq,
-      std::move(wal_files), version_set, seq_per_batch_, io_tracer_));
+      std::move(wal_files), version_set, seq_per_batch_, io_tracer_,
+      recovery_sequence_tracker_, recovery_sequence_generation));
   return (*iter)->status();
+}
+
+void WalManager::RecordIndeterminateWriteSequence(uint64_t wal_number,
+                                                  SequenceNumber start_sequence,
+                                                  SequenceNumber end_sequence) {
+  recovery_sequence_tracker_->Record(wal_number, start_sequence, end_sequence);
 }
 
 // 1. Go through all archived files and
@@ -286,11 +311,13 @@ void WalManager::PurgeObsoleteWALFiles() {
 
 void WalManager::ArchiveWALFile(const std::string& fname, uint64_t number) {
   auto archived_log_name = ArchivedLogFileName(wal_dir_, number);
-  // The sync point below is used in (DBTest,TransactionLogIteratorRace)
+  // The sync point below is used in
+  // (DBWalIteratorTest,Race)
   TEST_SYNC_POINT("WalManager::PurgeObsoleteFiles:1");
   Status s = env_->RenameFile(fname, archived_log_name);
   IGNORE_STATUS_IF_ERROR(s);
-  // The sync point below is used in (DBTest,TransactionLogIteratorRace)
+  // The sync point below is used in
+  // (DBWalIteratorTest,Race)
   TEST_SYNC_POINT("WalManager::PurgeObsoleteFiles:2");
   // The sync point below is used in
   // (CheckPointTest, CheckpointWithArchievedLog)
@@ -329,7 +356,7 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
 
       // Reproduce the race condition where a log file is moved
       // to archived dir, between these two sync points, used in
-      // (DBTest,TransactionLogIteratorRace)
+      // (DBWalIteratorTest,Race)
       TEST_SYNC_POINT("WalManager::GetSortedWalsOfType:1");
       TEST_SYNC_POINT("WalManager::GetSortedWalsOfType:2");
 

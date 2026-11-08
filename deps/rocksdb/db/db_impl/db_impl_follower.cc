@@ -36,7 +36,7 @@ DBImplFollower::DBImplFollower(const DBOptions& db_options,
 }
 
 DBImplFollower::~DBImplFollower() {
-  Status s = Close();
+  Status s = DBImplFollower::Close();
   if (!s.ok()) {
     ROCKS_LOG_INFO(immutable_db_options_.info_log, "Error closing DB : %s",
                    s.ToString().c_str());
@@ -131,21 +131,21 @@ Status DBImplFollower::TryCatchUpWithLeader() {
       for (auto cfd : cfds_changed) {
         if (cfd->mem()->GetEarliestSequenceNumber() <
             versions_->LastSequence()) {
-          // Construct a new memtable with earliest sequence number set to the
-          // last sequence number in the VersionSet. This matters when
-          // DBImpl::MultiCFSnapshot tries to get consistent references
-          // to super versions in a lock free manner, it checks the earliest
-          // sequence number to detect if there was a change in version in
-          // the meantime.
-          MemTable* new_mem = cfd->ConstructNewMemtable(
-              cfd->GetLatestMutableCFOptions(), versions_->LastSequence());
-          cfd->mem()->SetNextLogNumber(cfd->GetLogNumber());
-          cfd->mem()->ConstructFragmentedRangeTombstones();
-          cfd->imm()->Add(cfd->mem(), &job_context.memtables_to_free);
-          new_mem->Ref();
-          cfd->SetMemtable(new_mem);
+          // Seal the active memtable so that its replacement gets its earliest
+          // sequence number set to the last sequence number in the VersionSet.
+          // This matters when DBImpl::MultiCFSnapshot tries to get consistent
+          // references to super versions in a lock free manner, it checks the
+          // earliest sequence number to detect if there was a change in
+          // version in the meantime.
+          SealActiveMemtable(cfd, cfd->GetLogNumber(),
+                             versions_->LastSequence(), &job_context);
         }
 
+        // `cfd->GetLogNumber()` is a safe watermark here, unlike in
+        // DBImplSecondary::TryCatchUpWithPrimary(): this catch-up path never
+        // replays WALs, so the memtables it collects hold nothing that only a
+        // not-yet-installed Version could make readable.
+        //
         // This will check if the old memtable is still referenced
         cfd->imm()->RemoveOldMemTables(cfd->GetLogNumber(),
                                        &job_context.memtables_to_free);
@@ -153,6 +153,7 @@ Status DBImplFollower::TryCatchUpWithLeader() {
         cfd->InstallSuperVersion(&sv_context, &mutex_);
         sv_context.NewSuperVersion();
       }
+      PublishSecondaryReadView();
     }
 
     for (auto& file : files_to_delete) {
@@ -164,6 +165,7 @@ Status DBImplFollower::TryCatchUpWithLeader() {
       }
     }
   }
+  CleanupRetiredSecondaryReadViews();
   job_context.Clean();
 
   // Cleanup unused, obsolete files.
@@ -295,7 +297,9 @@ Status DB::OpenAsFollower(
   impl->versions_.reset(new ReactiveVersionSet(
       dbname, &impl->immutable_db_options_, impl->mutable_db_options_,
       impl->file_options_, impl->table_cache_.get(),
-      impl->write_buffer_manager_, &impl->write_controller_, impl->io_tracer_));
+      impl->write_buffer_manager_, &impl->write_controller_, impl->io_tracer_,
+      impl->db_id_, impl->db_session_id_,
+      /*defer_sst_file_opening=*/false));
   impl->column_family_memtables_.reset(
       new ColumnFamilyMemTablesImpl(impl->versions_->GetColumnFamilySet()));
   impl->wal_in_db_path_ = impl->immutable_db_options_.IsWalDirSameAsDBPath();
@@ -321,9 +325,11 @@ Status DB::OpenAsFollower(
       sv_context.NewSuperVersion();
       cfd->InstallSuperVersion(&sv_context, &impl->mutex_);
     }
+    impl->PublishSecondaryReadView();
     impl->MarkAsyncFileOpenNotNeeded();
   }
   impl->mutex_.Unlock();
+  impl->CleanupRetiredSecondaryReadViews();
   sv_context.Clean();
   if (s.ok()) {
     dbptr->reset(impl);

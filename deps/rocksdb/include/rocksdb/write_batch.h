@@ -109,7 +109,8 @@ class WriteBatch : public WriteBatchBase {
                   const Slice& value, uint64_t write_unix_time) override;
 
   // Store the mapping "key->{column1:value1, column2:value2, ...}" in the
-  // column family specified by "column_family".
+  // column family specified by "column_family". See
+  // WriteBatchBase::PutEntity() for the lifetime requirements on `columns`.
   using WriteBatchBase::PutEntity;
   Status PutEntity(ColumnFamilyHandle* column_family, const Slice& key,
                    const WideColumns& columns) override;
@@ -479,7 +480,7 @@ class WriteBatch : public WriteBatchBase {
   WriteBatch(const WriteBatch& src);
   WriteBatch(WriteBatch&& src) noexcept;
   WriteBatch& operator=(const WriteBatch& src);
-  WriteBatch& operator=(WriteBatch&& src);
+  WriteBatch& operator=(WriteBatch&& src) noexcept;
 
   // marks this point in the WriteBatch as the last record to
   // be inserted into the WAL, provided the WAL is enabled

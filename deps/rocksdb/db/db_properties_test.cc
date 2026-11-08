@@ -125,7 +125,9 @@ TEST_F(DBPropertiesTest, Empty) {
 }
 
 TEST_F(DBPropertiesTest, CurrentVersionNumber) {
-  uint64_t v1, v2, v3;
+  uint64_t v1;
+  uint64_t v2;
+  uint64_t v3;
   ASSERT_TRUE(
       dbfull()->GetIntProperty("rocksdb.current-super-version-number", &v1));
   ASSERT_OK(Put("12345678", ""));
@@ -587,7 +589,9 @@ TEST_F(DBPropertiesTest, AggregatedTablePropertiesAtLevel) {
   std::string level_tp_strings[kMaxLevel];
   std::string tp_string;
   TableProperties level_tps[kMaxLevel];
-  TableProperties tp, sum_tp, expected_tp;
+  TableProperties tp;
+  TableProperties sum_tp;
+  TableProperties expected_tp;
   for (int table = 1; table <= kTableCount; ++table) {
     for (int i = 0; i < kPutsPerTable; ++i) {
       ASSERT_OK(db_->Put(WriteOptions(), rnd.RandomString(kKeySize),
@@ -770,6 +774,72 @@ TEST_F(DBPropertiesTest, NumImmutableMemTable) {
     SetPerfLevel(kDisable);
     ASSERT_TRUE(GetPerfLevel() == kDisable);
   } while (ChangeCompactOptions());
+}
+
+TEST_F(DBPropertiesTest, ConcurrentWriteMemTableProperties) {
+  Options options = CurrentOptions();
+  options.allow_concurrent_memtable_write = true;
+  options.memtable_factory = std::make_shared<SkipListFactory>();
+  options.flush_verify_memtable_count = true;
+  DestroyAndReopen(options);
+
+  // Multi-threaded writes that go through the concurrent Add() +
+  // BatchPostProcess path.
+  const int kNumThreads = 4;
+  const int kEntriesPerThread = 100;
+  std::vector<port::Thread> threads;
+  threads.reserve(kNumThreads);
+  for (int t = 0; t < kNumThreads; t++) {
+    threads.emplace_back([&, t]() {
+      for (int i = 0; i < kEntriesPerThread; i++) {
+        std::string key = "k_" + std::to_string(t) + "_" + std::to_string(i);
+        ASSERT_OK(Put(key, "val"));
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  uint64_t num_entries;
+  ASSERT_TRUE(dbfull()->GetIntProperty("rocksdb.num-entries-active-mem-table",
+                                       &num_entries));
+  ASSERT_EQ(num_entries,
+            static_cast<uint64_t>(kNumThreads * kEntriesPerThread));
+
+  // Write deletes and single deletes via concurrent path
+  threads.clear();
+  for (int t = 0; t < kNumThreads; t++) {
+    threads.emplace_back([&, t]() {
+      for (int i = 0; i < kEntriesPerThread; i++) {
+        std::string key = "d_" + std::to_string(t) + "_" + std::to_string(i);
+        if (i % 2 == 0) {
+          ASSERT_OK(Delete(key));
+        } else {
+          ASSERT_OK(SingleDelete(key));
+        }
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  uint64_t total_entries;
+  ASSERT_TRUE(dbfull()->GetIntProperty("rocksdb.num-entries-active-mem-table",
+                                       &total_entries));
+  ASSERT_EQ(total_entries,
+            static_cast<uint64_t>(kNumThreads * kEntriesPerThread * 2));
+
+  uint64_t num_deletes;
+  ASSERT_TRUE(dbfull()->GetIntProperty("rocksdb.num-deletes-active-mem-table",
+                                       &num_deletes));
+  ASSERT_EQ(num_deletes,
+            static_cast<uint64_t>(kNumThreads * kEntriesPerThread));
+
+  // Flush exercises the integrity check (flush_verify_memtable_count = true).
+  // If stat counters are wrong, this would return Corruption.
+  ASSERT_OK(Flush());
 }
 
 // TODO(techdept) : Disabled flaky test #12863555
@@ -1079,6 +1149,60 @@ TEST_F(DBPropertiesTest, EstimatePendingCompBytes) {
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   ASSERT_TRUE(dbfull()->GetIntProperty(
       "rocksdb.estimate-pending-compaction-bytes", &int_num));
+  ASSERT_EQ(int_num, 0U);
+}
+
+TEST_F(DBPropertiesTest, NumUnscheduledCompactions) {
+  if (env_ == nullptr) {
+    ADD_FAILURE() << "Missing test environment";
+    return;
+  }
+  auto& env = *env_;
+  env.SetBackgroundThreads(1, Env::HIGH);
+  env.SetBackgroundThreads(1, Env::LOW);
+
+  Options options = CurrentOptions();
+  WriteOptions writeOpt = WriteOptions();
+  writeOpt.disableWAL = true;
+  options.compaction_style = kCompactionStyleLevel;
+  options.level0_file_num_compaction_trigger = 2;
+  options.max_background_compactions = 1;
+  options.max_background_flushes = 1;
+  options.write_buffer_size = 1000000;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"one"}, options);
+
+  uint64_t int_num;
+
+  ASSERT_TRUE(dbfull()->GetIntProperty(
+      DB::Properties::kNumUnscheduledCompactions, &int_num));
+  ASSERT_EQ(int_num, 0U);
+
+  // Keep one scheduled compaction from completing.
+  test::SleepingBackgroundTask sleeping_task_low;
+  env.Schedule(&test::SleepingBackgroundTask::DoSleepTask, &sleeping_task_low,
+               Env::Priority::LOW);
+  sleeping_task_low.WaitUntilSleeping();
+
+  std::string big_value(1000000 * 2, 'x');
+  for (int cf = 0; cf < 2; cf++) {
+    for (int i = 0; i < 4; i++) {
+      ASSERT_OK(dbfull()->Put(writeOpt, handles_[cf], "k" + std::to_string(i),
+                              big_value));
+      ASSERT_OK(Flush(cf));
+    }
+  }
+
+  ASSERT_TRUE(dbfull()->GetIntProperty(
+      DB::Properties::kNumUnscheduledCompactions, &int_num));
+  ASSERT_GT(int_num, 0U);
+
+  sleeping_task_low.WakeUp();
+  sleeping_task_low.WaitUntilDone();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_TRUE(dbfull()->GetIntProperty(
+      DB::Properties::kNumUnscheduledCompactions, &int_num));
   ASSERT_EQ(int_num, 0U);
 }
 
