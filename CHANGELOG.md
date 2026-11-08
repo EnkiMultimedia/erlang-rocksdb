@@ -15,6 +15,16 @@
 
 ### Bug Fixes
 
+- a database opened with an env from `new_env/1` crashed the VM once the env term was garbage collected, for example when the process that opened it exited. The database now keeps its env alive. In-memory envs created by the `in_memory` and `{env, memenv}` options were never freed, they are now freed when the database closes.
+- using a write batch after `release_batch/1` crashed the VM, it now raises `badarg`. Concurrent calls on the same batch are serialized.
+- one malformed merge operand made flush fail and then every write, so the database stopped accepting writes. Now only reads of that key fail. This applies to the Erlang, bitset and counter merge operators.
+- the bitset merge operator wrote one byte past the bitmap for the first position after its end, and changed the stored value in place, so snapshots and concurrent readers saw bits they should not. Positions must now be plain decimal numbers inside the bitmap.
+- `int_add` in the Erlang merge operator and the counter merge operator wrapped around on overflow, they now fail the merge
+- closing a database, a column family or another handle while other processes still used it could crash the VM
+- an iterator using `auto_refresh_iterator_with_snapshot` read a freed snapshot after `release_snapshot/1`. Iterators now keep their snapshot. Reads given a released snapshot raise `badarg`, before they silently read the latest data.
+- an SST file reader iterator dropped without `sst_file_reader_iterator_close/1` kept its reader forever, and closing it could free the reader while the iterator still used it
+- `posting_list_contains/2` trusted the sizes inside the binary, a malformed one could ask for gigabytes of memory
+- repeating `iterate_upper_bound` or `iterate_lower_bound` in iterator options leaked memory
 - the build no longer downloads anything from the network: the vendored CRoaring build fetched a CMake helper from GitHub at configure time, so offline builds failed
 
 ### Changes

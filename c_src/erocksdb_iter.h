@@ -21,11 +21,14 @@
 #ifndef INCL_EROCKSDB_ITER_H
 #define INCL_EROCKSDB_ITER_H
 
+#include "refobjects.h"
+
 
 struct ItrBounds {
     rocksdb::ReadOptions* read_options;
     rocksdb::Slice *upper_bound_slice;
     rocksdb::Slice *lower_bound_slice;
+    erocksdb::ReferencePtr<erocksdb::SnapshotObject> snapshot;  //!< pinned read snapshot
 
     ItrBounds();
 };
