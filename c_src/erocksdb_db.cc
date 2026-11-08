@@ -108,6 +108,15 @@ parse_bbt_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::BlockBasedTableOpti
             else if (option[1] == erocksdb::ATOM_FLUSH_AND_COMPACTION)
                 opts.prepopulate_block_cache = rocksdb::BlockBasedTableOptions::PrepopulateBlockCache::kFlushAndCompaction;
         }
+        else if (option[0] == erocksdb::ATOM_OPTIMIZE_KEY_COMMON_PREFIX) {
+            // RocksDB 11.10: only takes effect with format_version >= 8
+            if (option[1] == erocksdb::ATOM_DISABLED)
+                opts.optimize_key_common_prefix = rocksdb::BlockBasedTableOptions::OptimizeKeyCommonPrefix::kDisabled;
+            else if (option[1] == erocksdb::ATOM_IF_FAST_SEEK)
+                opts.optimize_key_common_prefix = rocksdb::BlockBasedTableOptions::OptimizeKeyCommonPrefix::kIfFastSeek;
+            else if (option[1] == erocksdb::ATOM_ENABLED)
+                opts.optimize_key_common_prefix = rocksdb::BlockBasedTableOptions::OptimizeKeyCommonPrefix::kEnabled;
+        }
     }
 
     return erocksdb::ATOM_OK;
@@ -460,6 +469,28 @@ parse_db_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::DBOptions& opts)
         {
             opts.verify_manifest_content_on_close = (option[1] == erocksdb::ATOM_TRUE);
         }
+        else if (option[0] == erocksdb::ATOM_MAX_COMPACTION_TRIGGER_WAKEUP_SECONDS)
+        {
+            // RocksDB 11.2: how often compaction scores are re-evaluated on a quiet DB
+            ErlNifUInt64 val;
+            if (enif_get_uint64(env, option[1], &val))
+                opts.max_compaction_trigger_wakeup_seconds = val;
+        }
+        else if (option[0] == erocksdb::ATOM_OPTIMIZE_MANIFEST_FOR_RECOVERY)
+        {
+            // RocksDB 11.3
+            opts.optimize_manifest_for_recovery = (option[1] == erocksdb::ATOM_TRUE);
+        }
+        else if (option[0] == erocksdb::ATOM_REUSE_MANIFEST_ON_OPEN)
+        {
+            // RocksDB 11.3
+            opts.reuse_manifest_on_open = (option[1] == erocksdb::ATOM_TRUE);
+        }
+        else if (option[0] == erocksdb::ATOM_USE_DIRECT_IO_FOR_COMPACTION_READS)
+        {
+            // RocksDB 11.5
+            opts.use_direct_io_for_compaction_reads = (option[1] == erocksdb::ATOM_TRUE);
+        }
     }
     return erocksdb::ATOM_OK;
 }
@@ -631,6 +662,36 @@ ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnF
         {
             // RocksDB 11.1: batch lookup optimization for memtable MultiGet
             opts.memtable_batch_lookup_optimization = (option[1] == erocksdb::ATOM_TRUE);
+        }
+        else if (option[0] == erocksdb::ATOM_PERIODIC_COMPACTION_SECONDS)
+        {
+            ErlNifUInt64 val;
+            if (enif_get_uint64(env, option[1], &val))
+                opts.periodic_compaction_seconds = val;
+        }
+        else if (option[0] == erocksdb::ATOM_READ_TRIGGERED_COMPACTION_THRESHOLD)
+        {
+            // RocksDB 11.2: 0 disables; accept an integer or a float
+            double val;
+            ErlNifSInt64 ival;
+            if (enif_get_double(env, option[1], &val) && val >= 0.0)
+                opts.read_triggered_compaction_threshold = val;
+            else if (enif_get_int64(env, option[1], &ival) && ival >= 0)
+                opts.read_triggered_compaction_threshold = static_cast<double>(ival);
+        }
+        else if (option[0] == erocksdb::ATOM_MIN_TOMBSTONES_FOR_RANGE_CONVERSION)
+        {
+            // RocksDB 11.2: 0 disables
+            unsigned int val;
+            if (enif_get_uint(env, option[1], &val))
+                opts.min_tombstones_for_range_conversion = val;
+        }
+        else if (option[0] == erocksdb::ATOM_BLOB_FILE_WRITABLE_FILE_MAX_BUFFER_SIZE)
+        {
+            // RocksDB 11.9: 0 inherits writable_file_max_buffer_size
+            ErlNifUInt64 val;
+            if (enif_get_uint64(env, option[1], &val))
+                opts.blob_file_writable_file_max_buffer_size = val;
         }
         else if (option[0] == erocksdb::ATOM_MAX_BYTES_FOR_LEVEL_BASE)
         {

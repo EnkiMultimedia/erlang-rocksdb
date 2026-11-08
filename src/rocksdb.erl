@@ -424,12 +424,14 @@
                                       {block_cache, cache_handle()} |
                                       {block_cache_size, pos_integer()} |
                                       {bloom_filter_policy, BitsPerKey :: pos_integer()} |
-                                      {format_version, 2 | 3 | 4 | 5 | 6 | 7} |
+                                      {format_version, 2 | 3 | 4 | 5 | 6 | 7 | 8} |
                                       {cache_index_and_filter_blocks, boolean()} |
                                       %% RocksDB 11.0/11.1
                                       {index_block_search_type, binary_search | interpolation | auto} |
                                       {uniform_cv_threshold, float()} |
-                                      {prepopulate_block_cache, disable | flush_only | flush_and_compaction}].
+                                      {prepopulate_block_cache, disable | flush_only | flush_and_compaction} |
+                                      %% RocksDB 11.10+, needs format_version 8
+                                      {optimize_key_common_prefix, disabled | if_fast_seek | enabled}].
 
 -type merge_operator() :: erlang_merge_operator |
                           bitset_merge_operator |
@@ -513,7 +515,13 @@
                        {compaction_filter, compaction_filter_opts()} |
                        {target_file_size_is_upper_bound, boolean()} |
                        %% RocksDB 11.1+
-                       {memtable_batch_lookup_optimization, boolean()}
+                       {memtable_batch_lookup_optimization, boolean()} |
+                       {periodic_compaction_seconds, non_neg_integer()} |
+                       %% RocksDB 11.2+
+                       {read_triggered_compaction_threshold, number()} |
+                       {min_tombstones_for_range_conversion, non_neg_integer()} |
+                       %% RocksDB 11.9+
+                       {blob_file_writable_file_max_buffer_size, non_neg_integer()}
                       ].
 
 -type db_options() :: [{env, env()} |
@@ -572,7 +580,14 @@
                        %% open_files_async requires skip_stats_update_on_db_open = true
                        {open_files_async, boolean()} |
                        {enforce_write_buffer_manager_during_recovery, boolean()} |
-                       {verify_manifest_content_on_close, boolean()}].
+                       {verify_manifest_content_on_close, boolean()} |
+                       %% RocksDB 11.2+
+                       {max_compaction_trigger_wakeup_seconds, non_neg_integer()} |
+                       %% RocksDB 11.3+, experimental
+                       {optimize_manifest_for_recovery, boolean()} |
+                       {reuse_manifest_on_open, boolean()} |
+                       %% RocksDB 11.5+
+                       {use_direct_io_for_compaction_reads, boolean()}].
 
 -type options() :: db_options() | cf_options().
 

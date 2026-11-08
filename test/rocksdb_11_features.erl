@@ -88,6 +88,71 @@ abort_compactions_foreign_cf_test() ->
   ?rm_rf(Dir1), ?rm_rf(Dir2),
   ok.
 
+%% Options added in RocksDB 11.2 - 11.13. RocksDB writes the options it
+%% applied to an OPTIONS-* file, so check the values landed there.
+options_11_13_test() ->
+  Dir = "erocksdb.opts_11_13.test",
+  ?rm_rf(Dir),
+  Opts = [{create_if_missing, true},
+          {max_compaction_trigger_wakeup_seconds, 3600},
+          {optimize_manifest_for_recovery, true},
+          {reuse_manifest_on_open, true},
+          {periodic_compaction_seconds, 86400},
+          {read_triggered_compaction_threshold, 0.01},
+          {min_tombstones_for_range_conversion, 16},
+          {blob_file_writable_file_max_buffer_size, 1048576},
+          {block_based_table_options, [{format_version, 8},
+                                       {optimize_key_common_prefix, enabled}]}],
+  {ok, Ref} = rocksdb:open(Dir, Opts),
+  [ok = rocksdb:put(Ref, <<"prefix:", I:32>>, <<I:32>>, []) || I <- lists:seq(1, 500)],
+  [ok = rocksdb:delete(Ref, <<"prefix:", I:32>>, []) || I <- lists:seq(1, 100)],
+  ok = rocksdb:flush(Ref, []),
+  ok = rocksdb:close(Ref),
+
+  %% reopen exercises the manifest options and reads format_version 8 files
+  {ok, Ref2} = rocksdb:open(Dir, Opts),
+  not_found = rocksdb:get(Ref2, <<"prefix:", 1:32>>, []),
+  {ok, <<500:32>>} = rocksdb:get(Ref2, <<"prefix:", 500:32>>, []),
+  ok = rocksdb:close(Ref2),
+
+  Applied = latest_options_file(Dir),
+  lists:foreach(
+    fun(Expected) -> ?assertNotEqual(nomatch, binary:match(Applied, Expected)) end,
+    [<<"max_compaction_trigger_wakeup_seconds=3600">>,
+     <<"optimize_manifest_for_recovery=true">>,
+     <<"reuse_manifest_on_open=true">>,
+     <<"periodic_compaction_seconds=86400">>,
+     <<"read_triggered_compaction_threshold=0.01">>,
+     <<"min_tombstones_for_range_conversion=16">>,
+     <<"blob_file_writable_file_max_buffer_size=1048576">>,
+     <<"format_version=8">>,
+     <<"optimize_key_common_prefix=kEnabled">>]),
+
+  rocksdb:destroy(Dir, []),
+  ?rm_rf(Dir),
+  ok.
+
+use_direct_io_for_compaction_reads_test() ->
+  Dir = "erocksdb.direct_io_compaction_reads.test",
+  ?rm_rf(Dir),
+  {ok, Ref} = rocksdb:open(Dir, [{create_if_missing, true},
+                                 {use_direct_io_for_compaction_reads, true}]),
+  [ok = rocksdb:put(Ref, <<I:32>>, <<I:32>>, []) || I <- lists:seq(1, 100)],
+  ok = rocksdb:flush(Ref, []),
+  ok = rocksdb:compact_range(Ref, undefined, undefined, []),
+  {ok, <<100:32>>} = rocksdb:get(Ref, <<100:32>>, []),
+  ok = rocksdb:close(Ref),
+  ?assertNotEqual(nomatch, binary:match(latest_options_file(Dir),
+                                        <<"use_direct_io_for_compaction_reads=true">>)),
+  rocksdb:destroy(Dir, []),
+  ?rm_rf(Dir),
+  ok.
+
+latest_options_file(Dir) ->
+  [Latest | _] = lists:reverse(lists:sort(filelib:wildcard(filename:join(Dir, "OPTIONS-*")))),
+  {ok, Bin} = file:read_file(Latest),
+  Bin.
+
 %% DB options added in RocksDB 11.1
 db_options_test() ->
   Dir = "erocksdb.db_opts_11.test",
