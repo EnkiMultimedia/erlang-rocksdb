@@ -343,7 +343,11 @@ FilterResult ErlangCompactionFilter::CallErlangHandler(
     if (got_response) {
         result = batch->GetResult(0);
     } else {
-        // Timeout - default to keeping the key (safe fallback)
+        // Timeout: keep the key. A handler that did not answer in time is not
+        // asked again during this compaction, otherwise a stuck handler would
+        // cost one full timeout per key and stall compaction. The next
+        // compaction creates a new filter and asks it again.
+        m_HandlerDead = true;
         result = FilterResult(FilterDecision::Keep);
     }
 

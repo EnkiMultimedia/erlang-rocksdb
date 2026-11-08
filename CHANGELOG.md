@@ -27,6 +27,12 @@
 - repeating `iterate_upper_bound` or `iterate_lower_bound` in iterator options leaked memory
 - the build no longer downloads anything from the network: the vendored CRoaring build fetched a CMake helper from GitHub at configure time, so offline builds failed
 
+### Changes
+
+- posting list functions run on a dirty scheduler when the posting list is large (over 64 KB, or over 4096 keys for a parsed one), so they no longer hold a normal scheduler for milliseconds. Small lists still run inline.
+- a compaction filter handler that does not answer in time is not asked again for the rest of that compaction, the remaining keys are kept. Before, every key waited the full timeout, so a stuck handler could stall compaction for hours. The handler is asked again at the next compaction.
+- the `batch_size` option of the compaction filter is now documented as having no effect: keys are always sent one per message
+
 ### Deprecations
 
 - the `external_sst_file_global_seqno_offset` entry returned by `sst_file_reader_get_table_properties/1` is always 0: RocksDB 11.13 no longer records it

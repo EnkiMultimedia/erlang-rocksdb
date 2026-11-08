@@ -922,4 +922,66 @@ ERL_NIF_TERM PostingsToBinary(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
     return result_bin;
 }
 
+
+// Scheduling
+//
+// These functions take time linear in the size of the posting list, which the
+// caller controls. A normal scheduler should not be held much longer than a
+// millisecond, so large inputs move to a dirty CPU scheduler. Small ones,
+// the common case, stay inline and avoid the cost of rescheduling.
+
+static const size_t kDirtyInputBytes = 64 * 1024;  // binary inputs
+static const size_t kDirtyKeyCount = 4096;         // keys in a postings resource
+
+static size_t binary_args_size(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    size_t total = 0;
+    for (int i = 0; i < argc; i++) {
+        ErlNifBinary bin;
+        if (enif_inspect_binary(env, argv[i], &bin))
+            total += bin.size;
+    }
+    return total;
+}
+
+static size_t resource_key_count(ErlNifEnv* env, ERL_NIF_TERM term)
+{
+    PostingListResource* res;
+    if (!enif_get_resource(env, term, posting_list_resource_type, (void**)&res))
+        return 0;
+    return res->keys.size();
+}
+
+#define SCHEDULE_BY_BINARY_SIZE(NAME, FUN)                                         \
+    ERL_NIF_TERM FUN##Nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])     \
+    {                                                                              \
+        if (binary_args_size(env, argc, argv) > kDirtyInputBytes)                  \
+            return enif_schedule_nif(env, NAME, ERL_NIF_DIRTY_JOB_CPU_BOUND,       \
+                                     FUN, argc, argv);                             \
+        return FUN(env, argc, argv);                                               \
+    }
+
+#define SCHEDULE_BY_KEY_COUNT(NAME, FUN)                                           \
+    ERL_NIF_TERM FUN##Nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])     \
+    {                                                                              \
+        if (argc >= 1 && resource_key_count(env, argv[0]) > kDirtyKeyCount)        \
+            return enif_schedule_nif(env, NAME, ERL_NIF_DIRTY_JOB_CPU_BOUND,       \
+                                     FUN, argc, argv);                             \
+        return FUN(env, argc, argv);                                               \
+    }
+
+SCHEDULE_BY_BINARY_SIZE("posting_list_keys", PostingListKeys)
+SCHEDULE_BY_BINARY_SIZE("posting_list_contains", PostingListContains)
+SCHEDULE_BY_BINARY_SIZE("posting_list_find", PostingListFind)
+SCHEDULE_BY_BINARY_SIZE("posting_list_count", PostingListCount)
+SCHEDULE_BY_BINARY_SIZE("posting_list_to_map", PostingListToMap)
+SCHEDULE_BY_BINARY_SIZE("posting_list_intersection", PostingListIntersection)
+SCHEDULE_BY_BINARY_SIZE("posting_list_union", PostingListUnion)
+SCHEDULE_BY_BINARY_SIZE("posting_list_difference", PostingListDifference)
+SCHEDULE_BY_BINARY_SIZE("posting_list_intersection_count", PostingListIntersectionCount)
+SCHEDULE_BY_BINARY_SIZE("posting_list_bitmap_contains", PostingListBitmapContains)
+SCHEDULE_BY_BINARY_SIZE("postings_open", PostingsOpen)
+SCHEDULE_BY_KEY_COUNT("postings_keys", PostingsKeys)
+SCHEDULE_BY_KEY_COUNT("postings_to_binary", PostingsToBinary)
+
 } // namespace erocksdb

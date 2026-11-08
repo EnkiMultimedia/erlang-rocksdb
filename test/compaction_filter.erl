@@ -388,6 +388,48 @@ filter_handler_timeout_test() ->
     ok = rocksdb:close(Db),
     ok = destroy_and_rm(DbPath).
 
+%% A handler that stops answering is asked once per compaction, not once per
+%% key: otherwise each key costs a full timeout and compaction stalls.
+filter_handler_timeout_stops_asking_test() ->
+    DbPath = "compaction_filter_timeout_breaker.test",
+    rocksdb_test_util:rm_rf(DbPath),
+
+    Self = self(),
+    %% never replies, reports how many messages it got
+    Handler = spawn(fun() -> count_messages(Self, 0) end),
+
+    {ok, Db} = rocksdb:open(DbPath, [
+        {create_if_missing, true},
+        {compaction_filter, #{handler => Handler, timeout => 200}}
+    ]),
+    [ok = rocksdb:put(Db, <<"key", N:32>>, <<"value">>, []) || N <- lists:seq(1, 200)],
+    ok = rocksdb:flush(Db, []),
+    timer:sleep(100),
+
+    T0 = erlang:monotonic_time(millisecond),
+    ok = rocksdb:compact_range(Db, <<"key", 0:32>>, <<"key", 201:32>>,
+                               [{bottommost_level_compaction, force}]),
+    Elapsed = erlang:monotonic_time(millisecond) - T0,
+
+    Handler ! {count, self()},
+    Count = receive {count, C} -> C after 5000 -> timeout end,
+    %% at least one key was offered, far fewer than the 200 keys
+    ?assert(Count >= 1),
+    ?assert(Count < 10),
+    %% 200 keys x 200 ms would be 40 s
+    ?assert(Elapsed < 10000),
+    {ok, <<"value">>} = rocksdb:get(Db, <<"key", 100:32>>, []),
+
+    exit(Handler, kill),
+    ok = rocksdb:close(Db),
+    ok = destroy_and_rm(DbPath).
+
+count_messages(Parent, N) ->
+    receive
+        {count, From} -> From ! {count, N}, count_messages(Parent, N);
+        {compaction_filter, _, _} -> count_messages(Parent, N + 1)
+    end.
+
 %% Test dead handler doesn't crash
 filter_handler_dead_test() ->
     DbPath = "compaction_filter_dead.test",

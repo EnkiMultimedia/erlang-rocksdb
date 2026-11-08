@@ -468,6 +468,7 @@
 -type compaction_filter_opts() ::
     #{rules := [filter_rule()]} |
     #{handler := pid(),
+      %% accepted but has no effect: keys are sent one per message
       batch_size => pos_integer(),
       timeout => pos_integer()}.
 
