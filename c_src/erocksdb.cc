@@ -800,6 +800,10 @@ ERL_NIF_TERM ATOM_BYTES_PER_WRITE;
 // Transaction Histogram
 ERL_NIF_TERM ATOM_NUM_OP_PER_TRANSACTION;
 
+// Ingestion Histograms (RocksDB 11.5)
+ERL_NIF_TERM ATOM_INGEST_EXTERNAL_FILE_PREPARE_MICROS;
+ERL_NIF_TERM ATOM_INGEST_EXTERNAL_FILE_RUN_MICROS;
+
 // Compaction Statistics Tickers
 ERL_NIF_TERM ATOM_COMPACT_READ_BYTES;
 ERL_NIF_TERM ATOM_COMPACT_WRITE_BYTES;
@@ -1461,6 +1465,10 @@ try
 
   // Transaction Histogram
   ATOM(erocksdb::ATOM_NUM_OP_PER_TRANSACTION, "num_op_per_transaction");
+
+  // Ingestion Histograms (RocksDB 11.5)
+  ATOM(erocksdb::ATOM_INGEST_EXTERNAL_FILE_PREPARE_MICROS, "ingest_external_file_prepare_micros");
+  ATOM(erocksdb::ATOM_INGEST_EXTERNAL_FILE_RUN_MICROS, "ingest_external_file_run_micros");
 
   // Compaction Statistics Tickers
   ATOM(erocksdb::ATOM_COMPACT_READ_BYTES, "compact_read_bytes");

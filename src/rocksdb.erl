@@ -733,6 +733,10 @@
 
 -type transaction_histogram() :: num_op_per_transaction.
 
+%% RocksDB 11.5+, recorded for each successful ingestion
+-type ingestion_histogram() :: ingest_external_file_prepare_micros |
+      ingest_external_file_run_micros.
+
 -type compaction_ticker() :: compact_read_bytes |
       compact_write_bytes |
       flush_write_bytes |
@@ -2858,7 +2862,7 @@ statistics_ticker(_Statistics, _Ticker) ->
 %% Returns histogram information including median, percentiles, average, etc.
 %% For integrated BlobDB, relevant histograms are blob_db_blob_file_write_micros,
 %% blob_db_blob_file_read_micros, blob_db_compression_micros, etc.
--spec statistics_histogram(statistics_handle(), blob_db_histogram() | core_operation_histogram() | io_sync_histogram() | transaction_histogram()) -> {ok, histogram_info()}.
+-spec statistics_histogram(statistics_handle(), blob_db_histogram() | core_operation_histogram() | io_sync_histogram() | transaction_histogram() | ingestion_histogram()) -> {ok, histogram_info()}.
 statistics_histogram(_Statistics, _Histogram) ->
   ?nif_stub.
 

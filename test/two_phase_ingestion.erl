@@ -145,6 +145,42 @@ garbage_collected_handle_rolls_back_test() ->
     {ok, <<"1">>} = rocksdb:get(Db, <<"a">>, [])
   end).
 
+%% ingest_external_file_{prepare,run}_micros (RocksDB 11.5): one sample per
+%% successful ingestion, from both the one-shot and the two-phase path
+ingestion_histograms_test() ->
+  Dir = test_dir("histograms"),
+  {ok, Stats} = rocksdb:new_statistics(),
+  {ok, Db} = rocksdb:open(filename:join(Dir, "db"),
+                          [{create_if_missing, true}, {statistics, Stats}]),
+  {ok, #{count := 0}} = rocksdb:statistics_histogram(Stats, ingest_external_file_prepare_micros),
+  {ok, #{count := 0}} = rocksdb:statistics_histogram(Stats, ingest_external_file_run_micros),
+
+  ok = rocksdb:ingest_external_file(Db, [write_sst(Dir, "1", [{<<"a">>, <<"1">>}])], []),
+  {ok, #{count := 1}} = rocksdb:statistics_histogram(Stats, ingest_external_file_prepare_micros),
+  {ok, #{count := 1}} = rocksdb:statistics_histogram(Stats, ingest_external_file_run_micros),
+
+  {ok, I} = rocksdb:prepare_ingestion(Db, [write_sst(Dir, "2", [{<<"b">>, <<"2">>}])], []),
+  {ok, #{count := 2}} = rocksdb:statistics_histogram(Stats, ingest_external_file_prepare_micros),
+  {ok, #{count := 1}} = rocksdb:statistics_histogram(Stats, ingest_external_file_run_micros),
+  ok = rocksdb:commit_ingestion(Db, I),
+  {ok, #{count := 2}} = rocksdb:statistics_histogram(Stats, ingest_external_file_run_micros),
+
+  ok = rocksdb:close(Db),
+  ok = rocksdb:release_statistics(Stats),
+  ?rm_rf(Dir).
+
+compaction_queue_properties_test() ->
+  with_db("properties", fun(Db, _Dir) ->
+    lists:foreach(
+      fun(Name) ->
+        {ok, Value} = rocksdb:get_property(Db, Name),
+        ?assert(is_integer(binary_to_integer(Value)))
+      end,
+      [<<"rocksdb.num-unscheduled-compactions">>,
+       <<"rocksdb.num-running-compactions">>,
+       <<"rocksdb.num-running-remote-compactions">>])
+  end).
+
 %% helpers
 
 with_db(Name, Fun) ->

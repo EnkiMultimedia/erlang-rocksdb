@@ -785,6 +785,17 @@ bool HistogramAtomToEnum(ERL_NIF_TERM atom, rocksdb::Histograms* histogram)
         *histogram = rocksdb::NUM_OP_PER_TRANSACTION;
         return true;
     }
+    // Ingestion Histograms (RocksDB 11.5)
+    else if (atom == ATOM_INGEST_EXTERNAL_FILE_PREPARE_MICROS)
+    {
+        *histogram = rocksdb::INGEST_EXTERNAL_FILE_PREPARE_TIME;
+        return true;
+    }
+    else if (atom == ATOM_INGEST_EXTERNAL_FILE_RUN_MICROS)
+    {
+        *histogram = rocksdb::INGEST_EXTERNAL_FILE_RUN_TIME;
+        return true;
+    }
     return false;
 }
 

@@ -10,6 +10,7 @@
 - `abort_compactions/2` and `resume_compactions/2` stop and restart compactions of a single column family, leaving the others running
 - new column family options: `read_triggered_compaction_threshold` compacts files that are read often, `min_tombstones_for_range_conversion` speeds up reads over long runs of deleted keys, `periodic_compaction_seconds` and `blob_file_writable_file_max_buffer_size`
 - new database options: `use_direct_io_for_compaction_reads` keeps compaction scans out of the page cache, `max_compaction_trigger_wakeup_seconds`, and the experimental `optimize_manifest_for_recovery` and `reuse_manifest_on_open` for faster reopen
+- two new statistics histograms, `ingest_external_file_prepare_micros` and `ingest_external_file_run_micros`, show how long ingestion takes and how long it blocks writes. The statistics guide also documents the database properties that show if compactions fall behind.
 - block based tables accept `format_version` 8 and `optimize_key_common_prefix`, which stores the shared key prefix of a block once
 
 ### Bug Fixes
