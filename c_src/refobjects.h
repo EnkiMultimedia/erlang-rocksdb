@@ -36,7 +36,6 @@ namespace rocksdb {
     class ColumnFamilyHandle;
     class Snapshot;
     class Iterator;
-    class TransactionLogIterator;
     class BackupEngine;
     class Slice;
     class Transaction;
@@ -371,14 +370,14 @@ public:
 class TLogItrObject : public ErlRefObject
 {
 public:
-    rocksdb::TransactionLogIterator * m_Iter;
+    rocksdb::WalIterator * m_Iter;
     ReferencePtr<DbObject> m_DbPtr;
 
 protected:
     static ErlNifResourceType* m_TLogItr_RESOURCE;
 
 public:
-    TLogItrObject(DbObject *, rocksdb::TransactionLogIterator * Itr);
+    TLogItrObject(DbObject *, rocksdb::WalIterator * Itr);
 
     TLogItrObject() = delete;                                  // no default construct
     TLogItrObject(const TLogItrObject &) = delete;             // no copy
@@ -390,7 +389,7 @@ public:
 
     static void CreateTLogItrObjectType(ErlNifEnv * Env);
 
-    static TLogItrObject * CreateTLogItrObject(DbObject * Db, rocksdb::TransactionLogIterator * Itr);
+    static TLogItrObject * CreateTLogItrObject(DbObject * Db, rocksdb::WalIterator * Itr);
 
     static TLogItrObject * RetrieveTLogItrObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm);
 

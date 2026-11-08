@@ -386,6 +386,7 @@
     file_creation_time := non_neg_integer(),
     slow_compression_estimated_data_size := non_neg_integer(),
     fast_compression_estimated_data_size := non_neg_integer(),
+    %% Deprecated: removed in RocksDB 11.13, always 0.
     external_sst_file_global_seqno_offset := non_neg_integer()
 }.
 -opaque db_handle() :: reference() | binary().

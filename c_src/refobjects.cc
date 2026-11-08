@@ -952,7 +952,7 @@ TLogItrObject::CreateTLogItrObjectType(
 TLogItrObject *
 TLogItrObject::CreateTLogItrObject(
         DbObject *DbPtr,
-        rocksdb::TransactionLogIterator * Itr) {
+        rocksdb::WalIterator * Itr) {
     TLogItrObject *ret_ptr;
     void *alloc_ptr;
 
@@ -1015,7 +1015,7 @@ TLogItrObject::TLogItrObjectResourceCleanup(
 
 TLogItrObject::TLogItrObject(
         DbObject *DbPtr,
-        rocksdb::TransactionLogIterator * Itr)
+        rocksdb::WalIterator * Itr)
         : m_Iter(Itr), m_DbPtr(DbPtr) {
 
     if (NULL != DbPtr)

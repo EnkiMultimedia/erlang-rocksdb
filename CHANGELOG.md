@@ -1,3 +1,17 @@
+## erlang-rocksdb (unreleased)
+
+### Upgrades
+
+- update vendored RocksDB to 11.13.2 (from 11.1.2)
+
+### Bug Fixes
+
+- the build no longer downloads anything from the network: the vendored CRoaring build fetched a CMake helper from GitHub at configure time, so offline builds failed
+
+### Deprecations
+
+- the `external_sst_file_global_seqno_offset` entry returned by `sst_file_reader_get_table_properties/1` is always 0: RocksDB 11.13 no longer records it
+
 ## erlang-rocksdb 3.1.2, released on 2026/07/25
 
 ### Bug Fixes
