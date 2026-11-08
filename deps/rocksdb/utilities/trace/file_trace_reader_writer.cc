@@ -22,7 +22,7 @@ FileTraceReader::FileTraceReader(
       buffer_(new char[kBufferSize]) {}
 
 FileTraceReader::~FileTraceReader() {
-  Close().PermitUncheckedError();
+  FileTraceReader::Close().PermitUncheckedError();
   delete[] buffer_;
 }
 
@@ -41,7 +41,7 @@ Status FileTraceReader::Reset() {
 
 Status FileTraceReader::Read(std::string* data) {
   assert(file_reader_ != nullptr);
-  Status s = file_reader_->Read(IOOptions(), offset_, kTraceMetadataSize,
+  Status s = file_reader_->Read(offset_, kTraceMetadataSize, IOOptions(),
                                 &result_, buffer_, nullptr);
   if (!s.ok()) {
     return s;
@@ -66,7 +66,7 @@ Status FileTraceReader::Read(std::string* data) {
   unsigned int to_read =
       bytes_to_read > kBufferSize ? kBufferSize : bytes_to_read;
   while (to_read > 0) {
-    s = file_reader_->Read(IOOptions(), offset_, to_read, &result_, buffer_,
+    s = file_reader_->Read(offset_, to_read, IOOptions(), &result_, buffer_,
                            nullptr);
     if (!s.ok()) {
       return s;
@@ -88,7 +88,9 @@ FileTraceWriter::FileTraceWriter(
     std::unique_ptr<WritableFileWriter>&& file_writer)
     : file_writer_(std::move(file_writer)) {}
 
-FileTraceWriter::~FileTraceWriter() { Close().PermitUncheckedError(); }
+FileTraceWriter::~FileTraceWriter() {
+  FileTraceWriter::Close().PermitUncheckedError();
+}
 
 Status FileTraceWriter::Close() {
   file_writer_.reset();
@@ -96,7 +98,7 @@ Status FileTraceWriter::Close() {
 }
 
 Status FileTraceWriter::Write(const Slice& data) {
-  return file_writer_->Append(IOOptions(), data);
+  return file_writer_->Append(data, IOOptions());
 }
 
 uint64_t FileTraceWriter::GetFileSize() { return file_writer_->GetFileSize(); }

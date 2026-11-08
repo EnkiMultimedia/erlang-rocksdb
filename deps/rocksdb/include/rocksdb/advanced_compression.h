@@ -151,6 +151,41 @@ class Compressor {
     return CompressionType::kDisableCompressionOption;
   }
 
+  // DEPRECATED: override MaybeOverrideCompressionOptions() instead, which
+  // subsumes this hook.
+  //
+  // Returns a recommended number of parallel compression threads for SST
+  // file building, or 0 to defer to CompressionOptions::parallel_threads.
+  // Built-in compressors return the parallel_threads from their
+  // CompressionOptions, enabling CompressionManager to override this by
+  // customizing the options passed to GetCompressor().
+  virtual uint32_t GetRecommendedParallelThreads() const { return 0; }
+
+  // Allows this Compressor to override the subset of CompressionOptions that
+  // are applied by the *caller* of the Compressor (e.g. the SST file builder)
+  // rather than by the Compressor itself. These options govern how compression
+  // is applied across a stream of blocks, not how any individual block is
+  // compressed, so they are the builder's responsibility to honor. On entry,
+  // `*to_modify` holds the options the caller is about to apply; the Compressor
+  // may modify in place any of the following (and possibly more such options in
+  // the future), and MUST leave all other fields unchanged:
+  //   * parallel_threads
+  //   * max_compressed_bytes_per_kb
+  //   * auto_skip
+  //   * auto_skip_min_sample_every
+  // This does not affect the Compressor's own per-block compression behavior;
+  // it only informs caller-side handling.
+  //
+  // The default implementation defers to the deprecated
+  // GetRecommendedParallelThreads().
+  virtual void MaybeOverrideCompressionOptions(
+      CompressionOptions* to_modify) const {
+    uint32_t recommended_parallel_threads = GetRecommendedParallelThreads();
+    if (recommended_parallel_threads > 0) {
+      to_modify->parallel_threads = recommended_parallel_threads;
+    }
+  }
+
   // Return a distinct but functionally equivalent Compressor. This is often
   // needed to implement MaybeCloneSpecialized() in wrapper compressors.
   virtual std::unique_ptr<Compressor> Clone() const = 0;
@@ -417,7 +452,7 @@ class CompressionManager
       public Customizable {
  public:
   CompressionManager() = default;
-  virtual ~CompressionManager() = default;
+  ~CompressionManager() override = default;
   static const char* Type() { return "CompressionManager"; }
 
   // *************** Creating various Compression Managers *************** //
@@ -448,6 +483,13 @@ class CompressionManager
   // type to GetCompressor/GetCompressorForSST should be rejected (not
   // supported)
   virtual bool SupportsCompressionType(CompressionType type) const = 0;
+
+  // Return a human-readable name for the given compression type within this
+  // CompressionManager's schema. The default implementation returns the
+  // generic built-in name such as "Snappy", "ZSTD", "Reserved4F", or
+  // "Custom8A". Override to provide more specific names for custom
+  // compression types.
+  virtual std::string CompressionTypeToString(CompressionType type) const;
 
   // TODO: function to check compatibility with or sanitize CompressionOptions
 
@@ -512,9 +554,12 @@ class CompressorWrapper : public Compressor {
  public:
   explicit CompressorWrapper(std::unique_ptr<Compressor> compressor)
       : wrapped_(std::move(compressor)) {}
+  ~CompressorWrapper() override = default;
   // No copies
   CompressorWrapper(const CompressorWrapper&) = delete;
   CompressorWrapper& operator=(const CompressorWrapper&) = delete;
+  CompressorWrapper(CompressorWrapper&&) = delete;
+  CompressorWrapper& operator=(CompressorWrapper&&) = delete;
 
   DictConfig GetDictGuidance(CacheEntryRole block_type) const override {
     return wrapped_->GetDictGuidance(block_type);
@@ -526,6 +571,15 @@ class CompressorWrapper : public Compressor {
 
   CompressionType GetPreferredCompressionType() const override {
     return wrapped_->GetPreferredCompressionType();
+  }
+
+  uint32_t GetRecommendedParallelThreads() const override {
+    return wrapped_->GetRecommendedParallelThreads();
+  }
+
+  void MaybeOverrideCompressionOptions(
+      CompressionOptions* to_modify) const override {
+    wrapped_->MaybeOverrideCompressionOptions(to_modify);
   }
 
   // NOTE: Clone() not implemented here because it needs to be in the derived
@@ -572,9 +626,12 @@ class DecompressorWrapper : public Decompressor {
  public:
   explicit DecompressorWrapper(std::shared_ptr<Decompressor> decompressor)
       : wrapped_(std::move(decompressor)) {}
+  ~DecompressorWrapper() override = default;
   // No copies
   DecompressorWrapper(const DecompressorWrapper&) = delete;
   DecompressorWrapper& operator=(const DecompressorWrapper&) = delete;
+  DecompressorWrapper(DecompressorWrapper&&) = delete;
+  DecompressorWrapper& operator=(DecompressorWrapper&&) = delete;
 
   const char* Name() const override { return wrapped_->Name(); }
 
@@ -645,6 +702,10 @@ class CompressionManagerWrapper : public CompressionManager {
     return wrapped_->SupportsCompressionType(type);
   }
 
+  std::string CompressionTypeToString(CompressionType type) const override {
+    return wrapped_->CompressionTypeToString(type);
+  }
+
   std::unique_ptr<Compressor> GetCompressorForSST(
       const FilterBuildingContext& context, const CompressionOptions& opts,
       CompressionType preferred) override {
@@ -686,11 +747,6 @@ const std::shared_ptr<CompressionManager>& GetBuiltinV2CompressionManager();
 // lead to unexpected schema changes for user CompressionManagers building on
 // the built-in schema, in the unlikely/rare case of a new built-in schema.
 
-// Creates CompressionManager designed for the automated compression strategy.
-// This may include deciding to compress or not.
-// EXPERIMENTAL
-std::shared_ptr<CompressionManagerWrapper> CreateAutoSkipCompressionManager(
-    std::shared_ptr<CompressionManager> wrapped = nullptr);
 // Creates CompressionManager designed for the CPU and IO cost aware compression
 // strategy
 // EXPERIMENTAL

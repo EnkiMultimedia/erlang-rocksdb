@@ -11,6 +11,7 @@
 #include "db/dbformat.h"
 #include "db/lookup_key.h"
 #include "db/merge_context.h"
+#include "db/read_callback.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "rocksdb/statistics.h"
@@ -36,6 +37,7 @@ struct KeyContext {
   SequenceNumber max_covering_tombstone_seq;
   bool key_exists;
   bool is_blob_index;
+  bool newer_version_present;
   void* cb_arg;
   PinnableSlice* value;
   PinnableWideColumns* columns;
@@ -52,6 +54,7 @@ struct KeyContext {
         max_covering_tombstone_seq(0),
         key_exists(false),
         is_blob_index(false),
+        newer_version_present(false),
         cb_arg(nullptr),
         value(val),
         columns(cols),
@@ -110,11 +113,12 @@ class MultiGetContext {
   MultiGetContext(autovector<KeyContext*, MAX_BATCH_SIZE>* sorted_keys,
                   size_t begin, size_t num_keys, SequenceNumber snapshot,
                   const ReadOptions& read_opts, FileSystem* fs,
-                  Statistics* stats)
+                  Statistics* stats, bool use_coro_read = false)
       : num_keys_(num_keys),
         value_mask_(0),
         value_size_(0),
-        lookup_key_ptr_(reinterpret_cast<LookupKey*>(lookup_key_stack_buf))
+        lookup_key_ptr_(reinterpret_cast<LookupKey*>(lookup_key_stack_buf)),
+        use_coro_read_(use_coro_read)
 #if USE_COROUTINES
         ,
         reader_(fs, stats),
@@ -147,6 +151,12 @@ class MultiGetContext {
     }
   }
 
+  // No copying allowed
+  MultiGetContext(const MultiGetContext&) = delete;
+  MultiGetContext& operator=(const MultiGetContext&) = delete;
+  MultiGetContext(MultiGetContext&&) = delete;
+  MultiGetContext& operator=(MultiGetContext&&) = delete;
+
   ~MultiGetContext() {
     for (size_t i = 0; i < num_keys_; ++i) {
       lookup_key_ptr_[i].~LookupKey();
@@ -159,6 +169,8 @@ class MultiGetContext {
   AsyncFileReader& reader() { return reader_; }
 #endif  // USE_COROUTINES
 
+  bool use_coro_read() const { return use_coro_read_; }
+
  private:
   static const int MAX_LOOKUP_KEYS_ON_STACK = 16;
   alignas(
@@ -170,6 +182,7 @@ class MultiGetContext {
   uint64_t value_size_;
   std::unique_ptr<char[]> lookup_key_heap_buf;
   LookupKey* lookup_key_ptr_;
+  bool use_coro_read_ = false;
 #if USE_COROUTINES
   AsyncFileReader reader_;
   SingleThreadExecutor executor_;
@@ -205,8 +218,9 @@ class MultiGetContext {
         while (index_ < range_->end_ &&
                (Mask{1} << index_) &
                    (range_->ctx_->value_mask_ | range_->skip_mask_ |
-                    range_->invalid_mask_))
+                    range_->invalid_mask_)) {
           index_++;
+        }
       }
 
       Iterator(const Iterator&) = default;
@@ -216,6 +230,9 @@ class MultiGetContext {
         assert(range->ctx_ == other.ctx_);
       }
       Iterator& operator=(const Iterator&) = default;
+      Iterator(Iterator&&) = default;
+      Iterator& operator=(Iterator&&) = default;
+      ~Iterator() = default;
 
       Iterator& operator++() {
         while (++index_ < range_->end_ &&

@@ -36,6 +36,7 @@ struct ImmutableDBOptions {
   std::shared_ptr<Logger> info_log;
   InfoLogLevel info_log_level;
   int max_file_opening_threads;
+  int read_io_executor_threads;
   std::shared_ptr<Statistics> statistics;
   bool use_fsync;
   std::vector<DbPath> db_paths;
@@ -48,6 +49,8 @@ struct ImmutableDBOptions {
   size_t log_file_time_to_roll;
   size_t keep_log_file_num;
   size_t recycle_log_file_num;
+  // Immutable copy of DBOptions::async_wal_precreate.
+  bool async_wal_precreate;
   int table_cache_numshardbits;
   uint64_t WAL_ttl_seconds;
   uint64_t WAL_size_limit_MB;
@@ -55,6 +58,7 @@ struct ImmutableDBOptions {
   bool allow_mmap_reads;
   bool allow_mmap_writes;
   bool use_direct_reads;
+  bool use_direct_io_for_compaction_reads;
   bool use_direct_io_for_flush_and_compaction;
   bool allow_fallocate;
   bool is_fd_close_on_exec;
@@ -88,6 +92,8 @@ struct ImmutableDBOptions {
   bool prefix_seek_opt_in_only;
   bool persist_stats_to_disk;
   bool write_dbid_to_manifest;
+  bool track_options_file_number_in_manifest;
+  bool reuse_manifest_on_open;
   bool write_identity_file;
   size_t log_readahead_size;
   std::shared_ptr<FileChecksumGenFactory> file_checksum_gen_factory;
@@ -99,6 +105,7 @@ struct ImmutableDBOptions {
   FileTypeSet checksum_handoff_file_types;
   CacheTier lowest_used_cache_tier;
   std::shared_ptr<CompactionService> compaction_service;
+  bool use_session_tmp_dir_for_remote_compaction;
   bool enforce_single_del_contracts;
   uint64_t follower_refresh_catchup_period_ms;
   uint64_t follower_catchup_retry_count;
@@ -149,7 +156,12 @@ struct MutableDBOptions {
   int max_manifest_space_amp_pct;
   size_t manifest_preallocation_size;
   bool verify_manifest_content_on_close;
+  bool optimize_manifest_for_recovery;
+  bool fast_sst_open;
+  bool remote_compaction_manifest_floor;
   std::string daily_offpeak_time_utc;
+  uint64_t max_compaction_trigger_wakeup_seconds;
+  int periodic_compaction_phase_recovery_percent;
 };
 
 Status GetStringFromMutableDBOptions(const ConfigOptions& config_options,

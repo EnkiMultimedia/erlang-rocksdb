@@ -24,6 +24,7 @@
 #include "table/block_based/reader_common.h"
 #include "table/format.h"
 #include "table/persistent_cache_helper.h"
+#include "util/aligned_buffer.h"
 #include "util/compression.h"
 #include "util/stop_watch.h"
 
@@ -151,8 +152,17 @@ inline bool BlockFetcher::TryGetSerializedBlockFromPersistentCache() {
 
 inline void BlockFetcher::PrepareBufferForBlockFromFile() {
   // cache miss read from device
-  if ((do_uncompress_ || ioptions_.allow_mmap_reads) &&
-      block_size_with_trailer_ < kDefaultStackBufferSize) {
+  if (block_buffer_provider_.has_value() && !maybe_compressed_) {
+    Status s = AllocateReadScopedBlockBuffer(block_buffer_provider_->get(),
+                                             block_size_with_trailer_, 1,
+                                             &read_scoped_buf_lease_);
+    if (!s.ok()) {
+      io_status_ = status_to_io_status(std::move(s));
+      return;
+    }
+    used_buf_ = read_scoped_buf_lease_.data;
+  } else if ((do_uncompress_ || ioptions_.allow_mmap_reads) &&
+             block_size_with_trailer_ < kDefaultStackBufferSize) {
     // If we've got a small enough chunk of data, read it in to the
     // trivially allocated stack buffer instead of needing a full malloc()
     //
@@ -165,9 +175,11 @@ inline void BlockFetcher::PrepareBufferForBlockFromFile() {
     // stack buffer, the cost of guessing incorrectly here is one extra memcpy.
     //
     // When `do_uncompress_` is true, we expect the uncompression step will
-    // allocate heap memory for the final result. However this expectation will
-    // be wrong if the block turns out to already be uncompressed, which we
-    // won't know for sure until after reading it.
+    // allocate memory for the final result, using the read-scoped provider if
+    // one is configured. However this expectation will be wrong if the block
+    // turns out to already be uncompressed, which we won't know for sure until
+    // after reading it. In that case provider-backed reads copy the block into
+    // provider storage in `GetBlockContents()`.
     //
     // When `ioptions_.allow_mmap_reads` is true, we do not expect the file
     // reader to use the scratch buffer at all, but instead return a pointer
@@ -231,14 +243,29 @@ inline void BlockFetcher::CopyBufferToCompressedBuf() {
 //    is not compressed
 // 3. heap_buf_ if the block is not compressed
 // 4. compressed_buf_ if the block is compressed
-// 5. direct_io_buf_ if direct IO is enabled or
+// 5. direct_io_buffer_ if direct IO is enabled or
 // 6. underlying file_system scratch is used (FSReadRequest.fs_scratch).
 //
-// After - After this method, if the block is compressed, it should be in
-// compressed_buf_ and heap_buf_ points to compressed_buf_, otherwise should be
-// in heap_buf_.
+// After - After this method, compressed blocks should be in compressed_buf_ and
+// heap_buf_ points to compressed_buf_. Uncompressed blocks should be recorded
+// in *contents_ with either heap ownership or read-scoped cleanup ownership.
 inline void BlockFetcher::GetBlockContents() {
-  if (slice_.data() != used_buf_) {
+  if (read_scoped_buf_lease_.cleanup.get() != nullptr &&
+      compression_type() == kNoCompression) {
+    contents_->data = Slice(slice_.data(), block_size_);
+    contents_->cleanup = std::move(read_scoped_buf_lease_.cleanup);
+    contents_->backing_size = read_scoped_buf_lease_.size;
+    contents_->AssertSingleOwner();
+  } else if (block_buffer_provider_.has_value() &&
+             compression_type() == kNoCompression) {
+    Status s = CopyBufferToReadScopedBlockContents(
+        Slice(slice_.data(), block_size_with_trailer_), block_size_,
+        block_buffer_provider_->get(), contents_);
+    if (!s.ok()) {
+      io_status_ = status_to_io_status(std::move(s));
+      return;
+    }
+  } else if (slice_.data() != used_buf_) {
     // the slice content is not the buffer provided
     *contents_ = BlockContents(Slice(slice_.data(), block_size_));
   } else {
@@ -253,7 +280,7 @@ inline void BlockFetcher::GetBlockContents() {
       } else {
         heap_buf_ = std::move(compressed_buf_);
       }
-    } else if (direct_io_buf_.get() != nullptr || use_fs_scratch_) {
+    } else if (direct_io_buffer_.BufferStart() != nullptr || use_fs_scratch_) {
       if (compression_type() == kNoCompression) {
         CopyBufferToHeapBuf();
       } else {
@@ -268,174 +295,18 @@ inline void BlockFetcher::GetBlockContents() {
 #endif
 }
 
-// Read a block from the file and verify its checksum. Upon return, io_status_
-// will be updated with the status of the read, and slice_ will be
-// updated with a pointer to the data.
-void BlockFetcher::ReadBlock(bool retry) {
-  FSReadRequest read_req;
-  IOOptions opts;
-  IODebugContext dbg;
-  io_status_ = file_->PrepareIOOptions(read_options_, opts, &dbg);
-  opts.verify_and_reconstruct_read = retry;
-  read_req.status.PermitUncheckedError();
-  // Actual file read
-  if (io_status_.ok()) {
-    if (file_->use_direct_io()) {
-      PERF_TIMER_GUARD(block_read_time);
-      PERF_CPU_TIMER_GUARD(
-          block_read_cpu_time,
-          ioptions_.env ? ioptions_.env->GetSystemClock().get() : nullptr);
-      io_status_ =
-          file_->Read(opts, handle_.offset(), block_size_with_trailer_, &slice_,
-                      /*scratch=*/nullptr, &direct_io_buf_, &dbg);
-      PERF_COUNTER_ADD(block_read_count, 1);
-      used_buf_ = const_cast<char*>(slice_.data());
-    } else if (use_fs_scratch_) {
-      PERF_TIMER_GUARD(block_read_time);
-      PERF_CPU_TIMER_GUARD(
-          block_read_cpu_time,
-          ioptions_.env ? ioptions_.env->GetSystemClock().get() : nullptr);
-      read_req.offset = handle_.offset();
-      read_req.len = block_size_with_trailer_;
-      read_req.scratch = nullptr;
-      io_status_ = file_->MultiRead(opts, &read_req, /*num_reqs=*/1,
-                                    /*AlignedBuf* =*/nullptr, &dbg);
-      PERF_COUNTER_ADD(block_read_count, 1);
+}  // namespace ROCKSDB_NAMESPACE
 
-      slice_ = Slice(read_req.result.data(), read_req.result.size());
-      used_buf_ = const_cast<char*>(slice_.data());
-    } else {
-      // It allocates/assign used_buf_
-      PrepareBufferForBlockFromFile();
+// clang-format off
+#define WITHOUT_COROUTINES
+#include "table/block_fetcher_sync_and_async.h"
+#undef WITHOUT_COROUTINES
+#define WITH_COROUTINES
+#include "table/block_fetcher_sync_and_async.h"
+#undef WITH_COROUTINES
+// clang-format on
 
-      PERF_TIMER_GUARD(block_read_time);
-      PERF_CPU_TIMER_GUARD(
-          block_read_cpu_time,
-          ioptions_.env ? ioptions_.env->GetSystemClock().get() : nullptr);
-
-      io_status_ =
-          file_->Read(opts, handle_.offset(), /*size*/ block_size_with_trailer_,
-                      /*result*/ &slice_, /*scratch*/ used_buf_,
-                      /*aligned_buf=*/nullptr, &dbg);
-      PERF_COUNTER_ADD(block_read_count, 1);
-#ifndef NDEBUG
-      if (slice_.data() == &stack_buf_[0]) {
-        num_stack_buf_memcpy_++;
-      } else if (slice_.data() == heap_buf_.get()) {
-        num_heap_buf_memcpy_++;
-      } else if (slice_.data() == compressed_buf_.get()) {
-        num_compressed_buf_memcpy_++;
-      }
-#endif
-    }
-  }
-
-  // TODO: introduce dedicated perf counter for range tombstones
-  switch (block_type_) {
-    case BlockType::kFilter:
-    case BlockType::kFilterPartitionIndex:
-      PERF_COUNTER_ADD(filter_block_read_count, 1);
-      break;
-
-    case BlockType::kCompressionDictionary:
-      PERF_COUNTER_ADD(compression_dict_block_read_count, 1);
-      break;
-
-    case BlockType::kIndex:
-      PERF_COUNTER_ADD(index_block_read_count, 1);
-      break;
-
-    // Nothing to do here as we don't have counters for the other types.
-    default:
-      break;
-  }
-
-  PERF_COUNTER_ADD(block_read_byte, block_size_with_trailer_);
-  RecordBlockReadBytePerfCounter(block_type_, block_size_with_trailer_);
-  IGNORE_STATUS_IF_ERROR(io_status_);
-  if (io_status_.ok()) {
-    if (use_fs_scratch_ && !read_req.status.ok()) {
-      io_status_ = read_req.status;
-    } else if (slice_.size() != block_size_with_trailer_) {
-      io_status_ = IOStatus::Corruption(
-          "truncated block read from " + file_->file_name() + " offset " +
-          std::to_string(handle_.offset()) + ", expected " +
-          std::to_string(block_size_with_trailer_) + " bytes, got " +
-          std::to_string(slice_.size()));
-    }
-  }
-
-  if (io_status_.ok()) {
-    ProcessTrailerIfPresent();
-  }
-
-  if (retry) {
-    RecordTick(ioptions_.stats, FILE_READ_CORRUPTION_RETRY_COUNT);
-  }
-  if (io_status_.ok()) {
-    InsertCompressedBlockToPersistentCacheIfNeeded();
-    fs_buf_ = std::move(read_req.fs_scratch);
-    if (retry) {
-      RecordTick(ioptions_.stats, FILE_READ_CORRUPTION_RETRY_SUCCESS_COUNT);
-    }
-  } else {
-    ReleaseFileSystemProvidedBuffer(&read_req);
-    direct_io_buf_.reset();
-    compressed_buf_.reset();
-    heap_buf_.reset();
-    used_buf_ = nullptr;
-  }
-}
-
-IOStatus BlockFetcher::ReadBlockContents() {
-  if (TryGetUncompressBlockFromPersistentCache()) {
-    compression_type() = kNoCompression;
-#ifndef NDEBUG
-    contents_->has_trailer = footer_.GetBlockTrailerSize() > 0;
-#endif  // NDEBUG
-    return IOStatus::OK();
-  }
-  if (TryGetFromPrefetchBuffer()) {
-    if (io_status_.IsCorruption() && retry_corrupt_read_) {
-      ReadBlock(/*retry=*/true);
-    }
-    if (!io_status_.ok()) {
-      assert(!fs_buf_);
-      return io_status_;
-    }
-  } else if (!TryGetSerializedBlockFromPersistentCache()) {
-    ReadBlock(/*retry =*/false);
-    // If the file system supports retry after corruption, then try to
-    // re-read the block and see if it succeeds.
-    if (io_status_.IsCorruption() && retry_corrupt_read_) {
-      assert(!fs_buf_);
-      ReadBlock(/*retry=*/true);
-    }
-    if (!io_status_.ok()) {
-      assert(!fs_buf_);
-      return io_status_;
-    }
-  }
-
-  if (do_uncompress_ && compression_type() != kNoCompression) {
-    PERF_TIMER_GUARD(block_decompress_time);
-    // Process the compressed block without trailer
-    slice_.size_ = block_size_;
-    decomp_args_.compressed_data = slice_;
-    io_status_ = status_to_io_status(DecompressSerializedBlock(
-        decomp_args_, *decompressor_, contents_, ioptions_, memory_allocator_));
-#ifndef NDEBUG
-    num_heap_buf_memcpy_++;
-#endif
-  } else {
-    GetBlockContents();
-    slice_ = Slice();
-  }
-
-  InsertUncompressedBlockToPersistentCacheIfNeeded();
-
-  return io_status_;
-}
+namespace ROCKSDB_NAMESPACE {
 
 IOStatus BlockFetcher::ReadAsyncBlockContents() {
   if (TryGetUncompressBlockFromPersistentCache()) {
@@ -477,9 +348,9 @@ IOStatus BlockFetcher::ReadAsyncBlockContents() {
           // Process the compressed block without trailer
           slice_.size_ = block_size_;
           decomp_args_.compressed_data = slice_;
-          io_status_ = status_to_io_status(
-              DecompressSerializedBlock(decomp_args_, *decompressor_, contents_,
-                                        ioptions_, memory_allocator_));
+          io_status_ = status_to_io_status(DecompressSerializedBlock(
+              decomp_args_, *decompressor_, contents_, ioptions_,
+              memory_allocator_, block_buffer_provider_));
 #ifndef NDEBUG
           num_heap_buf_memcpy_++;
 #endif

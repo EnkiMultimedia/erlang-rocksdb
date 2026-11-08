@@ -17,6 +17,7 @@
 #include "db/version_set.h"
 #include "logging/log_buffer.h"
 #include "logging/logging.h"
+#include "memory/arena.h"
 #include "monitoring/thread_status_util.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -28,8 +29,79 @@
 namespace ROCKSDB_NAMESPACE {
 
 class InternalKeyComparator;
-class Mutex;
 class VersionSet;
+
+bool MultiScanOverlapsUserKeyRange(const MultiScanArgs* scan_opts,
+                                   const Comparator* user_comparator,
+                                   const Slice& smallest_user_key,
+                                   const Slice& largest_user_key) {
+  if (scan_opts == nullptr || !scan_opts->HasBoundedScanRanges()) {
+    return true;
+  }
+
+  for (const ScanOptions& scan_range : scan_opts->GetScanRanges()) {
+    if (user_comparator->CompareWithoutTimestamp(
+            scan_range.range.limit.value(), /*a_has_ts=*/false,
+            smallest_user_key, /*b_has_ts=*/true) <= 0) {
+      continue;
+    }
+    if (user_comparator->CompareWithoutTimestamp(
+            scan_range.range.start.value(), /*a_has_ts=*/false,
+            largest_user_key, /*b_has_ts=*/true) > 0) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool MultiScanIteratorOverlapsUserKeyRange(InternalIterator* iter,
+                                           const MultiScanArgs* scan_opts,
+                                           const Comparator* user_comparator) {
+  iter->SeekToFirst();
+  if (!iter->status().ok()) {
+    return true;
+  }
+  if (!iter->Valid()) {
+    return true;
+  }
+  const std::string smallest_user_key = ExtractUserKey(iter->key()).ToString();
+  iter->SeekToLast();
+  if (!iter->status().ok()) {
+    return true;
+  }
+  if (!iter->Valid()) {
+    return true;
+  }
+  const std::string largest_user_key = ExtractUserKey(iter->key()).ToString();
+  return MultiScanOverlapsUserKeyRange(scan_opts, user_comparator,
+                                       smallest_user_key, largest_user_key);
+}
+
+bool MultiScanIntersectsMemTable(
+    ReadOnlyMemTable* memtable, const ReadOptions& read_options,
+    UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
+    const SliceTransform* prefix_extractor, const MultiScanArgs* scan_opts,
+    const Comparator* user_comparator) {
+  if (scan_opts == nullptr || !scan_opts->HasBoundedScanRanges()) {
+    return true;
+  }
+  if (memtable->NumRangeDeletion() > 0) {
+    return true;
+  }
+
+  Arena arena;
+  ReadOptions intersect_read_options(read_options);
+  intersect_read_options.total_order_seek = true;
+  intersect_read_options.iterate_lower_bound = nullptr;
+  intersect_read_options.iterate_upper_bound = nullptr;
+  InternalIterator* iter =
+      memtable->NewIterator(intersect_read_options, seqno_to_time_mapping,
+                            &arena, prefix_extractor, /*for_flush=*/false);
+  ScopedArenaPtr<InternalIterator> iter_guard(iter);
+  return MultiScanIteratorOverlapsUserKeyRange(iter, scan_opts,
+                                               user_comparator);
+}
 
 void MemTableListVersion::AddMemTable(ReadOnlyMemTable* m) {
   if (!memlist_.empty()) {
@@ -108,18 +180,19 @@ bool MemTableListVersion::Get(const LookupKey& key, std::string* value,
                               MergeContext* merge_context,
                               SequenceNumber* max_covering_tombstone_seq,
                               SequenceNumber* seq, const ReadOptions& read_opts,
-                              ReadCallback* callback, bool* is_blob_index) {
+                              ReadCallback* callback, bool* is_blob_index,
+                              const BlobFetcher* blob_fetcher) {
   return GetFromList(&memlist_, key, value, columns, timestamp, s,
                      merge_context, max_covering_tombstone_seq, seq, read_opts,
-                     callback, is_blob_index);
+                     callback, is_blob_index, blob_fetcher);
 }
 
 void MemTableListVersion::MultiGet(const ReadOptions& read_options,
-                                   MultiGetRange* range,
-                                   ReadCallback* callback) {
+                                   MultiGetRange* range, ReadCallback* callback,
+                                   const BlobFetcher* blob_fetcher) {
   for (auto memtable : memlist_) {
     memtable->MultiGet(read_options, range, callback,
-                       true /* immutable_memtable */);
+                       true /* immutable_memtable */, blob_fetcher);
     if (range->empty()) {
       return;
     }
@@ -128,12 +201,13 @@ void MemTableListVersion::MultiGet(const ReadOptions& read_options,
 
 bool MemTableListVersion::GetMergeOperands(
     const LookupKey& key, Status* s, MergeContext* merge_context,
-    SequenceNumber* max_covering_tombstone_seq, const ReadOptions& read_opts) {
+    SequenceNumber* max_covering_tombstone_seq, const ReadOptions& read_opts,
+    const BlobFetcher* blob_fetcher) {
   for (ReadOnlyMemTable* memtable : memlist_) {
     bool done = memtable->Get(
         key, /*value=*/nullptr, /*columns=*/nullptr, /*timestamp=*/nullptr, s,
         merge_context, max_covering_tombstone_seq, read_opts,
-        true /* immutable_memtable */, nullptr, nullptr, false);
+        true /* immutable_memtable */, nullptr, nullptr, false, blob_fetcher);
     if (done) {
       return true;
     }
@@ -145,10 +219,11 @@ bool MemTableListVersion::GetFromHistory(
     const LookupKey& key, std::string* value, PinnableWideColumns* columns,
     std::string* timestamp, Status* s, MergeContext* merge_context,
     SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
-    const ReadOptions& read_opts, bool* is_blob_index) {
+    const ReadOptions& read_opts, bool* is_blob_index,
+    const BlobFetcher* blob_fetcher) {
   return GetFromList(&memlist_history_, key, value, columns, timestamp, s,
                      merge_context, max_covering_tombstone_seq, seq, read_opts,
-                     nullptr /*read_callback*/, is_blob_index);
+                     nullptr /*read_callback*/, is_blob_index, blob_fetcher);
 }
 
 bool MemTableListVersion::GetFromList(
@@ -156,7 +231,8 @@ bool MemTableListVersion::GetFromList(
     std::string* value, PinnableWideColumns* columns, std::string* timestamp,
     Status* s, MergeContext* merge_context,
     SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
-    const ReadOptions& read_opts, ReadCallback* callback, bool* is_blob_index) {
+    const ReadOptions& read_opts, ReadCallback* callback, bool* is_blob_index,
+    const BlobFetcher* blob_fetcher) {
   *seq = kMaxSequenceNumber;
 
   for (auto& memtable : *list) {
@@ -166,7 +242,8 @@ bool MemTableListVersion::GetFromList(
     bool done =
         memtable->Get(key, value, columns, timestamp, s, merge_context,
                       max_covering_tombstone_seq, &current_seq, read_opts,
-                      true /* immutable_memtable */, callback, is_blob_index);
+                      true /* immutable_memtable */, callback, is_blob_index,
+                      true /* do_merge */, blob_fetcher);
     if (*seq == kMaxSequenceNumber) {
       // Store the most recent sequence number of any operation on this key.
       // Since we only care about the most recent change, we only need to
@@ -225,33 +302,42 @@ void MemTableListVersion::AddIterators(
     const ReadOptions& options,
     UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
     const SliceTransform* prefix_extractor,
-    MergeIteratorBuilder* merge_iter_builder, bool add_range_tombstone_iter) {
+    MergeIteratorBuilder* merge_iter_builder, bool add_range_tombstone_iter,
+    SequenceNumber read_seq, const MultiScanArgs* scan_opts,
+    const Comparator* user_comparator) {
   for (auto& m : memlist_) {
+    const bool should_probe_scan_intersection =
+        scan_opts != nullptr && scan_opts->HasBoundedScanRanges() &&
+        m->NumRangeDeletion() == 0;
+    if (should_probe_scan_intersection &&
+        !MultiScanIntersectsMemTable(m, options, seqno_to_time_mapping,
+                                     prefix_extractor, scan_opts,
+                                     user_comparator)) {
+      continue;
+    }
     auto mem_iter =
         m->NewIterator(options, seqno_to_time_mapping,
                        merge_iter_builder->GetArena(), prefix_extractor,
                        /*for_flush=*/false);
+    ScopedArenaPtr<InternalIterator> mem_iter_guard(mem_iter);
     if (!add_range_tombstone_iter || options.ignore_range_deletions) {
-      merge_iter_builder->AddIterator(mem_iter);
+      merge_iter_builder->AddIterator(mem_iter_guard.release());
     } else {
-      // Except for snapshot read, using kMaxSequenceNumber is OK because these
-      // are immutable memtables.
-      SequenceNumber read_seq = options.snapshot != nullptr
-                                    ? options.snapshot->GetSequenceNumber()
-                                    : kMaxSequenceNumber;
+      const SequenceNumber range_del_read_seq =
+          read_seq != kMaxSequenceNumber || options.snapshot == nullptr
+              ? read_seq
+              : options.snapshot->GetSequenceNumber();
       std::unique_ptr<TruncatedRangeDelIterator> mem_tombstone_iter;
-      auto range_del_iter = m->NewRangeTombstoneIterator(
-          options, read_seq, true /* immutale_memtable */);
-      if (range_del_iter == nullptr || range_del_iter->empty()) {
-        delete range_del_iter;
-      } else {
+      std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+          m->NewRangeTombstoneIterator(options, range_del_read_seq,
+                                       true /* immutale_memtable */));
+      if (range_del_iter != nullptr && !range_del_iter->empty()) {
         mem_tombstone_iter = std::make_unique<TruncatedRangeDelIterator>(
-            std::unique_ptr<FragmentedRangeTombstoneIterator>(range_del_iter),
-            &m->GetInternalKeyComparator(), nullptr /* smallest */,
-            nullptr /* largest */);
+            std::move(range_del_iter), &m->GetInternalKeyComparator(),
+            nullptr /* smallest */, nullptr /* largest */);
       }
       merge_iter_builder->AddPointAndTombstoneIterator(
-          mem_iter, std::move(mem_tombstone_iter));
+          mem_iter_guard.release(), std::move(mem_tombstone_iter));
     }
   }
 }
@@ -374,17 +460,16 @@ bool MemTableListVersion::TrimHistory(autovector<ReadOnlyMemTable*>* to_delete,
   return ret;
 }
 
-const Slice& MemTableListVersion::GetNewestUDT() const {
-  static Slice kEmptySlice;
+Slice MemTableListVersion::GetNewestUDT() const {
   for (auto it = memlist_.begin(); it != memlist_.end(); ++it) {
     ReadOnlyMemTable* m = *it;
     Slice timestamp = m->GetNewestUDT();
     assert(!timestamp.empty() || m->IsEmpty());
     if (!timestamp.empty()) {
-      return m->GetNewestUDT();
+      return timestamp;
     }
   }
-  return kEmptySlice;
+  return Slice();
 }
 
 // Returns true if there is at least one memtable on which flush has
@@ -413,7 +498,6 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_PICK_MEMTABLES_TO_FLUSH);
   const auto& memlist = current_->memlist_;
-  bool atomic_flush = false;
 
   // Note: every time MemTableList::Add(mem) is called, it adds the new mem
   // at the FRONT of the memlist (memlist.push_front(mem)). Therefore, by
@@ -424,9 +508,6 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
   auto it = memlist.rbegin();
   for (; it != memlist.rend(); ++it) {
     ReadOnlyMemTable* m = *it;
-    if (!atomic_flush && m->atomic_flush_seqno_ != kMaxSequenceNumber) {
-      atomic_flush = true;
-    }
     if (m->GetID() > max_memtable_id) {
       break;
     }
@@ -457,7 +538,12 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
     // since they map to the same WAL and have the same NextLogNumber().
     assert(strcmp((*it)->Name(), "WBWIMemTable") != 0);
   }
-  if (!atomic_flush || num_flush_not_started_ == 0) {
+  // The flush request is complete only after every unstarted immutable
+  // memtable has been picked. A request can be older than a newer immutable
+  // memtable; clearing flush_requested_ after a partial or empty pick would
+  // make the queued newer request look unnecessary and leave that memtable
+  // unflushed.
+  if (num_flush_not_started_ == 0) {
     flush_requested_ = false;  // start-flush request is complete
   }
 }
@@ -673,7 +759,6 @@ void MemTableList::Add(ReadOnlyMemTable* m,
   // we don't have to ref the memtable here. we just take over the
   // reference from the DBImpl.
   current_->Add(m, to_delete);
-  m->MarkImmutable();
   num_flush_not_started_++;
   if (num_flush_not_started_ == 1) {
     imm_flush_needed.store(true, std::memory_order_release);
@@ -704,6 +789,24 @@ size_t MemTableList::ApproximateUnflushedMemTablesMemoryUsage() {
   size_t total_size = 0;
   for (auto& memtable : current_->memlist_) {
     total_size += memtable->ApproximateMemoryUsage();
+  }
+  return total_size;
+}
+
+size_t MemTableList::WBMTrackedUnflushedMemTablesMemoryUsage() const {
+  size_t total_size = 0;
+  for (const ReadOnlyMemTable* memtable : current_->memlist_) {
+    total_size += memtable->WBMTrackedMemoryUsage();
+  }
+  return total_size;
+}
+
+size_t MemTableList::WBMTrackedUnstartedMemTablesMemoryUsage() const {
+  size_t total_size = 0;
+  for (const ReadOnlyMemTable* memtable : current_->memlist_) {
+    if (!memtable->flush_in_progress_) {
+      total_size += memtable->WBMTrackedMemoryUsage();
+    }
   }
   return total_size;
 }

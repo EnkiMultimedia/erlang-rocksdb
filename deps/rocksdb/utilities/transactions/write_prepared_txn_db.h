@@ -23,23 +23,34 @@
 #include "rocksdb/options.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "util/cast_util.h"
+#include "util/coro_utils.h"
 #include "util/set_comparator.h"
 #include "util/string_util.h"
 #include "utilities/transactions/pessimistic_transaction.h"
 #include "utilities/transactions/pessimistic_transaction_db.h"
 #include "utilities/transactions/write_prepared_txn.h"
 
+#if USE_COROUTINES
+#include "rocksdb/utilities/coro_stackable_db.h"
+#endif
+
 namespace ROCKSDB_NAMESPACE {
 enum SnapshotBackup : bool { kUnbackedByDBSnapshot, kBackedByDBSnapshot };
+
+#if USE_COROUTINES
+using WritePreparedTxnDBBase = CoroStackableDBBase<PessimisticTransactionDB>;
+#else
+using WritePreparedTxnDBBase = PessimisticTransactionDB;
+#endif
 
 // A PessimisticTransactionDB that writes data to DB after prepare phase of 2PC.
 // In this way some data in the DB might not be committed. The DB provides
 // mechanisms to tell such data apart from committed data.
-class WritePreparedTxnDB : public PessimisticTransactionDB {
+class WritePreparedTxnDB : public WritePreparedTxnDBBase {
  public:
   explicit WritePreparedTxnDB(DB* db,
                               const TransactionDBOptions& txn_db_options)
-      : PessimisticTransactionDB(db, txn_db_options),
+      : WritePreparedTxnDBBase(db, txn_db_options),
         SNAPSHOT_CACHE_BITS(txn_db_options.wp_snapshot_cache_bits),
         SNAPSHOT_CACHE_SIZE(static_cast<size_t>(1ull << SNAPSHOT_CACHE_BITS)),
         COMMIT_CACHE_BITS(txn_db_options.wp_commit_cache_bits),
@@ -50,7 +61,7 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
 
   explicit WritePreparedTxnDB(StackableDB* db,
                               const TransactionDBOptions& txn_db_options)
-      : PessimisticTransactionDB(db, txn_db_options),
+      : WritePreparedTxnDBBase(db, txn_db_options),
         SNAPSHOT_CACHE_BITS(txn_db_options.wp_snapshot_cache_bits),
         SNAPSHOT_CACHE_SIZE(static_cast<size_t>(1ull << SNAPSHOT_CACHE_BITS)),
         COMMIT_CACHE_BITS(txn_db_options.wp_commit_cache_bits),
@@ -59,7 +70,7 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
     Init(txn_db_options);
   }
 
-  virtual ~WritePreparedTxnDB();
+  ~WritePreparedTxnDB() override;
 
   Status Initialize(const std::vector<size_t>& compaction_enabled_cf_indices,
                     const std::vector<ColumnFamilyHandle*>& handles) override;
@@ -83,15 +94,44 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
                        size_t batch_cnt, WritePreparedTxn* txn);
 
   using DB::Get;
-  Status Get(const ReadOptions& _read_options,
-             ColumnFamilyHandle* column_family, const Slice& key,
-             PinnableSlice* value, std::string* timestamp) override;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(Status, Get, const ReadOptions& _read_options,
+                                  ColumnFamilyHandle* column_family,
+                                  const Slice& key, PinnableSlice* value,
+                                  std::string* timestamp);
+  using DB::GetAsync;
+
+  using DB::GetEntity;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(Status, GetEntity, const ReadOptions& options,
+                                  ColumnFamilyHandle* column_family,
+                                  const Slice& key,
+                                  PinnableWideColumns* columns);
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(Status, GetEntity, const ReadOptions& options,
+                                  const Slice& key,
+                                  PinnableAttributeGroups* result);
+
+  using DB::GetWithMetadata;
+  Status GetWithMetadata(const ReadOptions& options,
+                         ColumnFamilyHandle* column_family, const Slice& key,
+                         PinnableSlice* value,
+                         OutputMetadata* output_metadata) override;
 
   using DB::MultiGet;
-  void MultiGet(const ReadOptions& _read_options, const size_t num_keys,
-                ColumnFamilyHandle** column_families, const Slice* keys,
-                PinnableSlice* values, std::string* timestamps,
-                Status* statuses, const bool sorted_input) override;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(void, MultiGet,
+                                  const ReadOptions& _read_options,
+                                  const size_t num_keys,
+                                  ColumnFamilyHandle** column_families,
+                                  const Slice* keys, PinnableSlice* values,
+                                  std::string* timestamps, Status* statuses,
+                                  const bool sorted_input);
+  using DB::MultiGetAsync;
+
+  using DB::MultiGetWithMetadata;
+  void MultiGetWithMetadata(const ReadOptions& options, const size_t num_keys,
+                            ColumnFamilyHandle* const* column_families,
+                            const Slice* keys, PinnableSlice* values,
+                            Status* statuses,
+                            MultiGetOutputMetadata* output_metadata,
+                            const bool sorted_input) override;
 
   using DB::NewIterator;
   Iterator* NewIterator(const ReadOptions& _read_options,
@@ -99,6 +139,9 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
 
   using DB::NewIterators;
   Status NewIterators(const ReadOptions& _read_options,
+                      const std::vector<ColumnFamilyHandle*>& column_families,
+                      std::vector<Iterator*>* iterators) override;
+  Status NewIterators(const std::vector<ReadOptions>& read_options,
                       const std::vector<ColumnFamilyHandle*>& column_families,
                       std::vector<Iterator*>* iterators) override;
 
@@ -169,7 +212,8 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
     // commit cache, ii) delayed prepared, commit cache again. In this way if
     // the first query to commit cache missed the commit, the 2nd will catch it.
     bool was_empty;
-    SequenceNumber max_evicted_seq_lb, max_evicted_seq_ub;
+    SequenceNumber max_evicted_seq_lb;
+    SequenceNumber max_evicted_seq_ub;
     CommitEntry64b dont_care;
     auto indexed_seq = prep_seq % COMMIT_CACHE_SIZE;
     size_t repeats = 0;
@@ -545,8 +589,9 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
     return s;
   }
 
-  Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
-                 const Slice& key, PinnableSlice* value);
+  DECLARE_SYNC_AND_ASYNC(Status, GetImpl, const ReadOptions& options,
+                         ColumnFamilyHandle* column_family, const Slice& key,
+                         PinnableSlice* value);
 
   // A heap with the amortized O(1) complexity for erase. It uses one extra heap
   // to keep track of erased entries that are not yet on top of the main heap.
@@ -563,6 +608,13 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
     friend class WritePreparedTxnDB;
 
    public:
+    PreparedHeap() = default;
+    // No copying allowed
+    PreparedHeap(const PreparedHeap&) = delete;
+    PreparedHeap& operator=(const PreparedHeap&) = delete;
+    PreparedHeap(PreparedHeap&&) = delete;
+    PreparedHeap& operator=(PreparedHeap&&) = delete;
+
     ~PreparedHeap() {
       if (!TEST_CRASH_) {
         assert(heap_.empty());
@@ -851,7 +903,15 @@ class WritePreparedTxnReadCallback : public ReadCallback {
     (void)backed_by_snapshot_;  // to silence unused private field warning
   }
 
-  virtual ~WritePreparedTxnReadCallback() {
+  // No copying allowed
+  WritePreparedTxnReadCallback(const WritePreparedTxnReadCallback&) = delete;
+  WritePreparedTxnReadCallback& operator=(const WritePreparedTxnReadCallback&) =
+      delete;
+  WritePreparedTxnReadCallback(WritePreparedTxnReadCallback&&) = delete;
+  WritePreparedTxnReadCallback& operator=(WritePreparedTxnReadCallback&&) =
+      delete;
+
+  ~WritePreparedTxnReadCallback() override {
     // If it is not backed by snapshot, the caller must check validity
     assert(valid_checked_ || backed_by_snapshot_ == kBackedByDBSnapshot);
   }

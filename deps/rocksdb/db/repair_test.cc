@@ -14,7 +14,7 @@
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
-#include "rocksdb/transaction_log.h"
+#include "rocksdb/wal_iterator.h"
 #include "table/unique_id_impl.h"
 #include "util/string_util.h"
 
@@ -527,7 +527,8 @@ TEST_F(RepairTest, RepairColumnFamilyOptions) {
   const int kNumCfs = 2;
   const int kEntriesPerCf = 2;
 
-  Options opts(CurrentOptions()), rev_opts(CurrentOptions());
+  Options opts(CurrentOptions());
+  Options rev_opts(CurrentOptions());
   opts.comparator = BytewiseComparator();
   rev_opts.comparator = ReverseBytewiseComparator();
 

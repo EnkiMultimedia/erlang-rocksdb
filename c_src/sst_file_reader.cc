@@ -355,8 +355,9 @@ SstFileReaderGetTableProperties(
     keys.push_back(ATOM_FAST_COMPRESSION_ESTIMATED_DATA_SIZE);
     values.push_back(enif_make_uint64(env, props->fast_compression_estimated_data_size));
 
+    // Removed from RocksDB 11.13; kept in the map for compatibility.
     keys.push_back(ATOM_EXTERNAL_SST_FILE_GLOBAL_SEQNO_OFFSET);
-    values.push_back(enif_make_uint64(env, props->external_sst_file_global_seqno_offset));
+    values.push_back(enif_make_uint64(env, 0));
 
     ERL_NIF_TERM props_map;
     enif_make_map_from_arrays(env, keys.data(), values.data(), keys.size(), &props_map);

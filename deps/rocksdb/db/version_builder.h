@@ -64,14 +64,6 @@ class VersionBuilder {
 
   //============APIs only used by VersionEditHandlerPointInTime ============//
 
-  // Creates a save point for the Version that has been built so far. Subsequent
-  // VersionEdits applied to the builder will not affect the Version in this
-  // save point. VersionBuilder currently only supports creating one save point,
-  // so when `CreateOrReplaceSavePoint` is called again, the previous save point
-  // is cleared. `ClearSavePoint` can be called explicitly to clear
-  // the save point too.
-  void CreateOrReplaceSavePoint();
-
   // The builder can find all the files to build a `Version`. Or if
   // `allow_incomplete_valid_version_` is true and the version history is never
   // edited in an atomic group, and only a suffix of L0 SST files and their
@@ -85,36 +77,31 @@ class VersionBuilder {
 
   bool HasMissingFiles() const;
 
-  // When applying a sequence of VersionEdit, intermediate files are the ones
-  // that are added and then deleted. The caller should clear this intermediate
-  // files tracking after calling this API. So that the tracking for subsequent
-  // VersionEdits can start over with a clean state.
-  std::vector<std::string>& GetAndClearIntermediateFiles();
+  // When applying a sequence of VersionEdits, intermediate files are the ones
+  // that are added and then deleted. Returns the tracked files and clears them
+  // so that subsequent VersionEdits start with a clean state.
+  std::vector<std::string> GetAndClearIntermediateFiles();
 
   // Clearing all the found files in this Version.
   void ClearFoundFiles();
 
-  // Save the Version in the save point to the provided `vstorage`.
-  // Non-OK status will be returned if there is not a valid save point.
-  Status SaveSavePointTo(VersionStorageInfo* vstorage) const;
-
-  // Load all the table handlers for the Version in the save point.
-  // Non-OK status will be returned if there is not a valid save point.
-  Status LoadSavePointTableHandlers(InternalStats* internal_stats,
-                                    int max_threads,
-                                    bool prefetch_index_and_filter_in_cache,
-                                    bool is_initial_load,
-                                    const MutableCFOptions& mutable_cf_options,
-                                    size_t max_file_size_for_l0_meta_pin,
-                                    const ReadOptions& read_options);
-
-  void ClearSavePoint();
+  // Single-edit undo for building a Version reflecting the state *before* the
+  // most recent `Apply()`. On a valid->invalid negative edge,
+  // `RollbackLastApply()` reverts the builder to the pre-edit state (so
+  // `SaveTo`/`LoadTableHandlers` build the pre-edit Version), then
+  // `RedoLastApply()` restores the post-edit state to continue replay.
+  // `CommitLastApply()` finalizes the most recent `Apply()` (freeing files
+  // whose deletion was deferred) and must be called once per `Apply()`; it is a
+  // no-op if there is nothing pending. This replaces the previous per-edit
+  // whole-Rep save-point copy, which was quadratic over a MANIFEST.
+  void RollbackLastApply();
+  void RedoLastApply();
+  void CommitLastApply();
 
   //======= End of APIs only used by VersionEditPointInTime==========//
 
  private:
   class Rep;
-  std::unique_ptr<Rep> savepoint_;
   std::unique_ptr<Rep> rep_;
 };
 

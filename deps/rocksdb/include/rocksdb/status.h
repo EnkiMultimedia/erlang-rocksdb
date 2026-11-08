@@ -66,6 +66,15 @@ class Status {
   // error swallowing occurs.
   inline void PermitUncheckedError() const { MarkChecked(); }
 
+  // Like PermitUncheckedError(), but documents that this Status is expected to
+  // be OK and is permitted to go unread (e.g. a default-constructed member that
+  // may legitimately never be checked when a feature is unused). Asserts the
+  // status is OK in debug builds.
+  inline void PermitUncheckedOk() const {
+    assert(code_ == kOk);
+    MarkChecked();
+  }
+
   inline void MustCheck() const {
 #ifdef ROCKSDB_ASSERT_STATUS_CHECKED
     checked_ = false;
@@ -484,8 +493,8 @@ class Status {
     return (code() == kIncomplete) && (subcode() == kManualCompactionPaused);
   }
 
-  // Returns true iff the status indicates compaction aborted. This
-  // is caused by a call to AbortAllCompactions
+  // Returns true iff the status indicates compaction aborted by
+  // AbortAllCompactions() or AbortCompactions().
   bool IsCompactionAborted() const {
     MarkChecked();
     return (code() == kIncomplete) && (subcode() == kCompactionAborted);

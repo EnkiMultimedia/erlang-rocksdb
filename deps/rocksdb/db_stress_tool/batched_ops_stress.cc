@@ -8,13 +8,17 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #ifdef GFLAGS
+#include <sstream>
+
 #include "db_stress_tool/db_stress_common.h"
 
 namespace ROCKSDB_NAMESPACE {
 class BatchedOpsStressTest : public StressTest {
  public:
-  BatchedOpsStressTest() = default;
-  virtual ~BatchedOpsStressTest() = default;
+  BatchedOpsStressTest(int db_index, const std::string& db_path,
+                       const std::string& ev_path, const std::string& sec_path)
+      : StressTest(db_index, db_path, ev_path, sec_path) {}
+  ~BatchedOpsStressTest() override = default;
 
   bool IsStateTracked() const override { return false; }
 
@@ -161,7 +165,20 @@ class BatchedOpsStressTest : public StressTest {
     for (int i = 0; i < 10; i++) {
       keys[i] += key.ToString();
       key_slices[i] = keys[i];
-      s = db_->Get(readoptionscopy, cfh, key_slices[i], &from_db);
+      if (i == 0) {
+        OutputMetadata output_metadata;
+        output_metadata.WantNewerVersionPresent();
+        s = db_->GetWithMetadata(readoptionscopy, cfh, key_slices[i], &from_db,
+                                 &output_metadata);
+        if (s.IsNotSupported()) {
+          // Transaction DBs that require custom visibility callbacks cannot
+          // provide newer-version metadata. Preserve the ordinary batched
+          // stress coverage for those configurations.
+          s = DbStressGet(db_, readoptionscopy, cfh, key_slices[i], &from_db);
+        }
+      } else {
+        s = DbStressGet(db_, readoptionscopy, cfh, key_slices[i], &from_db);
+      }
       if (!s.ok() && !s.IsNotFound()) {
         fprintf(stderr, "get error: %s\n", s.ToString().c_str());
         values[i] = "";
@@ -233,8 +250,20 @@ class BatchedOpsStressTest : public StressTest {
         key_str.emplace_back(keys[key] + Key(rand_keys[rand_key]));
         key_slices.emplace_back(key_str.back());
       }
-      db_->MultiGet(readoptionscopy, cfh, num_prefixes, key_slices.data(),
-                    values.data(), statuses.data());
+      MultiGetOutputMetadata output_metadata;
+      output_metadata.WantNewerVersionPresent();
+      db_->MultiGetWithMetadata(readoptionscopy, cfh, num_prefixes,
+                                key_slices.data(), values.data(),
+                                statuses.data(), &output_metadata);
+      const bool metadata_not_supported = std::all_of(
+          statuses.begin(), statuses.end(),
+          [](const Status& status) { return status.IsNotSupported(); });
+      if (metadata_not_supported) {
+        // Preserve compatibility with transaction DBs whose custom visibility
+        // callbacks make newer-version tracking unsupported.
+        DbStressMultiGet(db_, readoptionscopy, cfh, num_prefixes,
+                         key_slices.data(), values.data(), statuses.data());
+      }
       for (size_t i = 0; i < num_prefixes; i++) {
         Status s = statuses[i];
         if (!s.ok() && !s.IsNotFound()) {
@@ -379,6 +408,19 @@ class BatchedOpsStressTest : public StressTest {
         }
       }
     }
+
+    // Reuse one of the sibling entities we just read (under read_opts_copy's
+    // snapshot, and cross-checked above) as the lazy read's reference, rather
+    // than issuing another eager read.
+    const size_t lazy_idx = thread->rand.Uniform(static_cast<int>(num_keys));
+    const std::string lazy_key = std::to_string(lazy_idx) + key_suffix;
+    const WideColumns& eager_ref_columns =
+        FLAGS_use_attribute_group
+            ? attribute_group_results[lazy_idx].front().columns()
+            : column_results[lazy_idx].columns();
+    const WideColumns* const eager_ref =
+        eager_ref_columns.empty() ? nullptr : &eager_ref_columns;
+    MaybeTestGetEntityLazy(thread, read_opts_copy, cfh, lazy_key, eager_ref);
   }
 
   void TestMultiGetEntity(ThreadState* thread, const ReadOptions& read_opts,
@@ -483,6 +525,16 @@ class BatchedOpsStressTest : public StressTest {
             }
           }
         }
+
+        std::vector<EagerEntityRef> eager_refs(num_prefixes);
+        for (size_t j = 0; j < num_prefixes; ++j) {
+          eager_refs[j].status = results[j][0].status();
+          if (eager_refs[j].status.ok()) {
+            eager_refs[j].columns = &results[j][0].columns();
+          }
+        }
+        MaybeTestMultiGetEntityLazy(thread, read_opts_copy, cfh, num_prefixes,
+                                    key_slices.data(), &eager_refs);
       } else {
         // Non-AttributeGroup MultiGetEntity verification
 
@@ -544,6 +596,16 @@ class BatchedOpsStressTest : public StressTest {
             }
           }
         }
+
+        std::vector<EagerEntityRef> eager_refs(num_prefixes);
+        for (size_t j = 0; j < num_prefixes; ++j) {
+          eager_refs[j].status = statuses[j];
+          if (statuses[j].ok()) {
+            eager_refs[j].columns = &results[j].columns();
+          }
+        }
+        MaybeTestMultiGetEntityLazy(thread, read_opts_copy, cfh, num_prefixes,
+                                    key_slices.data(), &eager_refs);
       }
     }
   }
@@ -572,6 +634,8 @@ class BatchedOpsStressTest : public StressTest {
     std::array<ReadOptions, num_prefixes> ro_copies;
     std::array<std::string, num_prefixes> upper_bounds;
     std::array<Slice, num_prefixes> ub_slices;
+    std::array<std::function<bool(const TableProperties&)>, num_prefixes>
+        table_filters;
     std::array<std::unique_ptr<Iterator>, num_prefixes> iters;
 
     const Snapshot* const snapshot = db_->GetSnapshot();
@@ -579,26 +643,55 @@ class BatchedOpsStressTest : public StressTest {
     ColumnFamilyHandle* const cfh = column_families_[rand_column_families[0]];
     assert(cfh);
 
+    ScanWitnessLog witness(thread, "prefix_scan_batched");
+    if (witness.Enabled()) {
+      std::ostringstream start_oss;
+      start_oss << "action=start cf=" << rand_column_families[0] << " key={"
+                << FormatDiagnosticSlice(Slice(key))
+                << "} prefix_count=" << num_prefixes;
+      witness.Add(start_oss.str());
+    }
+
     for (size_t i = 0; i < num_prefixes; ++i) {
       prefixes[i] = std::to_string(i) + key;
       prefix_slices[i] = Slice(prefixes[i].data(), prefix_to_use);
 
       ro_copies[i] = readoptions;
       ro_copies[i].snapshot = snapshot;
-      if (thread->rand.OneIn(2) &&
-          GetNextPrefix(prefix_slices[i], &(upper_bounds[i]))) {
-        // For half of the time, set the upper bound to the next prefix
+      // This verifier compares 10 prefix scans entry-by-entry, so each
+      // iterator must be constrained to its seek prefix before we assert
+      // lockstep progress across them. Either set an upper bound or
+      // prefix_same_as_start so no iterator overshoots its prefix.
+      if (GetNextPrefix(prefix_slices[i], &(upper_bounds[i])) &&
+          thread->rand.OneIn(2)) {
+        // Half the time, bound by upper key
         ub_slices[i] = upper_bounds[i];
         ro_copies[i].iterate_upper_bound = &(ub_slices[i]);
         if (FLAGS_use_sqfc_for_range_queries) {
-          ro_copies[i].table_filter =
-              sqfc_factory_->GetTableFilterForRangeQuery(prefix_slices[i],
-                                                         ub_slices[i]);
+          table_filters[i] = sqfc_factory_->GetTableFilterForRangeQuery(
+              prefix_slices[i], ub_slices[i]);
+          ro_copies[i].table_filter = &table_filters[i];
         }
+      } else {
+        // Otherwise, bound by prefix
+        ro_copies[i].prefix_same_as_start = true;
       }
 
       iters[i].reset(db_->NewIterator(ro_copies[i], cfh));
       iters[i]->Seek(prefix_slices[i]);
+      if (witness.Enabled()) {
+        std::ostringstream seek_oss;
+        seek_oss << "action=seek_setup iterator=" << i << " prefix={"
+                 << FormatDiagnosticSlice(prefix_slices[i]) << "} upper_bound={"
+                 << (upper_bounds[i].empty()
+                         ? "none"
+                         : FormatDiagnosticSlice(Slice(upper_bounds[i])))
+                 << "} read_options={"
+                 << FormatReadOptionsForDiagnostics(ro_copies[i]) << "}";
+        witness.Add(seek_oss.str());
+      }
+      witness.AddIteratorState("Seek", i, *iters[i],
+                               !ro_copies[i].allow_unprepared_value);
     }
 
     uint64_t count = 0;
@@ -611,6 +704,15 @@ class BatchedOpsStressTest : public StressTest {
       // get list of all values for this iteration
       for (size_t i = 0; i < num_prefixes; ++i) {
         // no iterator should finish before the first one
+        if (!(iters[i]->Valid() &&
+              iters[i]->key().starts_with(prefix_slices[i]))) {
+          witness.Add("failure=prefix_iterator_finished_early iterator=" +
+                      std::to_string(i) + " prefix={" +
+                      FormatDiagnosticSlice(prefix_slices[i]) + "}");
+          witness.AddIteratorState("IteratorFinishedEarly", i, *iters[i],
+                                   !ro_copies[i].allow_unprepared_value);
+          witness.Flush("prefix_scan_batched_iterator_finished_early");
+        }
         assert(iters[i]->Valid() &&
                iters[i]->key().starts_with(prefix_slices[i]));
 
@@ -618,14 +720,18 @@ class BatchedOpsStressTest : public StressTest {
           // Save key in case PrepareValue fails and invalidates the iterator
           const std::string prepare_value_key =
               iters[i]->key().ToString(/* hex */ true);
+          witness.AddIteratorState("PrepareValueBefore", i, *iters[i], false);
 
           if (!iters[i]->PrepareValue()) {
+            witness.AddIteratorState("PrepareValueFailed", i, *iters[i], false);
+            witness.Flush("prefix_scan_batched_prepare_value");
             fprintf(stderr,
                     "prefix scan error: PrepareValue failed for key %s: %s\n",
                     prepare_value_key.c_str(),
                     iters[i]->status().ToString().c_str());
             continue;
           }
+          witness.AddIteratorState("PrepareValue", i, *iters[i], true);
         }
 
         values[i] = iters[i]->value().ToString();
@@ -638,6 +744,12 @@ class BatchedOpsStressTest : public StressTest {
         const char actual = values[i].back();
 
         if (expected != actual) {
+          witness.Add("failure=prefix_value_suffix_mismatch iterator=" +
+                      std::to_string(i) +
+                      " expected=" + std::string(1, expected) +
+                      " actual=" + std::string(1, actual));
+          witness.AddIteratorState("ValueSuffixMismatch", i, *iters[i], true);
+          witness.Flush("prefix_scan_batched_value_suffix");
           fprintf(stderr, "prefix scan error expected = %c actual = %c\n",
                   expected, actual);
         }
@@ -646,6 +758,11 @@ class BatchedOpsStressTest : public StressTest {
 
         // make sure all values are equivalent
         if (values[i] != values[0]) {
+          witness.Add("failure=prefix_values_inconsistent iterator=" +
+                      std::to_string(i) + " prefix={" +
+                      FormatDiagnosticSlice(prefix_slices[i]) + "}");
+          witness.AddIteratorState("ValueMismatch", i, *iters[i], true);
+          witness.Flush("prefix_scan_batched_value_mismatch");
           fprintf(stderr,
                   "prefix scan error : %" ROCKSDB_PRIszt
                   ", inconsistent values for prefix %s: %s, %s\n",
@@ -658,6 +775,11 @@ class BatchedOpsStressTest : public StressTest {
 
         // make sure value() and columns() are consistent
         if (!VerifyWideColumns(iters[i]->value(), iters[i]->columns())) {
+          witness.Add("failure=prefix_wide_columns_inconsistent iterator=" +
+                      std::to_string(i) + " prefix={" +
+                      FormatDiagnosticSlice(prefix_slices[i]) + "}");
+          witness.AddIteratorState("WideColumnsMismatch", i, *iters[i], true);
+          witness.Flush("prefix_scan_batched_wide_columns");
           fprintf(stderr,
                   "prefix scan error : %" ROCKSDB_PRIszt
                   ", value and columns inconsistent for prefix %s: value: %s, "
@@ -668,15 +790,34 @@ class BatchedOpsStressTest : public StressTest {
         }
 
         iters[i]->Next();
+        witness.AddIteratorState("Next", i, *iters[i],
+                                 !ro_copies[i].allow_unprepared_value);
       }
     }
 
     // cleanup iterators and snapshot
     for (size_t i = 0; i < num_prefixes; ++i) {
       // if the first iterator finished, they should have all finished
+      if (!(!iters[i]->Valid() ||
+            !iters[i]->key().starts_with(prefix_slices[i]))) {
+        witness.Add("failure=prefix_iterator_not_exhausted iterator=" +
+                    std::to_string(i) + " prefix={" +
+                    FormatDiagnosticSlice(prefix_slices[i]) + "}");
+        witness.AddIteratorState("IteratorNotExhausted", i, *iters[i],
+                                 !ro_copies[i].allow_unprepared_value);
+        witness.Flush("prefix_scan_batched_iterator_not_exhausted");
+      }
       assert(!iters[i]->Valid() ||
              !iters[i]->key().starts_with(prefix_slices[i]));
-      assert(iters[i]->status().ok());
+      if (!iters[i]->status().ok()) {
+        witness.Add(
+            "failure=prefix_iterator_status iterator=" + std::to_string(i) +
+            " status=" + iters[i]->status().ToString());
+        witness.AddIteratorState("IteratorStatus", i, *iters[i],
+                                 !ro_copies[i].allow_unprepared_value);
+        witness.Flush("prefix_scan_batched_status");
+      }
+      DB_STRESS_ASSERT_OK(iters[i]->status());
     }
 
     db_->ReleaseSnapshot(snapshot);
@@ -715,7 +856,11 @@ class BatchedOpsStressTest : public StressTest {
   }
 };
 
-StressTest* CreateBatchedOpsStressTest() { return new BatchedOpsStressTest(); }
+StressTest* CreateBatchedOpsStressTest(int db_index, const std::string& db_path,
+                                       const std::string& ev_path,
+                                       const std::string& sec_path) {
+  return new BatchedOpsStressTest(db_index, db_path, ev_path, sec_path);
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // GFLAGS

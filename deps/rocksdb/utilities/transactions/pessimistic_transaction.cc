@@ -54,7 +54,7 @@ PessimisticTransaction::PessimisticTransaction(
   txn_db_impl_ = static_cast_with_check<PessimisticTransactionDB>(txn_db);
   db_impl_ = static_cast_with_check<DBImpl>(db_);
   if (init) {
-    Initialize(txn_options);
+    PessimisticTransaction::Initialize(txn_options);
   }
 }
 
@@ -737,6 +737,8 @@ Status PessimisticTransaction::Commit() {
     if (!s.ok()) {
       ROCKS_LOG_WARN(db_impl_->immutable_db_options().info_log,
                      "Commit write failed");
+      // Keep the transaction rollbackable after the commit marker write fails.
+      txn_state_.store(PREPARED);
       return s;
     }
 
@@ -928,6 +930,13 @@ Status WriteCommittedTxn::CommitInternal() {
       }
     }
   }
+  // Blob direct write must go through the normal WriteBatch path in
+  // DBImpl::WriteImpl() so large values can be transformed into BlobIndex
+  // entries. The bypass-memtable optimization commits through WBWI ingestion,
+  // which skips that transformation and does not support kTypeBlobIndex.
+  if (bypass_memtable && db_impl_->HasAnyBlobDirectWriteColumnFamily()) {
+    bypass_memtable = false;
+  }
   if (!bypass_memtable) {
     // insert prepared batch into Memtable only skipping WAL.
     // Memtable will ignore BeginPrepare/EndPrepare markers
@@ -996,6 +1005,10 @@ Status PessimisticTransaction::Rollback() {
           log_number_);
       Clear();
       txn_state_.store(ROLLEDBACK);
+    } else {
+      // Rollback writes can fail under retryable IO errors. Preserve the state
+      // so callers can retry after error recovery.
+      txn_state_.store(PREPARED);
     }
   } else if (txn_state_ == STARTED) {
     if (log_number_ > 0) {

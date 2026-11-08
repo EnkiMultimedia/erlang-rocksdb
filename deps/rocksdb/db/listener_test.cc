@@ -31,6 +31,7 @@
 #include "util/mutexlock.h"
 #include "util/rate_limiter_impl.h"
 #include "util/string_util.h"
+#include "utilities/fault_injection_fs.h"
 #include "utilities/merge_operators.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -201,6 +202,194 @@ TEST_F(EventListenerTest, OnSingleDBCompactionTest) {
   }
 }
 
+// Listener that asserts OnCompactionPreCommit fires strictly between
+// OnCompactionBegin and OnCompactionCompleted, and that input files'
+// being_compacted flag is still true at that point.
+class TestCompactionPreCommitListener : public EventListener {
+ public:
+  explicit TestCompactionPreCommitListener(EventListenerTest* test)
+      : test_(test) {}
+
+  void OnCompactionBegin(DB* /*db*/, const CompactionJobInfo& ci) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++begin_count_;
+    last_begin_job_id_ = ci.job_id;
+    EXPECT_EQ(begin_count_, pre_commit_count_ + 1);
+    EXPECT_EQ(begin_count_, completed_count_ + 1);
+  }
+
+  void OnCompactionPreCommit(DB* db, const CompactionJobInfo& ci) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++pre_commit_count_;
+    // Must fire after Begin and before Completed for this compaction.
+    EXPECT_EQ(pre_commit_count_, begin_count_);
+    EXPECT_EQ(pre_commit_count_, completed_count_ + 1);
+    EXPECT_EQ(ci.job_id, last_begin_job_id_);
+    EXPECT_GT(ci.input_files.size(), 0U);
+
+    // Verify input files are still marked being_compacted.
+    std::vector<std::vector<FileMetaData>> files_by_level;
+    test_->dbfull()->TEST_GetFilesMetaData(test_->handles_[ci.cf_id],
+                                           &files_by_level);
+    EXPECT_EQ(test_->db_.get(), db);
+    for (const auto& info : ci.input_file_infos) {
+      bool found = false;
+      for (const auto& level_files : files_by_level) {
+        for (const auto& meta : level_files) {
+          if (meta.fd.GetNumber() == info.file_number) {
+            found = true;
+            EXPECT_TRUE(meta.being_compacted)
+                << "input file " << info.file_number
+                << " should still be being_compacted in "
+                   "OnCompactionPreCommit";
+          }
+        }
+      }
+      EXPECT_TRUE(found) << "input file " << info.file_number
+                         << " not found in DB";
+    }
+  }
+
+  void OnCompactionCompleted(DB* /*db*/, const CompactionJobInfo& ci) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++completed_count_;
+    // Must fire after the matching PreCommit.
+    EXPECT_EQ(completed_count_, pre_commit_count_);
+    EXPECT_EQ(completed_count_, begin_count_);
+    EXPECT_EQ(ci.job_id, last_begin_job_id_);
+  }
+
+  size_t BeginCount() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return begin_count_;
+  }
+  size_t PreCommitCount() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pre_commit_count_;
+  }
+  size_t CompletedCount() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return completed_count_;
+  }
+
+ private:
+  EventListenerTest* test_;
+  std::mutex mutex_;
+  size_t begin_count_ = 0;
+  size_t pre_commit_count_ = 0;
+  size_t completed_count_ = 0;
+  int last_begin_job_id_ = -1;
+};
+
+TEST_F(EventListenerTest, OnCompactionPreCommitOrdering) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.compaction_style = kCompactionStyleLevel;
+  options.compression = kNoCompression;
+  options.level0_file_num_compaction_trigger = 4;
+  auto* listener = new TestCompactionPreCommitListener(this);
+  options.listeners.emplace_back(listener);
+
+  // Verify sync-point ordering: Begin -> PreCommit -> Completed.
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::NotifyOnCompactionBegin::UnlockMutex",
+        "DBImpl::NotifyOnCompactionPreCommit::UnlockMutex"},
+       {"DBImpl::NotifyOnCompactionPreCommit::UnlockMutex",
+        "DBImpl::NotifyOnCompactionCompleted::UnlockMutex"}});
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  Random rnd(301);
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 10; j++) {
+      ASSERT_OK(Put(1, rnd.RandomString(10), rnd.RandomString(10)));
+    }
+    ASSERT_OK(Flush(1));
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  EXPECT_GT(listener->BeginCount(), 0U);
+  EXPECT_EQ(listener->PreCommitCount(), listener->BeginCount());
+  EXPECT_EQ(listener->CompletedCount(), listener->BeginCount());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+class TestDBShutdownBeginListener : public EventListener {
+ public:
+  void OnDBShutdownBegin(DB* db) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++shutdown_count_;
+    last_db_ = db;
+  }
+
+  int ShutdownCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return shutdown_count_;
+  }
+
+  DB* LastDB() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_db_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  int shutdown_count_ = 0;
+  DB* last_db_ = nullptr;
+};
+
+TEST_F(EventListenerTest, OnDBShutdownBeginOnceForCancelAndClose) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  auto listener = std::make_shared<TestDBShutdownBeginListener>();
+  options.listeners.emplace_back(listener);
+  DestroyAndReopen(options);
+
+  DB* db = db_.get();
+  dbfull()->CancelAllBackgroundWork(false);
+  EXPECT_EQ(1, listener->ShutdownCount());
+  EXPECT_EQ(db, listener->LastDB());
+
+  Close();
+  EXPECT_EQ(1, listener->ShutdownCount());
+}
+
+TEST_F(EventListenerTest, OnDBShutdownBeginOnFailedOpen) {
+  Close();
+
+  std::shared_ptr<FaultInjectionTestFS> fs(
+      new FaultInjectionTestFS(env_->GetFileSystem()));
+  std::unique_ptr<Env> env(NewCompositeEnv(fs));
+
+  Options options = CurrentOptions();
+  options.env = env.get();
+  options.create_if_missing = true;
+  auto listener = std::make_shared<TestDBShutdownBeginListener>();
+  options.listeners.emplace_back(listener);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "PersistRocksDBOptions:create",
+      [&](void* /*arg*/) { fs->SetFilesystemActive(false); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "PersistRocksDBOptions:written",
+      [&](void* /*arg*/) { fs->SetFilesystemActive(true); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::unique_ptr<DB> db;
+  Status s = DB::Open(options, dbname_, &db);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  EXPECT_EQ(1, listener->ShutdownCount());
+  EXPECT_NE(nullptr, listener->LastDB());
+  EXPECT_EQ(nullptr, db.get());
+
+  fs->SetFilesystemActive(true);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
 // This simple Listener can only handle one flush at a time.
 class TestFlushListener : public EventListener {
  public:
@@ -209,7 +398,7 @@ class TestFlushListener : public EventListener {
     db_closed = false;
   }
 
-  virtual ~TestFlushListener() {
+  ~TestFlushListener() override {
     prev_fc_info_.status.PermitUncheckedError();  // Ignore the status
   }
   void OnTableFileCreated(const TableFileCreationInfo& info) override {
@@ -331,12 +520,13 @@ TEST_F(EventListenerTest, OnSingleDBFlushTest) {
   ASSERT_OK(Put(5, "nikitich", std::string(90000, 'n')));
   ASSERT_OK(Put(6, "alyosha", std::string(90000, 'a')));
   ASSERT_OK(Put(7, "popovich", std::string(90000, 'p')));
+  FlushOptions flush_opts;
+  flush_opts.listener_wait = true;
   for (int i = 1; i < 8; ++i) {
-    ASSERT_OK(Flush(i));
-    ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
-    // Ensure background work is fully finished including listener callbacks
-    // before accessing listener state.
-    ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+    ASSERT_OK(db_->Flush(flush_opts, handles_[i]));
+    // listener_wait guarantees the OnFlushCompleted callbacks have finished
+    // running by the time Flush() returns, so the listener state below is up to
+    // date without separately waiting for background work.
     ASSERT_EQ(listener->flushed_dbs_.size(), i);
     ASSERT_EQ(listener->flushed_column_family_names_.size(), i);
   }
@@ -446,19 +636,15 @@ TEST_F(EventListenerTest, MultiDBMultiListeners) {
     }
   }
 
+  FlushOptions flush_opts;
+  flush_opts.listener_wait = true;
   for (size_t c = 0; c < cf_names.size(); ++c) {
     for (int d = 0; d < kNumDBs; ++d) {
-      ASSERT_OK(dbs[d]->Flush(FlushOptions(), vec_handles[d][c]));
-      ASSERT_OK(static_cast_with_check<DBImpl>(dbs[d].get())
-                    ->TEST_WaitForFlushMemTable());
+      // listener_wait ensures the OnFlushCompleted callbacks have finished by
+      // the time Flush() returns, so the listener state checked below is up to
+      // date without separately waiting for background work.
+      ASSERT_OK(dbs[d]->Flush(flush_opts, vec_handles[d][c]));
     }
-  }
-
-  for (int d = 0; d < kNumDBs; ++d) {
-    // Ensure background work is fully finished including listener callbacks
-    // before accessing listener state.
-    ASSERT_OK(static_cast_with_check<DBImpl>(dbs[d].get())
-                  ->TEST_WaitForBackgroundWork());
   }
 
   for (auto* listener : listeners) {
@@ -1696,7 +1882,7 @@ TEST_F(EventListenerTest, BackgroundJobPressure) {
                  Env::Priority::LOW);
   sleeping_task.WaitUntilSleeping();
 
-  // Phase 1: No pressure — 3 SST files (below slowdown trigger=4).
+  // Phase 1: No pressure -- 3 SST files (below slowdown trigger=4).
   for (int i = 0; i < 3; i++) {
     ASSERT_OK(Put("k" + std::to_string(i), std::string(100, 'x')));
     ASSERT_OK(Flush());
@@ -1714,7 +1900,7 @@ TEST_F(EventListenerTest, BackgroundJobPressure) {
   // MaybeScheduleFlushOrCompaction() runs before the pressure callback and
   // may schedule new flush work, making flush counts non-deterministic.
 
-  // Phase 2: Build pressure — flush past slowdown trigger (4 L0 SST files).
+  // Phase 2: Build pressure -- flush past slowdown trigger (4 L0 SST files).
   // Compaction is blocked, so L0 SST files pile up.
   listener->Reset();
   {
@@ -1750,11 +1936,11 @@ TEST_F(EventListenerTest, BackgroundJobPressure) {
   ASSERT_TRUE(found_compaction_scheduled);
   ASSERT_TRUE(found_high_proximity);
 
-  // Phase 3: Relieve pressure — unblock compaction, wait for completion.
+  // Phase 3: Relieve pressure -- unblock compaction, wait for completion.
   listener->Reset();
   sleeping_task.WakeUp();
   sleeping_task.WaitUntilDone();
-  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
 
   snapshots = listener->GetSnapshots();
   CheckInvariants(snapshots);

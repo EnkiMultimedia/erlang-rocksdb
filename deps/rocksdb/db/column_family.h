@@ -29,6 +29,7 @@
 #include "trace_replay/block_cache_tracer.h"
 #include "util/cast_util.h"
 #include "util/hash_containers.h"
+#include "util/mutexlock.h"
 #include "util/thread_local.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -49,7 +50,9 @@ class InstrumentedMutex;
 class InstrumentedMutexLock;
 struct SuperVersionContext;
 class BlobFileCache;
+class BlobFilePartitionManager;
 class BlobSource;
+class FlushInitiator;
 
 extern const double kIncSlowdownRatio;
 // This file contains a list of data structures for managing column family
@@ -168,7 +171,7 @@ class ColumnFamilyHandleImpl : public ColumnFamilyHandle {
   ColumnFamilyHandleImpl(ColumnFamilyData* cfd, DBImpl* db,
                          InstrumentedMutex* mutex);
   // destroy without mutex
-  virtual ~ColumnFamilyHandleImpl();
+  ~ColumnFamilyHandleImpl() override;
   virtual ColumnFamilyData* cfd() const { return cfd_; }
   virtual DBImpl* db() const { return db_; }
 
@@ -415,6 +418,19 @@ class ColumnFamilyData {
   TableCache* table_cache() const { return table_cache_.get(); }
   BlobFileCache* blob_file_cache() const { return blob_file_cache_.get(); }
   BlobSource* blob_source() const { return blob_source_.get(); }
+  // Returns the write-path blob partition manager for this CF, or null if BDW
+  // is disabled.
+  BlobFilePartitionManager* blob_partition_manager() const {
+    return blob_partition_manager_.get();
+  }
+  // Returns a shared ownership handle for cold paths that must keep the
+  // manager alive beyond the lifetime of this ColumnFamilyData.
+  std::shared_ptr<BlobFilePartitionManager> blob_partition_manager_handle()
+      const {
+    return blob_partition_manager_;
+  }
+  // Installs the write-path blob partition manager for this CF.
+  void SetBlobPartitionManager(std::shared_ptr<BlobFilePartitionManager> mgr);
 
   // See documentation in compaction_picker.h
   // REQUIRES: DB mutex held
@@ -430,8 +446,8 @@ class ColumnFamilyData {
   // Check if the passed range overlap with any running compactions.
   // REQUIRES: DB mutex held
   bool RangeOverlapWithCompaction(const Slice& smallest_user_key,
-                                  const Slice& largest_user_key,
-                                  int level) const;
+                                  const Slice& largest_user_key, int level,
+                                  bool range_limit_exclusive) const;
 
   // Check if the passed ranges overlap with any unflushed memtables
   // (immutable or mutable).
@@ -442,7 +458,8 @@ class ColumnFamilyData {
   // Thread-safe
   Status RangesOverlapWithMemtables(const autovector<UserKeyRange>& ranges,
                                     SuperVersion* super_version,
-                                    bool allow_data_in_errors, bool* overlap);
+                                    bool allow_data_in_errors, bool* overlap,
+                                    bool range_limit_exclusive);
 
   // A flag to tell a manual compaction is to compact all levels together
   // instead of a specific level.
@@ -505,6 +522,32 @@ class ColumnFamilyData {
   void set_queued_for_compaction(bool value) { queued_for_compaction_ = value; }
   bool queued_for_flush() { return queued_for_flush_; }
   bool queued_for_compaction() { return queued_for_compaction_; }
+
+  int compaction_aborted() const {
+    return compaction_aborted_.obj_.load(std::memory_order_acquire);
+  }
+  void inc_compaction_aborted(InstrumentedMutex* db_mutex) {
+    db_mutex->AssertHeld();
+    compaction_aborted_.obj_.fetch_add(1, std::memory_order_release);
+  }
+  int dec_compaction_aborted(InstrumentedMutex* db_mutex) {
+    db_mutex->AssertHeld();
+    return compaction_aborted_.obj_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+  }
+
+  int num_in_flight_compactions(InstrumentedMutex* db_mutex) const {
+    db_mutex->AssertHeld();
+    return num_in_flight_compactions_;
+  }
+  void inc_num_in_flight_compactions(InstrumentedMutex* db_mutex) {
+    db_mutex->AssertHeld();
+    ++num_in_flight_compactions_;
+  }
+  void dec_num_in_flight_compactions(InstrumentedMutex* db_mutex) {
+    db_mutex->AssertHeld();
+    assert(num_in_flight_compactions_ > 0);
+    --num_in_flight_compactions_;
+  }
 
   static std::pair<WriteStallCondition, WriteStallCause>
   GetWriteStallConditionAndCause(
@@ -605,6 +648,10 @@ class ColumnFamilyData {
     return ioptions_.cf_allow_ingest_behind || ioptions_.allow_ingest_behind;
   }
 
+  // Per-CF reader-writer lock that serializes IngestExternalFiles with range
+  // tombstone conversion.
+  port::RWMutex& GetIngestSstLock() { return ingest_sst_lock_; }
+
  private:
   friend class ColumnFamilySet;
   ColumnFamilyData(
@@ -614,7 +661,8 @@ class ColumnFamilyData {
       const FileOptions* file_options, ColumnFamilySet* column_family_set,
       BlockCacheTracer* const block_cache_tracer,
       const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
-      const std::string& db_session_id, bool read_only);
+      const std::string& db_session_id, bool read_only,
+      bool options_are_sanitized, bool fast_sst_open = false);
 
   std::vector<std::string> GetDbPaths() const;
 
@@ -648,6 +696,8 @@ class ColumnFamilyData {
   std::unique_ptr<TableCache> table_cache_;
   std::unique_ptr<BlobFileCache> blob_file_cache_;
   std::unique_ptr<BlobSource> blob_source_;
+  // Per-CF manager for write-path blob direct-write files.
+  std::shared_ptr<BlobFilePartitionManager> blob_partition_manager_;
 
   std::unique_ptr<InternalStats> internal_stats_;
 
@@ -688,9 +738,25 @@ class ColumnFamilyData {
   // If true --> this ColumnFamily is currently present in DBImpl::flush_queue_
   bool queued_for_flush_;
 
-  // If true --> this ColumnFamily is currently present in
-  // DBImpl::compaction_queue_
+  // If true, this ColumnFamily is in DBImpl::compaction_queue_ or its parked
+  // compaction set.
   bool queued_for_compaction_;
+
+  // Read outside the DB mutex by compaction workers (acquire-loaded roughly
+  // every 1024 records in ProcessKeyValueCompaction). Given its own cache line
+  // via CacheAlignedWrapper to avoid false sharing with the DB-mutex-written
+  // fields packed around it.
+  CacheAlignedWrapper<std::atomic<int>> compaction_aborted_{};
+
+  // Per-CF count of compactions "in flight" for AbortCompactions(): a picked
+  // Compaction (or one CompactFiles call), tracked from
+  // BeginInFlightCompaction() until EndInFlightCompaction() at the end of
+  // BackgroundCompaction, so it covers the NotifyOnCompactionCompleted window
+  // that CompactionPicker's compactions_in_progress_ set does not. NOT the same
+  // as DBImpl::num_running_compactions_ (which counts BackgroundCallCompaction
+  // worker invocations, backs the public rocksdb.num-running-compactions
+  // property, and excludes CompactFiles). Protected by the DB mutex.
+  int num_in_flight_compactions_{0};
 
   uint64_t prev_compaction_needed_bytes_;
 
@@ -713,6 +779,10 @@ class ColumnFamilyData {
   bool mempurge_used_;
 
   std::atomic<uint64_t> next_epoch_number_;
+
+  // Used to synchronize IngestExternalFile with range tombstone conversion. See
+  // also Memtable::ingest_seqno_barrier_.
+  port::RWMutex ingest_sst_lock_;
 };
 
 // ColumnFamilySet has interesting thread-safety requirements
@@ -758,7 +828,8 @@ class ColumnFamilySet {
                   WriteController* _write_controller,
                   BlockCacheTracer* const block_cache_tracer,
                   const std::shared_ptr<IOTracer>& io_tracer,
-                  const std::string& db_id, const std::string& db_session_id);
+                  const std::string& db_id, const std::string& db_session_id,
+                  bool fast_sst_open = false);
   ~ColumnFamilySet();
 
   ColumnFamilyData* GetDefault() const;
@@ -777,7 +848,8 @@ class ColumnFamilySet {
   ColumnFamilyData* CreateColumnFamily(const std::string& name, uint32_t id,
                                        Version* dummy_version,
                                        const ColumnFamilyOptions& options,
-                                       bool read_only);
+                                       bool read_only,
+                                       bool options_are_sanitized);
 
   const UnorderedMap<uint32_t, size_t>& GetRunningColumnFamiliesTimestampSize()
       const {
@@ -794,7 +866,23 @@ class ColumnFamilySet {
 
   Cache* get_table_cache() { return table_cache_; }
 
+  bool GetFastSstOpen() const { return fast_sst_open_; }
+  void SetFastSstOpen(bool v) { fast_sst_open_ = v; }
+
   WriteBufferManager* write_buffer_manager() { return write_buffer_manager_; }
+
+  void SetFlushInitiator(FlushInitiator* flush_initiator) {
+    flush_initiator_ = flush_initiator;
+  }
+
+  FlushInitiator* flush_initiator() const { return flush_initiator_; }
+
+  void RefreshFlushableMemAccounting();
+
+  // Coalesces accounting rebuilds while a caller removes multiple column
+  // families. Both methods require the DB mutex.
+  void BeginBulkFlushableMemAccountingUpdate();
+  void EndBulkFlushableMemAccountingUpdate();
 
   WriteController* write_controller() { return write_controller_; }
 
@@ -823,6 +911,9 @@ class ColumnFamilySet {
   // column families with non-zero user-defined timestamp size.
   UnorderedMap<uint32_t, size_t> ts_sz_for_record_;
 
+  int bulk_flushable_mem_accounting_depth_ = 0;
+  bool bulk_flushable_mem_accounting_dirty_ = false;
+
   uint32_t max_column_family_;
   const FileOptions file_options_;
 
@@ -837,11 +928,13 @@ class ColumnFamilySet {
   const ImmutableDBOptions* const db_options_;
   Cache* table_cache_;
   WriteBufferManager* write_buffer_manager_;
+  FlushInitiator* flush_initiator_ = nullptr;
   WriteController* write_controller_;
   BlockCacheTracer* const block_cache_tracer_;
   std::shared_ptr<IOTracer> io_tracer_;
   const std::string& db_id_;
   std::string db_session_id_;
+  bool fast_sst_open_;
 };
 
 // A wrapper for ColumnFamilySet that supports releasing DB mutex during each
@@ -857,6 +950,11 @@ class RefedColumnFamilySet {
     explicit iterator(ColumnFamilySet::iterator wrapped) : wrapped_(wrapped) {
       MaybeRef(*wrapped_);
     }
+    // No copying allowed
+    iterator(const iterator&) = delete;
+    iterator& operator=(const iterator&) = delete;
+    iterator(iterator&&) = delete;
+    iterator& operator=(iterator&&) = delete;
     ~iterator() { MaybeUnref(*wrapped_); }
     inline void MaybeRef(ColumnFamilyData* cfd) {
       if (cfd->GetID() != ColumnFamilyData::kDummyColumnFamilyDataId) {

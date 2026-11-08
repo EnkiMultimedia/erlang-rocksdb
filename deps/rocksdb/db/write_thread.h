@@ -123,8 +123,13 @@ class WriteThread {
   // Information kept for every waiting writer.
   struct Writer {
     WriteBatch* batch;
+    // The logical user batch to record in query traces. This can differ from
+    // `batch` when the write path rewrites the applied batch, and preserved-
+    // order tracing consumes it later from each grouped writer.
+    WriteBatch* trace_batch;
     bool sync;
     bool no_slowdown;
+    bool non_blocking_join;
     bool disable_wal;
     Env::IOPriority rate_limiter_priority;
     bool disable_memtable;
@@ -152,8 +157,10 @@ class WriteThread {
 
     Writer()
         : batch(nullptr),
+          trace_batch(nullptr),
           sync(false),
           no_slowdown(false),
+          non_blocking_join(false),
           disable_wal(false),
           rate_limiter_priority(Env::IOPriority::IO_TOTAL),
           disable_memtable(false),
@@ -177,12 +184,14 @@ class WriteThread {
            uint64_t _log_ref, bool _disable_memtable, size_t _batch_cnt = 0,
            PreReleaseCallback* _pre_release_callback = nullptr,
            PostMemTableCallback* _post_memtable_callback = nullptr,
-           bool _ingest_wbwi = false)
+           bool _ingest_wbwi = false, WriteBatch* _trace_batch = nullptr)
         : batch(_batch),
+          trace_batch(_trace_batch != nullptr ? _trace_batch : _batch),
           // TODO: store a copy of WriteOptions instead of its separated data
           // members
           sync(write_options.sync),
           no_slowdown(write_options.no_slowdown),
+          non_blocking_join(false),
           disable_wal(write_options.disableWAL),
           rate_limiter_priority(write_options.rate_limiter_priority),
           disable_memtable(_disable_memtable),
@@ -201,6 +210,12 @@ class WriteThread {
           link_older(nullptr),
           link_newer(nullptr),
           ingest_wbwi(_ingest_wbwi) {}
+
+    // No copying allowed
+    Writer(const Writer&) = delete;
+    Writer& operator=(const Writer&) = delete;
+    Writer(Writer&&) = delete;
+    Writer& operator=(Writer&&) = delete;
 
     ~Writer() {
       if (made_waitable) {
@@ -377,6 +392,10 @@ class WriteThread {
   // InstrumentedMutex* mu:  The db mutex, to unlock while waiting
   // REQUIRES: db mutex held
   void EnterUnbatched(Writer* w, InstrumentedMutex* mu);
+
+  // Refuses an existing or newly started stall. Call ExitUnbatched() only when
+  // this returns true; false leaves `w` unlinked with Incomplete status.
+  bool EnterUnbatchedNonBlocking(Writer* w, InstrumentedMutex* mu);
 
   // Completes a Writer begun with EnterUnbatched, unblocking subsequent
   // writers.

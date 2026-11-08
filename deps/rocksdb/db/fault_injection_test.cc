@@ -194,7 +194,8 @@ class FaultInjectionTest
   }
 
   void Build(const WriteOptions& write_options, int start_idx, int num_vals) {
-    std::string key_space, value_space;
+    std::string key_space;
+    std::string value_space;
     WriteBatch batch;
     for (int i = start_idx; i < start_idx + num_vals; i++) {
       Slice key = Key(i, &key_space);
@@ -205,7 +206,8 @@ class FaultInjectionTest
   }
 
   Status ReadValue(int i, std::string* val) const {
-    std::string key_space, value_space;
+    std::string key_space;
+    std::string value_space;
     Slice key = Key(i, &key_space);
     Value(i, &value_space);
     ReadOptions options;
@@ -266,6 +268,9 @@ class FaultInjectionTest
     CloseDB();
     env_->ResetState();
     Status s = DB::Open(options_, dbname_, &db_);
+    if (!s.ok()) {
+      return s;
+    }
     assert(db_ != nullptr);
     return s;
   }
@@ -408,7 +413,8 @@ TEST_P(FaultInjectionTest, WriteOptionSyncTest) {
   WriteOptions write_options;
   write_options.sync = false;
 
-  std::string key_space, value_space;
+  std::string key_space;
+  std::string value_space;
   ASSERT_OK(
       db_->Put(write_options, Key(1, &key_space), Value(1, &value_space)));
   FlushOptions flush_options;
@@ -494,7 +500,8 @@ TEST_P(FaultInjectionTest, ManualLogSyncTest) {
   WriteOptions write_options;
   write_options.sync = false;
 
-  std::string key_space, value_space;
+  std::string key_space;
+  std::string value_space;
   ASSERT_OK(
       db_->Put(write_options, Key(1, &key_space), Value(1, &value_space)));
   FlushOptions flush_options;
@@ -642,6 +649,78 @@ TEST(FaultInjectionFSTest, ReadUnsyncedData) {
     }
     ASSERT_EQ(0, sl.compare(Slice(data.data() + first_read_len, sl.size())));
   }
+}
+
+TEST(FaultInjectionFSTest, FileOpenContractRejectsReadersWhileOpenForWrite) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  const std::string fname = test::PerThreadDBPath(
+      "file_open_contract_no_readers_while_open_for_write");
+
+  FileOptions writer_options;
+  writer_options.open_contract = FileOpenContract::kNoReadersWhileOpenForWrite;
+
+  std::unique_ptr<FSWritableFile> writer;
+  ASSERT_OK(fault_fs->NewWritableFile(fname, writer_options, &writer, nullptr));
+
+  std::unique_ptr<FSRandomAccessFile> reader;
+  IOStatus s =
+      fault_fs->NewRandomAccessFile(fname, FileOptions(), &reader, nullptr);
+  ASSERT_TRUE(s.IsNotSupported());
+
+  ASSERT_OK(writer->Close(IOOptions(), nullptr));
+  ASSERT_OK(
+      fault_fs->NewRandomAccessFile(fname, FileOptions(), &reader, nullptr));
+}
+
+TEST(FaultInjectionFSTest,
+     FileOpenContractAllowsSyncFileButRejectsReopenedWrite) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  const std::string fname =
+      test::PerThreadDBPath("file_open_contract_no_reopen_for_write");
+
+  FileOptions writer_options;
+  writer_options.open_contract = FileOpenContract::kNoReopenForWrite;
+
+  std::unique_ptr<FSWritableFile> writer;
+  ASSERT_OK(fault_fs->NewWritableFile(fname, writer_options, &writer, nullptr));
+  ASSERT_OK(writer->Append("abc", IOOptions(), nullptr));
+  ASSERT_OK(writer->Close(IOOptions(), nullptr));
+
+  ASSERT_OK(fault_fs->SyncFile(fname, FileOptions(), IOOptions(),
+                               /*use_fsync=*/false, nullptr));
+
+  std::unique_ptr<FSWritableFile> reopened_writer;
+  ASSERT_OK(fault_fs->ReopenWritableFile(fname, FileOptions(), &reopened_writer,
+                                         nullptr));
+  IOStatus s = reopened_writer->Append("d", IOOptions(), nullptr);
+  ASSERT_TRUE(s.IsNotSupported());
+  ASSERT_OK(reopened_writer->Close(IOOptions(), nullptr));
+}
+
+TEST(FaultInjectionFSTest, FileOpenContractAllowsCreateAfterDelete) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  const std::string fname =
+      test::PerThreadDBPath("file_open_contract_recreate_after_delete");
+
+  FileOptions writer_options;
+  writer_options.open_contract = FileOpenContract::kNoReopenForWrite;
+
+  std::unique_ptr<FSWritableFile> writer;
+  ASSERT_OK(fault_fs->NewWritableFile(fname, writer_options, &writer, nullptr));
+  ASSERT_OK(writer->Append("abc", IOOptions(), nullptr));
+  ASSERT_OK(writer->Close(IOOptions(), nullptr));
+
+  ASSERT_OK(FileSystem::Default()->DeleteFile(fname, IOOptions(), nullptr));
+
+  std::unique_ptr<FSWritableFile> recreated_writer;
+  ASSERT_OK(fault_fs->NewWritableFile(fname, writer_options, &recreated_writer,
+                                      nullptr));
+  ASSERT_OK(recreated_writer->Append("def", IOOptions(), nullptr));
+  ASSERT_OK(recreated_writer->Close(IOOptions(), nullptr));
+  ASSERT_OK(fault_fs->DeleteFile(fname, IOOptions(), nullptr));
 }
 }  // namespace ROCKSDB_NAMESPACE
 

@@ -5,9 +5,13 @@
 
 #include "db/db_impl/db_impl_readonly.h"
 
+#include <optional>
+
 #include "db/arena_wrapped_db_iter.h"
+#include "db/blob/blob_fetcher.h"
 #include "db/db_impl/compacted_db_impl.h"
 #include "db/db_impl/db_impl.h"
+#include "db/db_impl/db_impl_metadata.h"
 #include "db/manifest_ops.h"
 #include "db/merge_context.h"
 #include "logging/logging.h"
@@ -27,120 +31,28 @@ DBImplReadOnly::DBImplReadOnly(const DBOptions& db_options,
 
 DBImplReadOnly::~DBImplReadOnly() = default;
 
-// Implementations of the DB interface
-Status DBImplReadOnly::GetImpl(const ReadOptions& read_options,
-                               const Slice& key,
-                               GetImplOptions& get_impl_options) {
-  assert(get_impl_options.value != nullptr ||
-         get_impl_options.columns != nullptr ||
-         get_impl_options.merge_operands != nullptr);
-  assert(get_impl_options.column_family);
-
-  Status s;
-
-  if (read_options.timestamp) {
-    s = FailIfTsMismatchCf(get_impl_options.column_family,
-                           *(read_options.timestamp));
-    if (!s.ok()) {
-      return s;
-    }
-  } else {
-    s = FailIfCfHasTs(get_impl_options.column_family);
-    if (!s.ok()) {
-      return s;
-    }
+void DBImplReadOnly::MultiGetWithMetadata(
+    const ReadOptions& options, const size_t num_keys,
+    ColumnFamilyHandle* const* column_families, const Slice* keys,
+    PinnableSlice* values, Status* statuses,
+    MultiGetOutputMetadata* output_metadata, const bool sorted_input) {
+  std::vector<std::string>* timestamps = GetOutputTimestamps(output_metadata);
+  if (timestamps != nullptr) {
+    timestamps->resize(num_keys);
   }
-
-  // Clear the timestamps for returning results so that we can distinguish
-  // between tombstone or key that has never been written
-  if (get_impl_options.timestamp) {
-    get_impl_options.timestamp->clear();
+  std::vector<uint8_t>* newer_version_present =
+      GetOutputNewerVersionPresent(output_metadata);
+  if (newer_version_present != nullptr) {
+    newer_version_present->assign(num_keys, false);
   }
-
-  PERF_CPU_TIMER_GUARD(get_cpu_nanos, immutable_db_options_.clock);
-  StopWatch sw(immutable_db_options_.clock, stats_, DB_GET);
-  PERF_TIMER_GUARD(get_snapshot_time);
-
-  const Comparator* ucmp = get_impl_options.column_family->GetComparator();
-  assert(ucmp);
-  std::string* ts =
-      ucmp->timestamp_size() > 0 ? get_impl_options.timestamp : nullptr;
-  SequenceNumber snapshot = versions_->LastSequence();
-  GetWithTimestampReadCallback read_cb(snapshot);
-  auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
-      get_impl_options.column_family);
-  auto cfd = cfh->cfd();
-  if (tracer_) {
-    InstrumentedMutexLock lock(&trace_mutex_);
-    if (tracer_) {
-      tracer_->Get(get_impl_options.column_family, key);
-    }
-  }
-
-  // In read-only mode Get(), no super version operation is needed (i.e.
-  // GetAndRefSuperVersion and ReturnAndCleanupSuperVersion)
-  SuperVersion* super_version = cfd->GetSuperVersion();
-  if (read_options.timestamp && read_options.timestamp->size() > 0) {
-    s = FailIfReadCollapsedHistory(cfd, super_version,
-                                   *(read_options.timestamp));
-    if (!s.ok()) {
-      return s;
-    }
-  }
-  // Prepare to store a list of merge operations if merge occurs.
-  MergeContext merge_context;
-  // TODO - Large Result Optimization for Read Only DB
-  // (https://github.com/facebook/rocksdb/pull/10458)
-
-  SequenceNumber max_covering_tombstone_seq = 0;
-  LookupKey lkey(key, snapshot, read_options.timestamp);
-  PERF_TIMER_STOP(get_snapshot_time);
-
-  // Look up starts here
-  if (super_version->mem->Get(
-          lkey,
-          get_impl_options.value ? get_impl_options.value->GetSelf() : nullptr,
-          get_impl_options.columns, ts, &s, &merge_context,
-          &max_covering_tombstone_seq, read_options,
-          false /* immutable_memtable */, &read_cb,
-          /*is_blob_index=*/nullptr, /*do_merge=*/get_impl_options.get_value)) {
-    if (get_impl_options.value) {
-      get_impl_options.value->PinSelf();
-    }
-    RecordTick(stats_, MEMTABLE_HIT);
-  } else {
-    PERF_TIMER_GUARD(get_from_output_files_time);
-    PinnedIteratorsManager pinned_iters_mgr;
-    super_version->current->Get(
-        read_options, lkey, get_impl_options.value, get_impl_options.columns,
-        ts, &s, &merge_context, &max_covering_tombstone_seq, &pinned_iters_mgr,
-        /*value_found*/ nullptr,
-        /*key_exists*/ nullptr, /*seq*/ nullptr, &read_cb,
-        /*is_blob*/ nullptr,
-        /*do_merge=*/get_impl_options.get_value);
-    RecordTick(stats_, MEMTABLE_MISS);
-  }
-  {
-    RecordTick(stats_, NUMBER_KEYS_READ);
-    size_t size = 0;
-    if (get_impl_options.value) {
-      size = get_impl_options.value->size();
-    } else if (get_impl_options.columns) {
-      size = get_impl_options.columns->serialized_size();
-    } else if (get_impl_options.merge_operands) {
-      *get_impl_options.number_of_operands =
-          static_cast<int>(merge_context.GetNumOperands());
-      for (const Slice& sl : merge_context.GetOperands()) {
-        size += sl.size();
-        get_impl_options.merge_operands->PinSelf(sl);
-        get_impl_options.merge_operands++;
-      }
-    }
-    RecordTick(stats_, BYTES_READ, size);
-    RecordInHistogram(stats_, BYTES_PER_READ, size);
-    PERF_COUNTER_ADD(get_read_bytes, size);
-  }
-  return s;
+  autovector<ColumnFamilyHandle*, MultiGetContext::MAX_BATCH_SIZE>
+      stack_column_families;
+  std::vector<ColumnFamilyHandle*> heap_column_families;
+  ColumnFamilyHandle** mutable_column_families = MakeMutableCfHandles(
+      column_families, num_keys, &stack_column_families, &heap_column_families);
+  DBImpl::MultiGet(options, num_keys, mutable_column_families, keys, values,
+                   timestamps != nullptr ? timestamps->data() : nullptr,
+                   statuses, sorted_input);
 }
 
 Iterator* DBImplReadOnly::NewIterator(const ReadOptions& _read_options,
@@ -195,65 +107,111 @@ Status DBImplReadOnly::NewIterators(
     const ReadOptions& read_options,
     const std::vector<ColumnFamilyHandle*>& column_families,
     std::vector<Iterator*>* iterators) {
-  if (read_options.timestamp) {
-    for (auto* cf : column_families) {
-      assert(cf);
-      const Status s = FailIfTsMismatchCf(cf, *(read_options.timestamp));
-      if (!s.ok()) {
-        return s;
-      }
-    }
-  } else {
-    for (auto* cf : column_families) {
-      assert(cf);
-      const Status s = FailIfCfHasTs(cf);
-      if (!s.ok()) {
-        return s;
-      }
-    }
-  }
+  return NewIterators(
+      std::vector<ReadOptions>(column_families.size(), read_options),
+      column_families, iterators);
+}
 
-  ReadCallback* read_callback = nullptr;  // No read callback provided.
+Status DBImplReadOnly::NewIterators(
+    const std::vector<ReadOptions>& read_options,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::vector<Iterator*>* iterators) {
+  if (read_options.size() != column_families.size()) {
+    return Status::InvalidArgument(
+        "read_options and column_families must have the same size");
+  }
   if (iterators == nullptr) {
     return Status::InvalidArgument("iterators not allowed to be nullptr");
   }
+
+  if (column_families.empty()) {
+    iterators->clear();
+    return Status::OK();
+  }
+
+  const Snapshot* const snapshot = read_options.front().snapshot;
+  const bool tailing = read_options.front().tailing;
+  std::vector<ReadOptions> normalized_read_options;
+  normalized_read_options.reserve(read_options.size());
+  for (size_t i = 0; i < read_options.size(); ++i) {
+    const ReadOptions& options = read_options[i];
+    if (options.io_activity != Env::IOActivity::kUnknown &&
+        options.io_activity != Env::IOActivity::kDBIterator) {
+      return Status::InvalidArgument(
+          "Can only call NewIterators with `ReadOptions::io_activity` is "
+          "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`");
+    }
+    if (options.read_tier == kPersistedTier) {
+      return Status::NotSupported(
+          "ReadTier::kPersistedData is not yet supported in iterators.");
+    }
+    if (options.snapshot != snapshot) {
+      return Status::InvalidArgument(
+          "All ReadOptions must use the same snapshot");
+    }
+    if (options.tailing != tailing) {
+      return Status::InvalidArgument(
+          "All ReadOptions must use the same tailing setting");
+    }
+
+    auto* cf = column_families[i];
+    assert(cf);
+    Status s;
+    if (options.timestamp) {
+      s = FailIfTsMismatchCf(cf, *(options.timestamp));
+    } else {
+      s = FailIfCfHasTs(cf);
+    }
+    if (!s.ok()) {
+      return s;
+    }
+
+    normalized_read_options.emplace_back(options);
+    if (normalized_read_options.back().io_activity ==
+        Env::IOActivity::kUnknown) {
+      normalized_read_options.back().io_activity = Env::IOActivity::kDBIterator;
+    }
+  }
+
   iterators->clear();
   iterators->reserve(column_families.size());
-  SequenceNumber latest_snapshot = versions_->LastSequence();
+
   SequenceNumber read_seq =
-      read_options.snapshot != nullptr
-          ? static_cast<const SnapshotImpl*>(read_options.snapshot)->number_
-          : latest_snapshot;
-
+      snapshot != nullptr ? static_cast<const SnapshotImpl*>(snapshot)->number_
+                          : versions_->LastSequence();
   autovector<std::tuple<ColumnFamilyHandleImpl*, SuperVersion*>> cfh_to_sv;
+  for (auto* cf : column_families) {
+    auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(cf);
+    cfh_to_sv.emplace_back(cfh, cfh->cfd()->GetSuperVersion()->Ref());
+  }
 
-  const bool check_read_ts =
-      read_options.timestamp && read_options.timestamp->size() > 0;
-  for (auto cfh : column_families) {
-    auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(cfh)->cfd();
-    auto* sv = cfd->GetSuperVersion()->Ref();
-    cfh_to_sv.emplace_back(static_cast_with_check<ColumnFamilyHandleImpl>(cfh),
-                           sv);
-    if (check_read_ts) {
+  const auto unref_super_versions = [&]() {
+    for (const auto& entry : cfh_to_sv) {
+      std::get<1>(entry)->Unref();
+    }
+  };
+  for (size_t i = 0; i < cfh_to_sv.size(); ++i) {
+    const ReadOptions& options = normalized_read_options[i];
+    if (options.timestamp && !options.timestamp->empty()) {
+      auto* cfd = std::get<0>(cfh_to_sv[i])->cfd();
+      auto* sv = std::get<1>(cfh_to_sv[i]);
       const Status s =
-          FailIfReadCollapsedHistory(cfd, sv, *(read_options.timestamp));
+          FailIfReadCollapsedHistory(cfd, sv, *(options.timestamp));
       if (!s.ok()) {
-        for (auto prev_entry : cfh_to_sv) {
-          std::get<1>(prev_entry)->Unref();
-        }
+        unref_super_versions();
         return s;
       }
     }
   }
-  assert(cfh_to_sv.size() == column_families.size());
-  for (auto [cfh, sv] : cfh_to_sv) {
-    auto* db_iter = NewArenaWrappedDbIterator(
-        env_, read_options, cfh, sv, read_seq, read_callback, this,
-        /*expose_blob_index=*/false, /*allow_refresh=*/false,
-        /*allow_mark_memtable_for_flush=*/false);
-    iterators->push_back(db_iter);
-  }
 
+  for (size_t i = 0; i < cfh_to_sv.size(); ++i) {
+    auto* cfh = std::get<0>(cfh_to_sv[i]);
+    auto* sv = std::get<1>(cfh_to_sv[i]);
+    iterators->push_back(NewArenaWrappedDbIterator(
+        env_, normalized_read_options[i], cfh, sv, read_seq,
+        nullptr /* read_callback */, this, /* expose_blob_index */ false,
+        /* allow_refresh */ false, /* allow_mark_memtable_for_flush */ false));
+  }
   return Status::OK();
 }
 
@@ -383,3 +341,16 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
 }
 
 }  // namespace ROCKSDB_NAMESPACE
+
+// Generate the regular and coroutine versions of the functions defined in
+// db_impl_readonly_sync_and_async.h by including it twice. The macros expand
+// differently based on whether WITH_COROUTINES or WITHOUT_COROUTINES is
+// defined.
+// clang-format off
+#define WITHOUT_COROUTINES
+#include "db/db_impl/db_impl_readonly_sync_and_async.h"
+#undef WITHOUT_COROUTINES
+#define WITH_COROUTINES
+#include "db/db_impl/db_impl_readonly_sync_and_async.h"
+#undef WITH_COROUTINES
+// clang-format on

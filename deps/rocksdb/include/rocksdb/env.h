@@ -171,6 +171,8 @@ class Env : public Customizable {
   // No copying allowed
   Env(const Env&) = delete;
   void operator=(const Env&) = delete;
+  Env(Env&&) = delete;
+  void operator=(Env&&) = delete;
 
   ~Env() override;
 
@@ -385,6 +387,14 @@ class Env : public Customizable {
     return Status::NotSupported("LinkFile is not supported for this Env");
   }
 
+  // Syncs file data and, when requested, file metadata for `fname`.
+  //
+  // See FileSystem::SyncFile() for the corresponding path-level sync contract.
+  // The default implementation reopens the file as writable, calls Sync() or
+  // Fsync(), then closes it.
+  virtual Status SyncFile(const std::string& fname, const EnvOptions& options,
+                          bool use_fsync);
+
   virtual Status NumFileLinks(const std::string& /*fname*/,
                               uint64_t* /*count*/) {
     return Status::NotSupported(
@@ -456,6 +466,12 @@ class Env : public Customizable {
     kGetEntity = 8,
     kMultiGetEntity = 9,
     kGetFileChecksumsFromCurrentManifest = 10,
+    // Deferred blob-byte reads performed while resolving a lazy wide-column
+    // result (DB::GetEntityLazy / DB::MultiGetEntityLazy), i.e. reads issued by
+    // LazyWideColumns::MultiResolve after the originating call returned.
+    // Distinct from kGetEntity/kMultiGetEntity, which cover the initial entity
+    // read.
+    kLazyResolve = 11,
     // Enums after this, up to 0x7F, are reserved for future use for the public
     // RocksDB API (i.e. they should be "non-custom" IO activities). Make sure
     // to also update IOActivityToString when adding new values.
@@ -1032,6 +1048,8 @@ class WritableFile {
   // No copying allowed
   WritableFile(const WritableFile&) = delete;
   void operator=(const WritableFile&) = delete;
+  WritableFile(WritableFile&&) = delete;
+  void operator=(WritableFile&&) = delete;
 
   // For cases when Close() hasn't been called, many derived classes of
   // WritableFile will need to call Close() non-virtually in their destructor,
@@ -1106,11 +1124,28 @@ class WritableFile {
   // (However, implementations must also clean up properly in the destructor
   // even if Close() is not called.)
   virtual Status Close() = 0;
+
+  // Flush any internally buffered data to the underlying storage, so that
+  // the data is no longer dependent on this process's memory. After this
+  // call, the data should survive a process crash but is not necessarily
+  // persisted to stable storage. Use Sync() for that guarantee.
+  // All flushed data must be readable through file access APIs (e.g.
+  // RandomAccessFile), though path-level metadata queries such as
+  // Env::GetFileSize() might lag on some implementations.
+  // Not thread-safe; see IsSyncThreadSafe().
   virtual Status Flush() = 0;
-  virtual Status Sync() = 0;  // sync data
+
+  // Persist data to stable storage. After this call, the data should
+  // survive power failures. Does not necessarily persist file metadata
+  // (e.g. file size); see Fsync().
+  // Sync() implies Flush(): implementations must ensure all internally
+  // buffered data is also flushed.
+  // Not safe to call concurrently with Append() or Flush() unless
+  // IsSyncThreadSafe() returns true.
+  virtual Status Sync() = 0;
 
   /*
-   * Sync data and/or metadata as well.
+   * Persist data and metadata to stable storage.
    * By default, sync only data.
    * Override this method for environments where we need to sync
    * metadata as well.
@@ -1250,6 +1285,8 @@ class RandomRWFile {
   // No copying allowed
   RandomRWFile(const RandomRWFile&) = delete;
   RandomRWFile& operator=(const RandomRWFile&) = delete;
+  RandomRWFile(RandomRWFile&&) = delete;
+  RandomRWFile& operator=(RandomRWFile&&) = delete;
 
   // For cases when Close() hasn't been called, many derived classes of
   // RandomRWFile will need to call Close() non-virtually in their destructor,
@@ -1309,6 +1346,8 @@ class MemoryMappedFileBuffer {
   // movable if desired, however, since
   MemoryMappedFileBuffer(const MemoryMappedFileBuffer&) = delete;
   MemoryMappedFileBuffer& operator=(const MemoryMappedFileBuffer&) = delete;
+  MemoryMappedFileBuffer(MemoryMappedFileBuffer&&) = delete;
+  MemoryMappedFileBuffer& operator=(MemoryMappedFileBuffer&&) = delete;
 
   void* GetBase() const { return base_; }
   size_t GetLen() const { return length_; }
@@ -1324,7 +1363,7 @@ class Directory {
  public:
   // Many derived classes of Directory will need to call Close() in their
   // destructor, when not called already, to ensure resources are released.
-  virtual ~Directory() {}
+  virtual ~Directory() = default;
   // Fsync directory. Can be called concurrently from multiple threads.
   virtual Status Fsync() = 0;
   // Calling Close() before destroying a Directory is recommended to surface
@@ -1368,6 +1407,8 @@ class Logger {
   // No copying allowed
   Logger(const Logger&) = delete;
   void operator=(const Logger&) = delete;
+  Logger(Logger&&) = delete;
+  void operator=(Logger&&) = delete;
 
   virtual ~Logger();
 
@@ -1433,11 +1474,13 @@ class FileLock {
   // No copying allowed
   FileLock(const FileLock&) = delete;
   void operator=(const FileLock&) = delete;
+  FileLock(FileLock&&) = delete;
+  void operator=(FileLock&&) = delete;
 };
 
 class DynamicLibrary {
  public:
-  virtual ~DynamicLibrary() {}
+  virtual ~DynamicLibrary() = default;
 
   // Returns the name of the dynamic library.
   virtual const char* Name() const = 0;
@@ -1675,6 +1718,11 @@ class EnvWrapper : public Env {
 
   Status LinkFile(const std::string& s, const std::string& t) override {
     return target_.env->LinkFile(s, t);
+  }
+
+  Status SyncFile(const std::string& fname, const EnvOptions& options,
+                  bool use_fsync) override {
+    return target_.env->SyncFile(fname, options, use_fsync);
   }
 
   Status NumFileLinks(const std::string& fname, uint64_t* count) override {

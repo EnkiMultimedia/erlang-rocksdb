@@ -105,9 +105,10 @@ Compaction* FIFOCompactionPicker::PickTTLCompaction(
       TableReader* reader = f->fd.pinned_reader.Get();
       if (reader != nullptr && reader->GetTableProperties() != nullptr) {
         uint64_t newest_key_time = f->TryGetNewestKeyTime();
-        uint64_t creation_time = reader->GetTableProperties()->creation_time;
+        uint64_t oldest_ancestor_time =
+            reader->GetTableProperties()->oldest_ancestor_time;
         uint64_t est_newest_key_time = newest_key_time == kUnknownNewestKeyTime
-                                           ? creation_time
+                                           ? oldest_ancestor_time
                                            : newest_key_time;
         if (est_newest_key_time == kUnknownNewestKeyTime ||
             est_newest_key_time >= (current_time - mutable_cf_options.ttl)) {
@@ -165,13 +166,13 @@ Compaction* FIFOCompactionPicker::PickTTLCompaction(
   for (const auto& f : inputs[0].files) {
     assert(f);
     uint64_t newest_key_time = f->TryGetNewestKeyTime();
-    uint64_t creation_time = 0;
+    uint64_t oldest_ancestor_time = 0;
     TableReader* reader = f->fd.pinned_reader.Get();
     if (reader != nullptr && reader->GetTableProperties() != nullptr) {
-      creation_time = reader->GetTableProperties()->creation_time;
+      oldest_ancestor_time = reader->GetTableProperties()->oldest_ancestor_time;
     }
     uint64_t est_newest_key_time = newest_key_time == kUnknownNewestKeyTime
-                                       ? creation_time
+                                       ? oldest_ancestor_time
                                        : newest_key_time;
     ROCKS_LOG_BUFFER(log_buffer,
                      "[%s] FIFO compaction: picking file %" PRIu64
@@ -225,7 +226,8 @@ Compaction* FIFOCompactionPicker::PickSizeCompaction(
       vstorage->LevelFiles(last_level);
 
   // Compute effective size and limit for comparison.
-  uint64_t effective_size, effective_max;
+  uint64_t effective_size;
+  uint64_t effective_max;
   GetEffectiveSizeAndLimit(fifo_opts, total_size,
                            vstorage->GetBlobStats().total_file_size,
                            &effective_size, &effective_max);
@@ -251,7 +253,7 @@ Compaction* FIFOCompactionPicker::PickSizeCompaction(
     // When using blob-aware sizing, use proportional estimation (same
     // principle as EstimateTotalDataForSST): each SST "owns"
     // effective_size / num_files of total data. This is an approximation
-    // — individual SSTs may reference different amounts of blob data,
+    // -- individual SSTs may reference different amounts of blob data,
     // but uniform distribution is a reasonable estimate for FIFO dropping.
     uint64_t remaining_size = effective_size;
     const uint64_t num_files = last_level_files.size();
@@ -477,12 +479,12 @@ Compaction* FIFOCompactionPicker::PickIntraL0Compaction(
     if (fifo_opts.max_data_files_size == 0) {
       ROCKS_LOG_BUFFER(
           log_buffer,
-          "[%s] FIFO kv-ratio compaction: skipping — "
+          "[%s] FIFO kv-ratio compaction: skipping -- "
           "max_data_files_size is 0, cannot compute target file size. ",
           cf_name.c_str());
     } else if (fifo_opts.max_data_files_size < fifo_opts.max_table_files_size) {
       ROCKS_LOG_BUFFER(log_buffer,
-                       "[%s] FIFO kv-ratio compaction: skipping — "
+                       "[%s] FIFO kv-ratio compaction: skipping -- "
                        "max_data_files_size (%" PRIu64
                        ") < max_table_files_size "
                        "(%" PRIu64 ").",
@@ -547,7 +549,7 @@ Compaction* FIFOCompactionPicker::PickRatioBasedIntraL0Compaction(
   for (int level = 1; level < vstorage->num_levels(); ++level) {
     if (!vstorage->LevelFiles(level).empty()) {
       ROCKS_LOG_BUFFER(log_buffer,
-                       "[%s] FIFO kv-ratio compaction: skipping — non-L0 "
+                       "[%s] FIFO kv-ratio compaction: skipping -- non-L0 "
                        "level %d still has %" ROCKSDB_PRIszt
                        " files (migration in progress)",
                        cf_name.c_str(), level,
@@ -587,7 +589,7 @@ Compaction* FIFOCompactionPicker::PickRatioBasedIntraL0Compaction(
   // once per flush or compaction completion, so no caching is needed.
   uint64_t target = 0;
   if (mutable_cf_options.max_compaction_bytes > 0) {
-    // User explicitly set max_compaction_bytes — use it as target
+    // User explicitly set max_compaction_bytes -- use it as target
     target = mutable_cf_options.max_compaction_bytes;
   } else {
     // Auto-calculate from capacity and observed SST/blob ratio
@@ -642,7 +644,7 @@ Compaction* FIFOCompactionPicker::PickRatioBasedIntraL0Compaction(
   //   of linear) write amplification.
 
   // Build tier boundaries from smallest to largest.
-  // Stop at 10KB minimum — SST files of most workloads are larger than
+  // Stop at 10KB minimum -- SST files of most workloads are larger than
   // this, so lower boundaries would only waste CPU scanning L0 files.
   // Files smaller than the lowest boundary simply merge at that boundary.
   static constexpr uint64_t kMinTierBoundary = 10 * 1024;  // 10KB
@@ -651,7 +653,7 @@ Compaction* FIFOCompactionPicker::PickRatioBasedIntraL0Compaction(
     boundaries.push_back(b);
   }
   if (boundaries.empty()) {
-    // target itself is below kMinTierBoundary — use target as the
+    // target itself is below kMinTierBoundary -- use target as the
     // sole boundary so we can still compact at the target size.
     boundaries.push_back(target);
   }
@@ -668,7 +670,7 @@ Compaction* FIFOCompactionPicker::PickRatioBasedIntraL0Compaction(
         continue;
       }
 
-      // Found a file < boundary — collect contiguous batch
+      // Found a file < boundary -- collect contiguous batch
       std::vector<FileMetaData*> batch;
       uint64_t accumulated = 0;
       size_t pos = scan;
@@ -713,7 +715,7 @@ Compaction* FIFOCompactionPicker::PickRatioBasedIntraL0Compaction(
         return c;
       }
 
-      // This batch wasn't enough — advance past it
+      // This batch wasn't enough -- advance past it
       scan = pos;
     }
   }

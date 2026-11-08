@@ -18,6 +18,7 @@
 #include "table/table_builder.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/coding.h"
 #include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -84,7 +85,8 @@ TEST(DataBlockHashIndex, DataBlockHashTestSmall) {
 
     size_t estimated_size = builder.EstimateSize();
 
-    std::string buffer("fake"), buffer2;
+    std::string buffer("fake");
+    std::string buffer2;
     size_t original_size = buffer.size();
     estimated_size += original_size;
     builder.Finish(buffer);
@@ -96,7 +98,7 @@ TEST(DataBlockHashIndex, DataBlockHashTestSmall) {
     Slice s(buffer2);
     DataBlockHashIndex index;
     uint16_t map_offset;
-    index.Initialize(s.data(), static_cast<uint16_t>(s.size()), &map_offset);
+    ASSERT_TRUE(index.Initialize(s.data(), s.size(), &map_offset));
 
     // the additional hash map should start at the end of the buffer
     ASSERT_EQ(original_size, map_offset);
@@ -123,7 +125,8 @@ TEST(DataBlockHashIndex, DataBlockHashTest) {
 
   size_t estimated_size = builder.EstimateSize();
 
-  std::string buffer("fake content"), buffer2;
+  std::string buffer("fake content");
+  std::string buffer2;
   size_t original_size = buffer.size();
   estimated_size += original_size;
   builder.Finish(buffer);
@@ -135,7 +138,7 @@ TEST(DataBlockHashIndex, DataBlockHashTest) {
   Slice s(buffer2);
   DataBlockHashIndex index;
   uint16_t map_offset;
-  index.Initialize(s.data(), static_cast<uint16_t>(s.size()), &map_offset);
+  ASSERT_TRUE(index.Initialize(s.data(), s.size(), &map_offset));
 
   // the additional hash map should start at the end of the buffer
   ASSERT_EQ(original_size, map_offset);
@@ -144,6 +147,57 @@ TEST(DataBlockHashIndex, DataBlockHashTest) {
     uint8_t restart_point = i;
     ASSERT_TRUE(
         SearchForOffset(index, s.data(), map_offset, key, restart_point));
+  }
+}
+
+TEST(DataBlockHashIndex, InitializeRejectsCorruptNumBuckets) {
+  // Build a valid hash index, then corrupt the trailing NUM_BUCKETS field so
+  // that the encoded bucket count exceeds the buffer. Initialize must reject it
+  // instead of underflowing the map_offset computation (which, in a release
+  // build where the debug asserts are compiled out, would later drive an
+  // out-of-bounds read while parsing the block).
+  DataBlockHashIndexBuilder builder;
+  builder.Initialize(0.75 /*util_ratio*/);
+  for (uint8_t i = 0; i < 10; i++) {
+    builder.Add("key" + std::to_string(i), i);
+  }
+  std::string buffer("fake content");
+  builder.Finish(buffer);
+
+  // Sanity check: the unmodified index parses.
+  {
+    Slice s(buffer);
+    DataBlockHashIndex index;
+    uint16_t map_offset = 0;
+    ASSERT_TRUE(index.Initialize(s.data(), s.size(), &map_offset));
+  }
+
+  // Corrupt NUM_BUCKETS (last 2 bytes) to a value larger than the buffer.
+  std::string corrupted = buffer;
+  EncodeFixed16(&corrupted[corrupted.size() - sizeof(uint16_t)],
+                static_cast<uint16_t>(corrupted.size() + 1000));
+  Slice s(corrupted);
+  DataBlockHashIndex index;
+  uint16_t map_offset = 0;
+  ASSERT_FALSE(index.Initialize(s.data(), s.size(), &map_offset));
+  ASSERT_FALSE(index.Valid());
+
+  // A NUM_BUCKETS of zero is also invalid.
+  EncodeFixed16(&corrupted[corrupted.size() - sizeof(uint16_t)], 0);
+  Slice s0(corrupted);
+  DataBlockHashIndex index0;
+  ASSERT_FALSE(index0.Initialize(s0.data(), s0.size(), &map_offset));
+}
+
+TEST(DataBlockHashIndex, InitializeRejectsUnsupportedSize) {
+  for (const size_t size :
+       {size_t{0}, size_t{1}, kMaxBlockSizeSupportedByHashIndex,
+        kMaxBlockSizeSupportedByHashIndex + 1}) {
+    const std::string input(size, 'x');
+    DataBlockHashIndex index;
+    uint16_t map_offset = 0;
+    ASSERT_FALSE(index.Initialize(input.data(), input.size(), &map_offset));
+    ASSERT_FALSE(index.Valid());
   }
 }
 
@@ -160,7 +214,8 @@ TEST(DataBlockHashIndex, DataBlockHashTestCollision) {
 
   size_t estimated_size = builder.EstimateSize();
 
-  std::string buffer("some other fake content to take up space"), buffer2;
+  std::string buffer("some other fake content to take up space");
+  std::string buffer2;
   size_t original_size = buffer.size();
   estimated_size += original_size;
   builder.Finish(buffer);
@@ -172,7 +227,7 @@ TEST(DataBlockHashIndex, DataBlockHashTestCollision) {
   Slice s(buffer2);
   DataBlockHashIndex index;
   uint16_t map_offset;
-  index.Initialize(s.data(), static_cast<uint16_t>(s.size()), &map_offset);
+  ASSERT_TRUE(index.Initialize(s.data(), s.size(), &map_offset));
 
   // the additional hash map should start at the end of the buffer
   ASSERT_EQ(original_size, map_offset);
@@ -201,7 +256,8 @@ TEST(DataBlockHashIndex, DataBlockHashTestLarge) {
 
   size_t estimated_size = builder.EstimateSize();
 
-  std::string buffer("filling stuff"), buffer2;
+  std::string buffer("filling stuff");
+  std::string buffer2;
   size_t original_size = buffer.size();
   estimated_size += original_size;
   builder.Finish(buffer);
@@ -213,7 +269,7 @@ TEST(DataBlockHashIndex, DataBlockHashTestLarge) {
   Slice s(buffer2);
   DataBlockHashIndex index;
   uint16_t map_offset;
-  index.Initialize(s.data(), static_cast<uint16_t>(s.size()), &map_offset);
+  ASSERT_TRUE(index.Initialize(s.data(), s.size(), &map_offset));
 
   // the additional hash map should start at the end of the buffer
   ASSERT_EQ(original_size, map_offset);
@@ -261,10 +317,14 @@ TEST(DataBlockHashIndex, RestartIndexExceedMax) {
 TEST(DataBlockHashIndex, BlockRestartIndexExceedMax) {
   Options options = Options();
 
-  BlockBuilder builder(1 /* block_restart_interval */,
-                       true /* use_delta_encoding */,
-                       false /* use_value_delta_encoding */,
-                       BlockBasedTableOptions::kDataBlockBinaryAndHash);
+  BlockBuilder builder(
+      1 /* block_restart_interval */, true /* use_delta_encoding */,
+      false /* use_value_delta_encoding */,
+      BlockBasedTableOptions::kDataBlockBinaryAndHash,
+      0.75 /* data_block_hash_table_util_ratio */, 0 /* ts_sz */,
+      true /* persist_user_defined_timestamps */, false /* is_user_key */,
+      false /* use_separated_kv_storage */, nullptr /* statistics */,
+      -1.0 /* uniform_cv_threshold */, false /* use_common_prefix */);
 
   // #restarts <= 253. HashIndex is valid
   for (int i = 0; i <= 253; i++) {
@@ -314,10 +374,14 @@ TEST(DataBlockHashIndex, BlockSizeExceedMax) {
   std::string ukey(10, 'k');
   InternalKey ikey(ukey, 0, kTypeValue);
 
-  BlockBuilder builder(1 /* block_restart_interval */,
-                       false /* use_delta_encoding */,
-                       false /* use_value_delta_encoding */,
-                       BlockBasedTableOptions::kDataBlockBinaryAndHash);
+  BlockBuilder builder(
+      1 /* block_restart_interval */, false /* use_delta_encoding */,
+      false /* use_value_delta_encoding */,
+      BlockBasedTableOptions::kDataBlockBinaryAndHash,
+      0.75 /* data_block_hash_table_util_ratio */, 0 /* ts_sz */,
+      true /* persist_user_defined_timestamps */, false /* is_user_key */,
+      false /* use_separated_kv_storage */, nullptr /* statistics */,
+      -1.0 /* uniform_cv_threshold */, false /* use_common_prefix */);
 
   {
     // insert a large value. The block size plus HashIndex is 65536.
@@ -368,10 +432,14 @@ TEST(DataBlockHashIndex, BlockSizeExceedMax) {
 TEST(DataBlockHashIndex, BlockTestSingleKey) {
   Options options = Options();
 
-  BlockBuilder builder(16 /* block_restart_interval */,
-                       true /* use_delta_encoding */,
-                       false /* use_value_delta_encoding */,
-                       BlockBasedTableOptions::kDataBlockBinaryAndHash);
+  BlockBuilder builder(
+      16 /* block_restart_interval */, true /* use_delta_encoding */,
+      false /* use_value_delta_encoding */,
+      BlockBasedTableOptions::kDataBlockBinaryAndHash,
+      0.75 /* data_block_hash_table_util_ratio */, 0 /* ts_sz */,
+      true /* persist_user_defined_timestamps */, false /* is_user_key */,
+      false /* use_separated_kv_storage */, nullptr /* statistics */,
+      -1.0 /* uniform_cv_threshold */, false /* use_common_prefix */);
 
   std::string ukey("gopher");
   std::string value("gold");
@@ -443,10 +511,14 @@ TEST(DataBlockHashIndex, BlockTestLarge) {
   std::vector<std::string> keys;
   std::vector<std::string> values;
 
-  BlockBuilder builder(16 /* block_restart_interval */,
-                       true /* use_delta_encoding */,
-                       false /* use_value_delta_encoding */,
-                       BlockBasedTableOptions::kDataBlockBinaryAndHash);
+  BlockBuilder builder(
+      16 /* block_restart_interval */, true /* use_delta_encoding */,
+      false /* use_value_delta_encoding */,
+      BlockBasedTableOptions::kDataBlockBinaryAndHash,
+      0.75 /* data_block_hash_table_util_ratio */, 0 /* ts_sz */,
+      true /* persist_user_defined_timestamps */, false /* is_user_key */,
+      false /* use_separated_kv_storage */, nullptr /* statistics */,
+      -1.0 /* uniform_cv_threshold */, false /* use_common_prefix */);
   int num_records = 500;
 
   GenerateRandomKVs(&keys, &values, 0, num_records);

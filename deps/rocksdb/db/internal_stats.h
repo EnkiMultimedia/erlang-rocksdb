@@ -352,6 +352,10 @@ class InternalStats {
       return *this;
     }
 
+    CompactionStats(CompactionStats&&) = default;
+    CompactionStats& operator=(CompactionStats&&) = default;
+    ~CompactionStats() = default;
+
     void Clear() {
       this->micros = 0;
       this->cpu_micros = 0;
@@ -850,10 +854,16 @@ class InternalStats {
   bool HandleCompactionPending(uint64_t* value, DBImpl* db, Version* version);
   bool HandleNumRunningCompactions(uint64_t* value, DBImpl* db,
                                    Version* version);
+  bool HandleNumRunningRemoteCompactions(uint64_t* value, DBImpl* db,
+                                         Version* version);
+  bool HandleNumRunningBottomCompactions(uint64_t* value, DBImpl* db,
+                                         Version* version);
   bool HandleNumRunningCompactionSortedRuns(uint64_t* value, DBImpl* db,
                                             Version* version);
   bool HandleCompactionAbortCount(uint64_t* value, DBImpl* db,
                                   Version* version);
+  bool HandleNumUnscheduledCompactions(uint64_t* value, DBImpl* db,
+                                       Version* version);
   bool HandleBackgroundErrors(uint64_t* value, DBImpl* db, Version* version);
   bool HandleCurSizeActiveMemTable(uint64_t* value, DBImpl* db,
                                    Version* version);
@@ -949,6 +959,8 @@ class IntPropertyAggregator {
 
   IntPropertyAggregator(const IntPropertyAggregator&) = delete;
   void operator=(const IntPropertyAggregator&) = delete;
+  IntPropertyAggregator(IntPropertyAggregator&&) = delete;
+  void operator=(IntPropertyAggregator&&) = delete;
 
   // Add a column family's property value to the aggregator.
   virtual void Add(ColumnFamilyData* cfd, uint64_t value) = 0;

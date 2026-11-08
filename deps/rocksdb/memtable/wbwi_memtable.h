@@ -67,6 +67,8 @@ class WBWIMemTable final : public ReadOnlyMemTable {
   // No copying allowed
   WBWIMemTable(const WBWIMemTable&) = delete;
   WBWIMemTable& operator=(const WBWIMemTable&) = delete;
+  WBWIMemTable(WBWIMemTable&&) = delete;
+  WBWIMemTable& operator=(WBWIMemTable&&) = delete;
 
   ~WBWIMemTable() override { assert(refs_ == 0); }
 
@@ -84,6 +86,8 @@ class WBWIMemTable final : public ReadOnlyMemTable {
     //   Used in MemTableList to trim memtable history.
     return 0;
   }
+
+  size_t WBMTrackedMemoryUsage() const override { return 0; }
 
   void UniqueRandomSample(
       const uint64_t& /* target_sample_size */,
@@ -134,10 +138,12 @@ class WBWIMemTable final : public ReadOnlyMemTable {
            SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
            const ReadOptions& read_opts, bool immutable_memtable,
            ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
-           bool do_merge = true) override;
+           bool do_merge = true,
+           const BlobFetcher* blob_fetcher = nullptr) override;
 
   void MultiGet(const ReadOptions& read_options, MultiGetRange* range,
-                ReadCallback* callback, bool immutable_memtable) override;
+                ReadCallback* callback, bool immutable_memtable,
+                const BlobFetcher* blob_fetcher = nullptr) override;
 
   uint64_t NumEntries() const override { return num_entries_; }
 
@@ -191,7 +197,7 @@ class WBWIMemTable final : public ReadOnlyMemTable {
 
   uint64_t ApproximateOldestKeyTime() const override {
     // FIXME: can use the time when this is added to the DB.
-    return kUnknownOldestAncesterTime;
+    return kUnknownOldestAncestorTime;
   }
 
   bool IsFragmentedRangeTombstonesConstructed() const override {
@@ -199,10 +205,10 @@ class WBWIMemTable final : public ReadOnlyMemTable {
     return true;
   }
 
-  const Slice& GetNewestUDT() const override {
+  Slice GetNewestUDT() const override {
     // FIXME: support UDT
     assert(false);
-    return newest_udt_;
+    return Slice();
   }
 
   // Assign a sequence number to the entries in this memtable.
@@ -224,7 +230,14 @@ class WBWIMemTable final : public ReadOnlyMemTable {
  private:
   inline InternalIterator* NewIterator() const;
 
-  Slice newest_udt_;
+  bool GetImpl(const LookupKey& key, std::string* value,
+               PinnableWideColumns* columns, std::string* timestamp, Status* s,
+               MergeContext* merge_context,
+               SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
+               const ReadOptions& read_opts, bool immutable_memtable,
+               ReadCallback* callback, bool* is_blob_index, bool do_merge,
+               const BlobFetcher* blob_fetcher, bool* newer_version_present);
+
   std::shared_ptr<WriteBatchWithIndex> wbwi_;
   const Comparator* comparator_;
   InternalKeyComparator ikey_comparator_;
@@ -255,6 +268,10 @@ class WBWIMemTableIterator final : public InternalIterator {
   // No copying allowed
   WBWIMemTableIterator(const WBWIMemTableIterator&) = delete;
   WBWIMemTableIterator& operator=(const WBWIMemTableIterator&) = delete;
+  WBWIMemTableIterator(WBWIMemTableIterator&&) = delete;
+  WBWIMemTableIterator& operator=(WBWIMemTableIterator&&) = delete;
+
+  ~WBWIMemTableIterator() override = default;
 
   bool Valid() const override { return valid_; }
 

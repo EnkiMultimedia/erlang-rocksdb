@@ -52,12 +52,14 @@ class MergeOperator;
 class Snapshot;
 class MemTableRepFactory;
 class RateLimiter;
+class ReadScopedBlockBufferProvider;
 class Slice;
 class Statistics;
 class InternalKeyComparator;
 class WalFilter;
 class FileSystem;
-class UserDefinedIndexFactory;
+class IndexFactory;
+using UserDefinedIndexFactory = IndexFactory;
 class IODispatcher;
 
 struct Options;
@@ -191,28 +193,24 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
 
   // Compress blocks using the specified compression algorithm.
   //
-  // Default: kSnappyCompression, if it's supported. If snappy is not linked
-  // with the library, the default is kNoCompression.
+  // Default: kLZ4Compression if support is compiled in, else kSnappyCompression
+  // if support is compiled in, else kNoCompression
   //
-  // Typical speeds of kSnappyCompression on an Intel(R) Core(TM)2 2.4GHz:
-  //    ~200-500MB/s compression
-  //    ~400-800MB/s decompression
+  // Typical single-core speed of kLZ4Compression on an AMD EPYC-Genoa
+  //     ~800 -  1200 MB/s compression
+  //    ~8000 - 16000 MB/s decompression
+  // and with a 160 threads to saturate the cores:
+  //      ~60 -    90 GB/s compression
+  //     ~900 -  1000 GB/s decompression
+  // using db_bench compress/uncompress benchmarks.
   //
   // Note that these speeds are significantly faster than most
   // persistent storage speeds, and therefore it is typically never
   // worth switching to kNoCompression.  Even if the input data is
-  // incompressible, the kSnappyCompression implementation will
-  // efficiently detect that and will switch to uncompressed mode.
+  // incompressible, the compression implementation will
+  // efficiently detect that and fall back on no compression.
   //
-  // If you do not set `compression_opts.level`, or set it to
-  // `CompressionOptions::kDefaultCompressionLevel`, we will attempt to pick the
-  // default corresponding to `compression` as follows:
-  //
-  // - kZSTD: 3
-  // - kZlibCompression: Z_DEFAULT_COMPRESSION (currently -1)
-  // - kLZ4HCCompression: 0
-  // - kLZ4: -1 (i.e., `acceleration=1`; see `CompressionOptions::level` doc)
-  // - For all others, we do not specify a compression level
+  // See CompressionOptions for more options.
   //
   // Dynamically changeable through SetOptions() API
   CompressionType compression;
@@ -458,7 +456,7 @@ struct DbPath {
   DbPath(const std::string& p, uint64_t t) : path(p), target_size(t) {}
 };
 
-extern const char* kHostnameForDbHostId;
+extern const char* const kHostnameForDbHostId;
 
 enum class CompactionServiceJobStatus : char {
   kSuccess,
@@ -550,7 +548,18 @@ class CompactionService : public Customizable {
     return response;
   }
 
-  // Wait for the scheduled compaction to finish from the remote worker
+  // Wait for the scheduled compaction to finish from the remote worker and
+  // return its status; `result` is the serialized CompactionServiceResult from
+  // the worker's DB::OpenAndCompact.
+  //
+  // DB::OpenAndCompact may return Status::Incomplete to *decline* a scheduled
+  // job rather than fail it -- currently when the MANIFEST floor check finds
+  // the worker recovered an older/stale view of the DB than the primary
+  // scheduled from (see DBOptions::remote_compaction_manifest_floor). Whether
+  // to map that to kUseLocal (fall back to a local compaction) or kFailure
+  // (surface it) is up to the integrator; both are valid. (Cancellation also
+  // surfaces as Status::Incomplete, distinguishable by SubCode
+  // kManualCompactionPaused.)
   virtual CompactionServiceJobStatus Wait(
       const std::string& /*scheduled_job_id*/, std::string* /*result*/) {
     return CompactionServiceJobStatus::kUseLocal;
@@ -565,6 +574,10 @@ class CompactionService : public Customizable {
 
   ~CompactionService() override = default;
 };
+
+// Canonical name for the DB session temporary directory, which can be used as
+// the remote compaction output root when enabled.
+inline constexpr char kSessionTmpDirName[] = "session_tmp";
 
 struct DBOptions {
   // The function recovers options to the option as in version 4.6.
@@ -621,7 +634,7 @@ struct DBOptions {
   // checking for corruption, including
   // * paranoid_file_checks
   // * paranoid_memory_checks
-  // * memtable_veirfy_per_key_checksum_on_seek
+  // * memtable_verify_per_key_checksum_on_seek
   // * DB::VerifyChecksum()
   //
   // Default: true
@@ -783,21 +796,34 @@ struct DBOptions {
   // Default: 16
   int max_file_opening_threads = 16;
 
+  // Requested maximum number of threads in the shared read I/O executor.
+  // Opening a DB or SstFileReader can increase the executor to this size but
+  // cannot reduce it. Used exclusively for asynchronous read requests (e.g.
+  // GetAsync, MultiGetAsync).
+  int read_io_executor_threads = 1;
+
   // If true, SST files are opened and validated asynchronously in the
-  // background after DB::Open returns. This reduces DB open time for
-  // databases with many SST files and high latency file systems. Mostly useful
-  // when max_open_files = -1, as max_open_files != -1 usually has fast open
-  // times. See also `max_file_opening_threads` and
+  // background after DB::Open or DB::OpenAsSecondary returns. This reduces DB
+  // open time for databases with many SST files and high latency file systems.
+  // Mostly useful when max_open_files = -1, as max_open_files != -1 usually has
+  // fast open times. See also `max_file_opening_threads` and
   // `skip_stats_update_on_db_open` to improve file open latency.
+  //
+  // A secondary with this option can no longer rely on max_open_files = -1 to
+  // pin every current SST before OpenAsSecondary returns. If the primary
+  // deletes a file before the background job opens it, the background job or
+  // later reads can return an I/O error. TryCatchUpWithPrimary() does not clear
+  // a latched asynchronous-open background error; fix the underlying problem
+  // and reopen the secondary instead.
   //
   // Note: This option is currently not compatible with FIFO compaction and
   // requires skip_stats_update_on_db_open=true.
   //
-  // Errors will no longer show up in DB::Open, but instead can show up as
-  // either background errors and/or operations that access the file (e.g.
+  // Errors will no longer show up in the DB open call, but instead can show up
+  // as either background errors and/or operations that access the file (e.g.
   // reads, compactions).
   //
-  // When false (default), SST files are opened and validated during DB::Open.
+  // When false (default), SST files are opened and validated during DB open.
   //
   // Default: false
   bool open_files_async = false;
@@ -870,7 +896,7 @@ struct DBOptions {
   // and the db data dir's absolute path will be used as the log file
   // name's prefix.
   // NOTE: not for WALs
-  std::string db_log_dir = "";
+  std::string db_log_dir;
 
   // This specifies the absolute dir path for write-ahead logs (WAL).
   // If it is empty, the log files will be in the same dir as data,
@@ -878,7 +904,7 @@ struct DBOptions {
   // If it is non empty, the log files will be in kept the specified dir.
   // When destroying the db,
   //   all log files in wal_dir and the dir itself is deleted
-  std::string wal_dir = "";
+  std::string wal_dir;
 
   // The periodicity when obsolete files get deleted. The default
   // value is 6 hours. The files that get out of scope by compaction
@@ -975,6 +1001,17 @@ struct DBOptions {
   // Default: 0
   size_t recycle_log_file_num = 0;
 
+  // EXPERIMENTAL: If true, RocksDB asynchronously precreates the next WAL file
+  // so foreground memtable switching can usually avoid the filesystem latency
+  // of creating a new WAL. The precreated file is only reserved empty storage;
+  // it does not become a logical WAL and is not added to WAL tracking until it
+  // is consumed by a foreground WAL rotation.
+  //
+  // The option is sanitized to false when recycle_log_file_num is non-zero.
+  //
+  // Default: false
+  bool async_wal_precreate = false;
+
   // The manifest file is rolled over on reaching this limit AND the
   // space amp limit described in max_manifest_space_amp_pct. More trade-off
   // details there.
@@ -992,6 +1029,13 @@ struct DBOptions {
   //
   // This option is mutable with SetDBOptions(), taking effect on the next
   // manifest write (e.g. completed DB compaction or flush).
+  //
+  // For MANIFEST write batches containing foreground operations like external
+  // file ingestion/import, DeleteFilesInRange, CreateColumnFamily, and
+  // DropColumnFamily, the effective limit is relaxed by 25% to reduce the
+  // likelihood of user operations blocking on MANIFEST rotation.
+  // Background-only batches (flush and compaction) use the configured or
+  // auto-tuned limit directly.
   uint64_t max_manifest_file_size = 1024 * 1024 * 1024;
 
   // If true, on DB close, read back the entire MANIFEST file and validate
@@ -1000,6 +1044,36 @@ struct DBOptions {
   //
   // This option is mutable with SetDBOptions().
   bool verify_manifest_content_on_close = false;
+
+  // EXPERIMENTAL: If true, RocksDB can reduce recovery work after a clean
+  // shutdown, which may reduce DB::Open latency on warm reopens, especially on
+  // storage where metadata appends are expensive.
+  //
+  // Best-effort optimization: if it is disabled or unavailable, RocksDB falls
+  // back to the standard recovery path.
+  //
+  // Temporary rollout / kill switch for an optimization that is intended to be
+  // correct and eventually always enabled. Mutable via SetDBOptions().
+  bool optimize_manifest_for_recovery = false;
+
+  // EXPERIMENTAL: If true, DB::Open can try to reuse the existing MANIFEST
+  // for the first post-open metadata update instead of creating a fresh one.
+  // This can reduce warm-open latency for DBs whose MANIFEST is expensive to
+  // rebuild.
+  //
+  // Best-effort optimization: even when enabled, RocksDB may still create a
+  // fresh MANIFEST if the FileSystem does not support reopening the existing
+  // MANIFEST for append, or if RocksDB decides reuse is unsafe. That fallback
+  // is normal behavior.
+  //
+  // With very small `max_manifest_file_size` settings, the reused MANIFEST can
+  // still rotate earlier than expected after open, because RocksDB may keep a
+  // conservative auto-tuned rotation threshold until it later refreshes its
+  // compacted-size estimate.
+  //
+  // Temporary rollout / kill switch while this optimization is being
+  // validated.
+  bool reuse_manifest_on_open = false;
 
   // This option mostly replaces max_manifest_file_size to control an auto-tuned
   // balance of manifest write amplification and space amplification. A new
@@ -1102,7 +1176,46 @@ struct DBOptions {
   // Default: false
   bool use_direct_reads = false;
 
-  // Use O_DIRECT for writes in background flush and compactions.
+  // Use O_DIRECT for compaction-input SST reads only, leaving user reads
+  // buffered. Useful when sequential compaction reads would otherwise evict
+  // the hot user-read working set from the OS page cache. When this is true
+  // and use_direct_reads is false, compaction opens short-lived O_DIRECT
+  // readers for its input files instead of reusing the buffered readers cached
+  // for user reads. This is the read-side analogue of
+  // use_direct_io_for_flush_and_compaction, and the two are often paired on
+  // write-heavy workloads.
+  //
+  // Scope and limits:
+  //   * DBOption scope (applies to all column families); no per-CF setting.
+  //   * Covers compaction inputs only. Blob-file reads and compaction-output
+  //     verification (paranoid_file_checks) still use the buffered path.
+  //   * The ephemeral readers bypass the TableCache and are not counted against
+  //     max_open_files. Non-L0 levels keep one reader open at a time; L0 opens
+  //     all of a subcompaction's overlapping inputs at once, so with large L0
+  //     fan-in and many subcompactions, watch RLIMIT_NOFILE.
+  //   * Every input file is reopened per compaction, so NO_FILE_OPENS and
+  //     TABLE_OPEN_IO_MICROS rise while this is enabled.
+  //
+  // The same SST can be open through both a buffered handle (user reads) and an
+  // O_DIRECT handle (the compaction scan) at once; modern Linux handles this
+  // fine. The flag is neutral or slightly negative for in-memory DBs or
+  // uniform random reads, so measure before enabling.
+  //
+  // Has no effect when use_direct_reads is true (all reads are already
+  // O_DIRECT). Rejected at DB::Open when allow_mmap_reads is set.
+  //
+  // On a filesystem without O_DIRECT support (e.g. tmpfs), DB::Open fails: it
+  // probes by opening the MANIFEST with O_DIRECT. The probe only checks the
+  // filesystem holding the DB directory, so if SST files live elsewhere (via
+  // db_paths/cf_paths) without O_DIRECT, Open succeeds and the first compaction
+  // fails instead.
+  //
+  // Default: false
+  bool use_direct_io_for_compaction_reads = false;
+
+  // Use O_DIRECT for writes in background flush and compactions. See also
+  // use_direct_io_for_compaction_reads, the read-side analogue often paired
+  // with this on write-heavy workloads.
   // Default: false
   bool use_direct_io_for_flush_and_compaction = false;
 
@@ -1523,6 +1636,30 @@ struct DBOptions {
   // are phased out.
   bool write_dbid_to_manifest = true;
 
+  // EXPERIMENTAL: If true, each durable OPTIONS file is followed by a MANIFEST
+  // record committing its file number. For a column-family create or drop, the
+  // commit and membership edit are the same MANIFEST record.
+  //
+  // This value is persisted in OPTIONS files so readers can distinguish a
+  // tracked file that was durably renamed but not committed from a file written
+  // by a legacy or disabled writer. A higher file with this value false
+  // supersedes an older MANIFEST commit. A higher file with this value true is
+  // ignored until its number is committed.
+  //
+  // Older binaries safely ignore the MANIFEST field and retain their legacy
+  // highest-numbered-OPTIONS behavior. Rollback binaries must know this option
+  // before the feature is enabled so they can parse newly written OPTIONS
+  // files.
+  //
+  // The multi-column-family create/drop APIs preserve their existing partial
+  // success behavior while writing one complete OPTIONS snapshot per batch.
+  // A partial batch can leave the committed snapshot with extra column
+  // families; LoadLatestOptions and CheckOptionsCompatibility filter those
+  // entries against the live MANIFEST membership.
+  //
+  // Default: false
+  bool track_options_file_number_in_manifest = false;
+
   // It is expected that the Identity file will be obsoleted by recording
   // DB ID in the manifest (see write_dbid_to_manifest). Setting this to true
   // maintains the historical behavior of writing an Identity file, while
@@ -1612,7 +1749,10 @@ struct DBOptions {
   // Error happens, SetBGError is called to deal with the error. If the error
   // can be auto-recovered (e.g., retryable IO Error during Flush or WAL write),
   // then db resume is called in background to recover from the error. If this
-  // value is 0 or negative, DB::Resume() will not be called automatically.
+  // value is 0 or negative, DB::Resume() will not be called automatically, and
+  // any background retryable IO error (including one during compaction, which
+  // would otherwise be retried by rescheduling the compaction) stops writes
+  // until the user calls DB::Resume().
   //
   // Default: INT_MAX
   int max_bgerror_resume_count = INT_MAX;
@@ -1665,6 +1805,41 @@ struct DBOptions {
   // under development.
   std::shared_ptr<CompactionService> compaction_service = nullptr;
 
+  // Hardening for remote compaction (CompactionService / DB::OpenAndCompact).
+  // When true (default), the primary includes in each remote compaction request
+  // the MANIFEST position (file number and size) it scheduled the compaction
+  // from. The remote worker refuses to reconstruct the compaction against an
+  // older MANIFEST view than that -- e.g. an eventually-consistent filesystem
+  // returning a stale CURRENT, or a truncated MANIFEST -- and falls back to a
+  // local compaction rather than risk an incorrect result computed against the
+  // wrong (older) LSM shape.
+  //
+  // The presence of this position on the request also enables the worker's
+  // "trust the MANIFEST" recovery, which avoids failing a job over a
+  // transiently-unavailable file that is not one of the compaction's inputs.
+  //
+  // Setting this to false is a kill switch for disabling both behaviors (for
+  // subsequently scheduled compactions). Dynamically changeable through
+  // SetDBOptions() API. DEPRECATED because this kill switch should not be
+  // needed long term.
+  //
+  // Only affects a primary that schedules remote compactions; it has no effect
+  // when compaction_service is not configured.
+  bool remote_compaction_manifest_floor = true;
+
+  // When true, remote compaction uses the DB session temporary directory.
+  // An `output_directory` argument of `job_1` to `DB::OpenAndCompact()` is
+  // resolved to `<dbname>/session_tmp/job_1`. DB::Open() creates the directory
+  // and deletes contents left by the previous DB session before scheduling new
+  // compactions. Cleanup is best effort and never fails open.
+  //
+  // When false, output is written directly to `<dbname>/<output_directory>`
+  // and DB::Open() performs no remote compaction output cleanup, preserving
+  // the legacy behavior.
+  //
+  // Default: false
+  bool use_session_tmp_dir_for_remote_compaction = false;
+
   // It indicates, which lowest cache tier we want to
   // use for a certain DB. Currently we support volatile_tier and
   // non_volatile_tier. They are layered. By setting it to kVolatileTier, only
@@ -1707,7 +1882,84 @@ struct DBOptions {
   // spans to the next day (e.g., 23:30-04:00). To make an entire day off-peak,
   // use "0:00-23:59". To make an entire day have no offpeak period, leave
   // this field blank. Default: Empty string (no offpeak).
-  std::string daily_offpeak_time_utc = "";
+  std::string daily_offpeak_time_utc;
+
+  // Maximum interval in seconds between periodic compaction trigger checks.
+  // The periodic trigger re-evaluates compaction scores for all column
+  // families, which is necessary for features like read-triggered compaction
+  // and time-based compaction to work on a "quiet" DB with no writes.
+  //
+  // This is an upper bound: the actual check interval may be reduced to
+  // align with stats_dump_period_sec, stats_persist_period_sec, or per-CF
+  // time-based compaction intervals (periodic_compaction_seconds, ttl, etc.).
+  //
+  // Note: this option controls how often RocksDB *checks* whether compaction
+  // is needed. It is different from the CF option `periodic_compaction_seconds`
+  // which controls the *age threshold* at which SST files become eligible for
+  // periodic compaction.
+  //
+  // The minimum effective period is 1 second (values below 1 are clamped to 1).
+  // Setting this to 0 results in the most aggressive 1-second polling.
+  //
+  // Default: 43200 (12 hours)
+  //
+  // Dynamically changeable through SetDBOptions() API.
+  uint64_t max_compaction_trigger_wakeup_seconds = 43200;
+
+  // EXPERIMENTAL
+  // Enables and tunes preferred-phase scheduling of periodic (time-based)
+  // compaction, which de-herds periodic_compaction_seconds compactions across a
+  // fleet of similarly-configured DBs (a recurring "thundering herd" is
+  // especially costly with remote compaction). Each (DB, column family) is
+  // given a stable-but-well-spread preferred phase within
+  // periodic_compaction_seconds and compactions are steered toward it. The
+  // phase is derived from the DB ID -- stable across re-open and physical
+  // cloning/migration (at least when write_dbid_to_manifest=true), but distinct
+  // across DBs -- and each column family is spread quasi-uniformly around the
+  // DB's base phase by a golden-ratio recurrence, so different CFs of one DB
+  // get well-separated phases. No user tuning of the phase itself is needed.
+  //
+  // This value is the percent (0-100) of the gap between a file's unphased
+  // trigger time and its preferred-phase time that is closed on each
+  // periodic-compaction trigger, always by triggering *earlier* -- never later
+  // than periodic_compaction_seconds, which remains a soft upper bound on data
+  // age. Because each compaction re-stamps the file, the phase error then
+  // decays geometrically toward the preferred phase over successive cycles.
+  //
+  // "Never later" holds in steady state. It can be exceeded only for files
+  // already past due when phasing (re)anchors -- which it does on DB open, on
+  // enabling phasing, and on any change to periodic_compaction_seconds. The
+  // cases that matter are reopening a DB whose files aged out while it was
+  // down (e.g. DC power-outage recovery) and turning the interval *down*
+  // (which retroactively makes older files past due). Rather than compact that
+  // whole cohort at once (a herd), phasing spreads it over the first quarter
+  // of the interval after the anchor, on a stable per-(DB, CF) grid --
+  // expedited but herd-avoiding -- so such a file may be rewritten up to a
+  // quarter-interval past its (revised) deadline. To enforce the age limit
+  // immediately at such a transition, trigger a manual compaction.
+  //
+  // 0 disables phasing entirely (exact legacy behavior; this is the kill
+  // switch). 100 snaps to the preferred phase in a single cycle, which can
+  // recompact some files well before their normal interval and is generally not
+  // recommended. Values are clamped to [0, 100].
+  //
+  // Lower values converge more slowly but incur less extra compaction work,
+  // especially under write-driven or bursty workloads that keep re-randomizing
+  // a file's phase (where a high recovery rate wastefully "chases" the moving
+  // phase). ~33 is a good balance of spreading speed vs. extra work: almost
+  // always widely spread after a few periods while almost always below 5%
+  // extra compaction work overall, trending toward 0% in the long term for
+  // most workloads.
+  //
+  // This feature might become obsolete if a future feature is able to have
+  // compaction pressure, whether local or remote, feed back into compaction
+  // scheduling.
+  //
+  // Recommended setting: 33
+  // Default: feature disabled
+  //
+  // Dynamically changeable through SetDBOptions() API.
+  int periodic_compaction_phase_recovery_percent = 0;
 
   // EXPERIMENTAL
 
@@ -1759,6 +2011,14 @@ struct DBOptions {
   // Default: Enabled in kCompactionStyleLevel mode.
   CompactionStyleSet calculate_sst_write_lifetime_hint_set = {
       CompactionStyle::kCompactionStyleLevel};
+
+  // EXPERIMENTAL
+  // When this is true, save file system metadata (if supported by the FS) for
+  // SST files added to the DB in the MANIFEST, and use it to accelerate
+  // re-opening of those files on DB open. This will help cut down DB open
+  // latency on remote storage systems.
+  bool fast_sst_open = false;
+
   // End EXPERIMENTAL
 };
 
@@ -1881,12 +2141,14 @@ class MultiScanArgs {
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
     use_async_io = other.use_async_io;
+    reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
   }
   MultiScanArgs(MultiScanArgs&& other) noexcept
       : io_coalesce_threshold(other.io_coalesce_threshold),
         max_prefetch_size(other.max_prefetch_size),
         use_async_io(other.use_async_io),
+        reverse(other.reverse),
         io_dispatcher(std::move(other.io_dispatcher)),
         comp_(other.comp_),
         original_ranges_(std::move(other.original_ranges_)) {}
@@ -1897,6 +2159,7 @@ class MultiScanArgs {
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
     use_async_io = other.use_async_io;
+    reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
     return *this;
   }
@@ -1908,6 +2171,7 @@ class MultiScanArgs {
       io_coalesce_threshold = other.io_coalesce_threshold;
       max_prefetch_size = other.max_prefetch_size;
       use_async_io = other.use_async_io;
+      reverse = other.reverse;
       io_dispatcher = std::move(other.io_dispatcher);
     }
     return *this;
@@ -1936,6 +2200,21 @@ class MultiScanArgs {
   size_t size() const { return original_ranges_.size(); }
   bool empty() const { return original_ranges_.empty(); }
 
+  bool HasBoundedScanRanges() const {
+    if (empty()) {
+      return false;
+    }
+
+    for (const ScanOptions& scan_range : original_ranges_) {
+      if (!scan_range.range.start.has_value() ||
+          !scan_range.range.limit.has_value()) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   void reserve(size_t size) { original_ranges_.reserve(size); }
 
   operator std::vector<ScanOptions>*() { return &original_ranges_; }
@@ -1956,6 +2235,7 @@ class MultiScanArgs {
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
     use_async_io = other.use_async_io;
+    reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
   }
 
@@ -1978,6 +2258,10 @@ class MultiScanArgs {
   // When false, it will use synchronous MultiRead().
   bool use_async_io = false;
 
+  // Scan ranges in reverse order. Ranges are still specified in comparator
+  // order as [start, limit), and reverse scans require bounded ranges.
+  bool reverse = false;
+
   // Optional IODispatcher for multi-scan operations.
   // If nullptr (default), a new IODispatcher is created internally.
   // Users can provide their own IODispatcher for custom IO scheduling
@@ -1992,6 +2276,14 @@ class MultiScanArgs {
 
 // Options that control read operations
 struct ReadOptions {
+  // NOTE: for all pointer members of ReadOptions (e.g. snapshot, timestamp,
+  // iterate_lower_bound, iterate_upper_bound, table_filter, ...), when the
+  // pointer is non-nullptr the caller retains ownership of the pointed-to
+  // object and, unless documented otherwise, is responsible for keeping it
+  // alive and unchanged for as long as the read operation using these options
+  // is in progress (which, for an iterator, is the lifetime of the iterator).
+  // This keeps ReadOptions cheap to copy (internal to RocksDB).
+
   // *** BEGIN options relevant to point lookups as well as scans ***
 
   // If "snapshot" is non-nullptr, read as of the supplied snapshot
@@ -2049,9 +2341,12 @@ struct ReadOptions {
   // headers/footers, that we currently do not charge to rate limiter.
   Env::IOPriority rate_limiter_priority = Env::IO_TOTAL;
 
-  // It limits the maximum cumulative value size of the keys in batch while
-  // reading through MultiGet. Once the cumulative value size exceeds this
-  // soft limit then all the remaining keys are returned with status Aborted.
+  // Soft limit on the cumulative value size read by a single MultiGet, to bound
+  // how much it buffers. It always makes progress: at least one key is read
+  // even if its value alone exceeds the limit. Once the returned size exceeds
+  // the limit, subsequent keys get status Aborted (so a caller can retry them,
+  // and cannot loop forever on a single value that by itself exceeds the
+  // limit).
   uint64_t value_size_soft_limit = std::numeric_limits<uint64_t>::max();
 
   // When the number of merge operands applied exceeds this threshold
@@ -2095,6 +2390,16 @@ struct ReadOptions {
   // parallel if the keys in the MultiGet batch are in different levels. It
   // comes at the expense of slightly higher CPU overhead.
   bool optimize_multiget_for_io = true;
+
+  // EXPERIMENTAL
+  //
+  // An opaque, non-owning context passed to all table implementations for this
+  // read. RocksDB does not interpret, manage, or synchronize access to this
+  // context. It is intended to let external table implementations consume
+  // application-defined read options. The caller is responsible for keeping the
+  // context alive for the duration of the read operation (or iterator lifetime)
+  // and for any required synchronization.
+  void* custom_context = nullptr;
 
   // *** END options relevant to point lookups (as well as scans) ***
   // *** BEGIN options only relevant to iterators or scans ***
@@ -2211,8 +2516,24 @@ struct ReadOptions {
   // properties of each table during iteration. If the callback returns false,
   // the table will not be scanned. This option only affects Iterators and has
   // no impact on point lookups.
-  // Default: empty (every table will be scanned)
-  std::function<bool(const TableProperties&)> table_filter;
+  //
+  // Iterator creation on read-write DB variants returns InvalidArgument for
+  // safety when the target column family's min_tombstones_for_range_conversion
+  // is non-zero. The reasoning is that a fully visible iterator may create a
+  // range tombstone from tombstones that can be later converted to a range
+  // tombstone. If another iterator tries to filter out the table with the
+  // tombstones, the reader would expect the deletes to no longer apply, but it
+  // actually still does because of the range tombstone that was inserted.
+  // IMPORTANT: min_tombstones_for_range_conversion is a dynamic option, so
+  // disabling it may allow you to use table_filters again, you must account for
+  // the possibility that range tombstones have already been inserted into
+  // either the memtable or other sst files.
+  //
+  // A nullptr, or a pointer to an empty std::function, means no filtering
+  // (every table will be scanned).
+  //
+  // Default: nullptr (every table will be scanned)
+  const std::function<bool(const TableProperties&)>* table_filter = nullptr;
 
   // If auto_readahead_size is set to true, it will auto tune the readahead_size
   // during scans internally based on block cache data when block cache is
@@ -2278,15 +2599,62 @@ struct ReadOptions {
 
   // EXPERIMENTAL
   //
+  // Names which block-based-table index a read should use. This is a
+  // preparatory API for replacing direct table_index_factory selection in a
+  // follow-up change. Until that wiring lands, table_index_factory keeps its
+  // existing behavior and read_index is not consulted by table reading.
+  enum class ReadIndex : uint8_t {
+    // Use the column family's default index routing.
+    kDefault = 0,
+    // Use the standard block-based-table index.
+    kBuiltin = 1,
+    // Prefer the configured custom index when present.
+    kPreferCustom = 2,
+  };
+  ReadIndex read_index = ReadIndex::kDefault;
+
+  // EXPERIMENTAL
+  //
   // Specify an alternate index to use in the SST files instead of the native
   // block based table index. The table_factory used for the column family
   // must support building/reading this index.
   //
-  // Forward scans (SeekToFirst, Seek, Next) and point lookups (Get) are
-  // supported. Reverse operations (SeekToLast, SeekForPrev, Prev) are not
-  // yet supported and will return NotSupported when this is set. Leave this
-  // null to use the native index for reverse operations.
-  const UserDefinedIndexFactory* table_index_factory = nullptr;
+  // The UDI framework supports all iterator operations: forward scans
+  // (SeekToFirst, Seek, Next), reverse scans (SeekToLast, SeekForPrev, Prev),
+  // and point lookups (Get). Concrete UDI implementations may impose their
+  // own restrictions -- check the specific implementation's documentation.
+  //
+  // When BlockBasedTableOptions::use_udi_as_primary_index is true, this field
+  // does not need to be set -- all reads automatically use the UDI. If set
+  // while use_udi_as_primary_index is true, the UDI from
+  // BlockBasedTableOptions takes precedence. This field is only needed when
+  // the UDI is a secondary index and you want to explicitly select it for
+  // reads.
+  const IndexFactory* table_index_factory = nullptr;
+
+  // EXPERIMENTAL: Optional non-owning provider for data-block storage pinned by
+  // scans using this ReadOptions. Applications that set it are attempting
+  // advanced performance optimizations and are responsible for ensuring the
+  // provider outlives the iterator/read scope and any provider-backed data that
+  // can remain pinned by that scope.
+  //
+  // This is a raw pointer rather than a shared_ptr because ReadOptions is
+  // copied through stack frames and iterator internals; a shared_ptr would add
+  // refcount overhead to those copies. An internal shadow ReadOptions that
+  // strips ownership would add maintenance overhead for this advanced option.
+  //
+  // Current support is limited to block-based table iterators and MultiScan
+  // data-block reads, and is ignored when mmap reads are enabled. When set,
+  // supported scan reads bypass the data-block cache and use provider-backed
+  // final data-block memory. RocksDB may still use ordinary temporary scratch
+  // for serialized block bytes, such as when a block may be compressed. When
+  // unset, scans use the normal RocksDB data-block backing for the table: use
+  // the configured block cache when present, otherwise use RocksDB-owned block
+  // memory. Index/filter blocks keep their normal block-cache behavior.
+  //
+  // TODO: Extend support to point lookups (Get/MultiGet) once those paths can
+  // preserve provider-backed block ownership.
+  ReadScopedBlockBufferProvider* read_scoped_block_buffer_provider = nullptr;
 
   // *** END options only relevant to iterators or scans ***
 
@@ -2417,8 +2785,29 @@ struct FlushOptions {
   // is performed by someone else (foreground call or background thread).
   // Default: false
   bool allow_write_stall;
+  // If true, use atomic flush to flush all column families atomically,
+  // regardless of the DBOptions::atomic_flush setting. When used with
+  // DB::Flush() or internally via GetLiveFilesStorageInfo(), this forces
+  // all column families to be flushed in a single atomic operation.
+  // Default: false (uses DBOptions::atomic_flush setting).
+  bool force_atomic_flush;
 
-  FlushOptions() : wait(true), allow_write_stall(false) {}
+  // If true (and `wait` is also true), Flush() will not return until the
+  // registered EventListener::OnFlushCompleted callbacks for the flushed
+  // memtables have finished running. By default (false), Flush(wait=true) may
+  // return as soon as the flush result is committed, which can be before (or
+  // while) the OnFlushCompleted callbacks execute on the background flush
+  // thread. Set this to true when the caller needs to observe the effects of
+  // its OnFlushCompleted listener(s) immediately after Flush() returns.
+  // Has no effect when `wait == false`.
+  // Default: false
+  bool listener_wait;
+
+  FlushOptions()
+      : wait(true),
+        allow_write_stall(false),
+        force_atomic_flush(false),
+        listener_wait(false) {}
 };
 
 struct FlushWALOptions {
@@ -2665,14 +3054,6 @@ struct IngestExternalFileOptions {
   // with cf_allow_ingest_behind=true since CF creation (or before any write).
   // All files will be ingested at the bottommost level with seqno=0.
   bool ingest_behind = false;
-  // DEPRECATED - Set to true if you would like to write global_seqno to
-  // the external SST file on ingestion for backward compatibility before
-  // RocksDB 5.16.0. Such old versions of RocksDB expect any global_seqno to
-  // be written to the SST file rather than recorded in the DB manifest.
-  // This functionality was deprecated because (a) random writes might be
-  // costly or unsupported on some FileSystems, and (b) the file checksum
-  // changes with such a write.
-  bool write_global_seqno = false;
   // Set to true if you would like to verify the checksums of each block of the
   // external SST file before ingestion.
   // Warning: setting this to true causes slowdown in file ingestion because
@@ -2760,8 +3141,6 @@ struct IngestExternalFileOptions {
   //   with each other, you can set `fail_if_not_bottommost_level` to true.
   //   If ingested files overlap with each other, some file will be placed
   //   above Lmax, failing the ingestion if the option is set.
-  // - `write_global_seqno` must be false (sequence numbers cannot be
-  //    reassigned).
   bool allow_db_generated_files = false;
 
   // Controls whether data and metadata blocks (e.g. index, filter) read during
@@ -2771,7 +3150,30 @@ struct IngestExternalFileOptions {
   // When ingesting to multiple families, this option should be the same across
   // ingestion options.
   bool fill_cache = true;
+
+  // Controls whether external file ingestion should prefetch index and filter
+  // blocks while opening table readers during commit. Setting this to false can
+  // reduce commit latency for bulk loads into Lmax when
+  // (BlockBasedTableOptions::cache_index_and_filter_blocks=true or partitioned
+  // filters/indexes are enabled).
+  bool prefetch_lmax_index_and_filter_blocks = true;
+
+  // Maximum number of threads used to open table readers for the files being
+  // ingested during commit, can speed up ingestion performance, when ingesting
+  // multiple files at once.
+  int file_opening_threads = 1;
+
+  bool operator==(const IngestExternalFileOptions& rhs) const = default;
 };
+
+// Opaque per-file metadata accepted through IngestExternalFileArg::file_infos.
+// Supplying it lets DB::IngestExternalFiles() and DB::PrepareFileIngestion()
+// prepare ingestion without re-opening and scanning the SST to recompute file
+// metadata. It is produced by SstFileWriter::Finish() for writer-created files
+// or by DB::GetPreparedFileInfoForExternalSstIngestion() for live DB-generated
+// files. SerializePreparedFileInfo() and DeserializePreparedFileInfo() in
+// rocksdb/db.h can be used to persist it without exposing its contents.
+struct PreparedFileInfo;
 
 // It is valid that files_checksums and files_checksum_func_names are both
 // empty (no checksum information is provided for ingestion). Otherwise,
@@ -2798,17 +3200,24 @@ struct IngestExternalFileArg {
   //   to this range (not just the file ranges).
   // * Not compatible with ingest_behind=true.
   // * When options.snapshot_consistency = false, the range is cleared
-  // similarly to DeleteFilesInRange, but fails if any files overlap the range
-  // only partially.
-  //   * It is recommended to use fail_if_not_bottommost_level=true to ensure
-  //     data in the key range is ingested to a single compacted level (the
-  //     last level). (fail_if_not_bottommost_level=false allows overlap between
-  //     the ingested files.)
+  // similarly to DeleteFilesInRange. With universal compaction and a table
+  // factory that supports range deletion, a partial overlap is handled by
+  // retaining the overlapping file and adding a range tombstone below the
+  // ingested data. This requires allow_global_seqno=true,
+  // allow_db_generated_files=false, and no user-defined timestamps. Other
+  // configurations fail on partial overlap.
+  //   * fail_if_not_bottommost_level=true rejects partial overlap because the
+  //     retained file requires the tombstone and replacement files to be
+  //     placed on higher levels.
   // * options.snapshot_consistency = true is not yet supported.
-  // BUG: the upper bound of the range may be interpreted as inclusive or
-  // exclusive, so it is best not to depend on one or the other until it is
-  // sorted out.
+  // * The range is half-open: start is inclusive and limit is exclusive.
   std::optional<RangeOpt> atomic_replace_range;
+
+  // Optimizes for prepare performance, see `PreparedFileInfo` for details.
+  // The owning handle must stay alive until ingestion completes.
+  // Because the file is not opened, ingestion does not read its storage
+  // temperature and trusts the caller-supplied `file_temperature` hint as-is.
+  std::vector<const PreparedFileInfo*> file_infos;
 };
 
 enum TraceFilterType : uint64_t {
@@ -2854,11 +3263,26 @@ struct ImportColumnFamilyOptions {
 // Options used with DB::GetApproximateSizes()
 struct SizeApproximationOptions {
   // Defines whether the returned size should include the recently written
-  // data in the memtables. If set to false, include_files must be true.
+  // data in the memtables. If set to false, at least one of include_files or
+  // include_blob_files must be true.
   bool include_memtables = false;
   // Defines whether the returned size should include data serialized to disk.
-  // If set to false, include_memtables must be true.
+  // If set to false, at least one of include_memtables or include_blob_files
+  // must be true.
   bool include_files = true;
+  // Defines whether the returned size should include an approximation of
+  // blob file data in the key range. When enabled, the total blob file size
+  // is prorated by the ratio of SST data in the range to the total SST data:
+  //
+  //   blob_size_in_range ~= total_blob_size * (sst_in_range / total_sst)
+  //
+  // Limitations of this approximation:
+  // - Assumes blob data is distributed proportionally to SST data, which
+  //   may not hold if blob value sizes vary significantly across keys.
+  // - If there are no SST files (all data in memtables), the blob size
+  //   contribution will be 0 even if blob files exist on disk.
+  // Default: false (for backward compatibility).
+  bool include_blob_files = false;
   // When approximating the files total size that is used to store a keys range
   // using DB::GetApproximateSizes, allow approximation with an error margin of
   // up to total_files_size * files_size_error_margin. This allows to take some
@@ -2912,6 +3336,13 @@ struct OpenAndCompactOptions {
   // Allows cancellation of an in-progress compaction.
   std::atomic<bool>* canceled = nullptr;
 
+  // Maximum number of times to retry opening the source DB as a secondary
+  // after the initial attempt fails because CURRENT or MANIFEST was replaced
+  // concurrently. A value of zero disables retries.
+  //
+  // Default: 2
+  uint32_t max_secondary_open_retries = 2;
+
   // EXPERIMENTAL
   //
   // Controls whether OpenAndCompact() should attempt to resume from previously
@@ -2957,6 +3388,13 @@ struct LiveFilesStorageInfoOptions {
   // number (and DB is not read-only).
   // Default: always force a flush without checking sizes.
   uint64_t wal_size_for_flush = 0;
+  // If true, use atomic flush to flush all column families atomically,
+  // regardless of the DBOptions::atomic_flush setting. This ensures that the
+  // checkpoint captures a consistent view across all column families.
+  // Only takes effect when a flush is actually performed (i.e., not suppressed
+  // by wal_size_for_flush).
+  // Default: false (uses DBOptions::atomic_flush setting).
+  bool atomic_flush = false;
 };
 
 struct WaitForCompactOptions {

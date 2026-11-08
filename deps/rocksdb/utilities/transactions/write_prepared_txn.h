@@ -53,7 +53,7 @@ class WritePreparedTxnDB;
 //   db_impl_->WriteImpl(write_options, GetWriteBatch(),
 //                       ..., !DISABLE_MEMTABLE, ...);
 //
-// !DISABLE_MEMTABLE is false — memtable is enabled. This is the defining
+// !DISABLE_MEMTABLE is false -- memtable is enabled. This is the defining
 // characteristic of "WritePrepared": the actual data (Put("key1", "value1"))
 // is written to the memtable at Prepare time.
 //
@@ -68,7 +68,7 @@ class WritePreparedTxnDB;
 //
 // The data is now durable (WAL) and in the memtable, but not yet visible
 // to readers. Readers use GetLastPublishedSequence() which consults a
-// commit map — since prepare_seq is in the PreparedHeap but not yet in the
+// commit map -- since prepare_seq is in the PreparedHeap but not yet in the
 // CommitCache, readers know this data is uncommitted and skip it.
 //
 // -- Phase 2: Commit (CommitInternal) --
@@ -92,7 +92,7 @@ class WritePreparedTxnDB;
 //   Destination | What gets written   | Sequence
 //   ------------|---------------------|-----------
 //   WAL         | Commit(txn1) marker | commit_seq
-//   Memtable    | Nothing             | —
+//   Memtable    | Nothing             | --
 //
 // The PreReleaseCallback (WritePreparedCommitEntryPreReleaseCallback)
 // updates the CommitCache to record that prepare_seq was committed at
@@ -101,7 +101,7 @@ class WritePreparedTxnDB;
 //
 // -- Why two queues help --
 //
-// The Commit phase doesn't touch the memtable — it only writes a small
+// The Commit phase doesn't touch the memtable -- it only writes a small
 // marker to WAL and updates an in-memory commit map. By routing this
 // through a separate queue, Commit writes don't have to wait behind other
 // transactions' Prepare writes (which do the expensive memtable insertion
@@ -119,7 +119,7 @@ class WritePreparedTxnDB;
 //     FetchAdd alloc seq             9      |        10          |        9
 //     Write WAL + memtable
 //     SetLastSequence               10      |        10          |        9
-//     (published_seq not advanced yet — data is uncommitted)
+//     (published_seq not advanced yet -- data is uncommitted)
 //
 //   Commit (2nd queue):
 //     FetchAdd alloc seq            10      |        11          |        9
@@ -134,8 +134,10 @@ class WritePreparedTxn : public PessimisticTransaction {
   // No copying allowed
   WritePreparedTxn(const WritePreparedTxn&) = delete;
   void operator=(const WritePreparedTxn&) = delete;
+  WritePreparedTxn(WritePreparedTxn&&) = delete;
+  void operator=(WritePreparedTxn&&) = delete;
 
-  virtual ~WritePreparedTxn() {}
+  ~WritePreparedTxn() override {}
 
   // To make WAL commit markers visible, the snapshot will be based on the last
   // seq in the WAL that is also published, LastPublishedSequence, as opposed to
@@ -186,6 +188,15 @@ class WritePreparedTxn : public PessimisticTransaction {
   using Transaction::GetImpl;
   Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
                  const Slice& key, PinnableSlice* value) override;
+
+  Status GetEntityImpl(const ReadOptions& options,
+                       ColumnFamilyHandle* column_family, const Slice& key,
+                       PinnableWideColumns* columns) override;
+
+  void MultiGetEntityImpl(const ReadOptions& options,
+                          ColumnFamilyHandle* column_family, size_t num_keys,
+                          const Slice* keys, PinnableWideColumns* results,
+                          Status* statuses, bool sorted_input) override;
 
   Status PrepareInternal() override;
 

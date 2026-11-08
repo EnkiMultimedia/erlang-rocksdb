@@ -36,6 +36,9 @@ bool LevelCompactionPicker::NeedsCompaction(
   if (!vstorage->FilesMarkedForForcedBlobGC().empty()) {
     return true;
   }
+  if (!vstorage->ReadTriggeredCompactionFiles().empty()) {
+    return true;
+  }
   for (int i = 0; i <= vstorage->MaxInputLevel(); i++) {
     if (vstorage->CompactionScore(i) >= 1) {
       return true;
@@ -325,6 +328,14 @@ void LevelCompactionBuilder::SetupInitialFiles() {
     compaction_reason_ = CompactionReason::kForcedBlobGC;
     return;
   }
+
+  // Read-triggered compaction
+  PickFileToCompact(vstorage_->ReadTriggeredCompactionFiles(),
+                    CompactToNextLevel::kYes);
+  if (!start_level_inputs_.empty()) {
+    compaction_reason_ = CompactionReason::kReadTriggered;
+    return;
+  }
 }
 
 bool LevelCompactionBuilder::SetupOtherL0FilesIfNeeded() {
@@ -382,7 +393,8 @@ void LevelCompactionBuilder::SetupOtherFilesWithRoundRobinExpansion() {
   }
 
   size_t start_index = vstorage_->FilesByCompactionPri(start_level_)[0];
-  InternalKey smallest, largest;
+  InternalKey smallest;
+  InternalKey largest;
   // Constraint 4 (No need to check again later)
   compaction_picker_->GetRange(start_level_inputs_, &smallest, &largest);
   CompactionInputFiles output_level_inputs;
@@ -664,7 +676,8 @@ bool LevelCompactionBuilder::TryPickL0TrivialMove() {
     const std::vector<FileMetaData*>& level_files =
         vstorage_->LevelFiles(start_level_);
 
-    InternalKey my_smallest, my_largest;
+    InternalKey my_smallest;
+    InternalKey my_largest;
     for (auto it = level_files.rbegin(); it != level_files.rend(); ++it) {
       CompactionInputFiles output_level_inputs;
       output_level_inputs.level = output_level_;
@@ -875,7 +888,8 @@ bool LevelCompactionBuilder::PickFileToCompact() {
     // Note we rely on ExpandInputsToCleanCut() to tell us whether any output-
     // level files are locked, not just the extra ones pulled in for user-key
     // overlap.
-    InternalKey smallest, largest;
+    InternalKey smallest;
+    InternalKey largest;
     compaction_picker_->GetRange(start_level_inputs_, &smallest, &largest);
     CompactionInputFiles output_level_inputs;
     output_level_inputs.level = output_level_;

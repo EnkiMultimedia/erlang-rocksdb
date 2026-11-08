@@ -22,6 +22,8 @@ enum CompressionType : unsigned char {
   kSnappyCompression = 0x01,
   kZlibCompression = 0x02,
   kBZip2Compression = 0x03,
+  // NOTE: LZ4 and LZ4HC should be considered variants of the same compression
+  // type. See CompressionOptions::level
   kLZ4Compression = 0x04,
   kLZ4HCCompression = 0x05,
   kXpressCompression = 0x06,
@@ -188,10 +190,26 @@ struct CompressionOptions {
   // `kDefaultCompressionLevel` values will either favor speed over
   // compression ratio or have no effect.
   //
-  // In LZ4 specifically, the absolute value of a negative `level` internally
-  // configures the `acceleration` parameter. For example, set `level=-10` for
-  // `acceleration=10`. This negation is necessary to ensure decreasing `level`
-  // values favor speed over compression ratio.
+  // LZ4 and LZ4HC share one on-disk format, so they expose a single monotonic
+  // `level` axis: `level <= 0` selects LZ4 fast with `acceleration = -level`
+  // (e.g. -10 means acceleration 10, 0 is clamped to minimum acceleration 1),
+  // and `level >= 1` selects LZ4HC at that level (1..12). The configured type
+  // (kLZ4Compression vs kLZ4HCCompression) only sets the default `level` and
+  // the compression type byte recorded per block. Defaults are acceleration 1
+  // (level -1) for LZ4 and level 9 for LZ4HC. Levels outside the
+  // algorithm-recognized ranges are clamped to the nearest effective value:
+  // below -65537 acts like -65537 (max acceleration) and above 12 like 12 (max
+  // compression effort).
+  //
+  // For ZSTD (the other generally recommended compression alongside LZ4),
+  // `level` follows zstd's own scale, where higher values trade more CPU for a
+  // better compression ratio. The standard range is 1 (fastest) through 19,
+  // with 20..22 being "ultra" levels that require substantially more memory to
+  // compress (and decompress). zstd also supports negative levels (-1 and
+  // below) that favor speed over ratio, analogous to LZ4 acceleration.
+  // RocksDB's default (kDefaultCompressionLevel) maps to zstd's default of 3.
+  // (zstd itself treats a `level` of 0 as "use the default", but prefer
+  // kDefaultCompressionLevel to request that.)
   int level = kDefaultCompressionLevel;
 
   // zlib only: strategy parameter. See https://www.zlib.net/manual.html
@@ -297,6 +315,62 @@ struct CompressionOptions {
   // Default: abandon use of compression for a specific block or entry if
   // compressed by less than 12.5% (minimum ratio of 1.143:1).
   int max_compressed_bytes_per_kb = 1024 * 7 / 8;
+
+  // EXPERIMENTAL: "auto-skip" for compression. When true, the block-based table
+  // builder continuously estimates the compression ratio it is actually
+  // achieving on data blocks and, once that running estimate is worse than
+  // max_compressed_bytes_per_kb (i.e. attempting compression is not paying
+  // off), stops attempting compression on most data blocks to save CPU. It
+  // still (a) always attempts the first data block of each file and (b) samples
+  // a small fraction of blocks (see auto_skip_min_sample_every) so it can
+  // resume compressing if the data becomes compressible again. Estimator state
+  // is carried across the files a compaction/flush thread emits, so a sustained
+  // incompressible region does not re-learn on every file. Applies to data
+  // blocks only (index/meta blocks are unaffected). Default false (disabled).
+  //
+  // The decision reuses max_compressed_bytes_per_kb -- the same "minimum
+  // compression worth keeping" bar already applied per block -- as the bar for
+  // whether attempting compression on the stream is worthwhile. The estimate is
+  // the aggregate stored bytes per KB the builder would achieve by attempting
+  // (a block that compresses is counted at its achieved ratio; one that is
+  // rejected and stored raw is counted at 1024/1024). This is inherently
+  // payoff-weighted: a stream of blocks that each save only a little, or only a
+  // few blocks that compress well, will not clear the bar and is skipped, while
+  // a stream that compresses substantially is attempted. Because the bar is
+  // shared, an amount of compression given up per KB is bounded by
+  // (1024 - max_compressed_bytes_per_kb) -- i.e. never more than the minimum
+  // savings you already declared worth pursuing.
+  //
+  // This lives on CompressionOptions (rather than a block-based-table-specific
+  // option) because auto-skip is a property of how compression is applied, not
+  // of the block-based format per se; the mechanism could reasonably generalize
+  // to other table formats or compression consumers in the future. For now only
+  // the block-based table builder implements it.
+  //
+  // Caveat: auto-skip is a payoff heuristic, not a CPU-cost model. It assumes
+  // the CPU spent attempting compression is roughly proportional to the
+  // uncompressed size (empirically true within a small factor for real data),
+  // and it decides purely on achieved ratio. It will therefore still attempt
+  // data that clears the bar even in the rare case that such data is unusually
+  // expensive to compress.
+  //
+  // For now disabled by default, but we expect this to become enabled by
+  // default in a future release.
+  bool auto_skip = false;
+
+  // EXPERIMENTAL: only meaningful when auto_skip is true.
+  // While in the skip regime, auto-skip still attempts compression on roughly
+  // one out of every this many skipped data blocks (randomized by +/- 25% to
+  // avoid clustering and predictable patterns) so it can detect a return to
+  // compressible data. Smaller values detect such transitions sooner at the
+  // cost of more sampling CPU; larger values save more CPU but react more
+  // slowly. 0 selects an internal default.
+  //
+  // In short, this parameter limits the local impact around a worst-case
+  // transition from all-incompressible to all-compressible, while the
+  // max_compressed_bytes_per_kb threshold governs the long term behavior with
+  // mixed compressibility.
+  int auto_skip_min_sample_every = 0;
 
   // ZSTD only.
   // Enable compression algorithm's checksum feature.

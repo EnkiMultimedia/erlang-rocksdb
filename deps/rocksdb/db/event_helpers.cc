@@ -136,9 +136,9 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
               << table_properties.property_collectors_names << "compression"
               << table_properties.compression_name << "compression_options"
               << table_properties.compression_options << "creation_time"
-              << table_properties.creation_time << "oldest_key_time"
-              << table_properties.newest_key_time << "newest_key_time"
-              << table_properties.oldest_key_time << "file_creation_time"
+              << table_properties.oldest_ancestor_time << "oldest_key_time"
+              << table_properties.oldest_key_time << "newest_key_time"
+              << table_properties.newest_key_time << "file_creation_time"
               << table_properties.file_creation_time
               << "slow_compression_estimated_data_size"
               << table_properties.slow_compression_estimated_data_size
@@ -201,7 +201,7 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
 void EventHelpers::LogAndNotifyTableFileDeletion(
     EventLogger* event_logger, int job_id, uint64_t file_number,
     const std::string& file_path, const Status& status,
-    const std::string& dbname,
+    const std::string& dbname, const std::string& db_session_id,
     const std::vector<std::shared_ptr<EventListener>>& listeners) {
   if (!event_logger && listeners.empty()) {
     status.PermitUncheckedError();
@@ -213,7 +213,8 @@ void EventHelpers::LogAndNotifyTableFileDeletion(
     AppendCurrentTime(&jwriter);
 
     jwriter << "job" << job_id << "event" << "table_file_deletion"
-            << "file_number" << file_number << "status" << status.ToString();
+            << "file_number" << file_number << "db_session_id" << db_session_id
+            << "status" << status.ToString();
 
     jwriter.EndObject();
 
@@ -259,6 +260,7 @@ void EventHelpers::NotifyOnErrorRecoveryEnd(
     db_mutex->Lock();
   } else {
     old_bg_error.PermitUncheckedError();
+    new_bg_error.PermitUncheckedError();
   }
 }
 
@@ -321,7 +323,7 @@ void EventHelpers::LogAndNotifyBlobFileDeletion(
     EventLogger* event_logger,
     const std::vector<std::shared_ptr<EventListener>>& listeners, int job_id,
     uint64_t file_number, const std::string& file_path, const Status& status,
-    const std::string& dbname) {
+    const std::string& dbname, const std::string& db_session_id) {
   if (!event_logger && listeners.empty()) {
     status.PermitUncheckedError();
     return;
@@ -332,7 +334,8 @@ void EventHelpers::LogAndNotifyBlobFileDeletion(
     AppendCurrentTime(&jwriter);
 
     jwriter << "job" << job_id << "event" << "blob_file_deletion"
-            << "file_number" << file_number << "status" << status.ToString();
+            << "file_number" << file_number << "db_session_id" << db_session_id
+            << "status" << status.ToString();
 
     jwriter.EndObject();
     event_logger->Log(jwriter);

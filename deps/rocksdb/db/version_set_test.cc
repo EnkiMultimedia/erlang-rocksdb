@@ -10,6 +10,11 @@
 #include "db/version_set.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <future>
+#include <tuple>
 
 #include "db/blob/blob_log_writer.h"
 #include "db/db_impl/db_impl.h"
@@ -20,6 +25,7 @@
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/statistics.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/mock_table.h"
 #include "table/unique_id_impl.h"
@@ -53,7 +59,7 @@ class GenerateLevelFilesBriefTest : public testing::Test {
         InternalKey(smallest, smallest_seq, kTypeValue),
         InternalKey(largest, largest_seq, kTypeValue), smallest_seq,
         largest_seq, /* marked_for_compact */ false, Temperature::kUnknown,
-        kInvalidBlobFileNumber, kUnknownOldestAncesterTime,
+        kInvalidBlobFileNumber, kUnknownOldestAncestorTime,
         kUnknownFileCreationTime, kUnknownEpochNumber, kUnknownFileChecksum,
         kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
         /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
@@ -138,7 +144,7 @@ class VersionStorageInfoTestBase : public testing::Test {
                   /*_force_consistency_checks=*/false,
                   EpochNumberRequirement::kMustPresent, ioptions_.clock,
                   mutable_cf_options_.bottommost_file_compaction_delay,
-                  OffpeakTimeOption()) {}
+                  OffpeakTimeOption(), PeriodicCompactionPhaseParams{}) {}
 
   ~VersionStorageInfoTestBase() override {
     for (int i = 0; i < vstorage_.num_levels(); ++i) {
@@ -170,7 +176,7 @@ class VersionStorageInfoTestBase : public testing::Test {
         file_number, 0, file_size, smallest, largest, /* smallest_seq */ 0,
         /* largest_seq */ 0, /* marked_for_compact */ false,
         Temperature::kUnknown, oldest_blob_file_number,
-        kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+        kUnknownOldestAncestorTime, kUnknownFileCreationTime,
         kUnknownEpochNumber, kUnknownFileChecksum, kUnknownFileChecksumFuncName,
         kNullUniqueId64x2, compensated_range_deletion_size, 0,
         /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
@@ -1202,7 +1208,8 @@ class VersionSetTestBase {
     reactive_versions_ = std::make_shared<ReactiveVersionSet>(
         dbname_, &imm_db_options_, mutable_db_options_, env_options_,
         table_cache_.get(), &write_buffer_manager_, &write_controller_,
-        nullptr);
+        /*io_tracer=*/nullptr, /*db_id=*/"", /*db_session_id=*/"",
+        /*defer_sst_file_opening=*/false);
     imm_db_options_.db_paths.emplace_back(dbname_,
                                           std::numeric_limits<uint64_t>::max());
   }
@@ -1543,6 +1550,237 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   mutex_.Unlock();
   EXPECT_OK(s);
   EXPECT_EQ(kGroupSize - 1, count);
+}
+
+namespace {
+// Runs `fn` on its own thread and aborts if it does not return in time. A
+// LogAndApply queued behind a stranded writer is never woken, and the
+// VersionSet cannot be torn down while it waits.
+Status RunOrAbortOnHang(const std::function<Status()>& fn) {
+  std::promise<Status> result;
+  std::future<Status> finished = result.get_future();
+  port::Thread runner([&] { result.set_value(fn()); });
+  if (finished.wait_for(std::chrono::seconds(30)) !=
+      std::future_status::ready) {
+    fprintf(stderr, "LogAndApply did not finish: stranded manifest writer\n");
+    abort();
+  }
+  runner.join();
+  return finished.get();
+}
+}  // namespace
+
+// A batch that fails before the MANIFEST write must still take its writers off
+// the queue. They live on the failed caller's stack, so a stranded one leaves
+// the next LogAndApply waiting behind a writer that no longer exists.
+TEST_F(VersionSetTest, FailedEditReleasesEveryWriterInTheBatch) {
+  NewDB();
+
+  // Three writers from one call. The first deletes a file that is not in the
+  // LSM tree, which fails while the batch is still being assembled. Both
+  // followers must fail with it: a caller returns as soon as its first writer
+  // is done.
+  autovector<VersionEdit> edits;
+  edits.emplace_back();
+  edits.back().DeleteFile(/*level=*/1, /*file_number=*/12345);
+  edits.emplace_back();
+  edits.back().SetDBId("db_id_1");
+  edits.emplace_back();
+  edits.back().SetDBId("db_id_2");
+  autovector<ColumnFamilyData*> cfds;
+  autovector<autovector<VersionEdit*>> edit_lists;
+  for (VersionEdit& edit : edits) {
+    cfds.emplace_back(versions_->GetColumnFamilySet()->GetDefault());
+    edit_lists.emplace_back(autovector<VersionEdit*>{&edit});
+  }
+  // Each writer's callback must also run, with the batch's error: a flush
+  // install relies on it to restore the flags of the memtables it marked.
+  std::vector<int> callback_calls(edits.size(), 0);
+  std::vector<Status::Code> callback_codes(edits.size(), Status::kOk);
+  std::vector<std::function<void(const Status&)>> manifest_wcbs;
+  for (size_t i = 0; i < edits.size(); ++i) {
+    manifest_wcbs.emplace_back([&, i](const Status& cb_status) {
+      ++callback_calls[i];
+      callback_codes[i] = cb_status.code();
+    });
+  }
+  mutex_.Lock();
+  const Status s = versions_->LogAndApply(
+      cfds, read_options_, write_options_, edit_lists, &mutex_,
+      /*dir_contains_current_file=*/nullptr, /*new_descriptor_log=*/false,
+      /*new_cf_options=*/nullptr, manifest_wcbs);
+  mutex_.Unlock();
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  for (size_t i = 0; i < edits.size(); ++i) {
+    EXPECT_EQ(1, callback_calls[i]) << "writer " << i;
+    EXPECT_EQ(Status::kCorruption, callback_codes[i]) << "writer " << i;
+  }
+
+  ASSERT_OK(RunOrAbortOnHang([&] {
+    VersionEdit next;
+    next.SetDBId("next_db_id");
+    return LogAndApplyToDefaultCF(next);
+  }));
+}
+
+TEST_F(VersionSetTest, FailedBatchSignalsWriterFromAnotherCaller) {
+  NewDB();
+
+  std::promise<void> first_manifest_write_started;
+  std::future<void> first_manifest_write_started_future =
+      first_manifest_write_started.get_future();
+  std::promise<void> release_first_manifest_write;
+  std::future<void> release_first_manifest_write_future =
+      release_first_manifest_write.get_future();
+  std::promise<void> failing_writer_queued;
+  std::future<void> failing_writer_queued_future =
+      failing_writer_queued.get_future();
+  std::promise<void> external_writer_queued;
+  std::future<void> external_writer_queued_future =
+      external_writer_queued.get_future();
+  std::atomic<int> queued_writers{0};
+  std::atomic<bool> block_first_manifest_write{true};
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:BeforeWriterWaiting", [&](void*) {
+        const int num_queued =
+            queued_writers.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (num_queued == 2) {
+          failing_writer_queued.set_value();
+        } else if (num_queued == 3) {
+          external_writer_queued.set_value();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WriteManifestStart", [&](void*) {
+        if (block_first_manifest_write.exchange(false,
+                                                std::memory_order_relaxed)) {
+          first_manifest_write_started.set_value();
+          release_first_manifest_write_future.wait();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status leader_status;
+  Status failing_status;
+  Status external_status;
+  int external_callback_calls = 0;
+  Status::Code external_callback_code = Status::kOk;
+  ASSERT_OK(RunOrAbortOnHang([&] {
+    VersionEdit leader_edit;
+    leader_edit.SetDBId("leader_db_id");
+    port::Thread leader(
+        [&] { leader_status = LogAndApplyToDefaultCF(leader_edit); });
+    first_manifest_write_started_future.wait();
+
+    VersionEdit failing_edit;
+    failing_edit.DeleteFile(/*level=*/1, /*file_number=*/12345);
+    port::Thread failing(
+        [&] { failing_status = LogAndApplyToDefaultCF(failing_edit); });
+    failing_writer_queued_future.wait();
+
+    VersionEdit external_edit;
+    external_edit.SetDBId("external_db_id");
+    port::Thread external([&] {
+      mutex_.Lock();
+      external_status = versions_->LogAndApply(
+          versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+          write_options_, &external_edit, &mutex_,
+          /*dir_contains_current_file=*/nullptr,
+          /*new_descriptor_log=*/false,
+          /*column_family_options=*/nullptr, [&](const Status& cb_status) {
+            ++external_callback_calls;
+            external_callback_code = cb_status.code();
+          });
+      mutex_.Unlock();
+    });
+    external_writer_queued_future.wait();
+
+    release_first_manifest_write.set_value();
+    leader.join();
+    failing.join();
+    external.join();
+    return Status::OK();
+  }));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(leader_status);
+  ASSERT_TRUE(failing_status.IsCorruption()) << failing_status.ToString();
+  ASSERT_TRUE(external_status.IsCorruption()) << external_status.ToString();
+  EXPECT_EQ(1, external_callback_calls);
+  EXPECT_EQ(Status::kCorruption, external_callback_code);
+
+  ASSERT_OK(RunOrAbortOnHang([&] {
+    VersionEdit next;
+    next.SetDBId("next_db_id");
+    return LogAndApplyToDefaultCF(next);
+  }));
+}
+
+TEST_F(VersionSetTest, FailedVersionBuildReleasesTheBatch) {
+  NewDB();
+
+  VersionEdit edit;
+  for (const auto& [file_number, smallest, largest] :
+       {std::make_tuple(uint64_t{100}, "a", "b"),
+        std::make_tuple(uint64_t{101}, "c", "d")}) {
+    edit.AddFile(/*level=*/1, file_number, /*file_path_id=*/0,
+                 /*file_size=*/100, InternalKey(smallest, 1, kTypeValue),
+                 InternalKey(largest, 1, kTypeValue), /*smallest_seqno=*/1,
+                 /*largest_seqno=*/1, /*marked_for_compaction=*/false,
+                 Temperature::kUnknown, kInvalidBlobFileNumber,
+                 kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+                 /*epoch_number=*/file_number, kUnknownFileChecksum,
+                 kUnknownFileChecksumFuncName, kNullUniqueId64x2,
+                 /*compensated_range_deletion_size=*/0, /*tail_size=*/0,
+                 /*user_defined_timestamps_persisted=*/true);
+  }
+
+  // The file-pair hook fires only for a level holding two files, which here is
+  // the Version this batch builds and never the empty base, so the injected
+  // failure lands in SaveTo() after the batch is assembled.
+  bool armed = false;
+  bool injected = false;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack("VersionBuilder::CheckConsistency1",
+                                        [&](void*) { armed = !injected; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::CheckConsistencyBeforeReturn", [&](void* arg) {
+        if (armed) {
+          *static_cast<Status*>(arg) = Status::Corruption("Inject corruption");
+          armed = false;
+          injected = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  int callback_calls = 0;
+  Status::Code callback_code = Status::kOk;
+  mutex_.Lock();
+  const Status s = versions_->LogAndApply(
+      versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+      write_options_, &edit, &mutex_, /*dir_contains_current_file=*/nullptr,
+      /*new_descriptor_log=*/false, /*column_family_options=*/nullptr,
+      [&](const Status& cb_status) {
+        ++callback_calls;
+        callback_code = cb_status.code();
+      });
+  mutex_.Unlock();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(injected);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  EXPECT_EQ(1, callback_calls);
+  EXPECT_EQ(Status::kCorruption, callback_code);
+
+  ASSERT_OK(RunOrAbortOnHang([&] {
+    VersionEdit next;
+    next.SetDBId("next_db_id");
+    return LogAndApplyToDefaultCF(next);
+  }));
 }
 
 TEST_F(VersionSetTest, PersistBlobFileStateInNewManifest) {
@@ -2412,6 +2650,8 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseClean) {
   // Enable content validation, perform normal operations, close.
   // Verify no manifest rotation (file number unchanged).
   NewDB();
+  auto stats = CreateDBStatistics();
+  imm_db_options_.statistics = stats;
   mutable_db_options_.verify_manifest_content_on_close = true;
   mutex_.Lock();
   versions_->UpdatedMutableDbOptions(mutable_db_options_, &mutex_);
@@ -2437,6 +2677,9 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseClean) {
   // Verify content validation actually ran
   ASSERT_TRUE(content_validation_ran);
 
+  // No corruption -- counter should be zero
+  ASSERT_EQ(0, stats->getTickerCount(MANIFEST_VALIDATION_FAILURE_COUNT));
+
   // Manifest path should be unchanged (no rotation)
   std::string manifest_path_after;
   uint64_t manifest_file_number = 0;
@@ -2452,6 +2695,8 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseCorruptRecord) {
   // Enable content validation, corrupt the manifest after closing the writer,
   // verify manifest rotation occurs and DB reopens cleanly.
   NewDB();
+  auto stats = CreateDBStatistics();
+  imm_db_options_.statistics = stats;
   mutable_db_options_.verify_manifest_content_on_close = true;
   mutex_.Lock();
   versions_->UpdatedMutableDbOptions(mutable_db_options_, &mutex_);
@@ -2488,6 +2733,9 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseCorruptRecord) {
   CloseDB();
   SyncPoint::GetInstance()->DisableProcessing();
 
+  // Corruption detected once, rewrite succeeded
+  ASSERT_EQ(1, stats->getTickerCount(MANIFEST_VALIDATION_FAILURE_COUNT));
+
   // Manifest should have been rotated (new file number)
   std::string manifest_path_after;
   uint64_t manifest_file_number = 0;
@@ -2502,8 +2750,10 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseCorruptRecord) {
 
 TEST_F(VersionSetTest, ManifestContentValidationOnCloseDisabled) {
   // Default (option disabled), corrupt manifest after writer close,
-  // verify no rotation occurred — corrupt manifest persists.
+  // verify no rotation occurred -- corrupt manifest persists.
   NewDB();
+  auto stats = CreateDBStatistics();
+  imm_db_options_.statistics = stats;
   // verify_manifest_content_on_close defaults to false
 
   VersionEdit edit;
@@ -2525,6 +2775,9 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseDisabled) {
 
   ASSERT_FALSE(content_validation_ran);
 
+  // Validation disabled -- counter should be zero
+  ASSERT_EQ(0, stats->getTickerCount(MANIFEST_VALIDATION_FAILURE_COUNT));
+
   // Manifest path should be unchanged (no rotation since validation is off)
   std::string manifest_path_after;
   uint64_t manifest_file_number = 0;
@@ -2539,6 +2792,8 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseSizeCheckFails) {
   // Verify recovery happens via size-check path. Content validation still
   // runs afterward on the freshly rewritten manifest.
   NewDB();
+  auto stats = CreateDBStatistics();
+  imm_db_options_.statistics = stats;
   mutable_db_options_.verify_manifest_content_on_close = true;
   mutex_.Lock();
   versions_->UpdatedMutableDbOptions(mutable_db_options_, &mutex_);
@@ -2566,6 +2821,10 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseSizeCheckFails) {
   ASSERT_NO_FATAL_FAILURE(CloseDB());
   SyncPoint::GetInstance()->DisableProcessing();
 
+  // Size check caught the issue; content validation on rewritten manifest
+  // should pass -- no content validation failure recorded
+  ASSERT_EQ(0, stats->getTickerCount(MANIFEST_VALIDATION_FAILURE_COUNT));
+
   // Size check should have triggered rotation
   std::string manifest_path_after;
   uint64_t manifest_file_number = 0;
@@ -2583,6 +2842,8 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseCorruptAfterRewrite) {
   // The loop should detect corruption twice: once triggering a rewrite, and
   // once reporting that the rewritten manifest is also corrupt.
   NewDB();
+  auto stats = CreateDBStatistics();
+  imm_db_options_.statistics = stats;
   mutable_db_options_.verify_manifest_content_on_close = true;
   mutex_.Lock();
   versions_->UpdatedMutableDbOptions(mutable_db_options_, &mutex_);
@@ -2636,12 +2897,17 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseCorruptAfterRewrite) {
 
   // OnIOError should have fired twice (once per corrupt detection)
   ASSERT_EQ(io_error_count, 2);
+
+  // Validation failure counter should match
+  ASSERT_EQ(2, stats->getTickerCount(MANIFEST_VALIDATION_FAILURE_COUNT));
 }
 
 TEST_F(VersionSetTest, ManifestContentValidationOnCloseOpenFails) {
   // Delete the manifest before content validation so it can't be opened.
   // Close() should surface the I/O error to the caller.
   NewDB();
+  auto stats = CreateDBStatistics();
+  imm_db_options_.statistics = stats;
   mutable_db_options_.verify_manifest_content_on_close = true;
   mutex_.Lock();
   versions_->UpdatedMutableDbOptions(mutable_db_options_, &mutex_);
@@ -2667,6 +2933,9 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseOpenFails) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 
   ASSERT_TRUE(close_s.IsIOError()) << close_s.ToString();
+
+  // File couldn't be opened -- no content validation ran
+  ASSERT_EQ(0, stats->getTickerCount(MANIFEST_VALIDATION_FAILURE_COUNT));
 }
 
 TEST_F(VersionStorageInfoTest, AddRangeDeletionCompensatedFileSize) {
@@ -2970,6 +3239,70 @@ TEST_F(VersionSetAtomicGroupTest,
   EXPECT_TRUE(reactive_versions_->TEST_read_edits_in_atomic_group() == 0);
   EXPECT_TRUE(reactive_versions_->replay_buffer().size() == 0);
   EXPECT_EQ(kAtomicGroupSize, num_recovered_edits_);
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       ReactiveVersionSetResetsManifestAppendBoundaryOnSwitch) {
+  CreateCurrentFile();
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter;
+  std::unique_ptr<Status> manifest_reader_status;
+  ASSERT_OK(reactive_versions_->Recover(column_families_, &manifest_reader,
+                                        &manifest_reporter,
+                                        &manifest_reader_status));
+
+  uint64_t old_manifest_end = 0;
+  ASSERT_OK(reactive_versions_->GetManifestAppendBoundary(&old_manifest_end));
+  ASSERT_GT(old_manifest_end, 0);
+  log_writer_.reset();
+
+  constexpr uint64_t kNewManifestFileNumber = 2;
+  const std::string new_manifest_path =
+      DescriptorFileName(dbname_, kNewManifestFileNumber);
+  std::unique_ptr<WritableFileWriter> file_writer;
+  ASSERT_OK(WritableFileWriter::Create(
+      fs_, new_manifest_path, fs_->OptimizeForManifestWrite(env_options_),
+      &file_writer, nullptr));
+  log::Writer new_manifest_writer(std::move(file_writer), /*log_number=*/0,
+                                  /*recycle_log_files=*/false);
+
+  edits_.emplace_back();
+  VersionEdit& incomplete_edit = edits_.back();
+  incomplete_edit.SetLogNumber(0);
+  incomplete_edit.SetNextFile(kNewManifestFileNumber + 1);
+  incomplete_edit.SetLastSequence(last_seqno_++);
+  incomplete_edit.SetDBId(std::string(2 * log::kBlockSize, 'x'));
+  incomplete_edit.MarkAtomicGroup(1);
+  std::string record;
+  ASSERT_TRUE(incomplete_edit.EncodeTo(&record, 0));
+  ASSERT_OK(new_manifest_writer.AddRecord(WriteOptions(), record));
+  ASSERT_OK(new_manifest_writer.Close(WriteOptions()));
+
+  uint64_t new_manifest_size = 0;
+  ASSERT_OK(fs_->GetFileSize(new_manifest_path, IOOptions(), &new_manifest_size,
+                             nullptr));
+  ASSERT_GE(new_manifest_size, old_manifest_end);
+  ASSERT_OK(SetCurrentFile(WriteOptions(), fs_.get(), dbname_,
+                           kNewManifestFileNumber, Temperature::kUnknown,
+                           /*dir_contains_current_file=*/nullptr));
+
+  InstrumentedMutex mu;
+  std::unordered_set<ColumnFamilyData*> cfds_changed;
+  uint64_t new_manifest_end = 0;
+  Status boundary_status;
+  mu.Lock();
+  Status read_status = reactive_versions_->ReadAndApply(
+      &mu, &manifest_reader, manifest_reader_status.get(), &cfds_changed,
+      /*files_to_delete=*/nullptr);
+  if (read_status.ok()) {
+    boundary_status =
+        reactive_versions_->GetManifestAppendBoundary(&new_manifest_end);
+  }
+  mu.Unlock();
+
+  ASSERT_OK(read_status);
+  ASSERT_EQ(1, reactive_versions_->TEST_read_edits_in_atomic_group());
+  ASSERT_TRUE(boundary_status.IsCorruption()) << boundary_status.ToString();
 }
 
 TEST_F(VersionSetAtomicGroupTest,

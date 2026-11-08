@@ -10,7 +10,10 @@
 
 #include "db/compaction/compaction_outputs.h"
 
+#include <inttypes.h>
+
 #include "db/builder.h"
+#include "logging/logging.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -32,7 +35,7 @@ Status CompactionOutputs::Finish(
         meta->fd.largest_seqno);
     relevant_mapping.SetCapacity(kMaxSeqnoTimePairsPerSST);
     builder_->SetSeqnoTimeTableProperties(relevant_mapping,
-                                          meta->oldest_ancester_time);
+                                          meta->oldest_ancestor_time);
     s = builder_->Finish();
 
   } else {
@@ -73,7 +76,7 @@ IOStatus CompactionOutputs::WriterSyncClose(const Status& input_status,
       WriteOptions(Env::IOActivity::kCompaction), opts);
   if (input_status.ok() && io_s.ok()) {
     StopWatch sw(clock, statistics, COMPACTION_OUTFILE_SYNC_MICROS);
-    io_s = file_writer_->Sync(opts, use_fsync);
+    io_s = use_fsync ? file_writer_->Fsync(opts) : file_writer_->Sync(opts);
   }
   if (input_status.ok() && io_s.ok()) {
     io_s = file_writer_->Close(opts);
@@ -267,11 +270,22 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
     return true;
   }
 
-  // If there's user defined partitioner, check that first
-  if (partitioner_ && partitioner_->ShouldPartition(PartitionerRequest(
-                          last_key_for_partitioner_, c_iter.user_key(),
-                          current_output_file_size_)) == kRequired) {
-    return true;
+  if (partitioner_) {
+    if (partitioner_prefix_valid_) {
+      // Fast path: no per-key copy or virtual call. A partition is requested at
+      // the first key that no longer shares the established prefix. An empty
+      // prefix means no further partitions (every key "starts with" it).
+      if (UNLIKELY(!c_iter.user_key().starts_with(partitioner_prefix_))) {
+        return true;
+      }
+    } else {
+      // Slow path: per-key callback (and copy elsewhere)
+      if (UNLIKELY(partitioner_->ShouldPartition(PartitionerRequest(
+                       last_key_for_partitioner_, c_iter.user_key(),
+                       current_output_file_size_)) == kRequired)) {
+        return true;
+      }
+    }
   }
 
   // files output to Level 0 won't be split
@@ -362,6 +376,24 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
   return false;
 }
 
+void CompactionOutputs::PrepareNewOutputForFirstKey(
+    const CompactionIterator& c_iter) {
+  // A new output file starts a fresh partition-tracking window. Establish the
+  // partitioner fast path from this file's first key: if the partitioner can
+  // express its next boundary as "first key not sharing this prefix", cache
+  // that prefix; otherwise fall back to per-key ShouldPartition(). This is the
+  // only place the prefix needs to be (re)derived, since a partition boundary
+  // always forces a file cut, and re-deriving on non-partition cuts just
+  // recomputes the same still-valid prefix.
+  if (partitioner_) {
+    OptSlice prefix = partitioner_->ShouldPartitionByPrefix(c_iter.user_key());
+    partitioner_prefix_valid_ = prefix.has_value();
+    if (partitioner_prefix_valid_) {
+      partitioner_prefix_.assign(prefix->data(), prefix->size());
+    }
+  }
+}
+
 Status CompactionOutputs::AddToOutput(
     const CompactionIterator& c_iter,
     const CompactionFileOpenFunc& open_file_func,
@@ -401,26 +433,117 @@ Status CompactionOutputs::AddToOutput(
     if (!s.ok()) {
       return s;
     }
-  }
-
-  // c_iter may emit range deletion keys, so update `last_key_for_partitioner_`
-  // here before returning below when `is_range_del` is true
-  if (partitioner_) {
-    last_key_for_partitioner_.assign(c_iter.user_key().data_,
-                                     c_iter.user_key().size_);
+    PrepareNewOutputForFirstKey(c_iter);
   }
 
   if (UNLIKELY(is_range_del)) {
+    // c_iter may emit range deletion keys, so update
+    // `last_key_for_partitioner_` before returning. Only needed in the fallback
+    // mode; the prefix fast path does not use it.
+    if (partitioner_ && !partitioner_prefix_valid_) {
+      last_key_for_partitioner_.assign(c_iter.user_key().data_,
+                                       c_iter.user_key().size_);
+    }
     return s;
   }
 
   assert(builder_ != nullptr);
   const Slice& value = c_iter.value();
-  s = current_output().validator.Add(key, value);
-  if (!s.ok()) {
-    return s;
+  bool retried_after_new_table = false;
+  while (true) {
+    s = current_output().validator.CanAdd(key);
+    if (!s.ok()) {
+      return s;
+    }
+
+    TableBuilderAddContext add_context;
+    TableBuilderAddResult add_result =
+        builder_->TryAdd(key, value, &add_context);
+
+    if (add_result == TableBuilderAddResult::kError) {
+      s = builder_->status();
+      if (s.ok()) {
+        return Status::Corruption(
+            "TableBuilder returned kError without a non-OK status");
+      }
+      return s;
+    }
+
+    if (add_result == TableBuilderAddResult::kAdded) {
+      current_output().validator.AddValidated(key, value);
+      break;
+    }
+
+    assert(add_result == TableBuilderAddResult::kRequiresNewTable);
+    s = builder_->status();
+    if (!s.ok()) {
+      return s;
+    }
+    const Compaction* compaction = compaction_;
+    if (compaction == nullptr) {
+      return Status::Corruption("Compaction output is missing compaction");
+    }
+    ColumnFamilyData* cfd = compaction->column_family_data();
+    if (cfd == nullptr) {
+      return Status::Corruption(
+          "Compaction output is missing column family data");
+    }
+    const bool allow_data_in_errors =
+        compaction->immutable_options().allow_data_in_errors;
+    const std::string key_for_diagnostics =
+        allow_data_in_errors ? key.ToString(/* hex */ true) : "hidden";
+    if (compaction->output_level() == 0) {
+      const std::string detail =
+          "cf: " + cfd->GetName() + ", file_number: " +
+          std::to_string(current_output().meta.fd.GetNumber()) + ", reason: " +
+          TableBuilderNewTableReasonToString(add_context.new_table_reason) +
+          ", key: " + key_for_diagnostics;
+      return Status::Corruption(
+          "TableBuilder requested a new table while producing level 0 output",
+          detail);
+    }
+    if (retried_after_new_table || builder_->IsEmpty()) {
+      const std::string detail =
+          "cf: " + cfd->GetName() + ", file_number: " +
+          std::to_string(current_output().meta.fd.GetNumber()) + ", reason: " +
+          TableBuilderNewTableReasonToString(add_context.new_table_reason) +
+          ", key: " + key_for_diagnostics;
+      return Status::Corruption(
+          "TableBuilder requested a new table without accepting any rows",
+          detail);
+    }
+
+    ROCKS_LOG_INFO(
+        compaction->immutable_options().info_log,
+        "[%s] Compaction output table builder requested a new table before "
+        "key %s for file #%" PRIu64 ". reason: %s",
+        cfd->GetName().c_str(), key_for_diagnostics.c_str(),
+        current_output().meta.fd.GetNumber(),
+        TableBuilderNewTableReasonToString(add_context.new_table_reason));
+
+    s = close_file_func(c_iter.InputStatus(), prev_iter_output_internal_key,
+                        key, &c_iter, *this);
+    if (!s.ok()) {
+      return s;
+    }
+
+    grandparent_boundary_switched_num_ = 0;
+    grandparent_overlapped_bytes_ =
+        GetCurrentKeyGrandparentOverlappedBytes(key);
+    range_tombstone_lower_bound_.Clear();
+
+    s = open_file_func(*this);
+    if (!s.ok()) {
+      return s;
+    }
+    PrepareNewOutputForFirstKey(c_iter);
+    retried_after_new_table = true;
   }
-  builder_->Add(key, value);
+
+  if (partitioner_ && !partitioner_prefix_valid_) {
+    last_key_for_partitioner_.assign(c_iter.user_key().data_,
+                                     c_iter.user_key().size_);
+  }
 
   stats_.num_output_records++;
   current_output_file_size_ = builder_->EstimatedFileSize();
@@ -485,10 +608,13 @@ Status CompactionOutputs::AddRangeDels(
   assert(!range_del_agg.IsEmpty());
   FileMetaData& meta = current_output().meta;
   const Comparator* ucmp = icmp.user_comparator();
-  InternalKey lower_bound_buf, upper_bound_buf;
-  Slice lower_bound_guard, upper_bound_guard;
+  InternalKey lower_bound_buf;
+  InternalKey upper_bound_buf;
+  Slice lower_bound_guard;
+  Slice upper_bound_guard;
   std::string smallest_user_key;
-  const Slice *lower_bound, *upper_bound;
+  const Slice* lower_bound;
+  const Slice* upper_bound;
 
   // We first determine the internal key lower_bound and upper_bound for
   // this output file. All and only range tombstones that overlap with
@@ -790,10 +916,10 @@ void CompactionOutputs::FillFilesToCutForTtl() {
       *(compaction_->inputs(compaction_->num_input_levels() - 1));
   for (FileMetaData* file : olevel) {
     // Worth filtering out by start and end?
-    uint64_t oldest_ancester_time = file->TryGetOldestAncesterTime();
+    uint64_t oldest_ancestor_time = file->TryGetOldestAncestorTime();
     // We put old files if they are not too small to prevent a flood
     // of small files.
-    if (oldest_ancester_time < old_age_thres &&
+    if (oldest_ancestor_time < old_age_thres &&
         file->fd.GetFileSize() >
             compaction_->mutable_cf_options().target_file_size_base / 2) {
       files_to_cut_for_ttl_.push_back(file);

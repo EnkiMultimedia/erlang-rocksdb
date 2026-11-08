@@ -114,6 +114,8 @@ class Compaction {
   // No copying allowed
   Compaction(const Compaction&) = delete;
   void operator=(const Compaction&) = delete;
+  Compaction(Compaction&&) = delete;
+  void operator=(Compaction&&) = delete;
 
   ~Compaction();
 
@@ -397,7 +399,8 @@ class Compaction {
   // Both smallest_key and largest_key include timestamps if user-defined
   // timestamp is enabled.
   bool OverlapProximalLevelOutputRange(const Slice& smallest_key,
-                                       const Slice& largest_key) const;
+                                       const Slice& largest_key,
+                                       bool range_limit_exclusive) const;
 
   // For testing purposes, check that a key is within proximal level
   // output range for per_key_placement feature, which is safe to place the key
@@ -437,8 +440,8 @@ class Compaction {
                                      const InternalKey* end) const;
 
   // start and end are sub compact range. Null if no boundary.
-  // This is used to filter out some input files' ancester's time range.
-  uint64_t MinInputFileOldestAncesterTime(const InternalKey* start,
+  // This is used to filter out some input files' ancestor's time range.
+  uint64_t MinInputFileOldestAncestorTime(const InternalKey* start,
                                           const InternalKey* end) const;
   // Return the minimum epoch number among
   // input files' associated with this compaction
@@ -452,6 +455,18 @@ class Compaction {
 
   bool ShouldNotifyOnCompactionCompleted() const {
     return notify_on_compaction_completion_;
+  }
+
+  // Called by DBImpl::NotifyOnCompactionPreCommit to ensure the
+  // OnCompactionPreCommit listener callback fires at most once per
+  // compaction lifecycle, even though the notify helper is invoked at multiple
+  // potential ReleaseCompactionFiles() sites for safety.
+  void SetNotifyOnCompactionPreCommitCalled() {
+    notify_on_compaction_pre_commit_called_ = true;
+  }
+
+  bool WasNotifyOnCompactionPreCommitCalled() const {
+    return notify_on_compaction_pre_commit_called_;
   }
 
   static constexpr int kInvalidLevel = -1;
@@ -625,6 +640,12 @@ class Compaction {
   // Notify on compaction completion only if listener was notified on compaction
   // begin.
   bool notify_on_compaction_completion_;
+
+  // Tracks whether OnCompactionPreCommit has already fired for this
+  // compaction. The notify helper is called from multiple potential
+  // ReleaseCompactionFiles() call sites; this flag guarantees that listeners
+  // observe the callback exactly once per compaction.
+  bool notify_on_compaction_pre_commit_called_ = false;
 
   // Enable/disable GC collection for blobs during compaction.
   bool enable_blob_garbage_collection_;

@@ -36,7 +36,6 @@ namespace rocksdb {
     class ColumnFamilyHandle;
     class Snapshot;
     class Iterator;
-    class TransactionLogIterator;
     class BackupEngine;
     class Slice;
     class Transaction;
@@ -192,12 +191,14 @@ public:
     std::mutex m_ColumnFamilyMutex;                //!< mutex protecting m_ColumnFamily
     std::mutex m_TLogItrMutex;                     //!< mutex protecting m_TransactionLogList
     std::mutex m_TransactionMutex;
+    std::mutex m_IngestionMutex;                   //!< mutex protecting m_IngestionList
 
     std::list<class ItrObject *> m_ItrList;        //!< ItrObjects holding ref count to this
     std::list<class SnapshotObject *> m_SnapshotList;
     std::list<class ColumnFamilyObject *> m_ColumnFamilyList;
     std::list<class TLogItrObject *> m_TLogItrList;
     std::list<class TransactionObject *> m_TransactionList;
+    std::list<class IngestionObject *> m_IngestionList;
 
 protected:
     static ErlNifResourceType* m_Db_RESOURCE;
@@ -237,6 +238,11 @@ public:
     void AddTransactionReference(class TransactionObject *);
 
     void RemoveTransactionReference(class TransactionObject *);
+
+    // manual back link to prepared ingestions holding reference to this
+    void AddIngestionReference(class IngestionObject *);
+
+    void RemoveIngestionReference(class IngestionObject *);
 
     static void CreateDbObjectType(ErlNifEnv * Env);
 
@@ -371,14 +377,14 @@ public:
 class TLogItrObject : public ErlRefObject
 {
 public:
-    rocksdb::TransactionLogIterator * m_Iter;
+    rocksdb::WalIterator * m_Iter;
     ReferencePtr<DbObject> m_DbPtr;
 
 protected:
     static ErlNifResourceType* m_TLogItr_RESOURCE;
 
 public:
-    TLogItrObject(DbObject *, rocksdb::TransactionLogIterator * Itr);
+    TLogItrObject(DbObject *, rocksdb::WalIterator * Itr);
 
     TLogItrObject() = delete;                                  // no default construct
     TLogItrObject(const TLogItrObject &) = delete;             // no copy
@@ -390,12 +396,60 @@ public:
 
     static void CreateTLogItrObjectType(ErlNifEnv * Env);
 
-    static TLogItrObject * CreateTLogItrObject(DbObject * Db, rocksdb::TransactionLogIterator * Itr);
+    static TLogItrObject * CreateTLogItrObject(DbObject * Db, rocksdb::WalIterator * Itr);
 
     static TLogItrObject * RetrieveTLogItrObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm);
 
     static void TLogItrObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
 };  // class TLogItrObject
+
+
+/**
+ * A prepared, not yet committed, external file ingestion
+ * (DB::PrepareFileIngestion). Created as erlang reference.
+ *
+ * RocksDB requires the handle to never outlive its DB: the object holds a
+ * reference to the DbObject and is closed by DbObject::Shutdown, and dropping
+ * a handle that was not committed rolls the ingestion back.
+ */
+class IngestionObject : public ErlRefObject
+{
+public:
+    ReferencePtr<DbObject> m_DbPtr;
+
+protected:
+    std::mutex m_HandleMutex;                                   //!< protects m_Handle
+    std::unique_ptr<rocksdb::FileIngestionHandle> m_Handle;     //!< NULL once committed or aborted
+
+    static ErlNifResourceType* m_Ingestion_RESOURCE;
+
+public:
+    IngestionObject(DbObject *, std::unique_ptr<rocksdb::FileIngestionHandle> Handle);
+
+    IngestionObject() = delete;
+    IngestionObject(const IngestionObject &) = delete;
+    IngestionObject & operator=(const IngestionObject &) = delete;
+
+    virtual ~IngestionObject();
+
+    virtual void Shutdown();
+
+    // Take the prepared handle out of the object. Returns NULL if it was
+    // already committed or aborted.
+    std::unique_ptr<rocksdb::FileIngestionHandle> TakeHandle();
+
+    // Put back a handle taken with TakeHandle (used when a batch commit is
+    // rejected before reaching RocksDB).
+    void RestoreHandle(std::unique_ptr<rocksdb::FileIngestionHandle> Handle);
+
+    static void CreateIngestionObjectType(ErlNifEnv * Env);
+
+    static IngestionObject * CreateIngestionObject(DbObject * Db, std::unique_ptr<rocksdb::FileIngestionHandle> Handle);
+
+    static IngestionObject * RetrieveIngestionObject(ErlNifEnv * Env, const ERL_NIF_TERM & Term);
+
+    static void IngestionObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
+};  // class IngestionObject
 
 
 

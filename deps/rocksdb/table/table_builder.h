@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 
+#include <cassert>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,7 +22,10 @@
 #include "file/writable_file_writer.h"
 #include "options/cf_options.h"
 #include "rocksdb/options.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/table_properties.h"
+#include "table/embedded_blob_sst.h"
 #include "table/unique_id_impl.h"
 #include "trace_replay/block_cache_tracer.h"
 #include "util/cast_util.h"
@@ -29,7 +33,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class Slice;
-class Status;
+class BlobSource;
 
 struct TableReaderOptions {
   // @param skip_filters Disables loading/accessing the filter block
@@ -45,7 +49,9 @@ struct TableReaderOptions {
       size_t _max_file_size_for_l0_meta_pin = 0,
       const std::string& _cur_db_session_id = "", uint64_t _cur_file_num = 0,
       UniqueId64x2 _unique_id = {}, SequenceNumber _largest_seqno = 0,
-      uint64_t _tail_size = 0, bool _user_defined_timestamps_persisted = true)
+      uint64_t _tail_size = 0, bool _user_defined_timestamps_persisted = true,
+      bool _avoid_shared_metadata_cache = false,
+      const std::string& _column_family_name = "")
       : ioptions(_ioptions),
         prefix_extractor(_prefix_extractor),
         compression_manager(_compression_manager),
@@ -63,7 +69,9 @@ struct TableReaderOptions {
         unique_id(_unique_id),
         block_protection_bytes_per_key(_block_protection_bytes_per_key),
         tail_size(_tail_size),
-        user_defined_timestamps_persisted(_user_defined_timestamps_persisted) {}
+        user_defined_timestamps_persisted(_user_defined_timestamps_persisted),
+        avoid_shared_metadata_cache(_avoid_shared_metadata_cache),
+        column_family_name(_column_family_name) {}
 
   const ImmutableOptions& ioptions;
   const std::shared_ptr<const SliceTransform>& prefix_extractor;
@@ -83,7 +91,8 @@ struct TableReaderOptions {
   // What level this table/file is on, -1 for "not set, don't know." Used
   // for level-specific statistics.
   int level;
-  // largest seqno in the table (or 0 means unknown???)
+  // Largest seqno in the table. kMaxSequenceNumber means unknown;
+  // kDisableGlobalSequenceNumber prevents file-wide seqno replacement.
   SequenceNumber largest_seqno;
   BlockCacheTracer* const block_cache_tracer;
   // Largest L0 file size whose meta-blocks may be pinned (can be zero when
@@ -103,6 +112,21 @@ struct TableReaderOptions {
 
   // Whether the key in the table contains user-defined timestamps.
   bool user_defined_timestamps_persisted;
+
+  // Open-time metadata reads should not insert index/filter/dictionary blocks
+  // into the shared block cache.
+  bool avoid_shared_metadata_cache;
+
+  // Column family that owns this table. Empty outside DB-owned table opens.
+  std::string column_family_name;
+
+  // Blob source for routing same-file ("embedded") blob reads through the blob
+  // value cache + BLOB_DB_* statistics. Owned by the ColumnFamilyData; the
+  // table reader's lifetime is a subset of the CFD's (it is owned via the CFD's
+  // TableCache), so a raw pointer is lifetime-safe. nullptr for non-DB openers
+  // (SstFileReader, sst_dump, repair, external-file ingestion prevalidation,
+  // etc.), in which case embedded reads fall back to a direct (uncached) read.
+  BlobSource* blob_source = nullptr;
 };
 
 struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
@@ -121,7 +145,9 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
       const std::string& _db_session_id = "",
       const uint64_t _target_file_size = 0, const uint64_t _cur_file_num = 0,
       const SequenceNumber _last_level_inclusive_max_seqno_threshold =
-          kMaxSequenceNumber)
+          kMaxSequenceNumber,
+      const Slice _db_name = Slice(), const bool _is_remote_compaction = false,
+      const EmbeddedBlobSstBuilderOptions* _embedded_blob_options = nullptr)
       : TablePropertiesCollectorFactory::Context(
             _column_family_id, _level, _ioptions.num_levels,
             _last_level_inclusive_max_seqno_threshold),
@@ -142,7 +168,10 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
         db_session_id(_db_session_id),
         is_bottommost(_is_bottommost),
         reason(_reason),
-        cur_file_num(_cur_file_num) {}
+        db_name(_db_name),
+        is_remote_compaction(_is_remote_compaction),
+        cur_file_num(_cur_file_num),
+        embedded_blob_options(_embedded_blob_options) {}
 
   const ImmutableOptions& ioptions;
   const MutableCFOptions& moptions;
@@ -162,9 +191,59 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
   // BEGIN for FilterBuildingContext
   const bool is_bottommost;
   const TableFileCreationReason reason;
+  const Slice db_name;
+  const bool is_remote_compaction;
   // END for FilterBuildingContext
 
   const uint64_t cur_file_num;
+  // Non-null only for table builders that should write eligible large values as
+  // same-file ("embedded") blob records. Currently only honored by
+  // BlockBasedTableBuilder.
+  const EmbeddedBlobSstBuilderOptions* embedded_blob_options;
+};
+
+enum class TableBuilderAddResult : uint8_t {
+  // The row was consumed by this builder. The caller may advance input.
+  kAdded,
+  // The row was not consumed. The caller should finish the current table,
+  // create another table through the same TableFactory, and retry the same row.
+  kRequiresNewTable,
+  // A real error occurred. The caller should abandon the current output.
+  kError,
+};
+
+enum class TableBuilderNewTableReason : uint8_t {
+  kNone = 0,
+  kRowClassificationChanged,
+  kSchemaIdChanged,
+  kSchemaVersionIncompatible,
+  kUnsupportedEntryType,
+  kBuilderPolicy,
+};
+
+inline const char* TableBuilderNewTableReasonToString(
+    TableBuilderNewTableReason reason) {
+  switch (reason) {
+    case TableBuilderNewTableReason::kNone:
+      return "None";
+    case TableBuilderNewTableReason::kRowClassificationChanged:
+      return "RowClassificationChanged";
+    case TableBuilderNewTableReason::kSchemaIdChanged:
+      return "SchemaIdChanged";
+    case TableBuilderNewTableReason::kSchemaVersionIncompatible:
+      return "SchemaVersionIncompatible";
+    case TableBuilderNewTableReason::kUnsupportedEntryType:
+      return "UnsupportedEntryType";
+    case TableBuilderNewTableReason::kBuilderPolicy:
+      return "BuilderPolicy";
+  }
+  assert(false);
+  return "Invalid";
+}
+
+struct TableBuilderAddContext {
+  TableBuilderNewTableReason new_table_reason =
+      TableBuilderNewTableReason::kNone;
 };
 
 // TableBuilder provides the interface used to build a Table
@@ -177,12 +256,32 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
 class TableBuilder {
  public:
   // REQUIRES: Either Finish() or Abandon() has been called.
-  virtual ~TableBuilder() {}
+  virtual ~TableBuilder() = default;
 
   // Add key,value to the table being constructed.
   // REQUIRES: key is after any previously added key according to comparator.
   // REQUIRES: Finish(), Abandon() have not been called
   virtual void Add(const Slice& key, const Slice& value) = 0;
+
+  // Add key,value to the table being constructed and report whether the row was
+  // accepted or whether the caller should cut the current table and retry this
+  // same row with a new table builder. A kRequiresNewTable result is not an
+  // error: the row must not have been consumed and status() must remain OK.
+  // A kError result must be reported through status().
+  //
+  // Existing table builders do not request table cuts; they inherit this
+  // default adapter around Add().
+  //
+  // REQUIRES: key is after any previously added key according to comparator.
+  // REQUIRES: Finish(), Abandon() have not been called
+  // REQUIRES: context != nullptr
+  virtual TableBuilderAddResult TryAdd(const Slice& key, const Slice& value,
+                                       TableBuilderAddContext* context) {
+    assert(context != nullptr);
+    context->new_table_reason = TableBuilderNewTableReason::kNone;
+    Add(key, value);
+    return TableBuilderAddResult::kAdded;
+  }
 
   // Return non-ok iff some error has been detected.
   virtual Status status() const = 0;

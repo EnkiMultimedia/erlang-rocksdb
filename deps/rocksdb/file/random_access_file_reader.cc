@@ -16,10 +16,15 @@
 #include "monitoring/histogram.h"
 #include "monitoring/iostats_context_imp.h"
 #include "port/port.h"
+#include "rocksdb/io_status.h"
 #include "table/format.h"
 #include "test_util/sync_point.h"
 #include "util/random.h"
 #include "util/rate_limiter_impl.h"
+
+#if USE_COROUTINES
+#include "folly/io/async/EventBase.h"
+#endif
 
 namespace ROCKSDB_NAMESPACE {
 inline Histograms GetFileReadHistograms(Statistics* stats,
@@ -128,187 +133,6 @@ IOStatus RandomAccessFileReader::Create(
   return io_s;
 }
 
-IOStatus RandomAccessFileReader::Read(const IOOptions& opts, uint64_t offset,
-                                      size_t n, Slice* result, char* scratch,
-                                      AlignedBuf* aligned_buf,
-                                      IODebugContext* dbg) const {
-  (void)aligned_buf;
-  const Env::IOPriority rate_limiter_priority = opts.rate_limiter_priority;
-
-  TEST_SYNC_POINT_CALLBACK("RandomAccessFileReader::Read", nullptr);
-  TEST_SYNC_POINT_CALLBACK("RandomAccessFileReader::Read:IODebugContext",
-                           const_cast<void*>(static_cast<void*>(dbg)));
-
-  // To be paranoid: modify scratch a little bit, so in case underlying
-  // FileSystem doesn't fill the buffer but return success and `scratch` returns
-  // contains a previous block, returned value will not pass checksum.
-  if (n > 0 && scratch != nullptr) {
-    // This byte might not change anything for direct I/O case, but it's OK.
-    scratch[0]++;
-  }
-
-  IOStatus io_s;
-  uint64_t elapsed = 0;
-  size_t alignment = file_->GetRequiredBufferAlignment();
-  bool is_aligned = false;
-  if (scratch != nullptr) {
-    // Check if offset, length and buffer are aligned.
-    is_aligned = (offset & (alignment - 1)) == 0 &&
-                 (n & (alignment - 1)) == 0 &&
-                 (uintptr_t(scratch) & (alignment - 1)) == 0;
-  }
-
-  {
-    StopWatch sw(clock_, stats_, hist_type_,
-                 GetFileReadHistograms(stats_, opts.io_activity),
-                 (stats_ != nullptr) ? &elapsed : nullptr, true /*overwrite*/,
-                 true /*delay_enabled*/);
-    auto prev_perf_level = GetPerfLevel();
-    IOSTATS_TIMER_GUARD(read_nanos);
-    if (use_direct_io() && is_aligned == false) {
-      size_t aligned_offset =
-          TruncateToPageBoundary(alignment, static_cast<size_t>(offset));
-      size_t offset_advance = static_cast<size_t>(offset) - aligned_offset;
-      size_t read_size =
-          Roundup(static_cast<size_t>(offset + n), alignment) - aligned_offset;
-      AlignedBuffer buf;
-      buf.Alignment(alignment);
-      buf.AllocateNewBuffer(read_size);
-      while (buf.CurrentSize() < read_size) {
-        size_t allowed;
-        if (rate_limiter_priority != Env::IO_TOTAL &&
-            rate_limiter_ != nullptr) {
-          allowed = rate_limiter_->RequestToken(
-              buf.Capacity() - buf.CurrentSize(), buf.Alignment(),
-              rate_limiter_priority, stats_, RateLimiter::OpType::kRead);
-        } else {
-          assert(buf.CurrentSize() == 0);
-          allowed = read_size;
-        }
-        Slice tmp;
-
-        FileOperationInfo::StartTimePoint start_ts;
-        uint64_t orig_offset = 0;
-        if (ShouldNotifyListeners()) {
-          start_ts = FileOperationInfo::StartNow();
-          orig_offset = aligned_offset + buf.CurrentSize();
-        }
-
-        {
-          IOSTATS_CPU_TIMER_GUARD(cpu_read_nanos, clock_);
-          // Only user reads are expected to specify a timeout. And user reads
-          // are not subjected to rate_limiter and should go through only
-          // one iteration of this loop, so we don't need to check and adjust
-          // the opts.timeout before calling file_->Read
-          assert(!opts.timeout.count() || allowed == read_size);
-          io_s = file_->Read(aligned_offset + buf.CurrentSize(), allowed, opts,
-                             &tmp, buf.Destination(), dbg);
-        }
-        if (ShouldNotifyListeners()) {
-          auto finish_ts = FileOperationInfo::FinishNow();
-          NotifyOnFileReadFinish(orig_offset, tmp.size(), start_ts, finish_ts,
-                                 io_s);
-          if (!io_s.ok()) {
-            NotifyOnIOError(io_s, FileOperationType::kRead, file_name(),
-                            tmp.size(), orig_offset);
-          }
-        }
-
-        buf.Size(buf.CurrentSize() + tmp.size());
-        if (!io_s.ok() || tmp.size() < allowed) {
-          break;
-        }
-      }
-      size_t res_len = 0;
-      if (io_s.ok() && offset_advance < buf.CurrentSize()) {
-        res_len = std::min(buf.CurrentSize() - offset_advance, n);
-        if (aligned_buf == nullptr) {
-          buf.Read(scratch, offset_advance, res_len);
-        } else {
-          scratch = buf.BufferStart() + offset_advance;
-          *aligned_buf = buf.Release();
-        }
-      }
-      *result = Slice(scratch, res_len);
-    } else {
-      size_t pos = 0;
-      const char* res_scratch = nullptr;
-      while (pos < n) {
-        size_t allowed;
-        if (rate_limiter_priority != Env::IO_TOTAL &&
-            rate_limiter_ != nullptr) {
-          if (rate_limiter_->IsRateLimited(RateLimiter::OpType::kRead)) {
-            sw.DelayStart();
-          }
-          allowed = rate_limiter_->RequestToken(
-              n - pos, (use_direct_io() ? alignment : 0), rate_limiter_priority,
-              stats_, RateLimiter::OpType::kRead);
-          if (rate_limiter_->IsRateLimited(RateLimiter::OpType::kRead)) {
-            sw.DelayStop();
-          }
-        } else {
-          allowed = n;
-        }
-        Slice tmp_result;
-
-        FileOperationInfo::StartTimePoint start_ts;
-        if (ShouldNotifyListeners()) {
-          start_ts = FileOperationInfo::StartNow();
-        }
-
-        {
-          IOSTATS_CPU_TIMER_GUARD(cpu_read_nanos, clock_);
-          // Only user reads are expected to specify a timeout. And user reads
-          // are not subjected to rate_limiter and should go through only
-          // one iteration of this loop, so we don't need to check and adjust
-          // the opts.timeout before calling file_->Read
-          assert(!opts.timeout.count() || allowed == n);
-          io_s = file_->Read(offset + pos, allowed, opts, &tmp_result,
-                             scratch + pos, dbg);
-        }
-        if (ShouldNotifyListeners()) {
-          auto finish_ts = FileOperationInfo::FinishNow();
-          NotifyOnFileReadFinish(offset + pos, tmp_result.size(), start_ts,
-                                 finish_ts, io_s);
-
-          if (!io_s.ok()) {
-            NotifyOnIOError(io_s, FileOperationType::kRead, file_name(),
-                            tmp_result.size(), offset + pos);
-          }
-        }
-        if (res_scratch == nullptr) {
-          // we can't simply use `scratch` because reads of mmap'd files return
-          // data in a different buffer.
-          res_scratch = tmp_result.data();
-        } else {
-          // make sure chunks are inserted contiguously into `res_scratch`.
-          assert(tmp_result.data() == res_scratch + pos);
-        }
-        pos += tmp_result.size();
-        if (!io_s.ok() || tmp_result.size() < allowed) {
-          break;
-        }
-      }
-      *result = Slice(res_scratch, io_s.ok() ? pos : 0);
-    }
-    RecordIOStats(stats_, file_temperature_, is_last_level_, result->size());
-    SetPerfLevel(prev_perf_level);
-  }
-  if (stats_ != nullptr && file_read_hist_ != nullptr) {
-    file_read_hist_->Add(elapsed);
-  }
-
-#ifndef NDEBUG
-  auto pair = std::make_pair(&file_name_, &io_s);
-  if (offset == 0) {
-    TEST_SYNC_POINT_CALLBACK("RandomAccessFileReader::Read::BeforeReturn",
-                             &pair);
-  }
-  TEST_SYNC_POINT_CALLBACK("RandomAccessFileReader::Read::AnyOffset", &pair);
-#endif
-  return io_s;
-}
-
 size_t End(const FSReadRequest& r) {
   return static_cast<size_t>(r.offset) + r.len;
 }
@@ -335,173 +159,38 @@ bool TryMerge(FSReadRequest* dest, const FSReadRequest& src) {
   return true;
 }
 
-IOStatus RandomAccessFileReader::MultiRead(const IOOptions& opts,
-                                           FSReadRequest* read_reqs,
-                                           size_t num_reqs,
-                                           AlignedBuf* aligned_buf,
-                                           IODebugContext* dbg) const {
-  (void)aligned_buf;  // suppress warning of unused variable in LITE mode
-  assert(num_reqs > 0);
+}  // namespace ROCKSDB_NAMESPACE
 
-#ifndef NDEBUG
-  for (size_t i = 0; i < num_reqs - 1; ++i) {
-    assert(read_reqs[i].offset <= read_reqs[i + 1].offset);
+// clang-format off
+#define WITHOUT_COROUTINES
+#include "file/random_access_file_reader_sync_and_async.h"
+#undef WITHOUT_COROUTINES
+#define WITH_COROUTINES
+#include "file/random_access_file_reader_sync_and_async.h"
+#undef WITH_COROUTINES
+// clang-format on
+
+namespace ROCKSDB_NAMESPACE {
+
+IOStatus RandomAccessFileReader::Read(uint64_t offset, size_t n,
+                                      const IOOptions& opts, Slice* result,
+                                      char* scratch,
+                                      IODebugContext* dbg) const {
+  FSReadRequest req;
+  req.offset = offset;
+  req.len = n;
+  req.scratch = scratch;
+  Read(opts, &req, /*direct_io_buffer_context=*/nullptr, dbg);
+  if (req.fs_scratch != nullptr) {
+    *result = Slice();
+    if (!req.status.ok()) {
+      return std::move(req.status);
+    }
+    return IOStatus::InvalidArgument(
+        "Use the FSReadRequest overload for filesystem-owned buffers");
   }
-#endif  // !NDEBUG
-  const Env::IOPriority rate_limiter_priority = opts.rate_limiter_priority;
-
-  // To be paranoid modify scratch a little bit, so in case underlying
-  // FileSystem doesn't fill the buffer but return success and `scratch` returns
-  // contains a previous block, returned value will not pass checksum.
-  // This byte might not change anything for direct I/O case, but it's OK.
-  for (size_t i = 0; i < num_reqs; i++) {
-    FSReadRequest& r = read_reqs[i];
-    if (r.len > 0 && r.scratch != nullptr) {
-      r.scratch[0]++;
-    }
-  }
-
-  IOStatus io_s;
-  uint64_t elapsed = 0;
-  {
-    StopWatch sw(clock_, stats_, hist_type_,
-                 GetFileReadHistograms(stats_, opts.io_activity),
-                 (stats_ != nullptr) ? &elapsed : nullptr, true /*overwrite*/,
-                 true /*delay_enabled*/);
-    auto prev_perf_level = GetPerfLevel();
-    IOSTATS_TIMER_GUARD(read_nanos);
-
-    FSReadRequest* fs_reqs = read_reqs;
-    size_t num_fs_reqs = num_reqs;
-    std::vector<FSReadRequest> aligned_reqs;
-    if (use_direct_io()) {
-      // num_reqs is the max possible size,
-      // this can reduce std::vecector's internal resize operations.
-      aligned_reqs.reserve(num_reqs);
-      // Align and merge the read requests.
-      size_t alignment = file_->GetRequiredBufferAlignment();
-      for (size_t i = 0; i < num_reqs; i++) {
-        FSReadRequest r = Align(read_reqs[i], alignment);
-        if (i == 0) {
-          // head
-          aligned_reqs.push_back(std::move(r));
-
-        } else if (!TryMerge(&aligned_reqs.back(), r)) {
-          // head + n
-          aligned_reqs.push_back(std::move(r));
-
-        } else {
-          // unused
-          r.status.PermitUncheckedError();
-        }
-      }
-      TEST_SYNC_POINT_CALLBACK("RandomAccessFileReader::MultiRead:AlignedReqs",
-                               &aligned_reqs);
-
-      // Allocate aligned buffer and let scratch buffers point to it.
-      size_t total_len = 0;
-      for (const auto& r : aligned_reqs) {
-        total_len += r.len;
-      }
-      AlignedBuffer buf;
-      buf.Alignment(alignment);
-      buf.AllocateNewBuffer(total_len);
-      char* scratch = buf.BufferStart();
-      for (auto& r : aligned_reqs) {
-        r.scratch = scratch;
-        scratch += r.len;
-      }
-
-      *aligned_buf = buf.Release();
-      fs_reqs = aligned_reqs.data();
-      num_fs_reqs = aligned_reqs.size();
-    }
-
-    FileOperationInfo::StartTimePoint start_ts;
-    if (ShouldNotifyListeners()) {
-      start_ts = FileOperationInfo::StartNow();
-    }
-
-    {
-      IOSTATS_CPU_TIMER_GUARD(cpu_read_nanos, clock_);
-      if (rate_limiter_priority != Env::IO_TOTAL && rate_limiter_ != nullptr) {
-        // TODO: ideally we should call `RateLimiter::RequestToken()` for
-        // allowed bytes to multi-read and then consume those bytes by
-        // satisfying as many requests in `MultiRead()` as possible, instead of
-        // what we do here, which can cause burst when the
-        // `total_multi_read_size` is big.
-        size_t total_multi_read_size = 0;
-        assert(fs_reqs != nullptr);
-        for (size_t i = 0; i < num_fs_reqs; ++i) {
-          FSReadRequest& req = fs_reqs[i];
-          total_multi_read_size += req.len;
-        }
-        size_t remaining_bytes = total_multi_read_size;
-        size_t request_bytes = 0;
-        while (remaining_bytes > 0) {
-          request_bytes = std::min(
-              static_cast<size_t>(rate_limiter_->GetSingleBurstBytes()),
-              remaining_bytes);
-          rate_limiter_->Request(request_bytes, rate_limiter_priority,
-                                 nullptr /* stats */,
-                                 RateLimiter::OpType::kRead);
-          remaining_bytes -= request_bytes;
-        }
-      }
-      TEST_SYNC_POINT_CALLBACK(
-          "RandomAccessFileReader::MultiRead:IODebugContext",
-          const_cast<void*>(static_cast<void*>(dbg)));
-      io_s = file_->MultiRead(fs_reqs, num_fs_reqs, opts, dbg);
-      RecordInHistogram(stats_, MULTIGET_IO_BATCH_SIZE, num_fs_reqs);
-    }
-
-    if (use_direct_io()) {
-      // Populate results in the unaligned read requests.
-      size_t aligned_i = 0;
-      for (size_t i = 0; i < num_reqs; i++) {
-        auto& r = read_reqs[i];
-        if (static_cast<size_t>(r.offset) > End(aligned_reqs[aligned_i])) {
-          aligned_i++;
-        }
-        const auto& fs_r = fs_reqs[aligned_i];
-        r.status = fs_r.status;
-        if (r.status.ok()) {
-          uint64_t offset = r.offset - fs_r.offset;
-          if (fs_r.result.size() <= offset) {
-            // No byte in the read range is returned.
-            r.result = Slice();
-          } else {
-            size_t len = std::min(
-                r.len, static_cast<size_t>(fs_r.result.size() - offset));
-            r.result = Slice(fs_r.scratch + offset, len);
-          }
-        } else {
-          r.result = Slice();
-        }
-      }
-    }
-
-    for (size_t i = 0; i < num_reqs; ++i) {
-      if (ShouldNotifyListeners()) {
-        auto finish_ts = FileOperationInfo::FinishNow();
-        NotifyOnFileReadFinish(read_reqs[i].offset, read_reqs[i].result.size(),
-                               start_ts, finish_ts, read_reqs[i].status);
-      }
-      if (!read_reqs[i].status.ok()) {
-        NotifyOnIOError(read_reqs[i].status, FileOperationType::kRead,
-                        file_name(), read_reqs[i].result.size(),
-                        read_reqs[i].offset);
-      }
-      RecordIOStats(stats_, file_temperature_, is_last_level_,
-                    read_reqs[i].result.size());
-    }
-    SetPerfLevel(prev_perf_level);
-  }
-  if (stats_ != nullptr && file_read_hist_ != nullptr) {
-    file_read_hist_->Add(elapsed);
-  }
-
-  return io_s;
+  *result = req.result;
+  return std::move(req.status);
 }
 
 IOStatus RandomAccessFileReader::PrepareIOOptions(const ReadOptions& ro,
@@ -517,16 +206,26 @@ IOStatus RandomAccessFileReader::PrepareIOOptions(const ReadOptions& ro,
 
 // Notes for when direct_io is enabled:
 // Unless req.offset, req.len, req.scratch are all already aligned,
-// RandomAccessFileReader will creats aligned requests and aligned buffer for
-// the request. User should only provide either req.scratch or aligned_buf. If
-// only req.scratch is provided, result will be copied from allocated aligned
-// buffer to req.scratch. If only alignd_buf is provided, it will be set to
-// the ailgned buf allocated by RandomAccessFileReader and saves a copy.
+// RandomAccessFileReader creates an aligned request and aligned buffer for the
+// request. If direct_io_buffer_context is provided, its buffer owns the aligned
+// backing storage and its optional allocator is used only for this allocation.
+// Otherwise, callers should provide either req.scratch or aligned_buf. If only
+// req.scratch is provided, the result is copied from the allocated aligned
+// buffer to req.scratch. If only aligned_buf is provided, it is set to the
+// aligned buffer allocated by RandomAccessFileReader and saves a copy.
 IOStatus RandomAccessFileReader::ReadAsync(
     FSReadRequest& req, const IOOptions& opts,
     std::function<void(FSReadRequest&, void*)> cb, void* cb_arg,
     void** io_handle, IOHandleDeleter* del_fn, AlignedBuf* aligned_buf,
-    IODebugContext* dbg) {
+    IODebugContext* dbg,
+    AlignedBufferAllocationContext* direct_io_buffer_context) {
+  AlignedBuffer* direct_io_buffer = direct_io_buffer_context != nullptr
+                                        ? direct_io_buffer_context->buffer
+                                        : nullptr;
+  const AlignedBuffer::Allocator* direct_io_allocator =
+      direct_io_buffer_context != nullptr ? direct_io_buffer_context->allocator
+                                          : nullptr;
+  assert(direct_io_buffer_context == nullptr || direct_io_buffer != nullptr);
   IOStatus s;
   TEST_SYNC_POINT_CALLBACK("RandomAccessFileReader::ReadAsync:InjectStatus",
                            &s);
@@ -546,7 +245,18 @@ IOStatus RandomAccessFileReader::ReadAsync(
   }
 
   size_t alignment = file_->GetRequiredBufferAlignment();
-  bool is_aligned = (req.offset & (alignment - 1)) == 0 &&
+  // The "already aligned" fast path forwards the caller's request (including
+  // its scratch pointer) straight to the FileSystem. It is only safe when the
+  // caller actually supplied a scratch buffer to read into. A null scratch
+  // combined with an `aligned_buf` out-parameter means the caller expects this
+  // reader to allocate the backing buffer (returned via `aligned_buf`), so we
+  // must take the allocating path below. Otherwise a null buffer would be
+  // submitted to the async read (e.g. a null iovec base to io_uring, which
+  // fails with EFAULT).
+  const bool caller_needs_allocation =
+      req.scratch == nullptr && aligned_buf != nullptr;
+  bool is_aligned = direct_io_buffer == nullptr && !caller_needs_allocation &&
+                    (req.offset & (alignment - 1)) == 0 &&
                     (req.len & (alignment - 1)) == 0 &&
                     (uintptr_t(req.scratch) & (alignment - 1)) == 0;
   read_async_info->is_aligned_ = is_aligned;
@@ -556,21 +266,27 @@ IOStatus RandomAccessFileReader::ReadAsync(
     FSReadRequest aligned_req = Align(req, alignment);
     aligned_req.status.PermitUncheckedError();
 
-    // Allocate aligned buffer.
-    read_async_info->buf_.Alignment(alignment);
-    read_async_info->buf_.AllocateNewBuffer(aligned_req.len);
-
-    // Set rem fields in aligned FSReadRequest.
-    aligned_req.scratch = read_async_info->buf_.BufferStart();
+    AlignedBuffer* aligned_read_buffer =
+        direct_io_buffer != nullptr ? direct_io_buffer : &read_async_info->buf_;
+    aligned_read_buffer->Alignment(alignment);
+    Status allocate_status = aligned_read_buffer->AllocateNewBuffer(
+        aligned_req.len, direct_io_allocator);
+    if (!allocate_status.ok()) {
+      delete read_async_info;
+      return status_to_io_status(std::move(allocate_status));
+    }
+    aligned_req.scratch = aligned_read_buffer->BufferStart();
 
     // Set user provided fields to populate back in callback.
     read_async_info->user_scratch_ = req.scratch;
     read_async_info->user_aligned_buf_ = aligned_buf;
+    read_async_info->direct_io_buffer_ = direct_io_buffer;
     read_async_info->user_len_ = req.len;
     read_async_info->user_offset_ = req.offset;
     read_async_info->user_result_ = req.result;
 
-    assert(read_async_info->buf_.CurrentSize() == 0);
+    assert(direct_io_buffer != nullptr ||
+           read_async_info->buf_.CurrentSize() == 0);
 
     StopWatch sw(clock_, stats_, hist_type_,
                  GetFileReadHistograms(stats_, opts.io_activity),
@@ -601,6 +317,38 @@ IOStatus RandomAccessFileReader::ReadAsync(
   return s;
 }
 
+bool RandomAccessFileReader::SubmitReadAsync(
+    FSReadRequest& req, const IOOptions& opts,
+    std::function<void(FSReadRequest&)> cb, IODebugContext* dbg) {
+#if USE_COROUTINES
+  if (file_system_ != nullptr) {
+    auto* read_executor = file_system_->GetReadExecutor();
+    if (read_executor != nullptr) {
+      auto* read_event_base = read_executor->getEventBase();
+      assert(read_event_base != nullptr);
+      auto task = [](RandomAccessFileReader* reader, FSReadRequest* task_req,
+                     IOOptions task_opts,
+                     std::function<void(FSReadRequest&)> task_cb,
+                     IODebugContext* task_dbg) -> folly::coro::Task<void> {
+        co_await folly::coro::co_nothrow(reader->ReadCoroutine(
+            task_opts, task_req,
+            /*direct_io_buffer_context=*/nullptr, task_dbg));
+        task_cb(*task_req);
+      }(this, &req, opts, std::move(cb), dbg);
+      auto task_with_executor = folly::coro::co_withExecutor(
+          folly::Executor::getKeepAliveToken(read_event_base), std::move(task));
+      if (read_event_base->inRunningEventBaseThread()) {
+        std::move(task_with_executor).startInlineUnsafe();
+      } else {
+        std::move(task_with_executor).start();
+      }
+      return true;
+    }
+  }
+#endif  // USE_COROUTINES
+  return FSRandomAccessFile::SubmitReadAsync(req, opts, std::move(cb), dbg);
+}
+
 void RandomAccessFileReader::ReadAsyncCallback(FSReadRequest& req,
                                                void* cb_arg) {
   ReadAsyncInfo* read_async_info = static_cast<ReadAsyncInfo*>(cb_arg);
@@ -618,20 +366,25 @@ void RandomAccessFileReader::ReadAsyncCallback(FSReadRequest& req,
     user_req.result = req.result;
     user_req.status = req.status;
 
-    read_async_info->buf_.Size(read_async_info->buf_.CurrentSize() +
-                               req.result.size());
+    size_t current_size = req.result.size();
+    if (read_async_info->direct_io_buffer_ == nullptr) {
+      read_async_info->buf_.Size(read_async_info->buf_.CurrentSize() +
+                                 req.result.size());
+      current_size = read_async_info->buf_.CurrentSize();
+    }
 
     size_t offset_advance_len = static_cast<size_t>(
         /*offset_passed_by_user=*/read_async_info->user_offset_ -
         /*aligned_offset=*/req.offset);
 
     size_t res_len = 0;
-    if (req.status.ok() &&
-        offset_advance_len < read_async_info->buf_.CurrentSize()) {
-      res_len =
-          std::min(read_async_info->buf_.CurrentSize() - offset_advance_len,
-                   read_async_info->user_len_);
-      if (read_async_info->user_aligned_buf_ == nullptr) {
+    if (req.status.ok() && offset_advance_len < current_size) {
+      res_len = std::min(current_size - offset_advance_len,
+                         read_async_info->user_len_);
+      if (read_async_info->direct_io_buffer_ != nullptr) {
+        user_req.scratch = read_async_info->direct_io_buffer_->BufferStart() +
+                           offset_advance_len;
+      } else if (read_async_info->user_aligned_buf_ == nullptr) {
         // Copy the data into user's scratch.
 // Clang analyzer assumes that it will take use_direct_io() == false in
 // ReadAsync and use_direct_io() == true in Callback which cannot be true.

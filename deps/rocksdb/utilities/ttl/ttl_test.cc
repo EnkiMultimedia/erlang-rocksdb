@@ -19,6 +19,11 @@
 #include <unistd.h>
 #endif
 
+#if USE_COROUTINES
+#include "folly/coro/BlockingWait.h"
+#include "rocksdb/coro_db.h"
+#endif
+
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
@@ -412,6 +417,86 @@ class TtlTest : public testing::Test {
   std::unique_ptr<CompactionFilter> test_comp_filter_;
 };  // class TtlTest
 
+#if USE_COROUTINES
+TEST_F(TtlTest, GetCoroutine) {
+  options_.env = Env::Default();
+  OpenTtl();
+  ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "value"));
+
+  PinnableSlice value;
+  CoroDB* coro_db = db_ttl_->GetCoroDB();
+  ASSERT_NE(nullptr, coro_db);
+  std::string timestamp;
+  ASSERT_TRUE(
+      folly::coro::blockingWait(CoroDB::CoGet(db_ttl_, ReadOptions(),
+                                              db_ttl_->DefaultColumnFamily(),
+                                              "key", &value, &timestamp))
+          .IsNotSupported());
+
+  Status status = folly::coro::blockingWait(CoroDB::CoGet(
+      db_ttl_, ReadOptions(), db_ttl_->DefaultColumnFamily(), "key", &value,
+      /*timestamp=*/nullptr));
+
+  ASSERT_OK(status);
+  ASSERT_EQ("value", value.ToString());
+}
+
+TEST_F(TtlTest, MultiGetCoroutine) {
+  options_.env = Env::Default();
+  OpenTtl();
+  ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "value"));
+
+  ColumnFamilyHandle* column_families[] = {db_ttl_->DefaultColumnFamily()};
+  const Slice keys[] = {Slice("key")};
+  PinnableSlice values[1];
+  Status statuses[1];
+  CoroDB* coro_db = db_ttl_->GetCoroDB();
+  ASSERT_NE(nullptr, coro_db);
+  std::string timestamps[1];
+  folly::coro::blockingWait(
+      CoroDB::CoMultiGet(db_ttl_, ReadOptions(), 1, column_families, keys,
+                         values, timestamps, statuses, /*sorted_input=*/false));
+  ASSERT_TRUE(statuses[0].IsNotSupported());
+
+  folly::coro::blockingWait(CoroDB::CoMultiGet(
+      db_ttl_, ReadOptions(), 1, column_families, keys, values,
+      /*timestamps=*/nullptr, statuses, /*sorted_input=*/false));
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ("value", values[0].ToString());
+}
+#endif  // USE_COROUTINES
+
+TEST_F(TtlTest, SnapshotNewerVersionMetadata) {
+  OpenTtl();
+  assert(db_ttl_);
+  ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "old"));
+  const Snapshot* snapshot = db_ttl_->GetSnapshot();
+  ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "new"));
+
+  ReadOptions read_options;
+  read_options.snapshot = snapshot;
+  OutputMetadata output_metadata;
+  output_metadata.WantNewerVersionPresent();
+  std::string value;
+  ASSERT_OK(
+      db_ttl_->GetWithMetadata(read_options, "key", &value, &output_metadata));
+  ASSERT_EQ("old", value);
+  ASSERT_TRUE(*output_metadata.newer_version_present);
+
+  MultiGetOutputMetadata multiget_output_metadata;
+  multiget_output_metadata.WantNewerVersionPresent();
+  std::vector<Slice> keys{"key"};
+  std::vector<std::string> values;
+  const std::vector<Status> statuses = db_ttl_->MultiGetWithMetadata(
+      read_options, keys, &values, &multiget_output_metadata);
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ("old", values[0]);
+  ASSERT_TRUE((*multiget_output_metadata.newer_version_present)[0]);
+
+  db_ttl_->ReleaseSnapshot(snapshot);
+}
+
 // If TTL is non positive or not provided, the behaviour is TTL = infinity
 // This test opens the db 3 times with such default behavior and inserts a
 // bunch of kvs each time. All kvs should accumulate in the db till the end
@@ -644,6 +729,45 @@ TEST_F(TtlTest, MultiGetTest) {
   SimpleMultiGetTest();
 
   CloseTtl();
+}
+
+TEST_F(TtlTest, NewIteratorsStripTimestamps) {
+  OpenTtl();
+  ColumnFamilyHandle* second_cf;
+  ASSERT_OK(
+      db_ttl_->CreateColumnFamilyWithTtl(options_, "second", &second_cf, 0));
+
+  const std::vector<ColumnFamilyHandle*> column_families = {
+      db_ttl_->DefaultColumnFamily(), second_cf};
+  const std::vector<std::string> values = {"default-value", "second-value"};
+  for (size_t i = 0; i < column_families.size(); ++i) {
+    ASSERT_OK(
+        db_ttl_->Put(WriteOptions(), column_families[i], "key", values[i]));
+  }
+
+  const auto verify_iterators = [&](Status status,
+                                    std::vector<Iterator*>* iterators) {
+    ASSERT_OK(status);
+    ASSERT_EQ(iterators->size(), column_families.size());
+    for (size_t i = 0; i < iterators->size(); ++i) {
+      std::unique_ptr<Iterator> iterator((*iterators)[i]);
+      iterator->SeekToFirst();
+      ASSERT_TRUE(iterator->Valid());
+      ASSERT_EQ(iterator->value().ToString(), values[i]);
+      ASSERT_OK(iterator->status());
+    }
+  };
+
+  std::vector<Iterator*> iterators;
+  verify_iterators(
+      db_ttl_->NewIterators(ReadOptions(), column_families, &iterators),
+      &iterators);
+  verify_iterators(
+      db_ttl_->NewIterators(std::vector<ReadOptions>(column_families.size()),
+                            column_families, &iterators),
+      &iterators);
+
+  delete second_cf;
 }
 
 TEST_F(TtlTest, TtlFiftenYears) {

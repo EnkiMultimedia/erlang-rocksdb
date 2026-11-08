@@ -82,12 +82,12 @@ class ExternalFileRangeChecker {
                              range2_largest) <= 0;
   }
 
-  bool Contains(const KeyRangeInfo& range1, const KeyRangeInfo& range2) {
+  bool Contains(const KeyRangeInfo& range1, const KeyRangeInfo& range2) const {
     return Contains(range1, range2.smallest_internal_key,
                     range2.largest_internal_key);
   }
   bool Contains(const KeyRangeInfo& range1, const InternalKey& range2_smallest,
-                const InternalKey& range2_largest) {
+                const InternalKey& range2_largest) const {
     bool any_unset =
         range1.unset() || range2_smallest.unset() || range2_largest.unset();
     if (any_unset) {
@@ -133,9 +133,6 @@ struct IngestedFileInfo : public KeyRangeInfo {
   std::string limit_ukey;
   // Sequence number for keys in external file
   SequenceNumber original_seqno;
-  // Offset of the global sequence number field in the file, will
-  // be zero if version is 1 (global seqno is not supported)
-  size_t global_seqno_offset;
   // External file size
   uint64_t file_size;
   // total number of keys in external file
@@ -180,6 +177,14 @@ struct IngestedFileInfo : public KeyRangeInfo {
   // the user key's format in the external file matches the column family's
   // setting.
   bool user_defined_timestamps_persisted = true;
+
+  // Whether Lmax commit-time table opening should prefetch index/filter blocks.
+  bool prefetch_lmax_index_and_filter_blocks = true;
+
+  // Whether RocksDB generated this file as part of the ingestion job. Such a
+  // file is already in the DB directory and must not be unlinked as a caller
+  // input when move_files is enabled.
+  bool generated_for_ingestion = false;
 
   SequenceNumber largest_seqno = kMaxSequenceNumber;
   SequenceNumber smallest_seqno = kMaxSequenceNumber;
@@ -240,6 +245,14 @@ class ExternalSstFileIngestionJob {
     assert(ucmp_);
   }
 
+  // No copying allowed
+  ExternalSstFileIngestionJob(const ExternalSstFileIngestionJob&) = delete;
+  ExternalSstFileIngestionJob& operator=(const ExternalSstFileIngestionJob&) =
+      delete;
+  ExternalSstFileIngestionJob(ExternalSstFileIngestionJob&&) = delete;
+  ExternalSstFileIngestionJob& operator=(ExternalSstFileIngestionJob&&) =
+      delete;
+
   ~ExternalSstFileIngestionJob() { UnregisterRange(); }
 
   ColumnFamilyData* GetColumnFamilyData() const { return cfd_; }
@@ -248,6 +261,7 @@ class ExternalSstFileIngestionJob {
   Status Prepare(const std::vector<std::string>& external_files_paths,
                  const std::vector<std::string>& files_checksums,
                  const std::vector<std::string>& files_checksum_func_names,
+                 const std::vector<const PreparedFileInfo*>& file_infos,
                  const std::optional<RangeOpt>& atomic_replace_range,
                  const Temperature& file_temperature, uint64_t next_file_number,
                  SuperVersion* sv);
@@ -301,7 +315,39 @@ class ExternalSstFileIngestionJob {
     return max_assigned_seqno_;
   }
 
+  // Max threads requested for opening this job's files during commit, from the
+  // per-CF IngestExternalFileOptions.
+  int file_opening_threads() const {
+    return ingestion_options_.file_opening_threads;
+  }
+
+  size_t NumFilesToPrepare(
+      size_t num_external_files,
+      const std::optional<RangeOpt>& atomic_replace_range) const;
+
+  // Merge another already-Prepare()d job for the SAME column family into this
+  // one so both sets of files are committed by a single Run(). The other job's
+  // files are appended after this job's, so for any overlapping keys the other
+  // job's data wins via a higher assigned sequence number -- the same semantics
+  // as passing all the files to a single ingestion call in this order. The
+  // other job is left empty.
+  Status MergeForSameColumnFamily(ExternalSstFileIngestionJob* other);
+
  private:
+  bool SupportsAtomicReplaceRangeTombstone() const;
+
+  bool CanUseAtomicReplaceRangeTombstone(
+      const std::optional<RangeOpt>& atomic_replace_range) const;
+
+  bool HasPartialOverlap(const VersionStorageInfo* vstorage) const;
+
+  Status PrepareAtomicReplaceRangeTombstone(const Slice& start,
+                                            const Slice& limit,
+                                            uint64_t file_number,
+                                            SuperVersion* super_version);
+
+  void ActivateAtomicReplaceRangeTombstone();
+
   Status ResetTableReader(const std::string& external_file,
                           uint64_t new_file_number,
                           bool user_defined_timestamps_persisted,
@@ -315,16 +361,36 @@ class ExternalSstFileIngestionJob {
   // different options. For example: when external file does not contain
   // timestamps while column family enables UDT in Memtables only feature.
   Status SanityCheckTableProperties(const std::string& external_file,
-                                    uint64_t new_file_number, SuperVersion* sv,
-                                    IngestedFileInfo* file_to_ingest,
-                                    std::unique_ptr<TableReader>* table_reader);
+                                    const TableProperties& props,
+                                    IngestedFileInfo* file_to_ingest);
 
   // Open the external file and populate `file_to_ingest` with all the
-  // external information we need to ingest this file.
+  // external information we need to ingest this file. When
+  // `prepared_file_info` is non-null, its caller-supplied metadata is reused
+  // instead of opening and scanning the file.
   Status GetIngestedFileInfo(const std::string& external_file,
                              uint64_t new_file_number,
+                             const PreparedFileInfo* prepared_file_info,
                              IngestedFileInfo* file_to_ingest,
                              SuperVersion* sv);
+
+  // Acquire the per-file metadata from the caller-supplied opaque
+  // `PreparedFileInfo` (produced by SstFileWriter::Finish) instead of opening
+  // the file.
+  Status GetIngestedFileInfoFromFileInfo(
+      const std::string& external_file,
+      const PreparedFileInfo& prepared_file_info,
+      IngestedFileInfo* file_to_ingest);
+
+  // Acquire the per-file metadata by opening the external file and scanning it
+  // (table properties, sequence number bounds, and boundary keys including any
+  // range-tombstone extensions). Used when no file_info is available. The
+  // opened `TableReader` is returned via `*table_reader` so the caller can
+  // reuse it (e.g. to verify the file checksum) without re-opening the file.
+  Status GetIngestedFileInfoFromFile(
+      const std::string& external_file, uint64_t new_file_number,
+      IngestedFileInfo* file_to_ingest, SuperVersion* sv,
+      std::unique_ptr<TableReader>* out_table_reader);
 
   // If the input files' key range overlaps themselves, this function divides
   // them in the user specified order into multiple batches. Where the files
@@ -333,6 +399,10 @@ class ExternalSstFileIngestionJob {
   // If the input files' key range don't overlap themselves, they always just
   // make one batch.
   void DivideInputFilesIntoBatches();
+
+  // Returns whether any two files in `files` have overlapping key ranges, by
+  // sorting the file ranges and checking adjacent pairs.
+  bool ComputeFilesOverlap(const autovector<IngestedFileInfo>& files) const;
 
   // Assign level for the files in one batch. The files within one batch are not
   // overlapping, and we assign level to each file one after another.
@@ -365,20 +435,14 @@ class ExternalSstFileIngestionJob {
   // REQUIRES: Mutex held
   Status CheckLevelForIngestedBehindFile(IngestedFileInfo* file_to_ingest);
 
-  // Set the file global sequence number to `seqno`
+  // Set the file's assigned global sequence number to `seqno`.
   Status AssignGlobalSeqnoForIngestedFile(IngestedFileInfo* file_to_ingest,
                                           SequenceNumber seqno);
-  // Generate the file checksum and store in the IngestedFileInfo
-  IOStatus GenerateChecksumForIngestedFile(IngestedFileInfo* file_to_ingest);
 
   // Check if `file_to_ingest` can fit in level `level`
   // REQUIRES: Mutex held
   bool IngestedFileFitInLevel(const IngestedFileInfo* file_to_ingest,
                               int level);
-
-  // Helper method to sync given file.
-  template <typename TWritableFile>
-  Status SyncIngestedFile(TWritableFile* file);
 
   // Helper function to obtain the smallest and largest sequence number from a
   // file. When OK is returned, file_to_ingest->smallest_seqno and
@@ -407,8 +471,10 @@ class ExternalSstFileIngestionJob {
   SnapshotList* db_snapshots_;
   autovector<IngestedFileInfo> files_to_ingest_;
   std::vector<FileBatchInfo> file_batches_to_ingest_;
-  const IngestExternalFileOptions& ingestion_options_;
+  const IngestExternalFileOptions ingestion_options_;
   std::optional<KeyRangeInfo> atomic_replace_range_;
+  std::optional<IngestedFileInfo> atomic_replace_range_tombstone_;
+  bool atomic_replace_range_tombstone_active_{false};
   Directories* directories_;
   EventLogger* event_logger_;
   VersionEdit edit_;
@@ -417,9 +483,6 @@ class ExternalSstFileIngestionJob {
   // Set in ExternalSstFileIngestionJob::Prepare(), if true all files are
   // ingested in L0
   bool files_overlap_{false};
-  // Set in ExternalSstFileIngestionJob::Prepare(), if true and DB
-  // file_checksum_gen_factory is set, DB will generate checksum each file.
-  bool need_generate_file_checksum_{true};
   std::shared_ptr<IOTracer> io_tracer_;
 
   // Flag indicating whether the column family is flushed after `Prepare` and

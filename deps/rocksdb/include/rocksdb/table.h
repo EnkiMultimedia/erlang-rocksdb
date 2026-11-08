@@ -23,6 +23,7 @@
 #include <unordered_map>
 
 #include "rocksdb/cache.h"
+#include "rocksdb/cleanable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
@@ -44,7 +45,68 @@ class TableReader;
 class WritableFileWriter;
 struct ConfigOptions;
 struct EnvOptions;
-class UserDefinedIndexFactory;
+class IndexFactory;
+
+// Hook for providing read-scoped storage for data blocks read from SST files.
+// This is configured through C++ options rather than OPTIONS files.
+//
+// Current support is limited to block-based table iterator scans and MultiScan
+// data-block reads. Reads using mmap ignore this provider and use normal
+// RocksDB block backing.
+//
+// The provider backs final data-block contents pinned by the scan. RocksDB may
+// still use ordinary temporary scratch for serialized block bytes, such as when
+// reading a block that may be compressed before decompressing or copying the
+// final data block into provider-backed storage.
+//
+// This is separate from MemoryAllocator because each allocation needs a
+// per-lease cleanup handle that RocksDB can attach to pinned blocks/slices, and
+// direct-I/O reads that use provider-backed read buffers need the requested
+// alignment to be passed to the provider.
+//
+// TODO: Extend support to point lookups (Get/MultiGet) once those paths can
+// preserve provider-backed block ownership.
+//
+// Requirements:
+// - If the same provider instance is shared by multiple concurrently active
+//   readers, `Allocate()` must be safe to call concurrently.
+// - `Lease::data` must point to at least `size` bytes of writable contiguous
+//   memory that remains valid until every copy of `Lease::cleanup` is reset.
+// - `Lease::data` must be aligned to `alignment` bytes, where `alignment` is a
+//   power of two and `1` means no special alignment requirement.
+// - When `alignment` is greater than 1, `Lease::size` must also be a multiple
+//   of `alignment` so it can be used as direct-I/O backing storage.
+// - `Lease::cleanup` must be non-null on success. Its cleanup may run on any
+//   thread that releases the last RocksDB reference. If the cleanup touches
+//   provider or other shared state, it must synchronize with Allocate() and
+//   other provider cleanup callbacks.
+// - After `Allocate()` succeeds, RocksDB releases `Lease::cleanup` on all
+//   paths, including later I/O or decompression failure.
+class ReadScopedBlockBufferProvider {
+ public:
+  // A Lease hands one writable backing allocation from the provider to
+  // RocksDB. For a provider-backed block, the final BlockContents data points
+  // into this allocation and RocksDB attaches `cleanup` to the resulting Blocks
+  // and any slices pinned from them. File-read scratch, copying, and
+  // decompression choices are implementation details outside this contract.
+  //
+  // The provider controls allocation reclamation. RocksDB keeps the data valid
+  // by copying `cleanup`; the provider must not reuse or release `data` until
+  // every copy of `cleanup` has been reset. `size` is the usable backing
+  // allocation size and may be larger than the requested allocation size. For
+  // direct-I/O reads, `size` must be a multiple of the requested alignment.
+  struct Lease {
+    // Writable contiguous memory for the loaded block.
+    char* data = nullptr;
+    size_t size = 0;
+    // Reclaims `data` after all derived pinned key/value slices are released.
+    SharedCleanablePtr cleanup;
+  };
+
+  virtual ~ReadScopedBlockBufferProvider() = default;
+
+  virtual Status Allocate(size_t size, size_t alignment, Lease* out) = 0;
+};
 
 // Types of checksums to use for checking integrity of logical blocks within
 // files. All checksums currently use 32 bits of checking power (1 in 4B
@@ -533,14 +595,90 @@ struct BlockBasedTableOptions {
   // This allows users to define their own index format and build the index
   // during table building.
   //
-  // NOTE: UserDefinedIndexFactory currently disables parallel compression
+  // NOTE: IndexFactory currently disables parallel compression
   // (CompressionOptions::parallel_threads sanitized to 1).
-  std::shared_ptr<UserDefinedIndexFactory> user_defined_index_factory = nullptr;
+  std::shared_ptr<IndexFactory> user_defined_index_factory = nullptr;
+
+  // EXPERIMENTAL
+  //
+  // Names the intended relationship between the standard block-based-table
+  // index and a custom index. This is a preparatory API for replacing the
+  // legacy UDI booleans below in a follow-up change. Until that wiring lands,
+  // use_udi_as_primary_index and fail_if_no_udi_on_open keep their existing
+  // behavior and index_mode is not consulted by table building or reading.
+  enum class IndexMode {
+    // Build and read the standard index only.
+    kStandardOnly = 0,
+    // Build both indexes, read the standard index by default, and allow
+    // per-read custom-index selection.
+    kStandardDefault = 1,
+    // Build both indexes and read the custom index by default.
+    kCustomDefault = 2,
+    // Build only the custom index. This requires a later format-safety change
+    // before it can be used by table writing.
+    kCustomOnly = 3,
+    // Build both indexes, read the standard index by default, and require the
+    // custom index block when a factory is configured.
+    kStandardRequired = 4,
+  };
+  IndexMode index_mode = IndexMode::kStandardDefault;
+
+  // EXPERIMENTAL
+  //
+  // When true and user_defined_index_factory is set, the UDI becomes the
+  // primary index for reads. All reads (including internal operations like
+  // compaction and VerifyChecksum) automatically route through the UDI
+  // without needing ReadOptions::table_index_factory.
+  //
+  // Both the standard binary search index and the UDI are always fully
+  // built. The standard index serves as a safety fallback (e.g., for
+  // backup/restore or rollback to a non-UDI configuration). A future
+  // refactor will extract the index abstraction to allow skipping the
+  // standard index build when the UDI is primary.
+  //
+  // When the UDI is primary:
+  // - All reads automatically use the UDI (ReadOptions::table_index_factory
+  //   does not need to be set)
+  // - Partitioned index (kTwoLevelIndexSearch) and partitioned filters are
+  //   incompatible with this option
+  // - fail_if_no_udi_on_open is automatically enforced to prevent silent
+  //   data loss if these SSTs are opened without UDI support
+  //
+  // Recommended migration path:
+  //
+  // 1. Deploy with user_defined_index_factory set but
+  //    use_udi_as_primary_index=false (secondary mode). New SSTs are written
+  //    with both indexes. Reads use the standard index by default.
+  //
+  // 2. Validate reads through the UDI by setting
+  //    ReadOptions::table_index_factory on a subset of reads.
+  //
+  // 3. Compact the entire DB to rewrite all pre-existing SSTs with both
+  //    indexes. All SSTs must have a UDI block before proceeding.
+  //
+  // 4. Enable use_udi_as_primary_index=true. All reads use the UDI.
+  //
+  // Rollback: set use_udi_as_primary_index=false. Since the standard index
+  // is always fully populated, SSTs are immediately readable through the
+  // standard index. No compaction is required. All reads immediately
+  // revert to the standard index path.
+  //
+  // Backup/restore: the user_defined_index_factory is a shared_ptr that
+  // cannot survive Options serialization (e.g., GetStringFromDBOptions).
+  // Since the standard index is always fully populated, a restored DB can
+  // be opened and read without the factory (reads fall back to the standard
+  // index). Set the factory when opening the restored DB to resume using
+  // the UDI.
+  //
+  // Default: false (UDI is built alongside the standard index as a secondary)
+  bool use_udi_as_primary_index = false;
 
   // EXPERIMENTAL
   //
   // Return an error Status if a user_defined_index_factory is configured,
   // but there's no corresponding UDI block in the SST file being opened.
+  // When use_udi_as_primary_index is true, this check is automatically
+  // enforced (a missing UDI block is always an error in primary mode).
   bool fail_if_no_udi_on_open = false;
 
   // If true, place whole keys in the filter (not just prefixes).
@@ -615,6 +753,10 @@ struct BlockBasedTableOptions {
   // using a non-built-in CompatibilityName(). See `compression_manager` in
   // ColumnFamilyOptions. Also changes the format of TableProperties field
   // `compression_name`. Can be read by RocksDB versions >= 10.4.0.
+  // 8 -- Support for optimize_key_common_prefix, cleaner support for some
+  // features like super_block_alignment_size that impact index encoding, and
+  // more future-proofing that might guard future opt-in features. Can be read
+  // by RocksDB versions >= 11.10.0
   //
   // Using the default setting of format_version is strongly recommended, so
   // that available enhancements are adopted eventually and automatically. The
@@ -623,6 +765,11 @@ struct BlockBasedTableOptions {
   // (6 months recommended) to ensure a clean downgrade/revert path for users
   // who might only upgrade a few times per year.
   uint32_t format_version = 7;
+
+  // Latest format_version supported by this version of RocksDB for both
+  // reading and writing SST files. Setting format_version higher than this is
+  // rejected as InvalidArgument (e.g. by DB::Open() or SetOptions()).
+  static constexpr uint32_t kLatestSupportedFormatVersion = 8;
 
   // When true, data blocks store keys and values separately. Keys are stored
   // at the beginning of the block, followed by values at the end. This can
@@ -648,6 +795,39 @@ struct BlockBasedTableOptions {
   // NOTE: Currently only supports index blocks. May update to include data
   // blocks in the future.
   double uniform_cv_threshold = -1;
+
+  // Controls the conditions under which the format_version >= 8 "common
+  // user-key prefix" data-block optimization is enabled: the common prefix
+  // shared by all keys in a data block is stored once at the start of the block
+  // instead of at every restart point. This shrinks the block (and its
+  // block-cache footprint) for prefix-heavy data and, for bytewise-ordered
+  // keys, speeds up Seek by comparing prefix-stripped suffixes.
+  //
+  // Only takes effect at format_version >= 8, and requires use_delta_encoding
+  // (it builds on delta encoding). When use_delta_encoding is false -- e.g. to
+  // preserve zero-copy key pinning for ReadOptions::pin_data -- this is a
+  // no-op.
+  //
+  // The Seek speedup ("fast seek") is only correct for the built-in bytewise
+  // and reverse-bytewise comparators. Other comparators can still get the space
+  // savings (the reader reconstructs full keys) at a small read-CPU cost.
+  //
+  // Expressed as a criteria so it need not be toggled per column family based
+  // on the comparator (which can vary by CF).
+  enum class OptimizeKeyCommonPrefix : char {
+    // Never use the optimization.
+    kDisabled = 0,
+    // Use it only where it also enables the Seek speedup: format_version >= 8
+    // with a (reverse-)bytewise comparator. Left off for other comparators.
+    // This is the default.
+    kIfFastSeek = 1,
+    // Use it for all comparators at format_version >= 8. (Reverse-)bytewise get
+    // space savings + fast seek; other comparators get the space savings only,
+    // read via full-key reconstruction.
+    kEnabled = 2,
+  };
+  OptimizeKeyCommonPrefix optimize_key_common_prefix =
+      OptimizeKeyCommonPrefix::kIfFastSeek;
 
   // Store index blocks on disk in compressed format. Changing this option to
   // false  will avoid the overhead of decompression if index blocks are evicted
@@ -994,8 +1174,6 @@ class RandomAccessFileReader;
 // A base class for table factories.
 class TableFactory : public Customizable {
  public:
-  ~TableFactory() override {}
-
   static const char* kBlockCacheOpts() { return "BlockCache"; }
   static const char* kBlockBasedTableName() { return "BlockBasedTable"; }
   static const char* kPlainTableName() { return "PlainTable"; }

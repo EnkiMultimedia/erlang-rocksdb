@@ -84,7 +84,9 @@ class TraceRecord {
   virtual Status Accept(Handler* handler,
                         std::unique_ptr<TraceRecordResult>* result) = 0;
 
-  // Create a handler for the exeution of TraceRecord.
+  // Create a handler for the execution of TraceRecord. `handles` are the column
+  // families that read records may refer to. The default column family of
+  // `db` is always included, so `handles` may be empty.
   static Handler* NewExecutionHandler(
       DB* db, const std::vector<ColumnFamilyHandle*>& handles);
 
@@ -104,6 +106,12 @@ class WriteQueryTraceRecord : public QueryTraceRecord {
   WriteQueryTraceRecord(PinnableSlice&& write_batch_rep, uint64_t timestamp);
 
   WriteQueryTraceRecord(const std::string& write_batch_rep, uint64_t timestamp);
+
+  // No copying allowed
+  WriteQueryTraceRecord(const WriteQueryTraceRecord&) = delete;
+  WriteQueryTraceRecord& operator=(const WriteQueryTraceRecord&) = delete;
+  WriteQueryTraceRecord(WriteQueryTraceRecord&&) = delete;
+  WriteQueryTraceRecord& operator=(WriteQueryTraceRecord&&) = delete;
 
   ~WriteQueryTraceRecord() override;
 
@@ -127,6 +135,12 @@ class GetQueryTraceRecord : public QueryTraceRecord {
 
   GetQueryTraceRecord(uint32_t column_family_id, const std::string& key,
                       uint64_t timestamp);
+
+  // No copying allowed
+  GetQueryTraceRecord(const GetQueryTraceRecord&) = delete;
+  GetQueryTraceRecord& operator=(const GetQueryTraceRecord&) = delete;
+  GetQueryTraceRecord(GetQueryTraceRecord&&) = delete;
+  GetQueryTraceRecord& operator=(GetQueryTraceRecord&&) = delete;
 
   ~GetQueryTraceRecord() override;
 
@@ -194,6 +208,14 @@ class IteratorSeekQueryTraceRecord : public IteratorQueryTraceRecord {
                                const std::string& upper_bound,
                                uint64_t timestamp);
 
+  // No copying allowed
+  IteratorSeekQueryTraceRecord(const IteratorSeekQueryTraceRecord&) = delete;
+  IteratorSeekQueryTraceRecord& operator=(const IteratorSeekQueryTraceRecord&) =
+      delete;
+  IteratorSeekQueryTraceRecord(IteratorSeekQueryTraceRecord&&) = delete;
+  IteratorSeekQueryTraceRecord& operator=(IteratorSeekQueryTraceRecord&&) =
+      delete;
+
   ~IteratorSeekQueryTraceRecord() override;
 
   // Trace type matches the seek type.
@@ -227,6 +249,12 @@ class MultiGetQueryTraceRecord : public QueryTraceRecord {
   MultiGetQueryTraceRecord(std::vector<uint32_t> column_family_ids,
                            const std::vector<std::string>& keys,
                            uint64_t timestamp);
+
+  // No copying allowed
+  MultiGetQueryTraceRecord(const MultiGetQueryTraceRecord&) = delete;
+  MultiGetQueryTraceRecord& operator=(const MultiGetQueryTraceRecord&) = delete;
+  MultiGetQueryTraceRecord(MultiGetQueryTraceRecord&&) = delete;
+  MultiGetQueryTraceRecord& operator=(MultiGetQueryTraceRecord&&) = delete;
 
   ~MultiGetQueryTraceRecord() override;
 

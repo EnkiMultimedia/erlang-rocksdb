@@ -55,7 +55,7 @@ class LockManagerHandle {
   // to use.
   virtual LockManager* getLockManager() = 0;
 
-  virtual ~LockManagerHandle() {}
+  virtual ~LockManagerHandle() = default;
 };
 
 // Same as class Endpoint, but use std::string to manage the buffer allocation
@@ -119,6 +119,14 @@ class RangeLockManagerHandle : public LockManagerHandle {
   // Set the user-provided barrier check function
   virtual void SetEscalationBarrierFunc(EscalationBarrierFunc func) = 0;
 
+  // Predicate returning true if the thread waiting for a lock has been killed.
+  // A range lock wait polls this and returns promptly (DB_LOCK_INTERRUPTED ->
+  // Status::Aborted()) when it fires.
+  using IsKilledCallback = std::function<bool()>;
+
+  // Set the user-provided kill-check function
+  virtual void SetIsKilledCallback(IsKilledCallback func) = 0;
+
   virtual RangeLockStatus GetRangeLockStatusData() = 0;
 
   class Counters {
@@ -143,7 +151,7 @@ class RangeLockManagerHandle : public LockManagerHandle {
   virtual std::vector<RangeDeadlockPath> GetRangeDeadlockInfoBuffer() = 0;
   virtual void SetRangeDeadlockInfoBufferSize(uint32_t target_size) = 0;
 
-  ~RangeLockManagerHandle() override {}
+  ~RangeLockManagerHandle() override = default;
 };
 
 // A factory function to create a Range Lock Manager. The created object should
@@ -627,6 +635,8 @@ class TransactionDB : public StackableDB {
   // No copying allowed
   TransactionDB(const TransactionDB&) = delete;
   void operator=(const TransactionDB&) = delete;
+  TransactionDB(TransactionDB&&) = delete;
+  void operator=(TransactionDB&&) = delete;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

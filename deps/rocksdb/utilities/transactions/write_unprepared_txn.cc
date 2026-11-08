@@ -608,13 +608,18 @@ Status WriteUnpreparedTxn::CommitInternal() {
       for (const auto& seq : unprep_seqs_) {
         wpt_db_->RemovePrepared(seq.first, seq.second);
       }
-    }
-    if (UNLIKELY(!do_one_write)) {
+      unprep_seqs_.clear();
+      flushed_save_points_.reset(nullptr);
+      unflushed_save_points_.reset(nullptr);
+    } else if (UNLIKELY(!do_one_write)) {
+      // The commit write failed after add_prepared_callback may have added a
+      // prepared entry for commit_batch_seq. Since commit_batch_seq is never
+      // stored in unprep_seqs_ on this path, a follow-up Rollback() cannot
+      // remove it, so clean it up here. unprep_seqs_ is otherwise preserved so
+      // the transaction can still be rolled back after the caller recovers
+      // from the write error.
       wpt_db_->RemovePrepared(commit_batch_seq, commit_batch_cnt);
     }
-    unprep_seqs_.clear();
-    flushed_save_points_.reset(nullptr);
-    unflushed_save_points_.reset(nullptr);
     return s;
   }  // else do the 2nd write to publish seq
 
@@ -969,7 +974,8 @@ void WriteUnpreparedTxn::MultiGet(const ReadOptions& _read_options,
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kMultiGet;
   }
-  SequenceNumber min_uncommitted, snap_seq;
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
   const SnapshotBackup backed_by_snapshot = wupt_db_->AssignMinMaxSeqs(
       read_options.snapshot, &min_uncommitted, &snap_seq);
   WriteUnpreparedTxnReadCallback callback(wupt_db_, snap_seq, min_uncommitted,
@@ -1006,7 +1012,8 @@ Status WriteUnpreparedTxn::Get(const ReadOptions& _read_options,
 Status WriteUnpreparedTxn::GetImpl(const ReadOptions& options,
                                    ColumnFamilyHandle* column_family,
                                    const Slice& key, PinnableSlice* value) {
-  SequenceNumber min_uncommitted, snap_seq;
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
   const SnapshotBackup backed_by_snapshot =
       wupt_db_->AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
   WriteUnpreparedTxnReadCallback callback(wupt_db_, snap_seq, min_uncommitted,
@@ -1020,6 +1027,52 @@ Status WriteUnpreparedTxn::GetImpl(const ReadOptions& options,
     res.PermitUncheckedError();
     wupt_db_->WPRecordTick(TXN_GET_TRY_AGAIN);
     return Status::TryAgain();
+  }
+}
+
+Status WriteUnpreparedTxn::GetEntityImpl(const ReadOptions& options,
+                                         ColumnFamilyHandle* column_family,
+                                         const Slice& key,
+                                         PinnableWideColumns* columns) {
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
+  const SnapshotBackup backed_by_snapshot =
+      wupt_db_->AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
+  WriteUnpreparedTxnReadCallback callback(wupt_db_, snap_seq, min_uncommitted,
+                                          unprep_seqs_, backed_by_snapshot);
+  Status res = write_batch_.GetEntityFromBatchAndDB(db_, options, column_family,
+                                                    key, columns, &callback);
+  if (LIKELY(callback.valid() &&
+             wupt_db_->ValidateSnapshot(snap_seq, backed_by_snapshot))) {
+    return res;
+  } else {
+    res.PermitUncheckedError();
+    wupt_db_->WPRecordTick(TXN_GET_TRY_AGAIN);
+    return Status::TryAgain();
+  }
+}
+
+void WriteUnpreparedTxn::MultiGetEntityImpl(const ReadOptions& options,
+                                            ColumnFamilyHandle* column_family,
+                                            size_t num_keys, const Slice* keys,
+                                            PinnableWideColumns* results,
+                                            Status* statuses,
+                                            bool sorted_input) {
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
+  const SnapshotBackup backed_by_snapshot =
+      wupt_db_->AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
+  WriteUnpreparedTxnReadCallback callback(wupt_db_, snap_seq, min_uncommitted,
+                                          unprep_seqs_, backed_by_snapshot);
+  write_batch_.MultiGetEntityFromBatchAndDB(db_, options, column_family,
+                                            num_keys, keys, results, statuses,
+                                            sorted_input, &callback);
+  if (UNLIKELY(!callback.valid() ||
+               !wupt_db_->ValidateSnapshot(snap_seq, backed_by_snapshot))) {
+    wupt_db_->WPRecordTick(TXN_GET_TRY_AGAIN);
+    for (size_t i = 0; i < num_keys; i++) {
+      statuses[i] = Status::TryAgain();
+    }
   }
 }
 

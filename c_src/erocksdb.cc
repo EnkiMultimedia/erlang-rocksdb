@@ -67,6 +67,8 @@ static ErlNifFunc nif_funcs[] =
         {"enable_manual_compaction", 1, erocksdb::EnableManualCompaction, ERL_NIF_REGULAR_BOUND},
         {"abort_all_compactions", 1, erocksdb::AbortAllCompactions, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"resume_all_compactions", 1, erocksdb::ResumeAllCompactions, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"abort_compactions", 2, erocksdb::AbortCompactions, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"resume_compactions", 2, erocksdb::ResumeCompactions, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"set_db_background_threads", 2, erocksdb::SetDBBackgroundThreads, ERL_NIF_REGULAR_BOUND},
 
         {"get_approximate_sizes", 3, erocksdb::GetApproximateSizes, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -256,6 +258,10 @@ static ErlNifFunc nif_funcs[] =
         // Ingest External File
         {"ingest_external_file", 3, erocksdb::IngestExternalFile, ERL_NIF_DIRTY_JOB_IO_BOUND},
         {"ingest_external_file", 4, erocksdb::IngestExternalFile, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"prepare_ingestion", 3, erocksdb::PrepareIngestion, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"prepare_ingestion", 4, erocksdb::PrepareIngestion, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"commit_ingestion", 2, erocksdb::CommitIngestion, ERL_NIF_DIRTY_JOB_IO_BOUND},
+        {"abort_ingestion", 1, erocksdb::AbortIngestion, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
         // SST File Reader
         {"sst_file_reader_open", 2, erocksdb::SstFileReaderOpen, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -794,6 +800,10 @@ ERL_NIF_TERM ATOM_BYTES_PER_WRITE;
 // Transaction Histogram
 ERL_NIF_TERM ATOM_NUM_OP_PER_TRANSACTION;
 
+// Ingestion Histograms (RocksDB 11.5)
+ERL_NIF_TERM ATOM_INGEST_EXTERNAL_FILE_PREPARE_MICROS;
+ERL_NIF_TERM ATOM_INGEST_EXTERNAL_FILE_RUN_MICROS;
+
 // Compaction Statistics Tickers
 ERL_NIF_TERM ATOM_COMPACT_READ_BYTES;
 ERL_NIF_TERM ATOM_COMPACT_WRITE_BYTES;
@@ -909,6 +919,19 @@ ERL_NIF_TERM ATOM_OPEN_FILES_ASYNC;
 ERL_NIF_TERM ATOM_ENFORCE_WRITE_BUFFER_MANAGER_DURING_RECOVERY;
 ERL_NIF_TERM ATOM_VERIFY_MANIFEST_CONTENT_ON_CLOSE;
 ERL_NIF_TERM ATOM_MEMTABLE_BATCH_LOOKUP_OPTIMIZATION;
+
+// Options added in RocksDB 11.2 - 11.13
+ERL_NIF_TERM ATOM_OPTIMIZE_KEY_COMMON_PREFIX;
+ERL_NIF_TERM ATOM_IF_FAST_SEEK;
+ERL_NIF_TERM ATOM_DISABLED;
+ERL_NIF_TERM ATOM_READ_TRIGGERED_COMPACTION_THRESHOLD;
+ERL_NIF_TERM ATOM_MAX_COMPACTION_TRIGGER_WAKEUP_SECONDS;
+ERL_NIF_TERM ATOM_MIN_TOMBSTONES_FOR_RANGE_CONVERSION;
+ERL_NIF_TERM ATOM_BLOB_FILE_WRITABLE_FILE_MAX_BUFFER_SIZE;
+ERL_NIF_TERM ATOM_PERIODIC_COMPACTION_SECONDS;
+ERL_NIF_TERM ATOM_USE_DIRECT_IO_FOR_COMPACTION_READS;
+ERL_NIF_TERM ATOM_OPTIMIZE_MANIFEST_FOR_RECOVERY;
+ERL_NIF_TERM ATOM_REUSE_MANIFEST_ON_OPEN;
 ERL_NIF_TERM ATOM_MAX_DATA_FILES_SIZE;
 ERL_NIF_TERM ATOM_USE_KV_RATIO_COMPACTION;
 ERL_NIF_TERM ATOM_INDEX_BLOCK_SEARCH_TYPE;
@@ -949,6 +972,7 @@ try
   erocksdb::CreateBatchType(env);
   erocksdb::TransactionObject::CreateTransactionObjectType(env);
   erocksdb::TLogItrObject::CreateTLogItrObjectType(env);
+  erocksdb::IngestionObject::CreateIngestionObjectType(env);
   erocksdb::BackupEngineObject::CreateBackupEngineObjectType(env);
   erocksdb::Cache::CreateCacheType(env);
   erocksdb::Statistics::CreateStatisticsType(env);
@@ -1442,6 +1466,10 @@ try
   // Transaction Histogram
   ATOM(erocksdb::ATOM_NUM_OP_PER_TRANSACTION, "num_op_per_transaction");
 
+  // Ingestion Histograms (RocksDB 11.5)
+  ATOM(erocksdb::ATOM_INGEST_EXTERNAL_FILE_PREPARE_MICROS, "ingest_external_file_prepare_micros");
+  ATOM(erocksdb::ATOM_INGEST_EXTERNAL_FILE_RUN_MICROS, "ingest_external_file_run_micros");
+
   // Compaction Statistics Tickers
   ATOM(erocksdb::ATOM_COMPACT_READ_BYTES, "compact_read_bytes");
   ATOM(erocksdb::ATOM_COMPACT_WRITE_BYTES, "compact_write_bytes");
@@ -1557,6 +1585,19 @@ try
   ATOM(erocksdb::ATOM_ENFORCE_WRITE_BUFFER_MANAGER_DURING_RECOVERY, "enforce_write_buffer_manager_during_recovery");
   ATOM(erocksdb::ATOM_VERIFY_MANIFEST_CONTENT_ON_CLOSE, "verify_manifest_content_on_close");
   ATOM(erocksdb::ATOM_MEMTABLE_BATCH_LOOKUP_OPTIMIZATION, "memtable_batch_lookup_optimization");
+
+  // Options added in RocksDB 11.2 - 11.13
+  ATOM(erocksdb::ATOM_OPTIMIZE_KEY_COMMON_PREFIX, "optimize_key_common_prefix");
+  ATOM(erocksdb::ATOM_IF_FAST_SEEK, "if_fast_seek");
+  ATOM(erocksdb::ATOM_DISABLED, "disabled");
+  ATOM(erocksdb::ATOM_READ_TRIGGERED_COMPACTION_THRESHOLD, "read_triggered_compaction_threshold");
+  ATOM(erocksdb::ATOM_MAX_COMPACTION_TRIGGER_WAKEUP_SECONDS, "max_compaction_trigger_wakeup_seconds");
+  ATOM(erocksdb::ATOM_MIN_TOMBSTONES_FOR_RANGE_CONVERSION, "min_tombstones_for_range_conversion");
+  ATOM(erocksdb::ATOM_BLOB_FILE_WRITABLE_FILE_MAX_BUFFER_SIZE, "blob_file_writable_file_max_buffer_size");
+  ATOM(erocksdb::ATOM_PERIODIC_COMPACTION_SECONDS, "periodic_compaction_seconds");
+  ATOM(erocksdb::ATOM_USE_DIRECT_IO_FOR_COMPACTION_READS, "use_direct_io_for_compaction_reads");
+  ATOM(erocksdb::ATOM_OPTIMIZE_MANIFEST_FOR_RECOVERY, "optimize_manifest_for_recovery");
+  ATOM(erocksdb::ATOM_REUSE_MANIFEST_ON_OPEN, "reuse_manifest_on_open");
   ATOM(erocksdb::ATOM_MAX_DATA_FILES_SIZE, "max_data_files_size");
   ATOM(erocksdb::ATOM_USE_KV_RATIO_COMPACTION, "use_kv_ratio_compaction");
   ATOM(erocksdb::ATOM_INDEX_BLOCK_SEARCH_TYPE, "index_block_search_type");

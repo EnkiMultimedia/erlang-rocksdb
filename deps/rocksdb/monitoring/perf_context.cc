@@ -5,6 +5,7 @@
 //
 
 #include <sstream>
+#include <utility>
 
 #include "monitoring/perf_context_imp.h"
 
@@ -78,6 +79,7 @@ struct PerfContextByLevelInt {
   defCmd(multiget_read_bytes)                      \
   defCmd(iter_read_bytes)                          \
   defCmd(blob_cache_hit_count)                     \
+  defCmd(blob_cache_read_byte)                     \
   defCmd(blob_read_count)                          \
   defCmd(blob_read_byte)                           \
   defCmd(blob_read_time)                           \
@@ -161,7 +163,13 @@ struct PerfContextByLevelInt {
   defCmd(index_block_read_byte)                    \
   defCmd(filter_block_read_byte)                   \
   defCmd(compression_dict_block_read_byte)         \
-  defCmd(metadata_block_read_byte)
+  defCmd(metadata_block_read_byte)                 \
+  defCmd(multiscan_prepare_count)                  \
+  defCmd(multiscan_blocks_prefetched)             \
+  defCmd(multiscan_blocks_from_cache)             \
+  defCmd(multiscan_prefetch_bytes)                \
+  defCmd(multiscan_io_requests)                   \
+  defCmd(multiscan_io_coalesced_nonadjacent)
 // clang-format on
 
 struct PerfContextInt {
@@ -176,6 +184,14 @@ struct PerfContextInt {
 PerfContext perf_context;
 #else
 thread_local PerfContext perf_context;
+#if !defined(OS_SOLARIS)
+thread_local constinit PerfContext* perf_context_fast_ptr = nullptr;
+
+PerfContext* InitPerfContextFastPtr() {
+  perf_context_fast_ptr = &perf_context;
+  return perf_context_fast_ptr;
+}
+#endif
 #endif
 
 PerfContext* get_perf_context() {
@@ -217,12 +233,8 @@ PerfContext::PerfContext(const PerfContext& other) {
 #endif
 }
 
-PerfContext::PerfContext(PerfContext&& other) noexcept {
-#ifdef NPERF_CONTEXT
-  (void)other;
-#else
-  copyMetrics(&other);
-#endif
+PerfContext::PerfContext(PerfContext&& other) noexcept : PerfContext() {
+  *this = std::move(other);
 }
 
 PerfContext& PerfContext::operator=(const PerfContext& other) {
@@ -230,6 +242,24 @@ PerfContext& PerfContext::operator=(const PerfContext& other) {
   (void)other;
 #else
   copyMetrics(&other);
+#endif
+  return *this;
+}
+
+PerfContext& PerfContext::operator=(PerfContext&& other) noexcept {
+#ifdef NPERF_CONTEXT
+  (void)other;
+#else
+  if (this != &other) {
+    ClearPerLevelPerfContext();
+#define EMIT_MOVE_FIELDS(x) x = other.x;
+    DEF_PERF_CONTEXT_METRICS(EMIT_MOVE_FIELDS)
+#undef EMIT_MOVE_FIELDS
+    level_to_perf_context = other.level_to_perf_context;
+    per_level_perf_context_enabled = other.per_level_perf_context_enabled;
+    other.level_to_perf_context = nullptr;
+    other.per_level_perf_context_enabled = false;
+  }
 #endif
   return *this;
 }
@@ -265,11 +295,41 @@ void PerfContext::Reset() {
 #endif
 }
 
+void PerfContext::Merge(const PerfContext& other) {
+#ifndef NPERF_CONTEXT
+#define EMIT_FIELDS(x) x += other.x;
+  DEF_PERF_CONTEXT_METRICS(EMIT_FIELDS)
+#undef EMIT_FIELDS
+  if (other.level_to_perf_context != nullptr) {
+    if (level_to_perf_context == nullptr) {
+      level_to_perf_context = new std::map<uint32_t, PerfContextByLevel>();
+    }
+    for (const auto& kv : *other.level_to_perf_context) {
+      (*level_to_perf_context)[kv.first].Merge(kv.second);
+    }
+  }
+  per_level_perf_context_enabled =
+      per_level_perf_context_enabled || other.per_level_perf_context_enabled;
+#else
+  (void)other;
+#endif
+}
+
 void PerfContextByLevel::Reset() {
 #ifndef NPERF_CONTEXT
 #define EMIT_FIELDS(x) x = 0;
   DEF_PERF_CONTEXT_LEVEL_METRICS(EMIT_FIELDS)
 #undef EMIT_FIELDS
+#endif
+}
+
+void PerfContextByLevel::Merge(const PerfContextByLevel& other) {
+#ifndef NPERF_CONTEXT
+#define EMIT_FIELDS(x) x += other.x;
+  DEF_PERF_CONTEXT_LEVEL_METRICS(EMIT_FIELDS)
+#undef EMIT_FIELDS
+#else
+  (void)other;
 #endif
 }
 

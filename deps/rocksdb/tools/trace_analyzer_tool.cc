@@ -208,8 +208,6 @@ uint64_t MultiplyCheckOverflow(uint64_t op1, uint64_t op2) {
 AnalyzerOptions::AnalyzerOptions()
     : correlation_map(kTaTypeNum, std::vector<int>(kTaTypeNum, -1)) {}
 
-AnalyzerOptions::~AnalyzerOptions() = default;
-
 void AnalyzerOptions::SparseCorrelationInput(const std::string& in_str) {
   std::string cur = in_str;
   if (cur.size() == 0) {
@@ -220,7 +218,8 @@ void AnalyzerOptions::SparseCorrelationInput(const std::string& in_str) {
       fprintf(stderr, "Invalid correlation input: %s\n", in_str.c_str());
       exit(1);
     }
-    std::string opt1, opt2;
+    std::string opt1;
+    std::string opt2;
     std::size_t split = cur.find_first_of(',');
     if (split != std::string::npos) {
       opt1 = cur.substr(1, split - 1);
@@ -608,7 +607,9 @@ Status TraceAnalyzer::MakeStatistics() {
       }
 
       // output the value size distribution
-      uint64_t v_begin = 0, v_end = 0, v_count = 0;
+      uint64_t v_begin = 0;
+      uint64_t v_end = 0;
+      uint64_t v_count = 0;
       get_mid = false;
       for (auto& record : stat.second.a_value_size_stats) {
         v_begin = v_end;
@@ -1041,7 +1042,8 @@ Status TraceAnalyzer::ReProcessing() {
     if (!FLAGS_key_space_dir.empty()) {
       std::string whole_key_path =
           FLAGS_key_space_dir + "/" + std::to_string(cf_id) + ".txt";
-      std::string input_key, get_key;
+      std::string input_key;
+      std::string get_key;
       std::vector<std::string> prefix(kTaTypeNum);
       std::unique_ptr<FSSequentialFile> file;
 
@@ -1586,6 +1588,13 @@ Status TraceAnalyzer::PutCF(uint32_t column_family_id, const Slice& key,
                               column_family_id, key, value.size());
 }
 
+Status TraceAnalyzer::TimedPutCF(uint32_t column_family_id, const Slice& key,
+                                 const Slice& value,
+                                 uint64_t /*write_unix_time*/) {
+  return OutputAnalysisResult(TraceOperationType::kPut, write_batch_ts_,
+                              column_family_id, key, value.size());
+}
+
 Status TraceAnalyzer::PutEntityCF(uint32_t column_family_id, const Slice& key,
                                   const Slice& value) {
   return OutputAnalysisResult(TraceOperationType::kPutEntity, write_batch_ts_,
@@ -1633,14 +1642,21 @@ Status TraceAnalyzer::OutputAnalysisResult(TraceOperationType op_type,
   Status s;
 
   if (FLAGS_convert_to_human_readable_trace && trace_sequence_f_) {
-    // DeleteRane only writes the begin_key.
-    size_t cnt =
-        op_type == TraceOperationType::kRangeDelete ? 1 : cf_ids.size();
-    for (size_t i = 0; i < cnt; i++) {
-      s = WriteTraceSequence(op_type, cf_ids[i], keys[i], value_sizes[i],
-                             timestamp);
+    if (op_type == TraceOperationType::kRangeDelete) {
+      assert(cf_ids.size() == 2);
+      assert(keys.size() == 2);
+      s = WriteRangeDeleteTraceSequence(cf_ids[0], keys[0], keys[1], timestamp);
       if (!s.ok()) {
         return Status::Corruption("Failed to write the trace sequence to file");
+      }
+    } else {
+      for (size_t i = 0; i < cf_ids.size(); i++) {
+        s = WriteTraceSequence(op_type, cf_ids[i], keys[i], value_sizes[i],
+                               timestamp);
+        if (!s.ok()) {
+          return Status::Corruption(
+              "Failed to write the trace sequence to file");
+        }
       }
     }
   }
@@ -1864,6 +1880,28 @@ Status TraceAnalyzer::WriteTraceSequence(const uint32_t& type,
   std::string printout(buffer_);
   if (!FLAGS_no_key) {
     printout = hex_key + " " + printout;
+  }
+  return trace_sequence_f_->Append(printout);
+}
+
+Status TraceAnalyzer::WriteRangeDeleteTraceSequence(const uint32_t& cf_id,
+                                                    const Slice& begin_key,
+                                                    const Slice& end_key,
+                                                    const uint64_t ts) {
+  int ret;
+  ret = snprintf(buffer_, sizeof(buffer_), "%u %u %zu %" PRIu64 "\n",
+                 TraceOperationType::kRangeDelete, cf_id,
+                 static_cast<size_t>(0), ts);
+  if (ret < 0) {
+    return Status::IOError("failed to format the output");
+  }
+  std::string printout(buffer_);
+  if (!FLAGS_no_key) {
+    const std::string begin_hex =
+        ROCKSDB_NAMESPACE::LDBCommand::StringToHex(begin_key.ToString());
+    const std::string end_hex =
+        ROCKSDB_NAMESPACE::LDBCommand::StringToHex(end_key.ToString());
+    printout = begin_hex + " " + end_hex + " " + printout;
   }
   return trace_sequence_f_->Append(printout);
 }

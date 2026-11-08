@@ -292,6 +292,39 @@ Options = [
 ok = rocksdb:ingest_external_file(Db, Files, Options).
 ```
 
+### Two-Phase Ingestion
+
+`ingest_external_file/3` does all its work in one call, and part of that work blocks writes. Two-phase ingestion splits it: `prepare_ingestion` does the slow part (checking the files, copying or linking them into the database) without blocking writes, and `commit_ingestion` makes them visible in a short step. Use it when you want to stage a load ahead of time, or to make several loads visible at once.
+
+```erlang
+%% Stage the files; nothing is visible yet
+{ok, Ingestion} = rocksdb:prepare_ingestion(Db, ["/tmp/data.sst"], []),
+
+%% Make them visible
+ok = rocksdb:commit_ingestion(Db, Ingestion).
+```
+
+To publish several loads together, pass a list. All files become visible in one atomic step, or none do. The list can mix column families:
+
+```erlang
+{ok, Users} = rocksdb:prepare_ingestion(Db, UsersCf, ["/tmp/users.sst"], []),
+{ok, Index} = rocksdb:prepare_ingestion(Db, IndexCf, ["/tmp/index.sst"], []),
+ok = rocksdb:commit_ingestion(Db, [Users, Index]).
+```
+
+To cancel, abort the handle. The staged copies are removed and your files are left as they were:
+
+```erlang
+ok = rocksdb:abort_ingestion(Ingestion).
+```
+
+Notes:
+
+- A handle can be committed or aborted once. Using it again raises `badarg`.
+- A handle you drop without committing is rolled back when it is garbage collected, and when the database is closed.
+- When handles in one commit overlap on the same column family, the later one in the list wins. They must use the same options.
+- `prepare_ingestion` takes the same options as `ingest_external_file`.
+
 ## Reading SST Files
 
 The SstFileReader allows you to inspect SST files without loading them into a database. This is useful for:
@@ -667,6 +700,10 @@ verify_sst_file(Path) ->
 |----------|-------------|
 | `ingest_external_file(Db, Files, Options)` | Ingest files into default CF |
 | `ingest_external_file(Db, Cf, Files, Options)` | Ingest files into specific CF |
+| `prepare_ingestion(Db, Files, Options)` | Stage files for ingestion into default CF |
+| `prepare_ingestion(Db, Cf, Files, Options)` | Stage files for ingestion into specific CF |
+| `commit_ingestion(Db, Ingestion \| [Ingestion])` | Make staged files visible, atomically |
+| `abort_ingestion(Ingestion)` | Cancel a staged ingestion |
 
 ### SstFileReader Functions
 
