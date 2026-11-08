@@ -38,6 +38,20 @@
 
 
 
+// One call on an iterator holds its transaction's lock first (an iterator over
+// a transaction reads the transaction's writes), then the iterator's lock.
+// Transaction calls only take the transaction lock, so the order is the same
+// everywhere.
+struct ItrCallLock {
+    std::unique_lock<std::mutex> tx;
+    std::unique_lock<std::mutex> itr;
+    explicit ItrCallLock(erocksdb::ItrObject* itr_ptr) {
+        if (itr_ptr->m_TxPtr.get() != nullptr)
+            tx = std::unique_lock<std::mutex>(itr_ptr->m_TxPtr->m_Mutex);
+        itr = std::unique_lock<std::mutex>(itr_ptr->m_Mutex);
+    }
+};
+
 ItrBounds::ItrBounds()
     : upper_bound_slice(nullptr),
       lower_bound_slice(nullptr) {}
@@ -191,7 +205,7 @@ Iterator(
     // pin the column family so GC of its handle cannot free it while this
     // iterator is still using it
     if(cf_ptr.get() != nullptr)
-        itr_ptr->KeepResource(cf_ptr.get());
+        itr_ptr->KeepColumnFamily(cf_ptr.get());
 
     if(bounds.upper_bound_slice != nullptr)
     {
@@ -201,6 +215,12 @@ Iterator(
     if(bounds.lower_bound_slice != nullptr)
     {
         itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
+    }
+
+    if (RefuseClosingChild(itr_ptr))   // the database is closing
+    {
+        delete opts;
+        return enif_make_badarg(env);
     }
 
     ERL_NIF_TERM result = enif_make_resource(env, itr_ptr);
@@ -234,20 +254,20 @@ Iterators(
         return enif_make_badarg(env);
     }
 
+    // the references keep each column family alive until its iterator pins it
     std::vector<rocksdb::ColumnFamilyHandle*> column_families;
+    std::vector<ReferencePtr<ColumnFamilyObject>> cf_refs;
     ERL_NIF_TERM head, tail = argv[1];
     while(enif_get_list_cell(env, tail, &head, &tail))
     {
-        ReferencePtr<ColumnFamilyObject> cf_ptr;
-        cf_ptr.try_assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
-        ColumnFamilyObject* cf = cf_ptr.get();
-        if(NULL == cf)
+        cf_refs.emplace_back();
+        if(!cf_refs.back().try_assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head)))
         {
             delete bounds.upper_bound_slice;
             delete bounds.lower_bound_slice;
             return enif_make_badarg(env);
         }
-        column_families.push_back(cf->m_ColumnFamily);
+        column_families.push_back(cf_refs.back()->m_ColumnFamily);
     }
 
     std::vector<rocksdb::Iterator*> iterators;
@@ -257,10 +277,12 @@ Iterators(
     ERL_NIF_TERM result = enif_make_list(env, 0);
     ItrObject * itr_ptr;
     bool exception_occurred = false;
+    bool closing = false;
     try {
         for (size_t i = 0; i < iterators.size(); i++) {
             itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterators[i]);
             itr_ptr->KeepSnapshot(bounds.snapshot.get());
+            itr_ptr->KeepColumnFamily(cf_refs[i].get());
 
             // Clone slices for each iterator so each has independent ownership
             if(bounds.upper_bound_slice != nullptr)
@@ -275,6 +297,15 @@ Iterators(
                 rocksdb::Slice* lower_clone = new rocksdb::Slice(
                     bounds.lower_bound_slice->data(), bounds.lower_bound_slice->size());
                 itr_ptr->SetLowerBoundSlice(lower_clone);
+            }
+            if (RefuseClosingChild(itr_ptr))
+            {
+                // the database is closing: free the iterators not wrapped yet,
+                // the ones already wrapped are collected with their terms
+                for (size_t j = i + 1; j < iterators.size(); j++)
+                    delete iterators[j];
+                closing = true;
+                break;
             }
             ERL_NIF_TERM itr_res = enif_make_resource(env, itr_ptr);
             result = enif_make_list_cell(env, itr_res, result);
@@ -292,6 +323,9 @@ Iterators(
     {
         return error_tuple(env, ATOM_ERROR, "iterator creation failed");
     }
+
+    if (closing)
+        return enif_make_badarg(env);
 
     ERL_NIF_TERM result_out;
     enif_make_reverse_list(env, result, &result_out);
@@ -322,19 +356,20 @@ CoalescingIterator(
         return enif_make_badarg(env);
     }
 
+    // the coalescing iterator keeps the handles: the iterator pins them all
     std::vector<rocksdb::ColumnFamilyHandle*> column_families;
+    std::vector<ReferencePtr<ColumnFamilyObject>> cf_refs;
     ERL_NIF_TERM head, tail = argv[1];
     while(enif_get_list_cell(env, tail, &head, &tail))
     {
-        ReferencePtr<ColumnFamilyObject> cf_ptr;
-        cf_ptr.try_assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
-        if(NULL == cf_ptr.get())
+        cf_refs.emplace_back();
+        if(!cf_refs.back().try_assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head)))
         {
             delete bounds.upper_bound_slice;
             delete bounds.lower_bound_slice;
             return enif_make_badarg(env);
         }
-        column_families.push_back(cf_ptr->m_ColumnFamily);
+        column_families.push_back(cf_refs.back()->m_ColumnFamily);
     }
 
     std::unique_ptr<rocksdb::Iterator> iterator =
@@ -350,6 +385,8 @@ CoalescingIterator(
     ItrObject* itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterator.release());
 
     itr_ptr->KeepSnapshot(bounds.snapshot.get());
+    for (auto& cf_ref : cf_refs)
+        itr_ptr->KeepColumnFamily(cf_ref.get());
 
     if(bounds.upper_bound_slice != nullptr)
     {
@@ -360,6 +397,9 @@ CoalescingIterator(
     {
         itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
     }
+
+    if (RefuseClosingChild(itr_ptr))   // the database is closing
+        return enif_make_badarg(env);
 
     ERL_NIF_TERM result = enif_make_resource(env, itr_ptr);
     enif_release_resource(itr_ptr);
@@ -383,6 +423,7 @@ IteratorMove(
     {
         return enif_make_badarg(env);
     }
+    ItrCallLock itr_lock(itr_ptr.get());
 
     rocksdb::Iterator* itr = itr_ptr->m_Iterator;
     rocksdb::Slice key;
@@ -467,6 +508,7 @@ IteratorRefresh(
     {
         return enif_make_badarg(env);
     }
+    ItrCallLock itr_lock(itr_ptr.get());
 
     rocksdb::Iterator* itr = itr_ptr->m_Iterator;
     rocksdb::Status status = itr->Refresh();
@@ -494,6 +536,7 @@ IteratorPrepareValue(
     {
         return enif_make_badarg(env);
     }
+    ItrCallLock itr_lock(itr_ptr.get());
 
     rocksdb::Iterator* itr = itr_ptr->m_Iterator;
 
@@ -551,6 +594,7 @@ IteratorColumns(
     {
         return enif_make_badarg(env);
     }
+    ItrCallLock itr_lock(itr_ptr.get());
 
     rocksdb::Iterator* itr = itr_ptr->m_Iterator;
 

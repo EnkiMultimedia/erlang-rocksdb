@@ -3204,6 +3204,10 @@ PrepareIngestion(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     IngestionObject* ingestion_ptr =
         IngestionObject::CreateIngestionObject(db_ptr.get(), std::move(handle));
+
+    if (RefuseClosingChild(ingestion_ptr))   // the database is closing
+
+        return enif_make_badarg(env);
     ERL_NIF_TERM result = enif_make_resource(env, ingestion_ptr);
     enif_release_resource(ingestion_ptr);
 
@@ -3488,6 +3492,10 @@ CreateColumnFamilyWithTtl(
         return error_tuple(env, ATOM_ERROR, status);
 
     ColumnFamilyObject* cf_ptr = ColumnFamilyObject::CreateColumnFamilyObject(db_ptr.get(), handle);
+
+    if (RefuseClosingChild(cf_ptr))   // the database is closing
+
+        return enif_make_badarg(env);
     ERL_NIF_TERM cf_term = enif_make_resource(env, cf_ptr);
     enif_release_resource(cf_ptr);
 

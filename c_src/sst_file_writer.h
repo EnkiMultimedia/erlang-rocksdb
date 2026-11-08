@@ -18,6 +18,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 
 #include "erl_nif.h"
 #include "env.h"
@@ -35,6 +36,9 @@ namespace erocksdb {
     public:
       // Declared before writer_ so the env outlives the writer.
       EnvRef m_Env;
+
+      // SstFileWriter is not thread-safe: every NIF using it holds this.
+      std::mutex m_Mutex;
 
       explicit SstFileWriterObject(std::unique_ptr<rocksdb::SstFileWriter> writer);
 

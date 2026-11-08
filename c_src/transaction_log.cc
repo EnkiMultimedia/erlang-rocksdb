@@ -64,6 +64,8 @@ TransactionLogIterator(
 
     TLogItrObject * tlog_ptr;
     tlog_ptr = TLogItrObject::CreateTLogItrObject(db_ptr.get(), itr_ptr);
+    if (RefuseClosingChild(tlog_ptr))   // the database is closing
+        return enif_make_badarg(env);
     ERL_NIF_TERM result = enif_make_resource(env, tlog_ptr);
     enif_release_resource(tlog_ptr);
     iter = NULL;
@@ -102,6 +104,7 @@ TransactionLogNextUpdate(
     {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> itr_lock(itr_ptr->m_Mutex);
 
     rocksdb::WalIterator* itr = itr_ptr->m_Iter;
 
@@ -148,6 +151,7 @@ TransactionLogNextBinaryUpdate(
     {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> itr_lock(itr_ptr->m_Mutex);
 
     rocksdb::WalIterator* itr = itr_ptr->m_Iter;
 
