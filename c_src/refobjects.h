@@ -138,6 +138,11 @@ public:
     // From the Erlang resource destructor only: wait for ReleaseNative to
     // finish, then run the C++ destructor. Erlang frees the memory after.
     static void AwaitCloseAndDestructor(ErlRefObject * Object);
+
+    // Wait until ReleaseNative has finished, without destroying anything.
+    // The caller must keep the object alive (hold its Erlang term) and must
+    // not hold a reference itself, or the release could never happen.
+    void AwaitRelease();
 };  // class RefObject
 
 /**

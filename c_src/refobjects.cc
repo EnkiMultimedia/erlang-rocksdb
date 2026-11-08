@@ -141,6 +141,15 @@ ErlRefObject::AwaitCloseAndDestructor(
 }   // ErlRefObject::AwaitCloseAndDestructor
 
 
+void
+ErlRefObject::AwaitRelease()
+{
+    std::unique_lock<std::mutex> lk(m_CloseMutex);
+    while (3!=m_CloseRequested)
+        m_CloseCond.wait(lk);
+}   // ErlRefObject::AwaitRelease
+
+
 uint32_t
 ErlRefObject::RefDec()
 {

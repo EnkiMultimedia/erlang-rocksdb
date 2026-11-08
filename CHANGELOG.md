@@ -35,6 +35,7 @@
 
 ### Changes
 
+- `close/1` now returns once the database is really closed and its files are released, so the same path can be opened again right away. Before, a call still running in another process, or the cleanup of a handle, could keep RocksDB open a moment after `close/1` returned, and reopening failed on the lock file. As a consequence `close/1` now waits for calls still running on the database, such as a long `compact_range/4`.
 - the bundled zstd is now really used to build RocksDB: before, RocksDB looked for zstd on its own and could compile against the system headers while the NIF linked the bundled library. A clean parallel build could also fail when RocksDB started before the bundled zstd was ready (#21)
 - new build option `WITH_STATIC_ZSTD` links a static system zstd into the NIF, so it has no `libzstd` runtime dependency. Off by default, the system archive must be built with `-fPIC` (#21)
 - posting list functions run on a dirty scheduler when the posting list is large (over 64 KB, or over 4096 keys for a parsed one), so they no longer hold a normal scheduler for milliseconds. Small lists still run inline.

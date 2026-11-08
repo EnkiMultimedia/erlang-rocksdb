@@ -962,7 +962,13 @@ set_ttl(_DBHandle, _CFHandle, _TTL) ->
 create_column_family_with_ttl(_DBHandle, _Name, _CFOpts, _TTL) ->
   ?nif_stub.
 
-%% @doc Close RocksDB
+%% @doc Close RocksDB.
+%%
+%% Returns once the database is closed and its files are released, so the
+%% same path can be opened again right away. Calls still running on the
+%% database, or on its iterators and other handles, finish first: a long call
+%% such as `compact_range/4' delays the return. Handles of the database are
+%% closed with it.
 -spec close(DBHandle) -> Res when
   DBHandle :: db_handle(),
   Res :: ok | {error, any()}.
