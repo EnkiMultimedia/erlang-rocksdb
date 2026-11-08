@@ -12,9 +12,11 @@
 #include <cinttypes>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 #include "block_fetcher.h"
 #include "file/random_access_file_reader.h"
+#include "file/read_write_util.h"
 #include "memory/memory_allocator_impl.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics_impl.h"
@@ -26,6 +28,7 @@
 #include "table/block_based/block.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/persistent_cache_helper.h"
+#include "test_util/sync_point.h"
 #include "unique_id_impl.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
@@ -38,7 +41,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-const char* kHostnameForDbHostId = "__hostname__";
+const char* const kHostnameForDbHostId = "__hostname__";
 
 bool ShouldReportDetailedTime(Env* env, Statistics* stats) {
   return env != nullptr && stats != nullptr &&
@@ -98,13 +101,35 @@ std::string BlockHandle::ToString(bool hex) const {
 const BlockHandle BlockHandle::kNullBlockHandle(0, 0);
 
 void IndexValue::EncodeTo(std::string* dst, bool have_first_key,
-                          const BlockHandle* previous_handle) const {
+                          const BlockHandle* previous_handle,
+                          bool use_value_delta_escape) const {
   if (previous_handle) {
     // WART: this is specific to Block-based table
-    assert(handle.offset() == previous_handle->offset() +
-                                  previous_handle->size() +
-                                  BlockBasedTable::kBlockTrailerSize);
-    PutVarsignedint64(dst, handle.size() - previous_handle->size());
+    const uint64_t contiguous_offset = previous_handle->offset() +
+                                       previous_handle->size() +
+                                       BlockBasedTable::kBlockTrailerSize;
+    if (use_value_delta_escape) {
+      // format_version >= 8: reserve varint 0 as an escape so a non-contiguous
+      // handle can still be a (key-delta-encoded) non-restart entry. Genuine
+      // size deltas are remapped to zigzag(delta)+1 (always >= 1) to keep 0
+      // free.
+      if (handle.offset() == contiguous_offset) {
+        int64_t size_delta = static_cast<int64_t>(handle.size()) -
+                             static_cast<int64_t>(previous_handle->size());
+        // +1 could only overflow for |size_delta| ~ 2^63, which is impossible
+        // for block-size deltas (block size is 32-bit).
+        assert(i64ToZigzag(size_delta) != ~uint64_t{0});
+        PutVarint64(dst, i64ToZigzag(size_delta) + 1);
+      } else {
+        // Escape: a full BlockHandle (offset + size) follows.
+        TEST_SYNC_POINT("IndexValue::EncodeTo:ValueDeltaEscape");
+        PutVarint64(dst, 0);
+        handle.EncodeTo(dst);
+      }
+    } else {
+      assert(handle.offset() == contiguous_offset);
+      PutVarsignedint64(dst, handle.size() - previous_handle->size());
+    }
   } else {
     handle.EncodeTo(dst);
   }
@@ -116,16 +141,36 @@ void IndexValue::EncodeTo(std::string* dst, bool have_first_key,
 }
 
 Status IndexValue::DecodeFrom(Slice* input, bool have_first_key,
-                              const BlockHandle* previous_handle) {
+                              const BlockHandle* previous_handle,
+                              bool use_value_delta_escape) {
   if (previous_handle) {
-    int64_t delta;
-    if (!GetVarsignedint64(input, &delta)) {
-      return Status::Corruption("bad delta-encoded index value");
-    }
     // WART: this is specific to Block-based table
-    handle = BlockHandle(previous_handle->offset() + previous_handle->size() +
-                             BlockBasedTable::kBlockTrailerSize,
-                         previous_handle->size() + delta);
+    const uint64_t contiguous_offset = previous_handle->offset() +
+                                       previous_handle->size() +
+                                       BlockBasedTable::kBlockTrailerSize;
+    if (use_value_delta_escape) {
+      uint64_t u;
+      if (!GetVarint64(input, &u)) {
+        return Status::Corruption("bad delta-encoded index value");
+      }
+      if (u == 0) {
+        // Escape: a full BlockHandle (offset + size) follows.
+        Status s = handle.DecodeFrom(input);
+        if (!s.ok()) {
+          return s;
+        }
+      } else {
+        int64_t delta = zigzagToI64(u - 1);
+        handle =
+            BlockHandle(contiguous_offset, previous_handle->size() + delta);
+      }
+    } else {
+      int64_t delta;
+      if (!GetVarsignedint64(input, &delta)) {
+        return Status::Corruption("bad delta-encoded index value");
+      }
+      handle = BlockHandle(contiguous_offset, previous_handle->size() + delta);
+    }
   } else {
     Status s = handle.DecodeFrom(input);
     if (!s.ok()) {
@@ -206,8 +251,12 @@ inline uint8_t BlockTrailerSizeForMagicNumber(uint64_t magic_number) {
 //        - Checksum of above checksum type of whole footer, with this field
 //          set to all zeros.
 //      base_context_checksum (uint32LE, 4 bytes)
-//      metaindex block size (uint32LE, 4 bytes)
-//        - Assumed to be immediately before footer, < 4GB
+//      metaindex block size (& offset from footer) (uint32LE, 4 bytes)
+//        -> format_version < 8
+//           - Assumed to be immediately before footer, < 4GB
+//        -> format_version >= 8
+//           - Top 16 bits are number of bytes gap between start of footer and
+//             end of metaindex block (space for future file checksum data)
 //      <zero padding> (24 bytes, reserved for future use)
 //        - Brings part2 size also to 40 bytes
 //        - Checked that last eight bytes == 0, so reserved for a future
@@ -287,16 +336,37 @@ Status FooterBuilder::Build(uint64_t magic_number, uint32_t format_version,
     // Save base context checksum
     EncodeFixed32(cur, base_context_checksum);
     cur += 4;
-    // Compute and save metaindex size
-    uint32_t metaindex_size = static_cast<uint32_t>(metaindex_handle.size());
-    if (metaindex_size != metaindex_handle.size()) {
-      return Status::NotSupported("Metaindex block size > 4GB");
+    // Compute and save the metaindex block size, and (format_version >= 8) the
+    // gap between the end of the metaindex block and the start of the footer.
+    const uint64_t metaindex_block_end =
+        metaindex_handle.offset() + metaindex_handle.size() +
+        BlockTrailerSizeForMagicNumber(magic_number);
+    if (FormatVersionUsesMetaindexGap(format_version)) {
+      // Low 16 bits: metaindex block size. High 16 bits: gap in bytes.
+      if (metaindex_handle.size() > 0xFFFF) {
+        return Status::NotSupported(
+            "Metaindex block size > 64KB with format_version >= 8");
+      }
+      uint32_t metaindex_size = static_cast<uint32_t>(metaindex_handle.size());
+      uint64_t gap = 0;
+      if (metaindex_size != 0) {
+        assert(metaindex_block_end <= footer_offset);
+        gap = footer_offset - metaindex_block_end;
+      }
+      if (gap > 0xFFFF) {
+        return Status::NotSupported(
+            "Gap between metaindex block and footer > 64KB");
+      }
+      EncodeFixed32(cur, (static_cast<uint32_t>(gap) << 16) | metaindex_size);
+    } else {
+      uint32_t metaindex_size = static_cast<uint32_t>(metaindex_handle.size());
+      if (metaindex_size != metaindex_handle.size()) {
+        return Status::NotSupported("Metaindex block size > 4GB");
+      }
+      // Metaindex must be adjacent to footer
+      assert(metaindex_size == 0 || metaindex_block_end == footer_offset);
+      EncodeFixed32(cur, metaindex_size);
     }
-    // Metaindex must be adjacent to footer
-    assert(metaindex_size == 0 ||
-           metaindex_handle.offset() + metaindex_handle.size() ==
-               footer_offset - BlockTrailerSizeForMagicNumber(magic_number));
-    EncodeFixed32(cur, metaindex_size);
     cur += 4;
 
     // Zero pad remainder (for future use)
@@ -417,7 +487,8 @@ Status Footer::DecodeFrom(Slice input, uint64_t input_offset,
                                 ext_magic.ToString(/*hex*/ true));
     }
     input.remove_prefix(4);
-    uint32_t stored_checksum = 0, metaindex_size = 0;
+    uint32_t stored_checksum = 0;
+    uint32_t metaindex_size = 0;
     bool success;
     success = GetFixed32(&input, &stored_checksum);
     assert(success);
@@ -435,7 +506,18 @@ Status Footer::DecodeFrom(Slice input, uint64_t input_offset,
     success = GetFixed32(&input, &metaindex_size);
     assert(success);
     (void)success;
-    uint64_t metaindex_end = footer_offset - GetBlockTrailerSize();
+    // For format_version >= 8, the high 16 bits are the gap (in bytes) between
+    // the end of the metaindex block and the start of the footer (reserved for
+    // future file checksum data), and the low 16 bits are the metaindex block
+    // size. For older versions the whole field is the metaindex block size and
+    // the metaindex is adjacent to the footer.
+    uint64_t metaindex_gap = 0;
+    if (FormatVersionUsesMetaindexGap(format_version_)) {
+      metaindex_gap = metaindex_size >> 16;
+      metaindex_size &= 0xFFFF;
+    }
+    uint64_t metaindex_end =
+        footer_offset - GetBlockTrailerSize() - metaindex_gap;
     metaindex_handle_ =
         BlockHandle(metaindex_end - metaindex_size, metaindex_size);
 
@@ -498,16 +580,11 @@ static Status ReadFooterFromFileInternal(
     FilePrefetchBuffer* prefetch_buffer, uint64_t expected_file_size,
     Footer* footer, uint64_t enforce_table_magic_number) {
   uint64_t file_size_from_file_system = 0;
-  Status s;
-  // Prefer the more efficient FSRandomAccessFile::GetFileSize when available
-  s = file->file()->GetFileSize(&file_size_from_file_system);
+  Status s = GetFileSizeFromOpenFileOrPath(file->file(), &fs, file->file_name(),
+                                           &file_size_from_file_system, nullptr,
+                                           FileSizeFallback::kAnyOpenFileError);
   if (!s.ok()) {
-    // Fall back on FileSystem::GetFileSize on failure
-    s = fs.GetFileSize(file->file_name(), IOOptions(),
-                       &file_size_from_file_system, nullptr);
-    if (!s.ok()) {
-      return s;
-    }
+    return s;
   }
 
   if (expected_file_size != file_size_from_file_system) {
@@ -529,7 +606,7 @@ static Status ReadFooterFromFileInternal(
   }
 
   std::array<char, Footer::kMaxEncodedLength + 1> footer_buf;
-  AlignedBuf internal_buf;
+  AlignedBuffer direct_io_buffer;
   Slice footer_input;
   uint64_t read_offset = (expected_file_size > Footer::kMaxEncodedLength)
                              ? expected_file_size - Footer::kMaxEncodedLength
@@ -544,16 +621,22 @@ static Status ReadFooterFromFileInternal(
       !prefetch_buffer->TryReadFromCache(opts, file, read_offset,
                                          Footer::kMaxEncodedLength,
                                          &footer_input, nullptr)) {
+    FSReadRequest read_req;
+    read_req.offset = read_offset;
+    read_req.len = Footer::kMaxEncodedLength;
     if (file->use_direct_io()) {
-      s = file->Read(opts, read_offset, Footer::kMaxEncodedLength,
-                     &footer_input, nullptr, &internal_buf);
+      read_req.scratch = nullptr;
+      AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
+      file->Read(opts, &read_req, &direct_io_context);
     } else {
-      s = file->Read(opts, read_offset, Footer::kMaxEncodedLength,
-                     &footer_input, footer_buf.data(), nullptr);
+      read_req.scratch = footer_buf.data();
+      file->Read(opts, &read_req);
     }
+    s = std::move(read_req.status);
     if (!s.ok()) {
       return s;
     }
+    footer_input = read_req.result;
   }
 
   TEST_SYNC_POINT_CALLBACK("ReadFooterFromFileInternal:0", &footer_input);
@@ -683,10 +766,11 @@ uint32_t ComputeBuiltinChecksumWithLastByte(ChecksumType type, const char* data,
   }
 }
 
-Status DecompressBlockData(Decompressor::Args& args, Decompressor& decompressor,
-                           BlockContents* out_contents,
-                           const ImmutableOptions& ioptions,
-                           MemoryAllocator* allocator) {
+Status DecompressBlockData(
+    Decompressor::Args& args, Decompressor& decompressor,
+    BlockContents* out_contents, const ImmutableOptions& ioptions,
+    MemoryAllocator* allocator,
+    ReadScopedBlockBufferProviderRef block_buffer_provider) {
   assert(args.compression_type != kNoCompression && "Invalid compression type");
 
   StopWatchNano timer(ioptions.clock,
@@ -696,13 +780,35 @@ Status DecompressBlockData(Decompressor::Args& args, Decompressor& decompressor,
   if (UNLIKELY(!s.ok())) {
     return s;
   }
-  CacheAllocationPtr ubuf = AllocateBlock(args.uncompressed_size, allocator);
-  s = decompressor.DecompressBlock(args, ubuf.get());
-  if (UNLIKELY(!s.ok())) {
-    return s;
-  }
+  if (block_buffer_provider.has_value()) {
+    // Compressed provider path: allocate the final uncompressed block backing
+    // from the provider, then decompress directly into it.
+    ReadScopedBlockBufferProvider::Lease read_scoped_lease;
+    s = AllocateReadScopedBlockBuffer(block_buffer_provider->get(),
+                                      args.uncompressed_size, 1,
+                                      &read_scoped_lease);
+    if (UNLIKELY(!s.ok())) {
+      return s;
+    }
 
-  *out_contents = BlockContents(std::move(ubuf), args.uncompressed_size);
+    s = decompressor.DecompressBlock(args, read_scoped_lease.data);
+    if (UNLIKELY(!s.ok())) {
+      return s;
+    }
+
+    out_contents->data = Slice(read_scoped_lease.data, args.uncompressed_size);
+    out_contents->cleanup = std::move(read_scoped_lease.cleanup);
+    out_contents->backing_size = read_scoped_lease.size;
+  } else {
+    CacheAllocationPtr ubuf = AllocateBlock(args.uncompressed_size, allocator);
+
+    s = decompressor.DecompressBlock(args, ubuf.get());
+    if (UNLIKELY(!s.ok())) {
+      return s;
+    }
+
+    *out_contents = BlockContents(std::move(ubuf), args.uncompressed_size);
+  }
 
   if (ShouldReportDetailedTime(ioptions.env, ioptions.stats)) {
     RecordTimeToHistogram(ioptions.stats, DECOMPRESSION_TIMES_NANOS,
@@ -733,32 +839,42 @@ Status DecompressBlockData(const char* data, size_t size, CompressionType type,
   args.compression_type = type;
   args.working_area = working_area;
   return DecompressBlockData(args, decompressor, out_contents, ioptions,
-                             allocator);
+                             allocator, std::nullopt);
 }
 
-Status DecompressSerializedBlock(const char* data, size_t size,
-                                 CompressionType type,
-                                 Decompressor& decompressor,
-                                 BlockContents* out_contents,
-                                 const ImmutableOptions& ioptions,
-                                 MemoryAllocator* allocator) {
+Status DecompressSerializedBlock(
+    const char* data, size_t size, CompressionType type,
+    Decompressor& decompressor, BlockContents* out_contents,
+    const ImmutableOptions& ioptions, MemoryAllocator* allocator,
+    ReadScopedBlockBufferProviderRef block_buffer_provider) {
   assert(data[size] != kNoCompression);
   assert(data[size] == static_cast<char>(type));
-  return DecompressBlockData(data, size, type, decompressor, out_contents,
-                             ioptions, allocator);
+  Decompressor::Args args;
+  args.compressed_data = Slice(data, size);
+  args.compression_type = type;
+  return DecompressBlockData(args, decompressor, out_contents, ioptions,
+                             allocator, block_buffer_provider);
 }
 
-Status DecompressSerializedBlock(Decompressor::Args& args,
-                                 Decompressor& decompressor,
-                                 BlockContents* out_contents,
-                                 const ImmutableOptions& ioptions,
-                                 MemoryAllocator* allocator) {
+Status DecompressBlockData(Decompressor::Args& args, Decompressor& decompressor,
+                           BlockContents* out_contents,
+                           const ImmutableOptions& ioptions,
+                           MemoryAllocator* allocator) {
+  return DecompressBlockData(args, decompressor, out_contents, ioptions,
+                             allocator, std::nullopt);
+}
+
+Status DecompressSerializedBlock(
+    Decompressor::Args& args, Decompressor& decompressor,
+    BlockContents* out_contents, const ImmutableOptions& ioptions,
+    MemoryAllocator* allocator,
+    ReadScopedBlockBufferProviderRef block_buffer_provider) {
   assert(args.compressed_data.data()[args.compressed_data.size()] !=
          kNoCompression);
   assert(args.compressed_data.data()[args.compressed_data.size()] ==
          static_cast<char>(args.compression_type));
   return DecompressBlockData(args, decompressor, out_contents, ioptions,
-                             allocator);
+                             allocator, block_buffer_provider);
 }
 
 // Replace the contents of db_host_id with the actual hostname, if db_host_id

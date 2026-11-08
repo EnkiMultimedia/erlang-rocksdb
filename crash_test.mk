@@ -7,6 +7,13 @@ DB_STRESS_CMD?=./db_stress
 
 include common.mk
 
+ifdef COMPILE_WITH_TSAN
+	# Keep direct `make -f crash_test.mk COMPILE_WITH_TSAN=1 ...` runs
+	# aligned with the main Makefile's TSAN runtime options.
+	TSAN_OPTIONS?=suppressions=$(CURDIR)/tools/tsan_suppressions.txt
+	export TSAN_OPTIONS
+endif
+
 CRASHTEST_MAKE=$(MAKE) -f crash_test.mk
 CRASHTEST_PY=$(PYTHON) -u tools/db_crashtest.py --stress_cmd=$(DB_STRESS_CMD) --cleanup_cmd='$(DB_CLEANUP_CMD)' --destroy_db_initially=1
 
@@ -18,6 +25,8 @@ CRASHTEST_PY=$(PYTHON) -u tools/db_crashtest.py --stress_cmd=$(DB_STRESS_CMD) --
 	crash_test_with_multiops_wup_txn \
 	crash_test_with_optimistic_txn \
 	crash_test_with_tiered_storage \
+	crash_test_with_full_external_table \
+	liveness_crash_test \
 	blackbox_crash_test blackbox_crash_test_with_atomic_flush \
 	blackbox_crash_test_with_wc_txn blackbox_crash_test_with_wp_txn \
 	blackbox_crash_test_with_wup_txn \
@@ -28,6 +37,7 @@ CRASHTEST_PY=$(PYTHON) -u tools/db_crashtest.py --stress_cmd=$(DB_STRESS_CMD) --
 	blackbox_crash_test_with_multiops_wup_txn \
 	blackbox_crash_test_with_optimistic_txn \
 	blackbox_crash_test_with_tiered_storage \
+	blackbox_crash_test_with_full_external_table \
 	whitebox_crash_test whitebox_crash_test_with_atomic_flush \
 	whitebox_crash_test_with_wc_txn whitebox_crash_test_with_wp_txn \
 	whitebox_crash_test_with_wup_txn \
@@ -78,6 +88,8 @@ crash_test_with_tiered_storage: $(DB_STRESS_CMD)
 	$(CRASHTEST_MAKE) whitebox_crash_test_with_tiered_storage
 	$(CRASHTEST_MAKE) blackbox_crash_test_with_tiered_storage
 
+crash_test_with_full_external_table: blackbox_crash_test_with_full_external_table
+
 crash_test_with_multiops_wc_txn: $(DB_STRESS_CMD)
 	$(CRASHTEST_MAKE) blackbox_crash_test_with_multiops_wc_txn
 
@@ -86,6 +98,9 @@ crash_test_with_multiops_wp_txn: $(DB_STRESS_CMD)
 
 crash_test_with_multiops_wup_txn: $(DB_STRESS_CMD)
 	$(CRASHTEST_MAKE) blackbox_crash_test_with_multiops_wup_txn
+
+liveness_crash_test: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) liveness $(CRASH_TEST_EXT_ARGS)
 
 blackbox_crash_test: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --simple blackbox $(CRASH_TEST_EXT_ARGS)
@@ -120,6 +135,9 @@ blackbox_crash_test_with_multiops_wup_txn: $(DB_STRESS_CMD)
 
 blackbox_crash_test_with_tiered_storage: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --test_tiered_storage blackbox $(CRASH_TEST_EXT_ARGS)
+
+blackbox_crash_test_with_full_external_table: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_full_external_table blackbox $(CRASH_TEST_EXT_ARGS)
 
 blackbox_crash_test_with_optimistic_txn: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --optimistic_txn blackbox $(CRASH_TEST_EXT_ARGS)

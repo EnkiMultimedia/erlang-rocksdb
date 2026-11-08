@@ -87,13 +87,13 @@ set(JNI_NATIVE_SOURCES
         rocksjni/transaction.cc
         rocksjni/transaction_db.cc
         rocksjni/transaction_db_options.cc
-        rocksjni/transaction_log.cc
         rocksjni/transaction_notifier.cc
         rocksjni/transaction_notifier_jnicallback.cc
         rocksjni/transaction_options.cc
         rocksjni/ttl.cc
         rocksjni/wal_filter.cc
         rocksjni/wal_filter_jnicallback.cc
+        rocksjni/wal_iterator.cc
         rocksjni/write_batch.cc
         rocksjni/write_batch_test.cc
         rocksjni/write_batch_with_index.cc
@@ -174,6 +174,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/FlushOptions.java
   src/main/java/org/rocksdb/FlushReason.java
   src/main/java/org/rocksdb/GetStatus.java
+  src/main/java/org/rocksdb/GetWithMetadataResult.java
   src/main/java/org/rocksdb/HashLinkedListMemTableConfig.java
   src/main/java/org/rocksdb/HashSkipListMemTableConfig.java
   src/main/java/org/rocksdb/HistogramData.java
@@ -211,6 +212,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/OperationType.java
   src/main/java/org/rocksdb/OptimisticTransactionDB.java
   src/main/java/org/rocksdb/OptimisticTransactionOptions.java
+  src/main/java/org/rocksdb/OptimizeKeyCommonPrefix.java
   src/main/java/org/rocksdb/OptionString.java
   src/main/java/org/rocksdb/Options.java
   src/main/java/org/rocksdb/OptionsUtil.java
@@ -286,11 +288,13 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/WBWIRocksIterator.java
   src/main/java/org/rocksdb/WalFileType.java
   src/main/java/org/rocksdb/WalFilter.java
+  src/main/java/org/rocksdb/WalIterator.java
   src/main/java/org/rocksdb/WalProcessingOption.java
   src/main/java/org/rocksdb/WriteBatch.java
   src/main/java/org/rocksdb/WriteBatchInterface.java
   src/main/java/org/rocksdb/WriteBatchWithIndex.java
   src/main/java/org/rocksdb/WriteBufferManager.java
+  src/main/java/org/rocksdb/WriteBufferManagerFlushPolicy.java
   src/main/java/org/rocksdb/WriteOptions.java
   src/main/java/org/rocksdb/WriteStallCondition.java
   src/main/java/org/rocksdb/WriteStallInfo.java
@@ -398,7 +402,6 @@ set(JAVA_TEST_CLASSES
   src/test/java/org/rocksdb/TimedEnvTest.java
   src/test/java/org/rocksdb/TransactionDBOptionsTest.java
   src/test/java/org/rocksdb/TransactionDBTest.java
-  src/test/java/org/rocksdb/TransactionLogIteratorTest.java
   src/test/java/org/rocksdb/TransactionOptionsTest.java
   src/test/java/org/rocksdb/TransactionTest.java
   src/test/java/org/rocksdb/TtlDBTest.java
@@ -406,6 +409,7 @@ set(JAVA_TEST_CLASSES
   src/test/java/org/rocksdb/VerifyChecksumsTest.java
   src/test/java/org/rocksdb/WALRecoveryModeTest.java
   src/test/java/org/rocksdb/WalFilterTest.java
+  src/test/java/org/rocksdb/WalIteratorTest.java
   src/test/java/org/rocksdb/WriteBatchHandlerTest.java
   src/test/java/org/rocksdb/WriteBatchThreadedTest.java
   src/test/java/org/rocksdb/WriteBatchWithIndexTest.java
@@ -516,13 +520,13 @@ set(JAVA_TEST_RUNNING_CLASSES
   org.rocksdb.TimedEnvTest
   org.rocksdb.TransactionDBOptionsTest
   org.rocksdb.TransactionDBTest
-  org.rocksdb.TransactionLogIteratorTest
   org.rocksdb.TransactionOptionsTest
   org.rocksdb.TransactionTest
   org.rocksdb.TtlDBTest
   org.rocksdb.VerifyChecksumsTest
   org.rocksdb.WALRecoveryModeTest
   org.rocksdb.WalFilterTest
+  org.rocksdb.WalIteratorTest
   org.rocksdb.WriteBatchHandlerTest
   org.rocksdb.WriteBatchTest
   org.rocksdb.WriteBatchThreadedTest
@@ -614,9 +618,10 @@ endif()
 if (DEFINED CUSTOM_DEPS_URL)
   set(DEPS_URL ${CUSTOM_DEPS_URL}/)
 else ()
-  # Using a Facebook AWS account for S3 storage. (maven.org has a history
-  # of failing in Travis builds.)
-  set(DEPS_URL "https://rocksdb-deps.s3-us-west-2.amazonaws.com/jars")
+  # Hosted as assets on the "third-party-deps" GitHub release. (maven.org has a
+  # history of failing in CI builds.) To add or update a jar, upload it here
+  # (intentionally unlisted): https://github.com/facebook/rocksdb/releases/edit/third-party-deps
+  set(DEPS_URL "https://github.com/facebook/rocksdb/releases/download/third-party-deps")
 endif()
 
 if(NOT EXISTS ${JAVA_JUNIT_JAR})
@@ -758,8 +763,8 @@ if(${CMAKE_VERSION} VERSION_LESS "3.11.4")
           org.rocksdb.Transaction
           org.rocksdb.TransactionDB
           org.rocksdb.TransactionDBOptions
-          org.rocksdb.TransactionLogIterator
           org.rocksdb.TransactionOptions
+          org.rocksdb.WalIterator
           org.rocksdb.TtlDB
           org.rocksdb.UInt64AddOperator
           org.rocksdb.VectorMemTableConfig

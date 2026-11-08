@@ -91,6 +91,13 @@ class DbStressRandomAccessFileWrapper : public FSRandomAccessFileOwnerWrapper {
     return target()->ReadAsync(req, options, cb, cb_arg, io_handle, del_fn,
                                dbg);
   }
+
+  bool SubmitReadAsync(FSReadRequest& req, const IOOptions& options,
+                       std::function<void(FSReadRequest&)> cb,
+                       IODebugContext* dbg) override {
+    CheckIOActivity(options);
+    return target()->SubmitReadAsync(req, options, std::move(cb), dbg);
+  }
 };
 
 class DbStressWritableFileWrapper : public FSWritableFileOwnerWrapper {
@@ -197,10 +204,10 @@ class DbStressFSWrapper : public FileSystemWrapper {
       assert(!file_opts.file_checksum_func_name.empty());
       if (file_opts.file_checksum_func_name == kUnknownFileChecksumFuncName ||
           file_opts.file_checksum_func_name == kNoFileChecksumFuncName) {
-        // No checksum available — checksum value must be empty
+        // No checksum available -- checksum value must be empty
         assert(file_opts.file_checksum.empty());
       } else {
-        // A real checksum function — checksum value must be present
+        // A real checksum function -- checksum value must be present
         assert(!file_opts.file_checksum.empty());
       }
     }

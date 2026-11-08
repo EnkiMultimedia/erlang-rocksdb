@@ -34,7 +34,9 @@
 namespace ROCKSDB_NAMESPACE {
 
 // Return true if the ith bit is set in combination represented by comb
-bool IsInCombination(size_t i, size_t comb) { return comb & (size_t(1) << i); }
+inline bool IsInCombination(size_t i, size_t comb) {
+  return comb & (size_t(1) << i);
+}
 
 enum WriteOrdering : bool { kOrderedWrite, kUnorderedWrite };
 
@@ -103,7 +105,7 @@ class TransactionTestBase : public ::testing::Test {
     EXPECT_OK(s);
   }
 
-  ~TransactionTestBase() {
+  ~TransactionTestBase() override {
     delete db;
     db = nullptr;
     // This is to skip the assert statement in FaultInjectionTestEnv. There
@@ -166,7 +168,7 @@ class TransactionTestBase : public ::testing::Test {
     } else {
       s = OpenWithStackableDB();
     }
-    assert(db != nullptr);
+    assert(!s.ok() || db != nullptr);
     return s;
   }
 
@@ -228,6 +230,37 @@ class TransactionTestBase : public ::testing::Test {
       delete stackable_db;
     }
     return s;
+  }
+
+  // Verifies that both Transaction::GetEntity and Transaction::MultiGetEntity
+  // read `expected_value` for `key` in the default column family.
+  void VerifyTxnGetEntity(Transaction* txn, const ReadOptions& read_options,
+                          const Slice& key, const std::string& expected_value) {
+    const WideColumns expected_columns{
+        {kDefaultWideColumnName, expected_value}};
+    ColumnFamilyHandle* const cfh = db->DefaultColumnFamily();
+
+    PinnableWideColumns columns;
+    ASSERT_OK(txn->GetEntity(read_options, cfh, key, &columns));
+    ASSERT_EQ(columns.columns(), expected_columns);
+
+    PinnableWideColumns multi_get_columns;
+    Status s;
+    txn->MultiGetEntity(read_options, cfh, 1, &key, &multi_get_columns, &s);
+    ASSERT_OK(s);
+    ASSERT_EQ(multi_get_columns.columns(), expected_columns);
+  }
+
+  void VerifyTxnGetEntityForUpdate(Transaction* txn,
+                                   const ReadOptions& read_options,
+                                   const Slice& key,
+                                   const std::string& expected_value) {
+    const WideColumns expected_columns{
+        {kDefaultWideColumnName, expected_value}};
+    PinnableWideColumns columns;
+    ASSERT_OK(txn->GetEntityForUpdate(read_options, db->DefaultColumnFamily(),
+                                      key, &columns));
+    ASSERT_EQ(columns.columns(), expected_columns);
   }
 
   std::atomic<size_t> linked = {0};
@@ -542,9 +575,9 @@ class MySQLStyleTransactionTest
 };
 
 class WriteCommittedTxnWithTsTest
-    : public TransactionTestBase,
-      public ::testing::WithParamInterface<
-          std::tuple<bool, bool, bool, bool, int64_t>> {
+    : public ::testing::WithParamInterface<
+          std::tuple<bool, bool, bool, bool, int64_t>>,
+      public TransactionTestBase {
  public:
   WriteCommittedTxnWithTsTest()
       : TransactionTestBase(std::get<0>(GetParam()), std::get<1>(GetParam()),
@@ -584,9 +617,9 @@ class WriteCommittedTxnWithTsTest
 };
 
 class TimestampedSnapshotWithTsSanityCheck
-    : public TransactionTestBase,
-      public ::testing::WithParamInterface<std::tuple<
-          bool, bool, TxnDBWritePolicy, WriteOrdering, bool, int64_t>> {
+    : public ::testing::WithParamInterface<std::tuple<
+          bool, bool, TxnDBWritePolicy, WriteOrdering, bool, int64_t>>,
+      public TransactionTestBase {
  public:
   explicit TimestampedSnapshotWithTsSanityCheck()
       : TransactionTestBase(std::get<0>(GetParam()), std::get<1>(GetParam()),

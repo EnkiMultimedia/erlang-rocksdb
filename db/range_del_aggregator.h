@@ -288,7 +288,7 @@ class RangeDelAggregator {
  public:
   explicit RangeDelAggregator(const InternalKeyComparator* icmp)
       : icmp_(icmp) {}
-  virtual ~RangeDelAggregator() {}
+  virtual ~RangeDelAggregator() = default;
 
   virtual void AddTombstones(
       std::unique_ptr<FragmentedRangeTombstoneIterator> input_iter,
@@ -347,7 +347,8 @@ class RangeDelAggregator {
 
     // If user-defined timestamp is enabled, `start` and `end` are user keys
     // with timestamp.
-    bool IsRangeOverlapped(const Slice& start, const Slice& end);
+    bool IsRangeOverlapped(const Slice& start, const Slice& end,
+                           bool end_exclusive);
 
    private:
     bool InStripe(SequenceNumber seq) const {
@@ -378,7 +379,7 @@ class ReadRangeDelAggregator final : public RangeDelAggregator {
                          SequenceNumber upper_bound)
       : RangeDelAggregator(icmp),
         rep_(icmp, upper_bound, 0 /* lower_bound */) {}
-  ~ReadRangeDelAggregator() override {}
+  ~ReadRangeDelAggregator() override = default;
 
   using RangeDelAggregator::ShouldDelete;
   void AddTombstones(
@@ -387,14 +388,15 @@ class ReadRangeDelAggregator final : public RangeDelAggregator {
       const InternalKey* largest = nullptr) override;
 
   bool ShouldDelete(const ParsedInternalKey& parsed,
-                    RangeDelPositioningMode mode) final override {
+                    RangeDelPositioningMode mode) final {
     if (rep_.IsEmpty()) {
       return false;
     }
     return ShouldDeleteImpl(parsed, mode);
   }
 
-  bool IsRangeOverlapped(const Slice& start, const Slice& end);
+  bool IsRangeOverlapped(const Slice& start, const Slice& end,
+                         bool end_exclusive);
 
   void InvalidateRangeDelMapPositions() override { rep_.Invalidate(); }
 
@@ -429,7 +431,7 @@ class CompactionRangeDelAggregator : public RangeDelAggregator {
       }
     }
   }
-  ~CompactionRangeDelAggregator() override {}
+  ~CompactionRangeDelAggregator() override = default;
 
   void AddTombstones(
       std::unique_ptr<FragmentedRangeTombstoneIterator> input_iter,

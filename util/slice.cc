@@ -16,6 +16,7 @@
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
+#include "util/cast_util.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -322,14 +323,14 @@ bool Slice::DecodeHex(std::string* result) const {
   return true;
 }
 
-PinnableSlice::PinnableSlice(PinnableSlice&& other) {
+PinnableSlice::PinnableSlice(PinnableSlice&& other) : PinnableSlice() {
   *this = std::move(other);
 }
 
 PinnableSlice& PinnableSlice::operator=(PinnableSlice&& other) {
   if (this != &other) {
     Cleanable::Reset();
-    Cleanable::operator=(std::move(other));
+    Cleanable::operator=(std::move(up_cast<Cleanable>(other)));
     size_ = other.size_;
     pinned_ = other.pinned_;
     if (pinned_) {

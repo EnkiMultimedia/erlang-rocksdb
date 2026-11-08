@@ -31,7 +31,7 @@ WritePreparedTxn::WritePreparedTxn(WritePreparedTxnDB* txn_db,
   // Call Initialize outside PessimisticTransaction constructor otherwise it
   // would skip overridden functions in WritePreparedTxn since they are not
   // defined yet in the constructor of PessimisticTransaction
-  Initialize(txn_options);
+  WritePreparedTxn::Initialize(txn_options);
 }
 
 void WritePreparedTxn::Initialize(const TransactionOptions& txn_options) {
@@ -62,7 +62,8 @@ void WritePreparedTxn::MultiGet(const ReadOptions& _read_options,
     read_options.io_activity = Env::IOActivity::kMultiGet;
   }
 
-  SequenceNumber min_uncommitted, snap_seq;
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
   const SnapshotBackup backed_by_snapshot = wpt_db_->AssignMinMaxSeqs(
       read_options.snapshot, &min_uncommitted, &snap_seq);
   WritePreparedTxnReadCallback callback(wpt_db_, snap_seq, min_uncommitted,
@@ -100,7 +101,8 @@ Status WritePreparedTxn::GetImpl(const ReadOptions& options,
                                  ColumnFamilyHandle* column_family,
                                  const Slice& key,
                                  PinnableSlice* pinnable_val) {
-  SequenceNumber min_uncommitted, snap_seq;
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
   const SnapshotBackup backed_by_snapshot =
       wpt_db_->AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
   WritePreparedTxnReadCallback callback(wpt_db_, snap_seq, min_uncommitted,
@@ -120,6 +122,59 @@ Status WritePreparedTxn::GetImpl(const ReadOptions& options,
   }
 
   return res;
+}
+
+Status WritePreparedTxn::GetEntityImpl(const ReadOptions& options,
+                                       ColumnFamilyHandle* column_family,
+                                       const Slice& key,
+                                       PinnableWideColumns* columns) {
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
+  const SnapshotBackup backed_by_snapshot =
+      wpt_db_->AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
+  WritePreparedTxnReadCallback callback(wpt_db_, snap_seq, min_uncommitted,
+                                        backed_by_snapshot);
+  Status res = write_batch_.GetEntityFromBatchAndDB(db_, options, column_family,
+                                                    key, columns, &callback);
+  const bool callback_valid =
+      callback.valid();  // NOTE: validity of callback must always be checked
+                         // before it is destructed
+  if (res.ok()) {
+    if (!LIKELY(callback_valid &&
+                wpt_db_->ValidateSnapshot(callback.max_visible_seq(),
+                                          backed_by_snapshot))) {
+      wpt_db_->WPRecordTick(TXN_GET_TRY_AGAIN);
+      res = Status::TryAgain();
+    }
+  }
+
+  return res;
+}
+
+void WritePreparedTxn::MultiGetEntityImpl(const ReadOptions& options,
+                                          ColumnFamilyHandle* column_family,
+                                          size_t num_keys, const Slice* keys,
+                                          PinnableWideColumns* results,
+                                          Status* statuses, bool sorted_input) {
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
+  const SnapshotBackup backed_by_snapshot =
+      wpt_db_->AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
+  WritePreparedTxnReadCallback callback(wpt_db_, snap_seq, min_uncommitted,
+                                        backed_by_snapshot);
+  write_batch_.MultiGetEntityFromBatchAndDB(db_, options, column_family,
+                                            num_keys, keys, results, statuses,
+                                            sorted_input, &callback);
+  // Without an explicit snapshot, the DB read refreshes the callback to the
+  // actual read sequence while snap_seq remains zero.
+  if (UNLIKELY(!callback.valid() ||
+               !wpt_db_->ValidateSnapshot(callback.max_visible_seq(),
+                                          backed_by_snapshot))) {
+    wpt_db_->WPRecordTick(TXN_GET_TRY_AGAIN);
+    for (size_t i = 0; i < num_keys; i++) {
+      statuses[i] = Status::TryAgain();
+    }
+  }
 }
 
 Iterator* WritePreparedTxn::GetIterator(const ReadOptions& options) {

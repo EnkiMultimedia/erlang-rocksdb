@@ -133,6 +133,12 @@ class Repairer {
     }
   }
 
+  // No copying allowed
+  Repairer(const Repairer&) = delete;
+  Repairer& operator=(const Repairer&) = delete;
+  Repairer(Repairer&&) = delete;
+  Repairer& operator=(Repairer&&) = delete;
+
   const ColumnFamilyOptions* GetColumnFamilyOptions(
       const std::string& cf_name) {
     if (cf_name_to_opts_.find(cf_name) == cf_name_to_opts_.end()) {
@@ -482,7 +488,9 @@ class Repairer {
           current_time /* newest_key_time */, false /* is_bottommost */,
           TableFileCreationReason::kRecovery, 0 /* oldest_key_time */,
           0 /* file_creation_time */, "DB Repairer" /* db_id */, db_session_id_,
-          0 /*target_file_size*/, meta.fd.GetNumber());
+          0 /*target_file_size*/, meta.fd.GetNumber(),
+          kMaxSequenceNumber /*last_level_inclusive_max_seqno_threshold*/,
+          dbname_ /*db_name*/);
 
       SeqnoToTimeMapping empty_seqno_to_time_mapping;
       status = BuildTable(
@@ -573,7 +581,7 @@ class Repairer {
         status =
             AddColumnFamily(props->column_family_name, t->column_family_id);
       }
-      t->meta.oldest_ancester_time = props->creation_time;
+      t->meta.oldest_ancestor_time = props->oldest_ancestor_time;
       t->meta.user_defined_timestamps_persisted =
           static_cast<bool>(props->user_defined_timestamps_persisted);
     }
@@ -699,7 +707,8 @@ class Repairer {
           nullptr /* src_vstorage */, cfd->ioptions().force_consistency_checks,
           EpochNumberRequirement::kMightMissing, cfd->ioptions().clock,
           /*bottommost_file_compaction_delay=*/0,
-          cfd->current()->version_set()->offpeak_time_option());
+          cfd->current()->version_set()->offpeak_time_option(),
+          PeriodicCompactionPhaseParams{});
       Status s;
       VersionEdit dummy_edit;
       for (const auto* table : cf_id_and_tables.second) {
@@ -709,7 +718,7 @@ class Repairer {
             0, meta.fd.GetNumber(), meta.fd.GetPathId(), meta.fd.GetFileSize(),
             meta.smallest, meta.largest, meta.fd.smallest_seqno,
             meta.fd.largest_seqno, meta.marked_for_compaction, meta.temperature,
-            meta.oldest_blob_file_number, meta.oldest_ancester_time,
+            meta.oldest_blob_file_number, meta.oldest_ancestor_time,
             meta.file_creation_time, meta.epoch_number, meta.file_checksum,
             meta.file_checksum_func_name, meta.unique_id,
             meta.compensated_range_deletion_size, meta.tail_size,

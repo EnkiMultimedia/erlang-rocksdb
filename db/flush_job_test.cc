@@ -13,6 +13,7 @@
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
+#include "db/memtable.h"
 #include "db/version_set.h"
 #include "file/writable_file_writer.h"
 #include "rocksdb/cache.h"
@@ -57,7 +58,8 @@ class FlushJobTestBase : public testing::Test {
         shutting_down_(false),
         mock_table_factory_(new mock::MockTableFactory()) {}
 
-  virtual ~FlushJobTestBase() {
+ public:
+  ~FlushJobTestBase() override {
     if (getenv("KEEP_DB")) {
       fprintf(stdout, "db is still in %s\n", dbname_.c_str());
     } else {
@@ -67,6 +69,7 @@ class FlushJobTestBase : public testing::Test {
     }
   }
 
+ protected:
   void NewDB() {
     ASSERT_OK(
         SetIdentityFile(WriteOptions(), env_, dbname_, Temperature::kUnknown));
@@ -228,8 +231,11 @@ TEST_F(FlushJobTest, NonEmpty) {
   }
 
   {
+    MemTablePostProcessInfo post_process_info;
     ASSERT_OK(new_mem->Add(SequenceNumber(10000), kTypeRangeDeletion, "9995",
-                           "9999a", nullptr /* kv_prot_info */));
+                           "9999a", nullptr /* kv_prot_info */,
+                           true /* allow_concurrent */, &post_process_info));
+    new_mem->BatchPostProcess(post_process_info);
     InternalKey internal_key("9995", SequenceNumber(10000), kTypeRangeDeletion);
     inserted_keys.push_back({internal_key.Encode().ToString(), "9999a"});
   }

@@ -917,14 +917,15 @@ INSTANTIATE_TEST_CASE_P(
     ::testing::Values(
         std::make_tuple(kAutoBloom,
                         FilterPartitioning::kCoupledPartitionedFilter,
-                        kLatestBbtFormatVersion),
+                        BlockBasedTableOptions::kLatestSupportedFormatVersion),
         std::make_tuple(kAutoBloom,
                         FilterPartitioning::kDecoupledPartitionedFilter,
-                        kLatestBbtFormatVersion),
+                        BlockBasedTableOptions::kLatestSupportedFormatVersion),
         std::make_tuple(kAutoBloom, FilterPartitioning::kUnpartitionedFilter,
-                        kLatestBbtFormatVersion),
-        std::make_tuple(kAutoRibbon, FilterPartitioning::kUnpartitionedFilter,
-                        kLatestBbtFormatVersion)));
+                        BlockBasedTableOptions::kLatestSupportedFormatVersion),
+        std::make_tuple(
+            kAutoRibbon, FilterPartitioning::kUnpartitionedFilter,
+            BlockBasedTableOptions::kLatestSupportedFormatVersion)));
 #endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
 TEST_F(DBBloomFilterTest, BloomFilterRate) {
@@ -1800,6 +1801,7 @@ static std::map<TableFileCreationReason, std::string>
         {TableFileCreationReason::kFlush, "kFlush"},
         {TableFileCreationReason::kMisc, "kMisc"},
         {TableFileCreationReason::kRecovery, "kRecovery"},
+        {TableFileCreationReason::kSstFileWriter, "kSstFileWriter"},
     };
 
 class TestingContextCustomFilterPolicy
@@ -1814,6 +1816,15 @@ class TestingContextCustomFilterPolicy
       const FilterBuildingContext& context) const override {
     test_report_ += "cf=";
     test_report_ += context.column_family_name;
+    // Token rather than path, so expectations don't depend on test directory
+    test_report_ += ",db=";
+    if (context.db_name.empty()) {
+      test_report_ += "none";
+    } else if (context.db_name == Slice(expected_db_name_)) {
+      test_report_ += "expected";
+    } else {
+      test_report_ += "UNEXPECTED:" + context.db_name.ToString();
+    }
     test_report_ += ",s=";
     test_report_ +=
         OptionsHelper::compaction_style_to_string[context.compaction_style];
@@ -1836,8 +1847,13 @@ class TestingContextCustomFilterPolicy
     return rv;
   }
 
+  void SetExpectedDbName(std::string db_name) {
+    expected_db_name_ = std::move(db_name);
+  }
+
  private:
   mutable std::string test_report_;
+  std::string expected_db_name_;
 };
 }  // anonymous namespace
 
@@ -1859,6 +1875,13 @@ TEST_F(DBBloomFilterTest, ContextCustomFilterPolicy) {
 
     ASSERT_OK(TryReopen(options));
     CreateAndReopenWithCF({fifo ? "abe" : "bob"}, options);
+    policy->SetExpectedDbName(dbname_);
+
+    const char* expected_flush_report =
+        fifo
+            ? "cf=abe,db=expected,s=kCompactionStyleFIFO,n=7,l=0,b=0,r=kFlush\n"
+            : "cf=bob,db=expected,s=kCompactionStyleLevel,n=7,l=0,b=0,r="
+              "kFlush\n";
 
     const int maxKey = 10000;
     for (int i = 0; i < maxKey / 2; i++) {
@@ -1867,17 +1890,13 @@ TEST_F(DBBloomFilterTest, ContextCustomFilterPolicy) {
     // Add a large key to make the file contain wide range
     ASSERT_OK(Put(1, Key(maxKey + 55555), Key(maxKey + 55555)));
     ASSERT_OK(Flush(1));
-    EXPECT_EQ(policy->DumpTestReport(),
-              fifo ? "cf=abe,s=kCompactionStyleFIFO,n=7,l=0,b=0,r=kFlush\n"
-                   : "cf=bob,s=kCompactionStyleLevel,n=7,l=0,b=0,r=kFlush\n");
+    EXPECT_EQ(policy->DumpTestReport(), expected_flush_report);
 
     for (int i = maxKey / 2; i < maxKey; i++) {
       ASSERT_OK(Put(1, Key(i), Key(i)));
     }
     ASSERT_OK(Flush(1));
-    EXPECT_EQ(policy->DumpTestReport(),
-              fifo ? "cf=abe,s=kCompactionStyleFIFO,n=7,l=0,b=0,r=kFlush\n"
-                   : "cf=bob,s=kCompactionStyleLevel,n=7,l=0,b=0,r=kFlush\n");
+    EXPECT_EQ(policy->DumpTestReport(), expected_flush_report);
 
     // Check that they can be found
     for (int i = 0; i < maxKey; i++) {
@@ -1904,7 +1923,8 @@ TEST_F(DBBloomFilterTest, ContextCustomFilterPolicy) {
       ASSERT_OK(db_->CompactRange(CompactRangeOptions(), handles_[1], nullptr,
                                   nullptr));
       EXPECT_EQ(policy->DumpTestReport(),
-                "cf=bob,s=kCompactionStyleLevel,n=7,l=1,b=1,r=kCompaction\n");
+                "cf=bob,db=expected,s=kCompactionStyleLevel,n=7,l=1,b=1,r="
+                "kCompaction\n");
 
       // Check that we now have one filter, about 9.2% FP rate (5 bits per key)
       for (int i = 0; i < maxKey; i++) {
@@ -1926,7 +1946,8 @@ TEST_F(DBBloomFilterTest, ContextCustomFilterPolicy) {
       }
       // Note: kCompactionStyleLevel is default, ignored if num_levels == -1
       EXPECT_EQ(policy->DumpTestReport(),
-                "cf=abe,s=kCompactionStyleLevel,n=-1,l=-1,b=0,r=kMisc\n");
+                "cf=abe,db=none,s=kCompactionStyleLevel,n=-1,l=-1,b=0,r="
+                "kSstFileWriter\n");
     }
 
     // Destroy
@@ -2022,7 +2043,11 @@ TEST_F(DBBloomFilterTest, MutableFilterPolicy) {
   double expected_bpk = 10.0;
   // Other configs to try
   std::vector<std::pair<std::string, double>> configs = {
-      {"ribbonfilter:10:-1", 7.0}, {"bloomfilter:5", 5.0}, {"nullptr", 0.0}};
+      {"ribbonfilter:10:-1", 7.0},
+      {"bloomfilter:5", 5.0},
+      {"nullptr", 0.0},
+      // As serialized in OPTIONS file
+      {"{id=ribbonfilter:12:-1;bloom_before_level=-1;}", 8.4}};
 
   table_options.cache_index_and_filter_blocks = true;
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -2518,9 +2543,13 @@ TEST_P(DBBloomFilterTestVaryPrefixAndFormatVer, PartitionedMultiGet) {
       values[i] = PinnableSlice();
     }
 
+    get_perf_context()->Reset();
+    const PerfLevel previous_perf_level = GetPerfLevel();
+    SetPerfLevel(PerfLevel::kEnableTime);
     db_->MultiGet(ropts, Q, column_families.data(), key_slices.data(),
                   values.data(),
                   /*timestamps=*/nullptr, statuses.data(), true);
+    SetPerfLevel(previous_perf_level);
 
     // Confirm correct status results
     uint32_t number_not_found = 0;
@@ -2550,6 +2579,8 @@ TEST_P(DBBloomFilterTestVaryPrefixAndFormatVer, PartitionedMultiGet) {
     // Confirm no duplicate loading same filter partition
     uint64_t filter_accesses = PopTicker(options, BLOCK_CACHE_FILTER_HIT) +
                                PopTicker(options, BLOCK_CACHE_FILTER_MISS);
+    // Partition reads must contribute to the filter-block timing metric.
+    EXPECT_GT(get_perf_context()->read_filter_block_nanos, 0);
     if (stride == 1) {
       EXPECT_EQ(filter_accesses, 1);
     } else {
@@ -3974,7 +4005,8 @@ static std::vector<std::string> RangeQueryKeys(
   ReadOptions ro;
   ro.iterate_lower_bound = &lb;
   ro.iterate_upper_bound = &ub;
-  ro.table_filter = factory.GetTableFilterForRangeQuery(lb, ub);
+  auto filter = factory.GetTableFilterForRangeQuery(lb, ub);
+  ro.table_filter = &filter;
   auto it = db.NewIterator(ro);
   std::vector<std::string> ret;
   for (it->Seek(lb); it->Valid(); it->Next()) {

@@ -282,7 +282,7 @@ class SpecialEnv : public EnvWrapper {
           : env_(env), base_(std::move(b)) {
         env_->num_open_wal_file_.fetch_add(1);
       }
-      virtual ~SpecialWalFile() { env_->num_open_wal_file_.fetch_add(-1); }
+      ~SpecialWalFile() override { env_->num_open_wal_file_.fetch_add(-1); }
       Status Append(const Slice& data) override {
 #if !(defined NDEBUG) || !defined(OS_WIN)
         TEST_SYNC_POINT("SpecialEnv::SpecialWalFile::Append:1");
@@ -319,7 +319,8 @@ class SpecialEnv : public EnvWrapper {
 // SyncPoint is not supported in Released Windows Mode.
 #if !(defined NDEBUG) || !defined(OS_WIN)
         // Check preallocation size
-        size_t block_size, last_allocated_block;
+        size_t block_size;
+        size_t last_allocated_block;
         base_->GetPreallocationStatus(&block_size, &last_allocated_block);
         TEST_SYNC_POINT_CALLBACK("DBTestWalFile.GetPreallocationStatus",
                                  &block_size);
@@ -602,7 +603,7 @@ class SpecialEnv : public EnvWrapper {
       class NoopDirectory : public Directory {
        public:
         NoopDirectory() {}
-        ~NoopDirectory() {}
+        ~NoopDirectory() override {}
 
         Status Fsync() override { return Status::OK(); }
         Status Close() override { return Status::OK(); }
@@ -891,7 +892,7 @@ class FileTemperatureTestFS : public FileSystemWrapper {
 
 class OnFileDeletionListener : public EventListener {
  public:
-  OnFileDeletionListener() : matched_count_(0), expected_file_name_("") {}
+  OnFileDeletionListener() : matched_count_(0) {}
   const char* Name() const override { return kClassName(); }
   static const char* kClassName() { return "OnFileDeletionListener"; }
 
@@ -1107,7 +1108,7 @@ class DBTestBase : public testing::Test {
   // tests, but won't cover the exact fsync logic.
   DBTestBase(const std::string path, bool env_do_fsync);
 
-  ~DBTestBase();
+  ~DBTestBase() override;
 
   static std::string Key(int i) {
     char buf[100];
@@ -1231,22 +1232,32 @@ class DBTestBase : public testing::Test {
 
   Status SingleDelete(int cf, const std::string& k);
 
-  std::string Get(const std::string& k, const Snapshot* snapshot = nullptr);
+  std::string Get(const std::string& k, const Snapshot* snapshot = nullptr,
+                  bool use_coroutine = false);
 
   std::string Get(int cf, const std::string& k,
-                  const Snapshot* snapshot = nullptr);
+                  const Snapshot* snapshot = nullptr,
+                  bool use_coroutine = false);
 
-  Status Get(const std::string& k, PinnableSlice* v);
+  Status Get(const std::string& k, PinnableSlice* v,
+             bool use_coroutine = false);
 
   std::vector<std::string> MultiGet(std::vector<int> cfs,
                                     const std::vector<std::string>& k,
-                                    const Snapshot* snapshot,
-                                    const bool batched,
-                                    const bool async = false);
+                                    const Snapshot* snapshot, bool batched,
+                                    bool async = false,
+                                    bool use_coroutine = false);
 
   std::vector<std::string> MultiGet(const std::vector<std::string>& k,
                                     const Snapshot* snapshot = nullptr,
-                                    const bool async = false);
+                                    bool async = false,
+                                    bool optimize_multiget_for_io = true,
+                                    bool use_coroutine = false);
+
+  void MultiGet(const std::vector<std::string>& k, const Snapshot* snapshot,
+                bool async, bool optimize_multiget_for_io, bool use_coroutine,
+                std::vector<PinnableSlice>& values,
+                std::vector<Status>& statuses);
 
   Status CompactRange(const CompactRangeOptions& options,
                       std::optional<Slice> begin, std::optional<Slice> end);
@@ -1433,6 +1444,8 @@ class DBTestBase : public testing::Test {
     tp->raw_key_size = 0;
     tp->raw_value_size = 0;
     tp->num_data_blocks = 0;
+    tp->num_data_blocks_compression_rejected = 0;
+    tp->num_data_blocks_compression_bypassed = 0;
     tp->num_entries = 0;
     tp->num_deletions = 0;
     tp->num_merge_operands = 0;
@@ -1446,21 +1459,25 @@ class DBTestBase : public testing::Test {
     ResetTableProperties(tp);
     int count = sscanf(
         tp_string.c_str(),
-        "# data blocks %" SCNu64 " # entries %" SCNu64 " # deletions %" SCNu64
-        " # merge operands %" SCNu64 " # range deletions %" SCNu64
-        " raw key size %" SCNu64
+        "# data blocks %" SCNu64 " # data blocks compression rejected %" SCNu64
+        " # data blocks compression bypassed %" SCNu64
+        " # uniform blocks %" SCNu64 " # entries %" SCNu64
+        " # deletions %" SCNu64 " # merge operands %" SCNu64
+        " # range deletions %" SCNu64 " raw key size %" SCNu64
         " raw average key size %lf "
         " raw value size %" SCNu64
         " raw average value size %lf "
         " data block size %" SCNu64 " data uncompressed size %" SCNu64
         " index block size (user-key? %" SCNu64 ", delta-value? %" SCNu64
         ") %" SCNu64 " filter block size %" SCNu64,
-        &tp->num_data_blocks, &tp->num_entries, &tp->num_deletions,
-        &tp->num_merge_operands, &tp->num_range_deletions, &tp->raw_key_size,
-        &dummy_double, &tp->raw_value_size, &dummy_double, &tp->data_size,
+        &tp->num_data_blocks, &tp->num_data_blocks_compression_rejected,
+        &tp->num_data_blocks_compression_bypassed, &tp->num_uniform_blocks,
+        &tp->num_entries, &tp->num_deletions, &tp->num_merge_operands,
+        &tp->num_range_deletions, &tp->raw_key_size, &dummy_double,
+        &tp->raw_value_size, &dummy_double, &tp->data_size,
         &tp->uncompressed_data_size, &tp->index_key_is_user_key,
         &tp->index_value_is_delta_encoded, &tp->index_size, &tp->filter_size);
-    ASSERT_EQ(count, 15);
+    ASSERT_EQ(count, 18);
   }
 
  private:  // Prone to error on direct use

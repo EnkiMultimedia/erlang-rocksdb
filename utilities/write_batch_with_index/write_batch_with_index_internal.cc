@@ -307,7 +307,8 @@ void BaseDeltaIterator::SetValueAndColumnsFromDelta() {
     } else if (delta_entry.type == kPutEntityRecord) {
       Slice value_copy(delta_entry.value);
 
-      status_ = WideColumnSerialization::Deserialize(value_copy, columns_);
+      status_ =
+          WideColumnSerialization::DeserializeSimple(value_copy, columns_);
       if (!status_.ok()) {
         columns_.clear();
         return;
@@ -378,7 +379,7 @@ void BaseDeltaIterator::SetValueAndColumnsFromDelta() {
   if (result_type == kTypeWideColumnEntity) {
     Slice entity(merge_result_);
 
-    status_ = WideColumnSerialization::Deserialize(entity, columns_);
+    status_ = WideColumnSerialization::DeserializeSimple(entity, columns_);
     if (!status_.ok()) {
       columns_.clear();
       return;
@@ -696,7 +697,8 @@ int WriteBatchEntryComparator::operator()(
     return 1;
   }
 
-  Slice key1, key2;
+  Slice key1;
+  Slice key2;
   if (entry1->search_key == nullptr) {
     key1 = Slice(write_batch_->Data().data() + entry1->key_offset,
                  entry1->key_size);
@@ -750,7 +752,8 @@ const Comparator* WriteBatchEntryComparator::GetComparator(
 
 WriteEntry WBWIIteratorImpl::Entry() const {
   WriteEntry ret;
-  Slice blob, xid;
+  Slice blob;
+  Slice xid;
   const WriteBatchIndexEntry* iter_entry = skip_list_iter_.key();
   // this is guaranteed with Valid()
   assert(iter_entry != nullptr &&
@@ -929,10 +932,17 @@ WBWIIteratorImpl::Result WriteBatchWithIndexInternal::GetFromBatch(
     static Status SetWideColumnValue(const Slice& entity, OutputType* output) {
       assert(output);
 
-      Slice entity_copy = entity;
       Slice value_of_default;
-      const Status s = WideColumnSerialization::GetValueOfDefaultColumn(
-          entity_copy, value_of_default);
+      bool is_blob_reference = false;
+      Status s = WideColumnSerialization::GetValueOfDefaultColumn(
+          entity, value_of_default, is_blob_reference);
+      if (s.ok() && is_blob_reference) {
+        // WriteBatchWithIndex entities are written via PutEntity (V1, no blob
+        // references); a blob-backed default column is unexpected here and this
+        // in-memory path cannot resolve it.
+        s = Status::NotSupported(
+            "Blob-backed default column not supported in WriteBatchWithIndex");
+      }
       if (!s.ok()) {
         ClearOutput(output);
         return s;

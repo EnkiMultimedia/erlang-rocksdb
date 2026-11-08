@@ -12,7 +12,6 @@
 #include "db/seqno_to_time_mapping.h"
 #include "rocksdb/io_dispatcher.h"
 #include "table/block_based/block_based_table_reader.h"
-#include "table/block_based/block_based_table_reader_impl.h"
 #include "table/block_based/block_prefetcher.h"
 #include "table/block_based/multi_scan_index_iterator.h"
 #include "table/block_based/reader_common.h"
@@ -50,6 +49,11 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
         block_iter_points_to_real_block_(false) {
     multi_scan_status_.PermitUncheckedError();
   }
+  // No copying allowed
+  BlockBasedTableIterator(const BlockBasedTableIterator&) = delete;
+  BlockBasedTableIterator& operator=(const BlockBasedTableIterator&) = delete;
+  BlockBasedTableIterator(BlockBasedTableIterator&&) = delete;
+  BlockBasedTableIterator& operator=(BlockBasedTableIterator&&) = delete;
 
   ~BlockBasedTableIterator() override { ClearBlockHandles(); }
 
@@ -57,7 +61,7 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   void SeekForPrev(const Slice& target) override;
   void SeekToFirst() override;
   void SeekToLast() override;
-  void Next() final override;
+  void Next() final;
   bool NextAndGetResult(IterateResult* result) override;
   void Prev() override;
   bool Valid() const override {
@@ -315,6 +319,11 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
 
   bool IsIndexAtCurr() const { return is_index_at_curr_block_; }
 
+  inline bool IsReverseMultiScan() const {
+    return multi_scan_read_set_ && multi_scan_index_iter_ &&
+           multi_scan_index_iter_->scan_opts()->reverse;
+  }
+
   const BlockBasedTable* table_;
   const ReadOptions& read_options_;
   const InternalKeyComparator& icomp_;
@@ -335,10 +344,10 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   // `block_handles_` is lazily constructed to save CPU when it is unused
   std::unique_ptr<std::deque<BlockHandleInfo>> block_handles_;
 
-  // The prefix of the key called with SeekImpl().
-  // This is for readahead trimming so no data blocks containing keys of a
-  // different prefix are prefetched
-  std::string seek_key_prefix_for_readahead_trimming_ = "";
+  // Prefix of the seek key from the last Seek() under prefix_same_as_start,
+  // for readahead trimming so no data blocks containing keys of a different
+  // prefix are prefetched. Empty disables prefix-based trimming.
+  std::string seek_key_prefix_for_readahead_trimming_;
 
   const bool allow_unprepared_value_;
   // How current data block's boundary key with the next block is compared with
@@ -468,6 +477,7 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   }
 
   bool IsNextBlockOutOfReadaheadBound() {
+    assert(index_iter_->Valid());
     const Slice& index_iter_user_key = index_iter_->user_key();
     // If curr block's index key >= iterate_upper_bound, it means all the keys
     // in next block or above are out of bound.

@@ -214,7 +214,8 @@ bool Compaction::IsBottommostLevel(
   } else {
     output_l0_idx = -1;
   }
-  Slice smallest_key, largest_key;
+  Slice smallest_key;
+  Slice largest_key;
   GetBoundaryKeys(vstorage, inputs, &smallest_key, &largest_key);
   return !vstorage->RangeMightExistAfterSortedRun(smallest_key, largest_key,
                                                   output_level, output_l0_idx);
@@ -491,7 +492,8 @@ int Compaction::GetProximalLevel() const { return proximal_level_; }
 // smallest_key and largest_key include timestamps if user-defined timestamp is
 // enabled.
 bool Compaction::OverlapProximalLevelOutputRange(
-    const Slice& smallest_key, const Slice& largest_key) const {
+    const Slice& smallest_key, const Slice& largest_key,
+    bool range_limit_exclusive) const {
   if (!SupportsPerKeyPlacement()) {
     return false;
   }
@@ -506,10 +508,11 @@ bool Compaction::OverlapProximalLevelOutputRange(
   const Comparator* ucmp =
       input_vstorage_->InternalComparator()->user_comparator();
 
+  const int largest_cmp = ucmp->CompareWithoutTimestamp(
+      largest_key, proximal_level_smallest_.user_key());
   return ucmp->CompareWithoutTimestamp(
              smallest_key, proximal_level_largest_.user_key()) <= 0 &&
-         ucmp->CompareWithoutTimestamp(
-             largest_key, proximal_level_smallest_.user_key()) >= 0;
+         (range_limit_exclusive ? largest_cmp > 0 : largest_cmp >= 0);
 }
 
 // key includes timestamp if user-defined timestamp is enabled.
@@ -984,9 +987,9 @@ uint64_t Compaction::MaxInputFileNewestKeyTime(const InternalKey* start,
   return newest_key_time;
 }
 
-uint64_t Compaction::MinInputFileOldestAncesterTime(
+uint64_t Compaction::MinInputFileOldestAncestorTime(
     const InternalKey* start, const InternalKey* end) const {
-  uint64_t min_oldest_ancester_time = std::numeric_limits<uint64_t>::max();
+  uint64_t min_oldest_ancestor_time = std::numeric_limits<uint64_t>::max();
   const InternalKeyComparator& icmp =
       column_family_data()->internal_comparator();
   for (const auto& level_files : inputs_) {
@@ -997,14 +1000,14 @@ uint64_t Compaction::MinInputFileOldestAncesterTime(
       if (end != nullptr && icmp.Compare(file->smallest, *end) > 0) {
         continue;
       }
-      uint64_t oldest_ancester_time = file->TryGetOldestAncesterTime();
-      if (oldest_ancester_time != 0) {
-        min_oldest_ancester_time =
-            std::min(min_oldest_ancester_time, oldest_ancester_time);
+      uint64_t oldest_ancestor_time = file->TryGetOldestAncestorTime();
+      if (oldest_ancestor_time != 0) {
+        min_oldest_ancestor_time =
+            std::min(min_oldest_ancestor_time, oldest_ancestor_time);
       }
     }
   }
-  return min_oldest_ancester_time;
+  return min_oldest_ancestor_time;
 }
 
 uint64_t Compaction::MinInputFileEpochNumber() const {

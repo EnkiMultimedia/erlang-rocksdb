@@ -8,14 +8,17 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #ifndef NDEBUG
 #include <iostream>
+#include <unordered_set>
 
 #include "db/blob/blob_file_cache.h"
+#include "db/blob/blob_file_partition_manager.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/periodic_task_scheduler.h"
 #include "monitoring/thread_status_updater.h"
 #include "util/cast_util.h"
+#include "util/hash_containers.h"
 
 namespace ROCKSDB_NAMESPACE {
 uint64_t DBImpl::TEST_GetLevel0TotalSize() {
@@ -30,6 +33,11 @@ Status DBImpl::TEST_SwitchWAL() {
   auto s = SwitchWAL(&write_context);
   TEST_EndWrite(writer);
   return s;
+}
+
+Status DBImpl::TEST_ResumeImpl(DBRecoverContext context) {
+  InstrumentedMutexLock l(&mutex_);
+  return ResumeImpl(context, Env::IOActivity::kFlush);
 }
 
 uint64_t DBImpl::TEST_MaxNextLevelOverlappingBytes(
@@ -136,6 +144,18 @@ Status DBImpl::TEST_SwitchMemtable(ColumnFamilyData* cfd) {
   return s;
 }
 
+size_t DBImpl::TEST_GetWBMFlushableMemUsage() {
+  InstrumentedMutexLock l(&mutex_);
+  assert(wbm_flush_initiator_ != nullptr);
+  RefreshFlushableMemAccounting();
+  return wbm_flush_initiator_->GetFlushableMemUsage();
+}
+
+bool DBImpl::TEST_IsWBMFlushInitiatorFlushable() const {
+  assert(wbm_flush_initiator_ != nullptr);
+  return wbm_flush_initiator_->IsFlushable();
+}
+
 Status DBImpl::TEST_FlushMemTable(bool wait, bool allow_write_stall,
                                   ColumnFamilyHandle* cfh) {
   FlushOptions fo;
@@ -156,11 +176,49 @@ Status DBImpl::TEST_FlushMemTable(ColumnFamilyData* cfd,
   return FlushMemTable(cfd, flush_opts, FlushReason::kTest);
 }
 
+Status DBImpl::TEST_FlushMemTableWithListenerWait(bool allow_write_stall,
+                                                  ColumnFamilyHandle* cfh) {
+  FlushOptions fo;
+  fo.wait = true;
+  fo.listener_wait = true;
+  fo.allow_write_stall = allow_write_stall;
+  ColumnFamilyData* cfd;
+  if (cfh == nullptr) {
+    cfd = default_cf_handle_->cfd();
+  } else {
+    auto cfhi = static_cast_with_check<ColumnFamilyHandleImpl>(cfh);
+    cfd = cfhi->cfd();
+  }
+  return FlushMemTable(cfd, fo, FlushReason::kTest);
+}
+
 Status DBImpl::TEST_AtomicFlushMemTables(
     const autovector<ColumnFamilyData*>& provided_candidate_cfds,
-    const FlushOptions& flush_opts) {
-  return AtomicFlushMemTables(flush_opts, FlushReason::kTest,
-                              provided_candidate_cfds);
+    const FlushOptions& flush_opts, bool non_blocking_write_thread) {
+  const auto join_mode = non_blocking_write_thread
+                             ? WriteThreadJoinMode::kNonBlocking
+                             : WriteThreadJoinMode::kBlocking;
+  return AtomicFlushMemTablesImpl(
+      flush_opts, FlushReason::kTest, provided_candidate_cfds,
+      false /* entered_write_thread */, join_mode, nullptr /* made_progress */);
+}
+
+void DBImpl::TEST_BeginWriteStall() {
+  InstrumentedMutexLock l(&mutex_);
+  write_thread_.BeginWriteStall();
+  if (wbm_flush_initiator_ != nullptr &&
+      write_buffer_manager_->ShouldTrackFlushInitiator()) {
+    wbm_flush_initiator_->SetFlushable(false);
+  }
+}
+
+void DBImpl::TEST_EndWriteStall() {
+  InstrumentedMutexLock l(&mutex_);
+  write_thread_.EndWriteStall();
+  if (wbm_flush_initiator_ != nullptr &&
+      write_buffer_manager_->ShouldTrackFlushInitiator()) {
+    wbm_flush_initiator_->SetFlushable(true);
+  }
 }
 
 Status DBImpl::TEST_WaitForBackgroundWork() {
@@ -199,6 +257,12 @@ Status DBImpl::TEST_WaitForPurge() {
 Status DBImpl::TEST_GetBGError() {
   InstrumentedMutexLock l(&mutex_);
   return error_handler_.GetBGError();
+}
+
+void DBImpl::TEST_SetBGError(const IOStatus& error,
+                             BackgroundErrorReason reason) {
+  InstrumentedMutexLock l(&mutex_);
+  error_handler_.SetBGError(error, reason);
 }
 
 bool DBImpl::TEST_IsRecoveryInProgress() {
@@ -357,10 +421,14 @@ void DBImpl::TEST_VerifyNoObsoleteFilesCached(
   }
 
   // Live and "quarantined" files are allowed to be open in table cache
-  std::set<uint64_t> live_and_quar_files;
+  UnorderedSet<uint64_t> live_and_quar_files;
   for (auto cfd : *versions_->GetColumnFamilySet()) {
     if (cfd->IsDropped()) {
       continue;
+    }
+    if (auto* mgr = cfd->blob_partition_manager(); mgr != nullptr) {
+      mgr->GetActiveBlobFileNumbers(&live_and_quar_files);
+      mgr->GetProtectedBlobFileNumbers(&live_and_quar_files);
     }
     // Iterate over live versions
     Version* current = cfd->current();

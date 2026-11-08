@@ -395,6 +395,31 @@ public enum TickerType {
     WAL_FILE_BYTES((byte) 0x54),
 
     /**
+     * Number of WAL rotations that consumed an async precreated WAL.
+     */
+    WAL_PRECREATE_HIT((byte) -0x6C),
+
+    /**
+     * Number of WAL rotations that found no async precreated WAL to consume.
+     */
+    WAL_PRECREATE_MISS((byte) -0x6D),
+
+    /**
+     * Number of WAL rotations that waited for an in-flight WAL precreation.
+     */
+    WAL_PRECREATE_WAITED((byte) -0x6E),
+
+    /**
+     * Total foreground wait time for in-flight WAL precreation.
+     */
+    WAL_PRECREATE_WAIT_MICROS((byte) -0x6F),
+
+    /**
+     * Number of async WAL precreation attempts that failed.
+     */
+    WAL_PRECREATE_FAILED((byte) -0x70),
+
+    /**
      * Writes can be processed by requesting thread or by the thread at the
      * head of the writers queue.
      */
@@ -492,6 +517,46 @@ public enum TickerType {
      * Number of refill intervals where rate limiter's bytes are fully consumed.
      */
     NUMBER_RATE_LIMITER_DRAINS((byte) 0x76),
+
+    /**
+     * Bytes granted by the rate limiter for read requests.
+     */
+    RATE_LIMITER_BYTES_READ((byte) -0x71),
+
+    /**
+     * Bytes granted by the rate limiter for write requests.
+     */
+    RATE_LIMITER_BYTES_WRITE((byte) -0x72),
+
+    /**
+     * Number of read requests granted by the rate limiter.
+     */
+    RATE_LIMITER_REQUESTS_READ((byte) -0x73),
+
+    /**
+     * Number of write requests granted by the rate limiter.
+     */
+    RATE_LIMITER_REQUESTS_WRITE((byte) -0x74),
+
+    /**
+     * Number of read requests that waited for a future rate limiter refill.
+     */
+    RATE_LIMITER_DELAYED_REQUESTS_READ((byte) -0x75),
+
+    /**
+     * Number of write requests that waited for a future rate limiter refill.
+     */
+    RATE_LIMITER_DELAYED_REQUESTS_WRITE((byte) -0x76),
+
+    /**
+     * Total time read requests spent waiting for rate limiter refills.
+     */
+    RATE_LIMITER_TOTAL_WAIT_MICROS_READ((byte) -0x77),
+
+    /**
+     * Total time write requests spent waiting for rate limiter refills.
+     */
+    RATE_LIMITER_TOTAL_WAIT_MICROS_WRITE((byte) -0x78),
 
     /**
      * BlobDB specific stats
@@ -954,6 +1019,68 @@ public enum TickerType {
      * # of seek errors during multi-scan iteration
      */
     MULTISCAN_SEEK_ERRORS((byte) -0x68),
+
+    /**
+     * # of range tombstones inserted by read-path conversion from contiguous
+     * point tombstones
+     */
+    READ_PATH_RANGE_TOMBSTONES_INSERTED((byte) -0x69),
+
+    /**
+     * # of range tombstones not inserted because the memtable was already
+     * switched to immutable
+     */
+    READ_PATH_RANGE_TOMBSTONES_DISCARDED((byte) -0x6A),
+
+    /**
+     * # of times MANIFEST content validation detected corruption on DB close
+     */
+    MANIFEST_VALIDATION_FAILURE_COUNT((byte) -0x6B),
+
+    /**
+     * # of flushes triggered because the memtable reached write_buffer_size.
+     */
+    FLUSH_REASON_WRITE_BUFFER_FULL((byte) -0x79),
+
+    /**
+     * # of flushes triggered by WriteBufferManager memory pressure.
+     */
+    FLUSH_REASON_WRITE_BUFFER_MANAGER((byte) -0x7A),
+
+    /**
+     * # of flushes triggered because the memtable reached
+     * memtable_max_range_deletions.
+     */
+    FLUSH_REASON_MEMTABLE_MAX_RANGE_DELETIONS((byte) -0x7B),
+
+    /**
+     * # of atomic flush requests triggered because a memtable reached
+     * write_buffer_size.
+     */
+    ATOMIC_FLUSH_REQUEST_REASON_WRITE_BUFFER_FULL((byte) -0x7C),
+
+    /**
+     * # of atomic flush requests triggered by WriteBufferManager memory
+     * pressure.
+     */
+    ATOMIC_FLUSH_REQUEST_REASON_WRITE_BUFFER_MANAGER((byte) -0x7D),
+
+    /**
+     * # of atomic flush requests triggered because a memtable reached
+     * memtable_max_range_deletions.
+     */
+    ATOMIC_FLUSH_REQUEST_REASON_MEMTABLE_MAX_RANGE_DELETIONS((byte) -0x7E),
+
+    /**
+     * # of atomic flush requests triggered for reasons that do not have a
+     * dedicated atomic flush request reason ticker.
+     */
+    ATOMIC_FLUSH_REQUEST_REASON_OTHER((byte) -0x7F),
+
+    /**
+     * Number of SubmitReadAsync calls that fell back to a synchronous read
+     */
+    FILE_SUBMIT_ASYNC_READ_FALLBACK((byte) -0x80),
 
     TICKER_ENUM_MAX((byte) -0x54);
 

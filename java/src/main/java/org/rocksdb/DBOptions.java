@@ -692,6 +692,20 @@ public class DBOptions extends RocksObject
   }
 
   @Override
+  public DBOptions setMaxCompactionTriggerWakeupSeconds(
+      final long maxCompactionTriggerWakeupSeconds) {
+    assert (isOwningHandle());
+    setMaxCompactionTriggerWakeupSeconds(nativeHandle_, maxCompactionTriggerWakeupSeconds);
+    return this;
+  }
+
+  @Override
+  public long maxCompactionTriggerWakeupSeconds() {
+    assert (isOwningHandle());
+    return maxCompactionTriggerWakeupSeconds(nativeHandle_);
+  }
+
+  @Override
   public DBOptions setStatsPersistPeriodSec(
       final int statsPersistPeriodSec) {
     assert(isOwningHandle());
@@ -1168,6 +1182,18 @@ public class DBOptions extends RocksObject
   }
 
   @Override
+  public DBOptions setTrackOptionsFileNumberInManifest(final boolean track) {
+    setTrackOptionsFileNumberInManifest(nativeHandle_, track);
+    return this;
+  }
+
+  @Override
+  public boolean trackOptionsFileNumberInManifest() {
+    assert (isOwningHandle());
+    return trackOptionsFileNumberInManifest(nativeHandle_);
+  }
+
+  @Override
   public DBOptions setLogReadaheadSize(final long logReadaheadSize) {
     setLogReadaheadSize(nativeHandle_, logReadaheadSize);
     return this;
@@ -1335,6 +1361,9 @@ public class DBOptions extends RocksObject
   private static native boolean isFdCloseOnExec(long handle);
   private static native void setStatsDumpPeriodSec(long handle, int statsDumpPeriodSec);
   private static native int statsDumpPeriodSec(long handle);
+  private static native void setMaxCompactionTriggerWakeupSeconds(
+      long handle, long maxCompactionTriggerWakeupSeconds);
+  private static native long maxCompactionTriggerWakeupSeconds(long handle);
   private static native void setStatsPersistPeriodSec(
       final long handle, final int statsPersistPeriodSec);
   private static native int statsPersistPeriodSec(final long handle);
@@ -1426,6 +1455,9 @@ public class DBOptions extends RocksObject
   private static native void setWriteDbidToManifest(
       final long handle, final boolean writeDbidToManifest);
   private static native boolean writeDbidToManifest(final long handle);
+  private static native void setTrackOptionsFileNumberInManifest(
+      final long handle, final boolean track);
+  private static native boolean trackOptionsFileNumberInManifest(final long handle);
   private static native void setLogReadaheadSize(final long handle, final long logReadaheadSize);
   private static native long logReadaheadSize(final long handle);
   private static native void setBestEffortsRecovery(

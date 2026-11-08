@@ -230,6 +230,12 @@ class FilePrefetchBuffer {
     }
   }
 
+  // No copying allowed
+  FilePrefetchBuffer(const FilePrefetchBuffer&) = delete;
+  FilePrefetchBuffer& operator=(const FilePrefetchBuffer&) = delete;
+  FilePrefetchBuffer(FilePrefetchBuffer&&) = delete;
+  FilePrefetchBuffer& operator=(FilePrefetchBuffer&&) = delete;
+
   ~FilePrefetchBuffer() {
     // Abort any pending async read request before destroying the class object.
     if (fs_ != nullptr) {
@@ -527,7 +533,9 @@ class FilePrefetchBuffer {
     read_req.offset = offset;
     read_req.len = n;
     read_req.scratch = nullptr;
-    IOStatus s = reader->MultiRead(opts, &read_req, 1, nullptr);
+    AlignedBuffer direct_io_buffer;
+    AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
+    IOStatus s = reader->MultiRead(opts, &read_req, 1, &direct_io_context);
     if (!s.ok()) {
       return s;
     }

@@ -255,12 +255,12 @@ void LoudsTrieBuilder::Finish() {
     if (lcp > 0) {
       auto& pl = levels[lcp - 1];
       if (!pl.has_child.empty() && !pl.has_child.back()) {
-        // Leaf → internal transition.
+        // Leaf -> internal transition.
         pl.has_child.back() = true;
 
         // Handle migration: move the leaf's handle to a NEW child node at
         // level lcp as a prefix key. The child node is always new because
-        // this label just transitioned from leaf to internal — no child
+        // this label just transitioned from leaf to internal -- no child
         // node existed before for this branch.
         //
         // The leaf_handle must be valid (>= 0) because the label was marked
@@ -306,7 +306,7 @@ void LoudsTrieBuilder::Finish() {
   // created left-to-right as sorted keys are processed). We iterate by
   // level and by node within each level:
   //   - For each node: emit prefix key handle (if any), then for each label:
-  //     if leaf → emit handle; if internal → skip (child visited at next
+  //     if leaf -> emit handle; if internal -> skip (child visited at next
   //     level).
   //   - Build dense/sparse bitvectors from labels and has_child flags.
   // =========================================================================
@@ -393,7 +393,7 @@ void LoudsTrieBuilder::Finish() {
         emit_leaf(static_cast<size_t>(ld.prefix_handle[ni]));
       }
 
-      // Skip pure leaf nodes (no labels) — they are accounted for by
+      // Skip pure leaf nodes (no labels) -- they are accounted for by
       // has_child=0 in their parent. They don't produce LOUDS entries.
       if (label_start == label_end) {
         if (ld.is_prefix[ni]) {
@@ -640,7 +640,7 @@ void LoudsTrieBuilder::SerializeAll() {
         continue;
       }
 
-      // Check if the child node is a prefix key — if so, cannot skip it.
+      // Check if the child node is a prefix key -- if so, cannot skip it.
       {
         uint64_t child_sparse_node = bv_s_louds.Rank1(cs + 1) - 1;
         if (child_sparse_node < bv_s_is_prefix_key.NumBits() &&
@@ -674,7 +674,7 @@ void LoudsTrieBuilder::SerializeAll() {
           break;
         }
 
-        // Check if next node is a prefix key — stop chain here.
+        // Check if next node is a prefix key -- stop chain here.
         {
           uint64_t next_sparse_node = bv_s_louds.Rank1(next_cs + 1) - 1;
           if (next_sparse_node < bv_s_is_prefix_key.NumBits() &&
@@ -1118,7 +1118,7 @@ Status LoudsTrie::InitFromData(const Slice& data) {
   // Validate dense section counts against bitvector sizes. These counts
   // were read from the header (untrusted data) and will be used for leaf
   // ordinal computation during traversal. Inconsistent values would cause
-  // incorrect rank arithmetic leading to wrong leaf indices → wrong block
+  // incorrect rank arithmetic leading to wrong leaf indices -> wrong block
   // handles.
   if (dense_node_count_ > 0) {
     // Each dense node uses 256 bits in d_labels_.
@@ -2150,7 +2150,7 @@ bool LoudsTrieIterator::SeekImpl(const Slice& target) {
                     return DescendToLeftmostLeaf(false, SparseChildNodeNum(cs));
                   }
                 }  // if constexpr (kHasChains)
-                // No chain — normal child lookup.
+                // No chain -- normal child lookup.
                 sparse_start = trie_->s_child_start_pos_[child_idx];
                 sparse_end = trie_->s_child_end_pos_[child_idx];
                 have_sparse_bounds = true;
@@ -2386,7 +2386,7 @@ bool LoudsTrieIterator::SeekImpl(const Slice& target) {
               return DescendToLeftmostLeaf(false, SparseChildNodeNum(cs));
             }
           }  // if constexpr (kHasChains)
-          // No chain — normal child lookup.
+          // No chain -- normal child lookup.
           sparse_start = trie_->s_child_start_pos_[child_idx];
           sparse_end = trie_->s_child_end_pos_[child_idx];
           have_sparse_bounds = true;
@@ -2510,13 +2510,11 @@ bool LoudsTrieIterator::Next() {
 
 bool LoudsTrieIterator::Advance() {
   // Backtrack up the path to find the next sibling, then descend to the
-  // leftmost leaf in that subtree.
+  // leftmost leaf in that subtree. When a sibling is found, replace the
+  // top of the path stack in-place instead of pop+push (avoids 2 autovector
+  // size modifications + 2 key_len_ changes per level in the common case).
   while (!path_.empty()) {
-    auto cur = path_.back();
-    path_.pop_back();
-    if (key_len_ > 0) {
-      key_len_--;
-    }
+    auto& cur = path_.back();
 
     if (cur.is_dense()) {
       uint64_t cur_pos = cur.pos();
@@ -2525,8 +2523,9 @@ bool LoudsTrieIterator::Advance() {
       uint64_t next = trie_->d_labels_.NextSetBit(cur_pos + 1);
 
       if (next < node_end && next < trie_->d_labels_.NumBits()) {
-        path_.push_back(LevelPos::MakeDense(next));
-        AppendKeySlot() = static_cast<char>(next % 256);
+        assert(key_len_ > 0);
+        cur = LevelPos::MakeDense(next);
+        key_buf_[key_len_ - 1] = static_cast<char>(next % 256);
 
         uint64_t label_rank = trie_->d_labels_.Rank1(next + 1) - 1;
         if (!trie_->d_has_child_.GetBit(label_rank)) {
@@ -2544,8 +2543,10 @@ bool LoudsTrieIterator::Advance() {
       uint64_t next_pos = cur.pos() + 1;
       if (next_pos < trie_->s_labels_size_ &&
           !trie_->s_louds_.GetBit(next_pos)) {
-        path_.push_back(LevelPos::MakeSparse(next_pos));
-        AppendKeySlot() = static_cast<char>(trie_->s_labels_data_[next_pos]);
+        assert(key_len_ > 0);
+        cur = LevelPos::MakeSparse(next_pos);
+        key_buf_[key_len_ - 1] =
+            static_cast<char>(trie_->s_labels_data_[next_pos]);
 
         if (!trie_->s_has_child_.GetBit(next_pos)) {
           leaf_index_ = SparseLeafIndex(next_pos);
@@ -2556,10 +2557,228 @@ bool LoudsTrieIterator::Advance() {
         return DescendToLeftmostLeaf(false, SparseChildNodeNum(next_pos));
       }
     }
+
+    // No sibling found at this level -- pop and continue backtracking.
+    path_.pop_back();
+    if (key_len_ > 0) {
+      key_len_--;
+    }
   }
 
   valid_ = false;
   return false;
+}
+
+bool LoudsTrieIterator::DescendToRightmostLeaf(bool in_dense,
+                                               uint64_t node_num) {
+  // Mirror of DescendToLeftmostLeaf: go to the rightmost (largest) child
+  // at each level. Does NOT check prefix keys -- they are the smallest leaf
+  // at a node, so they come last in reverse order and are handled by
+  // Retreat() when backtracking past all children.
+
+  // Sparse child end position from the precomputed lookup table. When
+  // available, avoids SparseNodeEndPos's NextSetBit scan.
+  uint64_t sparse_end = 0;
+  bool have_sparse_end = false;
+
+  while (true) {
+    if (in_dense) {
+      // Find the LAST set bit in this node's 256-bit bitmap.
+      uint64_t node_end = (node_num + 1) * 256;
+      if (node_end > trie_->d_labels_.NumBits()) {
+        node_end = trie_->d_labels_.NumBits();
+      }
+      uint64_t base = node_num * 256;
+      if (base >= trie_->d_labels_.NumBits()) {
+        valid_ = false;
+        return false;
+      }
+      uint64_t last = trie_->d_labels_.PrevSetBit(node_end);
+      if (last >= trie_->d_labels_.NumBits() || last < base) {
+        // Empty node -- shouldn't happen in a valid trie, but guard anyway.
+        valid_ = false;
+        return false;
+      }
+
+      path_.push_back(LevelPos::MakeDense(last));
+      AppendKeySlot() = static_cast<char>(last % 256);
+
+      uint64_t label_rank = trie_->d_labels_.Rank1(last + 1) - 1;
+      if (!trie_->d_has_child_.GetBit(label_rank)) {
+        leaf_index_ = DenseLeafIndexFromRank(last, label_rank);
+        valid_ = true;
+        return true;
+      }
+
+      uint64_t child = DenseChildNodeNumFromRank(label_rank);
+      if (child < trie_->dense_node_count_) {
+        node_num = child;
+        in_dense = true;
+      } else {
+        node_num = child - trie_->dense_node_count_;
+        in_dense = false;
+      }
+    } else {
+      // Sparse: last label is at node_end - 1.
+      uint64_t end;
+      if (have_sparse_end) {
+        end = sparse_end;
+        have_sparse_end = false;
+      } else {
+        uint64_t start = SparseNodeStartPos(node_num);
+        if (start >= trie_->s_labels_size_) {
+          valid_ = false;
+          return false;
+        }
+        end = SparseNodeEndPos(start);
+      }
+      uint64_t last_pos = end - 1;
+
+      path_.push_back(LevelPos::MakeSparse(last_pos));
+      AppendKeySlot() = static_cast<char>(trie_->s_labels_data_[last_pos]);
+
+      if (!trie_->s_has_child_.GetBit(last_pos)) {
+        leaf_index_ = SparseLeafIndex(last_pos);
+        valid_ = true;
+        return true;
+      }
+
+      // Use the precomputed child lookup table when available to avoid
+      // SparseNodeEndPos's NextSetBit scan on the next iteration.
+      uint64_t child_idx = trie_->s_has_child_.Rank1(last_pos + 1) - 1;
+      if (child_idx < trie_->s_child_end_pos_.size()) {
+        sparse_end = trie_->s_child_end_pos_[child_idx];
+        have_sparse_end = true;
+      }
+      node_num = trie_->dense_child_count_ + child_idx;
+      in_dense = false;
+    }
+  }
+}
+
+bool LoudsTrieIterator::SeekToLast() {
+  valid_ = false;
+  leaf_index_ = 0;
+  key_len_ = 0;
+  path_.clear();
+  is_at_prefix_key_ = false;
+
+  if (trie_->NumKeys() == 0) {
+    return false;
+  }
+
+  bool in_dense = (trie_->cutoff_level_ > 0);
+  return DescendToRightmostLeaf(in_dense, /*node_num=*/0);
+}
+
+bool LoudsTrieIterator::Retreat() {
+  // Backtrack up the path to find the previous sibling, then descend to the
+  // rightmost leaf in that subtree. When a sibling is found, replace the
+  // top of the path stack in-place (same optimization as Advance). When no
+  // previous sibling exists, check the prefix key before popping.
+  while (!path_.empty()) {
+    auto& cur = path_.back();
+
+    if (cur.is_dense()) {
+      uint64_t cur_pos = cur.pos();
+      uint64_t node_num = cur_pos / 256;
+      uint64_t node_base = node_num * 256;
+
+      // Find previous set bit within the same node's 256-bit bitmap.
+      uint64_t prev = trie_->d_labels_.PrevSetBit(cur_pos);
+      if (prev < trie_->d_labels_.NumBits() && prev >= node_base) {
+        // Found a previous sibling -- replace in-place.
+        assert(key_len_ > 0);
+        cur = LevelPos::MakeDense(prev);
+        key_buf_[key_len_ - 1] = static_cast<char>(prev % 256);
+
+        uint64_t label_rank = trie_->d_labels_.Rank1(prev + 1) - 1;
+        if (!trie_->d_has_child_.GetBit(label_rank)) {
+          leaf_index_ = DenseLeafIndexFromRank(prev, label_rank);
+          valid_ = true;
+          return true;
+        }
+
+        uint64_t child = DenseChildNodeNumFromRank(label_rank);
+        bool cd = (child < trie_->dense_node_count_);
+        return DescendToRightmostLeaf(
+            cd, cd ? child : child - trie_->dense_node_count_);
+      }
+
+      // No previous sibling -- check prefix key at this node.
+      // Prefix keys are the smallest leaf at a node, so in reverse order
+      // they come after all children.
+      if (trie_->d_is_prefix_key_.NumBits() > 0 &&
+          node_num < trie_->d_is_prefix_key_.NumBits() &&
+          trie_->d_is_prefix_key_.GetBit(node_num)) {
+        // Pop the current level before returning the prefix key -- the
+        // prefix key doesn't have its own path entry.
+        path_.pop_back();
+        if (key_len_ > 0) {
+          key_len_--;
+        }
+        is_at_prefix_key_ = true;
+        leaf_index_ = DensePrefixKeyLeafIndex(node_num);
+        valid_ = true;
+        return true;
+      }
+    } else {
+      // Sparse: check if current position is the first label of its node.
+      uint64_t cur_sparse_pos = cur.pos();
+      if (!trie_->s_louds_.GetBit(cur_sparse_pos)) {
+        // Previous sibling exists at cur.pos() - 1 -- replace in-place.
+        assert(key_len_ > 0);
+        assert(cur_sparse_pos > 0);
+        uint64_t prev_pos = cur_sparse_pos - 1;
+        cur = LevelPos::MakeSparse(prev_pos);
+        key_buf_[key_len_ - 1] =
+            static_cast<char>(trie_->s_labels_data_[prev_pos]);
+
+        if (!trie_->s_has_child_.GetBit(prev_pos)) {
+          leaf_index_ = SparseLeafIndex(prev_pos);
+          valid_ = true;
+          return true;
+        }
+
+        return DescendToRightmostLeaf(false, SparseChildNodeNum(prev_pos));
+      }
+
+      // At first label -- no previous sibling. Check prefix key.
+      uint64_t sparse_node = SparseNodeNum(cur_sparse_pos);
+      if (trie_->s_is_prefix_key_.NumBits() > 0 &&
+          sparse_node < trie_->s_is_prefix_key_.NumBits() &&
+          trie_->s_is_prefix_key_.GetBit(sparse_node)) {
+        path_.pop_back();
+        if (key_len_ > 0) {
+          key_len_--;
+        }
+        is_at_prefix_key_ = true;
+        leaf_index_ = SparsePrefixKeyLeafIndex(sparse_node);
+        valid_ = true;
+        return true;
+      }
+    }
+
+    // No sibling and no prefix key -- pop and continue backtracking.
+    path_.pop_back();
+    if (key_len_ > 0) {
+      key_len_--;
+    }
+  }
+
+  valid_ = false;
+  return false;
+}
+
+bool LoudsTrieIterator::Prev() {
+  if (!valid_) {
+    return false;
+  }
+  // Clear prefix key flag before retreating. If we're at a prefix key, the
+  // path is already at the parent level (prefix keys don't have their own
+  // path entry), so Retreat() continues backtracking from there.
+  is_at_prefix_key_ = false;
+  return Retreat();
 }
 
 TrieBlockHandle LoudsTrieIterator::Value() const {

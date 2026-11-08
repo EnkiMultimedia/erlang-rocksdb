@@ -37,6 +37,10 @@
 #include "rocksdb/table.h"
 #include "rocksdb/thread_status.h"
 
+namespace folly {
+class IOExecutor;
+}
+
 namespace ROCKSDB_NAMESPACE {
 
 class FileLock;
@@ -119,7 +123,8 @@ struct IOOptions {
   // custom contract between a FileSystem user and the provider. This is only
   // useful in cases where a RocksDB user directly uses the FileSystem or file
   // object for their own purposes, and wants to pass extra options to APIs
-  // such as NewRandomAccessFile and NewWritableFile.
+  // such as NewRandomAccessFile and NewWritableFile. Prefer typed fields on
+  // IOOptions/FileOptions when a standardized semantic exists.
   std::unordered_map<std::string, std::string> property_bag;
 
   // Force directory fsync, some file systems like btrfs may skip directory
@@ -176,9 +181,37 @@ struct DirFsyncOptions {
   explicit DirFsyncOptions(FsyncReason fsync_reason);
 };
 
-// File scope options that control how a file is opened/created and accessed
-// while its open. We may add more options here in the future such as
-// redundancy level, media to use etc.
+// File-scope contracts that describe how RocksDB will open/create and access a
+// file. A FileSystem that detects a contract violation must return a non-OK
+// status or preserve its normal valid semantics; it must not expose undefined
+// or corrupt data.
+enum class FileOpenContract : uint8_t {
+  kDefault = 0,
+  // RocksDB will not call ReopenWritableFile for this file to overwrite,
+  // append, or truncate data. SyncFile is a separate durability API.
+  kNoReopenForWrite = 1 << 0,
+  // RocksDB will not open readers while this file is open for write.
+  kNoReadersWhileOpenForWrite = 1 << 1,
+};
+
+constexpr FileOpenContract operator|(FileOpenContract lhs,
+                                     FileOpenContract rhs) {
+  return static_cast<FileOpenContract>(static_cast<uint8_t>(lhs) |
+                                       static_cast<uint8_t>(rhs));
+}
+
+inline FileOpenContract& operator|=(FileOpenContract& lhs,
+                                    FileOpenContract rhs) {
+  lhs = lhs | rhs;
+  return lhs;
+}
+
+constexpr bool HasFileOpenContract(FileOpenContract contracts,
+                                   FileOpenContract contract) {
+  return (static_cast<uint8_t>(contracts) & static_cast<uint8_t>(contract)) ==
+         static_cast<uint8_t>(contract);
+}
+
 struct FileOptions : EnvOptions {
   // Embedded IOOptions to control the parameters for any IOs that need
   // to be issued for the file open/creation
@@ -190,6 +223,9 @@ struct FileOptions : EnvOptions {
   // underlying file systems can put it with appropriate storage media and/or
   // coding.
   Temperature temperature = Temperature::kUnknown;
+
+  // File-open contract. kDefault uses the provider's standard semantics.
+  FileOpenContract open_contract = FileOpenContract::kDefault;
 
   // The checksum type that is used to calculate the checksum value for
   // handoff during file writes.
@@ -214,6 +250,14 @@ struct FileOptions : EnvOptions {
   // that is forbidden for checking/auditing purposes.
   std::string file_checksum_func_name;
 
+  // EXPERIMENTAL
+  // This is used to pass file metadata that can be used by the file system
+  // to accelerate file opening. The content is opaque to RocksDB and is
+  // left to the file system to interpret. This is especially useful in the
+  // case of remote file systems to avoid expensive RPCs to retrieve the
+  // metadata.
+  std::string* file_metadata = nullptr;
+
   FileOptions() : EnvOptions(), handoff_checksum_type(ChecksumType::kCRC32c) {}
 
   FileOptions(const DBOptions& opts)
@@ -228,12 +272,17 @@ struct FileOptions : EnvOptions {
       : EnvOptions(opts),
         io_options(opts.io_options),
         temperature(opts.temperature),
+        open_contract(opts.open_contract),
         handoff_checksum_type(opts.handoff_checksum_type),
         write_hint(opts.write_hint),
         file_checksum(opts.file_checksum),
-        file_checksum_func_name(opts.file_checksum_func_name) {}
+        file_checksum_func_name(opts.file_checksum_func_name),
+        file_metadata(opts.file_metadata) {}
 
   FileOptions& operator=(const FileOptions&) = default;
+  FileOptions(FileOptions&&) = default;
+  FileOptions& operator=(FileOptions&&) = default;
+  ~FileOptions() = default;
 };
 
 // A structure to pass back some debugging information from the FileSystem
@@ -361,8 +410,9 @@ class FileSystem : public Customizable {
 
   // No copying allowed
   FileSystem(const FileSystem&) = delete;
+  FileSystem(FileSystem&&) = delete;
 
-  virtual ~FileSystem();
+  ~FileSystem() override;
 
   static const char* Type() { return "FileSystem"; }
   static const char* kDefaultName() { return "DefaultFileSystem"; }
@@ -413,6 +463,19 @@ class FileSystem : public Customizable {
     return Status::OK();
   }
 
+  // EXPERIMENTAL
+  //
+  // Used in the RocksDB coroutine query interface. Coroutine-based read
+  // requests will run on an EventBase from this executor. Returns nullptr when
+  // coroutine read execution is not supported. When called from one of its
+  // EventBases, the executor's getEventBase() must return that EventBase.
+  virtual folly::IOExecutor* GetReadExecutor() { return nullptr; }
+
+  // Increase the maximum number of threads used by the FileSystem-owned read
+  // IO executor to at least the requested number. The executor is not reduced
+  // when its current maximum is larger. The number must be positive.
+  virtual void SetReadIOExecutorThreads(int /*number*/) {}
+
   // Create a brand new sequentially-readable file with the specified name.
   // On success, stores a pointer to the new file in *result and returns OK.
   // On failure stores nullptr in *result and returns non-OK.  If the file does
@@ -434,17 +497,6 @@ class FileSystem : public Customizable {
   virtual IOStatus NewRandomAccessFile(
       const std::string& fname, const FileOptions& file_opts,
       std::unique_ptr<FSRandomAccessFile>* result, IODebugContext* dbg) = 0;
-  // These values match Linux definition
-  // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/uapi/linux/fcntl.h#n56
-  enum WriteLifeTimeHint {
-    kWLTHNotSet = 0,  // No hint information set
-    kWLTHNone,        // No hints about write life time
-    kWLTHShort,       // Data written has a short life time
-    kWLTHMedium,      // Data written has a medium life time
-    kWLTHLong,        // Data written has a long life time
-    kWLTHExtreme,     // Data written has an extremely long life time
-  };
-
   // Create an object that writes to a new file with the specified
   // name.  Deletes any existing file with the same name and creates a
   // new file.  On success, stores a pointer to the new file in
@@ -627,6 +679,22 @@ class FileSystem : public Customizable {
         "LinkFile is not supported for this FileSystem");
   }
 
+  // Syncs file data and, when requested, file metadata for `fname`.
+  //
+  // The default implementation reopens the file as writable, calls Sync() or
+  // Fsync(), then closes it. Filesystems that already make file contents
+  // durable on file flush/close can override this as a no-op to avoid the
+  // reopen overhead.
+  //
+  // RocksDB code that needs to sync a named file should use this API instead of
+  // hand-rolling ReopenWritableFile()+Sync()/Fsync(). This lets filesystems
+  // reject ReopenWritableFile() for post-close data writes while still
+  // providing a cleaner path-level sync implementation.
+  virtual IOStatus SyncFile(const std::string& fname,
+                            const FileOptions& file_opts,
+                            const IOOptions& io_opts, bool use_fsync,
+                            IODebugContext* dbg);
+
   virtual IOStatus NumFileLinks(const std::string& /*fname*/,
                                 const IOOptions& /*options*/,
                                 uint64_t* /*count*/, IODebugContext* /*dbg*/) {
@@ -796,10 +864,21 @@ class FileSystem : public Customizable {
     supported_ops |= (1 << FSSupportedOps::kFSPrefetch);
   }
 
+  // Returns false if this FileSystem never allocates space beyond a file's
+  // logical size (for example, via FSWritableFile::Allocate() or
+  // PrepareWrite()). RocksDB may then skip work whose only purpose is to
+  // release preallocated space, such as reopening and truncating the last
+  // WAL file during DB open. This should reflect the capability of the
+  // FileSystem rather than any per-file options or build configuration,
+  // since files may have been created by a prior process with different
+  // options or a different build. Defaults to true.
+  virtual bool IsPreallocationSupported() { return true; }
+
   // If you're adding methods here, remember to add them to EnvWrapper too.
 
  private:
   void operator=(const FileSystem&);
+  void operator=(FileSystem&&) = delete;
 };
 
 // A file abstraction for reading sequentially through a file
@@ -807,7 +886,7 @@ class FSSequentialFile {
  public:
   FSSequentialFile() {}
 
-  virtual ~FSSequentialFile() {}
+  virtual ~FSSequentialFile() = default;
 
   // Read up to "n" bytes from the file.  "scratch[0..n-1]" may be
   // written by this routine.  Sets "*result" to the data that was
@@ -937,7 +1016,7 @@ class FSRandomAccessFile {
  public:
   FSRandomAccessFile() {}
 
-  virtual ~FSRandomAccessFile() {}
+  virtual ~FSRandomAccessFile() = default;
 
   // Read up to "n" bytes from the file starting at "offset".
   // "scratch[0..n-1]" may be written by this routine.  Sets "*result"
@@ -1067,6 +1146,36 @@ class FSRandomAccessFile {
   }
 
   // EXPERIMENTAL
+  // Submit a read for RocksDB coroutine queries. The implementation owns the
+  // completion executor and must update req.status and invoke cb(req) exactly
+  // once.
+  //
+  // Returns true when the asynchronous path is used and false when the request
+  // is completed using the synchronous Read fallback.
+  //
+  // All arguments and any memory they reference remain valid until cb is
+  // invoked.
+  //
+  // Default implementation reads the data synchronously and invokes the
+  // callback before returning. It uses MultiRead() when scratch is nullptr so
+  // implementations supporting kFSBuffer can provide an allocated buffer.
+  virtual bool SubmitReadAsync(FSReadRequest& req, const IOOptions& opts,
+                               std::function<void(FSReadRequest&)> cb,
+                               IODebugContext* dbg) {
+    if (req.scratch == nullptr) {
+      IOStatus status = MultiRead(&req, /*num_reqs=*/1, opts, dbg);
+      if (!status.ok()) {
+        req.status = std::move(status);
+      }
+    } else {
+      req.status =
+          Read(req.offset, req.len, opts, &(req.result), req.scratch, dbg);
+    }
+    cb(req);
+    return false;
+  }
+
+  // EXPERIMENTAL
   // When available, returns the actual temperature for the file. This is
   // useful in case some outside process moves a file from one tier to another,
   // though the temperature is generally expected not to change while a file is
@@ -1079,6 +1188,19 @@ class FSRandomAccessFile {
   // immediately implement this function.
   virtual IOStatus GetFileSize(uint64_t* /*result*/) {
     return IOStatus::NotSupported("GetFileSize Not Supported");
+  }
+
+  // EXPERIMENTAL
+  // Returns metadata for the file that can be passed back later to the file
+  // system when reopening this file. This is optional. The implementation
+  // can return NotSupported. The metadata, if returned, is not mandatory
+  // for the file system to use when reopening. It can be ignored and the
+  // only downside is slower file open time.
+  // The returned metadata must not exceed kMaxFileOpenMetadataSize bytes.
+  // Larger metadata will be silently discarded by RocksDB.
+  static constexpr size_t kMaxFileOpenMetadataSize = 8 * 1024;  // 8KB
+  virtual IOStatus GetFileOpenMetadata(std::string* /*metadata*/) {
+    return IOStatus::NotSupported("GetFileOpenMetadata not supported");
   }
 
   // If you're adding methods here, remember to add them to
@@ -1198,12 +1320,27 @@ class FSWritableFile {
   virtual IOStatus Close(const IOOptions& /*options*/,
                          IODebugContext* /*dbg*/) = 0;
 
+  // Flush any internally buffered data to the underlying storage, so that
+  // the data is no longer dependent on this process's memory. After this
+  // call, the data should survive a process crash but is not necessarily
+  // persisted to stable storage. Use Sync() for that guarantee.
+  // All flushed data must be readable through file access APIs (e.g.
+  // FSRandomAccessFile), though path-level metadata queries such as
+  // FileSystem::GetFileSize() might lag on some implementations.
+  // Not thread-safe; see IsSyncThreadSafe().
   virtual IOStatus Flush(const IOOptions& options, IODebugContext* dbg) = 0;
-  virtual IOStatus Sync(const IOOptions& options,
-                        IODebugContext* dbg) = 0;  // sync data
+
+  // Persist data to stable storage. After this call, the data should
+  // survive power failures. Does not necessarily persist file metadata
+  // (e.g. file size); see Fsync().
+  // Sync() implies Flush(): implementations must ensure all internally
+  // buffered data is also flushed.
+  // Not safe to call concurrently with Append() or Flush() unless
+  // IsSyncThreadSafe() returns true.
+  virtual IOStatus Sync(const IOOptions& options, IODebugContext* dbg) = 0;
 
   /*
-   * Sync data and/or metadata as well.
+   * Persist data and metadata to stable storage.
    * By default, sync only data.
    * Override this method for environments where we need to sync
    * metadata as well.
@@ -1338,6 +1475,8 @@ class FSWritableFile {
   // No copying allowed
   FSWritableFile(const FSWritableFile&);
   void operator=(const FSWritableFile&);
+  FSWritableFile(FSWritableFile&&) = delete;
+  void operator=(FSWritableFile&&) = delete;
 
  protected:
   Env::IOPriority io_priority_;
@@ -1353,7 +1492,7 @@ class FSRandomRWFile {
   // For cases when Close() hasn't been called, many derived classes of
   // FSRandomRWFile will need to call Close() non-virtually in their destructor,
   // and ignore the result, to ensure resources are released.
-  virtual ~FSRandomRWFile() {}
+  virtual ~FSRandomRWFile() = default;
 
   // Indicates if the class makes use of direct I/O
   // If false you must pass aligned buffer to Write()
@@ -1423,6 +1562,8 @@ class FSMemoryMappedFileBuffer {
   // movable if desired, however, since
   FSMemoryMappedFileBuffer(const FSMemoryMappedFileBuffer&) = delete;
   FSMemoryMappedFileBuffer& operator=(const FSMemoryMappedFileBuffer&) = delete;
+  FSMemoryMappedFileBuffer(FSMemoryMappedFileBuffer&&) = delete;
+  FSMemoryMappedFileBuffer& operator=(FSMemoryMappedFileBuffer&&) = delete;
 
   void* GetBase() const { return base_; }
   size_t GetLen() const { return length_; }
@@ -1439,7 +1580,7 @@ class FSDirectory {
   // For cases when Close() hasn't been called, many derived classes of
   // FSDirectory will need to call Close() non-virtually in their destructor,
   // and ignore the result, to ensure resources are released.
-  virtual ~FSDirectory() {}
+  virtual ~FSDirectory() = default;
   // Fsync directory. Can be called concurrently from multiple threads.
   virtual IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) = 0;
 
@@ -1502,10 +1643,18 @@ class FileSystemWrapper : public FileSystem {
  public:
   // Initialize an EnvWrapper that delegates all calls to *t
   explicit FileSystemWrapper(const std::shared_ptr<FileSystem>& t);
-  ~FileSystemWrapper() override {}
+  ~FileSystemWrapper() override = default;
 
   // Return the target to which this Env forwards all calls
   FileSystem* target() const { return target_.get(); }
+
+  folly::IOExecutor* GetReadExecutor() override {
+    return target_->GetReadExecutor();
+  }
+
+  void SetReadIOExecutorThreads(int num) override {
+    target_->SetReadIOExecutorThreads(num);
+  }
 
   // The following text is boilerplate that forwards all methods to target()
   IOStatus NewSequentialFile(const std::string& f, const FileOptions& file_opts,
@@ -1616,6 +1765,12 @@ class FileSystemWrapper : public FileSystem {
     return target_->LinkFile(s, t, options, dbg);
   }
 
+  IOStatus SyncFile(const std::string& fname, const FileOptions& file_opts,
+                    const IOOptions& io_opts, bool use_fsync,
+                    IODebugContext* dbg) override {
+    return target_->SyncFile(fname, file_opts, io_opts, use_fsync, dbg);
+  }
+
   IOStatus NumFileLinks(const std::string& fname, const IOOptions& options,
                         uint64_t* count, IODebugContext* dbg) override {
     return target_->NumFileLinks(fname, options, count, dbg);
@@ -1714,6 +1869,10 @@ class FileSystemWrapper : public FileSystem {
     return target_->SupportedOps(supported_ops);
   }
 
+  bool IsPreallocationSupported() override {
+    return target_->IsPreallocationSupported();
+  }
+
  protected:
   std::shared_ptr<FileSystem> target_;
 };
@@ -1800,12 +1959,20 @@ class FSRandomAccessFileWrapper : public FSRandomAccessFile {
                      IODebugContext* dbg) override {
     return target()->ReadAsync(req, opts, cb, cb_arg, io_handle, del_fn, dbg);
   }
+  bool SubmitReadAsync(FSReadRequest& req, const IOOptions& opts,
+                       std::function<void(FSReadRequest&)> cb,
+                       IODebugContext* dbg) override {
+    return target()->SubmitReadAsync(req, opts, std::move(cb), dbg);
+  }
   Temperature GetTemperature() const override {
     return target_->GetTemperature();
   }
 
-  virtual IOStatus GetFileSize(uint64_t* result) override {
+  IOStatus GetFileSize(uint64_t* result) override {
     return target_->GetFileSize(result);
+  }
+  IOStatus GetFileOpenMetadata(std::string* metadata) override {
+    return target_->GetFileOpenMetadata(metadata);
   }
 
  private:

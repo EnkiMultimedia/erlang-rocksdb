@@ -26,7 +26,12 @@ struct SliceParts;
 // indexed implementation.
 class WriteBatchBase {
  public:
-  virtual ~WriteBatchBase() {}
+  WriteBatchBase() = default;
+  WriteBatchBase(const WriteBatchBase&) = default;
+  WriteBatchBase& operator=(const WriteBatchBase&) = default;
+  WriteBatchBase(WriteBatchBase&&) = default;
+  WriteBatchBase& operator=(WriteBatchBase&&) = default;
+  virtual ~WriteBatchBase() = default;
 
   // Store the mapping "key->value" in the database.
   virtual Status Put(ColumnFamilyHandle* column_family, const Slice& key,
@@ -59,7 +64,9 @@ class WriteBatchBase {
                           const Slice& value, uint64_t write_unix_time) = 0;
 
   // Store the mapping "key->{column1:value1, column2:value2, ...}" in the
-  // column family specified by "column_family".
+  // column family specified by "column_family". `columns` is a non-owning
+  // view, so the backing storage for each column name and value must remain
+  // valid until this method returns.
   virtual Status PutEntity(ColumnFamilyHandle* column_family, const Slice& key,
                            const WideColumns& columns) = 0;
 

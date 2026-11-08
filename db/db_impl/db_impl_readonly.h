@@ -19,21 +19,33 @@ class DBImplReadOnly : public DBImpl {
   // No copying allowed
   DBImplReadOnly(const DBImplReadOnly&) = delete;
   void operator=(const DBImplReadOnly&) = delete;
+  DBImplReadOnly(DBImplReadOnly&&) = delete;
+  void operator=(DBImplReadOnly&&) = delete;
 
-  virtual ~DBImplReadOnly();
+  ~DBImplReadOnly() override;
 
   // Implementations of the DB interface
   using DBImpl::GetImpl;
-  Status GetImpl(const ReadOptions& options, const Slice& key,
-                 GetImplOptions& get_impl_options) override;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(Status, GetImpl, const ReadOptions& options,
+                                  const Slice& key,
+                                  GetImplOptions& get_impl_options);
 
-  // TODO: Implement ReadOnly MultiGet?
+  using DBImpl::MultiGetWithMetadata;
+  void MultiGetWithMetadata(const ReadOptions& options, const size_t num_keys,
+                            ColumnFamilyHandle* const* column_families,
+                            const Slice* keys, PinnableSlice* values,
+                            Status* statuses,
+                            MultiGetOutputMetadata* output_metadata,
+                            const bool sorted_input = false) override;
 
   using DBImpl::NewIterator;
   Iterator* NewIterator(const ReadOptions& _read_options,
                         ColumnFamilyHandle* column_family) override;
 
   Status NewIterators(const ReadOptions& options,
+                      const std::vector<ColumnFamilyHandle*>& column_families,
+                      std::vector<Iterator*>* iterators) override;
+  Status NewIterators(const std::vector<ReadOptions>& read_options,
                       const std::vector<ColumnFamilyHandle*>& column_families,
                       std::vector<Iterator*>* iterators) override;
 
@@ -134,6 +146,19 @@ class DBImplReadOnly : public DBImpl {
     return Status::NotSupported("Not supported operation in read only mode.");
   }
 
+  using DB::PrepareFileIngestion;
+  Status PrepareFileIngestion(
+      const std::vector<IngestExternalFileArg>& /*args*/,
+      std::unique_ptr<FileIngestionHandle>* /*handle*/) override {
+    return Status::NotSupported("Not supported operation in read only mode.");
+  }
+
+  using DB::CommitFileIngestionHandles;
+  Status CommitFileIngestionHandles(
+      std::vector<std::unique_ptr<FileIngestionHandle>> /*handles*/) override {
+    return Status::NotSupported("Not supported operation in read only mode.");
+  }
+
   using DB::CreateColumnFamilyWithImport;
   Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& /*options*/,
@@ -186,7 +211,7 @@ class DBImplReadOnly : public DBImpl {
   // FIXME: some missing overrides for more "write" functions
 
  protected:
-  Status FlushForGetLiveFiles() override {
+  Status FlushForGetLiveFiles(bool /*force_atomic_flush*/) override {
     // No-op for read-only DB
     return Status::OK();
   }

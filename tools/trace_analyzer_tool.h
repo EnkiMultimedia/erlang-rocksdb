@@ -68,7 +68,7 @@ class AnalyzerOptions {
 
   AnalyzerOptions();
 
-  ~AnalyzerOptions();
+  ~AnalyzerOptions() = default;
 
   void SparseCorrelationInput(const std::string& in_str);
 };
@@ -170,7 +170,7 @@ class TraceAnalyzer : private TraceRecord::Handler,
  public:
   TraceAnalyzer(std::string& trace_path, std::string& output_path,
                 AnalyzerOptions _analyzer_opts);
-  ~TraceAnalyzer();
+  ~TraceAnalyzer() override;
 
   Status PrepareProcessing();
 
@@ -200,6 +200,10 @@ class TraceAnalyzer : private TraceRecord::Handler,
   using WriteBatch::Handler::PutCF;
   Status PutCF(uint32_t column_family_id, const Slice& key,
                const Slice& value) override;
+
+  using WriteBatch::Handler::TimedPutCF;
+  Status TimedPutCF(uint32_t column_family_id, const Slice& key,
+                    const Slice& value, uint64_t write_unix_time) override;
 
   using WriteBatch::Handler::PutEntityCF;
   Status PutEntityCF(uint32_t column_family_id, const Slice& key,
@@ -317,6 +321,9 @@ class TraceAnalyzer : private TraceRecord::Handler,
   Status WriteTraceSequence(const uint32_t& type, const uint32_t& cf_id,
                             const Slice& key, const size_t value_size,
                             const uint64_t ts);
+  Status WriteRangeDeleteTraceSequence(const uint32_t& cf_id,
+                                       const Slice& begin_key,
+                                       const Slice& end_key, const uint64_t ts);
   Status MakeStatisticKeyStatsOrPrefix(TraceStats& stats);
   Status MakeStatisticCorrelation(TraceStats& stats, StatsUnit& unit);
   Status MakeStatisticQPS();

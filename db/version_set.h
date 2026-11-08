@@ -41,6 +41,7 @@
 #include "db/error_handler.h"
 #include "db/file_indexer.h"
 #include "db/log_reader.h"
+#include "db/periodic_compaction_phaser.h"
 #include "db/range_del_aggregator.h"
 #include "db/read_callback.h"
 #include "db/table_cache.h"
@@ -48,10 +49,6 @@
 #include "db/version_edit.h"
 #include "db/write_controller.h"
 #include "env/file_system_tracer.h"
-#if USE_COROUTINES
-#include "folly/coro/BlockingWait.h"
-#include "folly/coro/Collect.h"
-#endif
 #include "monitoring/instrumented_mutex.h"
 #include "options/db_options.h"
 #include "options/offpeak_time_info.h"
@@ -76,6 +73,7 @@ class Compaction;
 class LogBuffer;
 class LookupKey;
 class MemTable;
+class SameFileBlobReader;
 class Version;
 class VersionSet;
 class WriteBufferManager;
@@ -85,6 +83,24 @@ class MergeIteratorBuilder;
 class SystemClock;
 class ManifestTailer;
 class FilePickerMultiGet;
+class MultiScanArgs;
+
+// The OPTIONS publication state recovered from a MANIFEST.
+struct OptionsFileManifestState {
+  uint64_t committed_options_file_number = 0;
+  bool has_committed_options_file_number = false;
+  std::map<uint32_t, std::string> column_family_names;
+
+  void ApplyCommit(uint64_t number);
+  void ApplyColumnFamilyEdit(const VersionEdit& edit);
+};
+
+struct OptionsFileSelection {
+  uint64_t file_number = 0;
+  bool selected_by_manifest = false;
+  bool used_fallback = false;
+  std::vector<uint64_t> rejected_tracked_file_numbers;
+};
 
 // VersionEdit is always supposed to be valid and it is used to point at
 // entries in Manifest. Ideally it should not be used as a container to
@@ -129,18 +145,20 @@ enum EpochNumberRequirement {
 // compaction, blob files, etc.
 class VersionStorageInfo {
  public:
-  VersionStorageInfo(const InternalKeyComparator* internal_comparator,
-                     const Comparator* user_comparator, int num_levels,
-                     CompactionStyle compaction_style,
-                     VersionStorageInfo* src_vstorage,
-                     bool _force_consistency_checks,
-                     EpochNumberRequirement epoch_number_requirement,
-                     SystemClock* clock,
-                     uint32_t bottommost_file_compaction_delay,
-                     OffpeakTimeOption offpeak_time_option);
+  VersionStorageInfo(
+      const InternalKeyComparator* internal_comparator,
+      const Comparator* user_comparator, int num_levels,
+      CompactionStyle compaction_style, VersionStorageInfo* src_vstorage,
+      bool _force_consistency_checks,
+      EpochNumberRequirement epoch_number_requirement, SystemClock* clock,
+      uint32_t bottommost_file_compaction_delay,
+      OffpeakTimeOption offpeak_time_option,
+      PeriodicCompactionPhaseParams periodic_compaction_phase_params);
   // No copying allowed
   VersionStorageInfo(const VersionStorageInfo&) = delete;
   void operator=(const VersionStorageInfo&) = delete;
+  VersionStorageInfo(VersionStorageInfo&&) = delete;
+  void operator=(VersionStorageInfo&&) = delete;
   ~VersionStorageInfo();
 
   void Reserve(int level, size_t size) { files_[level].reserve(size); }
@@ -250,6 +268,13 @@ class VersionStorageInfo {
       double blob_garbage_collection_force_threshold,
       bool enable_blob_garbage_collection);
 
+  // This computes read_triggered_compaction_files_ and is called by
+  // ComputeCompactionScore()
+  //
+  // REQUIRES: DB mutex held
+  void ComputeFilesMarkedForReadTriggeredCompaction(
+      double threshold, CompactionStyle compaction_style);
+
   bool level0_non_overlapping() const { return level0_non_overlapping_; }
 
   // Updates the oldest snapshot and related internal state, like the bottommost
@@ -258,6 +283,28 @@ class VersionStorageInfo {
   void UpdateOldestSnapshot(SequenceNumber oldest_snapshot_seqnum,
                             bool allow_ingest_behind, const Comparator* ucmp,
                             const std::string& full_history_ts_low);
+
+  // Sets the seqno->time preserve-window lower bound used when deciding whether
+  // a bottommost file can be marked for compaction (see
+  // preserve_time_min_seqno_ and BottommostSeqnoCanBeZeroed).
+  // kMaxSequenceNumber disables the constraint. Fed from DBImpl, which owns the
+  // seqno->time mapping. REQUIRES: DB mutex held
+  void SetPreserveTimeMinSeqno(SequenceNumber preserve_time_min_seqno) {
+    preserve_time_min_seqno_ = preserve_time_min_seqno;
+  }
+
+  // The seqno->time preserve-window lower bound set by SetPreserveTimeMinSeqno.
+  // For a bottommost-file (kBottommostFiles) compaction, CompactionJob folds
+  // this into its own preserve_seqno_after_ computation so that the compaction
+  // zeroes out at least the sequence numbers the marker
+  // (ComputeBottommostFilesMarkedForCompaction) deemed zeroable, even when the
+  // selected file's persisted seqno->time mapping is sparse or empty (e.g. a
+  // file written before preserve/preclude was enabled). Otherwise the two would
+  // disagree and a marked file could never make progress (infinite compaction
+  // loop). kMaxSequenceNumber means the constraint is inactive.
+  SequenceNumber GetPreserveTimeMinSeqno() const {
+    return preserve_time_min_seqno_;
+  }
 
   int MaxInputLevel() const;
   int MaxOutputLevel(bool allow_ingest_behind) const;
@@ -536,6 +583,19 @@ class VersionStorageInfo {
     return files_marked_for_forced_blob_gc_;
   }
 
+  // REQUIRES: ComputeCompactionScore has been called
+  // REQUIRES: DB mutex held during access
+  const autovector<std::pair<int, FileMetaData*>>&
+  ReadTriggeredCompactionFiles() const {
+    assert(finalized_);
+    return read_triggered_compaction_files_;
+  }
+
+  void TEST_AddFileMarkedForReadTriggeredCompaction(int level,
+                                                    FileMetaData* f) {
+    read_triggered_compaction_files_.emplace_back(level, f);
+  }
+
   int base_level() const { return base_level_; }
   double level_multiplier() const { return level_multiplier_; }
 
@@ -744,6 +804,8 @@ class VersionStorageInfo {
 
   autovector<std::pair<int, FileMetaData*>> files_marked_for_forced_blob_gc_;
 
+  autovector<std::pair<int, FileMetaData*>> read_triggered_compaction_files_;
+
   // Threshold for needing to mark another bottommost file. Maintain it so we
   // can quickly check when releasing a snapshot whether more bottommost files
   // became eligible for compaction. It's defined as the min of the max nonzero
@@ -761,6 +823,17 @@ class VersionStorageInfo {
   // current seqnum, which needs to be protected as a snapshot can still be
   // created that references it.
   SequenceNumber oldest_snapshot_seqnum_ = 0;
+
+  // The smallest sequence number whose write time is still within the
+  // seqno->time "preserve" window (preserve_internal_time_seconds /
+  // preclude_last_level_data_seconds). Bottommost keys at or above this seqno
+  // cannot have their sequence numbers zeroed out yet, so files whose largest
+  // seqno is at or above it must not be marked for bottommost compaction (that
+  // would be futile and loop). kMaxSequenceNumber means preserve is inactive.
+  // Fed from DBImpl (which owns the seqno->time mapping) via
+  // SetPreserveTimeMinSeqno; carried across versions like
+  // oldest_snapshot_seqnum_.
+  SequenceNumber preserve_time_min_seqno_ = kMaxSequenceNumber;
 
   // Level that should be compacted next and its compaction score.
   // Score < 1 means compaction is not strictly needed.  These fields
@@ -811,6 +884,8 @@ class VersionStorageInfo {
 
   OffpeakTimeOption offpeak_time_option_;
 
+  PeriodicCompactionPhaseParams periodic_compaction_phase_params_;
+
   friend class Version;
   friend class VersionSet;
 };
@@ -858,6 +933,9 @@ struct ObsoleteFileInfo {
 
     return *this;
   }
+
+  ~ObsoleteFileInfo() = default;
+
   void DeleteMetadata() {
     if (file_metadata_cache_res_mgr) {
       Status s = file_metadata_cache_res_mgr->UpdateCacheReservation(
@@ -894,17 +972,27 @@ class Version {
   // yield the contents of this Version when merged together.
   // @param read_options Must outlive any iterator built by
   // `merger_iter_builder`.
+  // @param read_seq Snapshot sequence to use for range tombstone visibility.
+  // This is passed separately because lazy iterator initialization may happen
+  // after read_options.snapshot has been released by the caller.
+  // @param scan_opts Optional bounded scan ranges used to prune levels/files
+  // while building the iterator tree.
   void AddIterators(const ReadOptions& read_options,
                     const FileOptions& soptions,
                     MergeIteratorBuilder* merger_iter_builder,
-                    bool allow_unprepared_value);
+                    bool allow_unprepared_value, SequenceNumber read_seq,
+                    const MultiScanArgs* scan_opts = nullptr);
 
   // @param read_options Must outlive any iterator built by
   // `merger_iter_builder`.
+  // @param read_seq Snapshot sequence to use for range tombstone visibility.
+  // @param scan_opts Optional bounded scan ranges used to prune this level.
   void AddIteratorsForLevel(const ReadOptions& read_options,
                             const FileOptions& soptions,
                             MergeIteratorBuilder* merger_iter_builder,
-                            int level, bool allow_unprepared_value);
+                            int level, bool allow_unprepared_value,
+                            SequenceNumber read_seq,
+                            const MultiScanArgs* scan_opts = nullptr);
 
   Status OverlapWithLevelIterator(const ReadOptions&, const FileOptions&,
                                   const Slice& smallest_user_key,
@@ -933,26 +1021,19 @@ class Version {
   //    merge_context.operands_list and don't merge the operands
   // REQUIRES: lock is not held
   // REQUIRES: pinned_iters_mgr != nullptr
-  void Get(const ReadOptions&, const LookupKey& key, PinnableSlice* value,
-           PinnableWideColumns* columns, std::string* timestamp, Status* status,
-           MergeContext* merge_context,
-           SequenceNumber* max_covering_tombstone_seq,
-           PinnedIteratorsManager* pinned_iters_mgr,
-           bool* value_found = nullptr, bool* key_exists = nullptr,
-           SequenceNumber* seq = nullptr, ReadCallback* callback = nullptr,
-           bool* is_blob = nullptr, bool do_merge = true);
+  DECLARE_SYNC_AND_ASYNC(
+      void, Get, const ReadOptions&, const LookupKey& key, PinnableSlice* value,
+      PinnableWideColumns* columns, std::string* timestamp, Status* status,
+      MergeContext* merge_context, SequenceNumber* max_covering_tombstone_seq,
+      PinnedIteratorsManager* pinned_iters_mgr, bool* value_found = nullptr,
+      bool* key_exists = nullptr, SequenceNumber* seq = nullptr,
+      ReadCallback* callback = nullptr, bool* is_blob = nullptr,
+      bool do_merge = true,
+      const SameFileBlobReader** lazy_columns_same_file_reader = nullptr);
 
-  void MultiGet(const ReadOptions&, MultiGetRange* range,
-                ReadCallback* callback = nullptr);
-
-  // Interprets blob_index_slice as a blob reference, and (assuming the
-  // corresponding blob file is part of this Version) retrieves the blob and
-  // saves it in *value.
-  // REQUIRES: blob_index_slice stores an encoded blob reference
-  Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
-                 const Slice& blob_index_slice,
-                 FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
-                 uint64_t* bytes_read) const;
+  DECLARE_SYNC_AND_ASYNC(void, MultiGet, const ReadOptions&,
+                         MultiGetRange* range,
+                         ReadCallback* callback = nullptr);
 
   // Retrieves a blob using a blob reference and saves it in *value,
   // assuming the corresponding blob file is part of this Version.
@@ -961,12 +1042,47 @@ class Version {
                  FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read) const;
 
+  // Retrieves a byte sub-range [range_offset, range_offset + range_length) of
+  // an *uncompressed*, separate-file blob's value into *value, reading only
+  // those bytes on a cache miss (see BlobSource::GetBlobRange). The blob file
+  // must be part of this Version. Returns Corruption for a
+  // TTL/inlined/same-file or compressed blob index (the lazy caller only routes
+  // uncompressed separate-file references here; other cases take the
+  // whole-value GetBlob path). The caller must ensure range_offset +
+  // range_length <= blob_index.size().
+  Status GetBlobRange(const ReadOptions& read_options, const Slice& user_key,
+                      const BlobIndex& blob_index, uint64_t range_offset,
+                      size_t range_length, PinnableSlice* value,
+                      uint64_t* bytes_read) const;
+
+  // A single separate-file blob reference to resolve via MultiGetBlobLazy:
+  // whole value (range_length == kWholeBlobLength) or a byte sub-range.
+  struct LazyBlobReadRequest {
+    const Slice* user_key = nullptr;
+    const BlobIndex* blob_index = nullptr;
+    uint64_t range_offset = 0;
+    size_t range_length = 0;  // kWholeBlobLength => whole value
+    PinnableSlice* result = nullptr;
+    Status* status = nullptr;
+  };
+
+  // Resolves a batch of separate-file blob references for the lazy (cross-key
+  // coalescing) read path, grouping by blob file so each file's reads are
+  // coalesced into one MultiRead. Whole-value requests (range_length ==
+  // kWholeBlobLength) go through BlobSource::MultiGetBlob (blob-cache fill +
+  // checksum per read_options); sub-range requests go through
+  // BlobSource::MultiGetBlobRange (uncompressed, no checksum, no cache fill).
+  // Per-request outcome is written to *reqs[i].status; a TTL/inlined index or
+  // an unknown blob file number yields Corruption on that request.
+  void MultiGetBlobLazy(const ReadOptions& read_options,
+                        autovector<LazyBlobReadRequest>& reqs) const;
+
   struct BlobReadContext {
-    BlobReadContext(const BlobIndex& blob_idx, const KeyContext* key_ctx)
+    BlobReadContext(const BlobIndex& blob_idx, KeyContext* key_ctx)
         : blob_index(blob_idx), key_context(key_ctx) {}
 
     BlobIndex blob_index;
-    const KeyContext* key_context;
+    KeyContext* key_context;
     PinnableSlice result;
   };
 
@@ -1087,6 +1203,9 @@ class Version {
   friend class VersionSet;
   friend class VersionEditHandler;
   friend class VersionEditHandlerPointInTime;
+  // Needs MaybeInitializeFileMetaData() to initialize input file stats before
+  // constructing a Compaction on the remote worker.
+  friend class DBImplSecondary;
 
   const InternalKeyComparator* internal_comparator() const {
     return storage_info_.internal_comparator_;
@@ -1162,7 +1281,6 @@ class Version {
   // used for debugging and logging purposes only.
   uint64_t version_number_;
   std::shared_ptr<IOTracer> io_tracer_;
-  bool use_async_io_;
 
   Version(ColumnFamilyData* cfd, VersionSet* vset, const FileOptions& file_opt,
           const MutableCFOptions& mutable_cf_options,
@@ -1176,6 +1294,8 @@ class Version {
   // No copying allowed
   Version(const Version&) = delete;
   void operator=(const Version&) = delete;
+  Version(Version&&) = delete;
+  void operator=(Version&&) = delete;
 };
 
 class BaseReferencedVersionBuilder;
@@ -1220,6 +1340,8 @@ class VersionSet {
   // No copying allowed
   VersionSet(const VersionSet&) = delete;
   void operator=(const VersionSet&) = delete;
+  VersionSet(VersionSet&&) = delete;
+  void operator=(VersionSet&&) = delete;
 
   virtual ~VersionSet();
 
@@ -1267,6 +1389,16 @@ class VersionSet {
                        dir_contains_current_file, new_descriptor_log,
                        column_family_options, {manifest_wcb}, pre_cb);
   }
+
+  // The live DB creation path has already sanitized these options for its
+  // OPTIONS snapshot. Reuse that exact value when installing the new column
+  // family so persistence and the in-memory configuration cannot drift.
+  Status LogAndApplyColumnFamilyAddWithSanitizedOptions(
+      const ReadOptions& read_options, const WriteOptions& write_options,
+      VersionEdit* edit, InstrumentedMutex* mu,
+      FSDirectory* dir_contains_current_file,
+      const ColumnFamilyOptions& sanitized_options);
+
   // The batch version. If edit_list.size() > 1, caller must ensure that
   // no edit in the list column family add or drop
   Status LogAndApply(
@@ -1297,7 +1429,8 @@ class VersionSet {
       bool new_descriptor_log = false,
       const ColumnFamilyOptions* new_cf_options = nullptr,
       const std::vector<std::function<void(const Status&)>>& manifest_wcbs = {},
-      const std::function<Status()>& pre_cb = {});
+      const std::function<Status()>& pre_cb = {},
+      int max_file_opening_threads = 1);
 
   void WakeUpWaitingManifestWriters();
 
@@ -1345,6 +1478,25 @@ class VersionSet {
       const std::string& manifest_path, FileSystem* fs,
       std::vector<std::string>* column_families);
 
+  // Replays CURRENT's MANIFEST and returns its committed OPTIONS file number.
+  static Status GetOptionsFileManifestState(
+      const std::string& dbname, FileSystem* fs,
+      OptionsFileManifestState* manifest_state);
+  static Status GetOptionsFileManifestState(
+      const std::string& dbname, FileSystem* fs,
+      OptionsFileManifestState* manifest_state, uint64_t* next_file_number,
+      uint64_t* last_valid_manifest_record_end);
+
+  // Resolves OPTIONS files against recovered MANIFEST state. A legacy file
+  // (tracking absent or false) supersedes an older committed file. Tracked
+  // files without a matching commit are skipped. If no committed or legacy
+  // file exists, falls back to the highest tracked file for RepairDB output.
+  static Status ResolveOptionsFileNumber(
+      const std::string& dbname, FileSystem* fs,
+      const OptionsFileManifestState& manifest_state,
+      const std::vector<std::string>& filenames,
+      bool inspect_options_file_tracking, OptionsFileSelection* selection);
+
   // Try to reduce the number of levels. This call is valid when
   // only one level from the new max level to the old
   // max level containing files.
@@ -1373,6 +1525,22 @@ class VersionSet {
   uint64_t manifest_file_number() const { return manifest_file_number_; }
 
   uint64_t options_file_number() const { return options_file_number_; }
+
+  // True when options_file_number() was committed by the current MANIFEST.
+  bool has_committed_options_file_number() const {
+    return has_committed_options_file_number_;
+  }
+
+  OptionsFileManifestState options_file_manifest_state() const {
+    OptionsFileManifestState state;
+    state.committed_options_file_number = options_file_number_;
+    state.has_committed_options_file_number =
+        has_committed_options_file_number_;
+    return state;
+  }
+
+  virtual void ApplyCommittedOptionsFileNumber(uint64_t number);
+  void ApplyLegacyOptionsFileNumber(uint64_t number);
 
   uint64_t pending_manifest_file_number() const {
     return pending_manifest_file_number_;
@@ -1446,8 +1614,9 @@ class VersionSet {
   // If an error occurs and recovery creates new memtables, SwitchMemtable
   // uses LastSequence() which may be lower than already-allocated sequences.
   //
-  // REQUIRED: DB mutex is held and no concurrent writers are active (i.e.,
-  // after WaitForBackgroundWork() in ResumeImpl).
+  // REQUIRED: DB mutex is held, and callers have reached a recovery fence
+  // where no concurrent writer can advance last_allocated_sequence_ before
+  // the memtable/WAL state that consumes last_sequence_ is created.
   void SyncLastSequenceWithAllocated() {
     uint64_t alloc_seq =
         last_allocated_sequence_.load(std::memory_order_seq_cst);
@@ -1536,12 +1705,16 @@ class VersionSet {
   // The caller should delete the iterator when no longer needed.
   // @param read_options Must outlive the returned iterator.
   // @param start, end indicates compaction range
+  // @param open_ephemeral_table_reader When true, the per-file iterators
+  //              bypass the shared TableCache and open fresh TableReaders
+  //              using `file_options_compactions`.
   InternalIterator* MakeInputIterator(
       const ReadOptions& read_options, const Compaction* c,
       RangeDelAggregator* range_del_agg,
       const FileOptions& file_options_compactions,
       const std::optional<const Slice>& start,
-      const std::optional<const Slice>& end);
+      const std::optional<const Slice>& end,
+      bool open_ephemeral_table_reader = false);
 
   // Add all files listed in any live version to *live_table_files and
   // *live_blob_files. Note that these lists may contain duplicates.
@@ -1564,6 +1737,32 @@ class VersionSet {
 
   // Return the size of the current manifest file
   uint64_t manifest_file_size() const { return manifest_file_size_; }
+
+  // Size of the maximal valid prefix recovered from the MANIFEST -- the largest
+  // leading range that is entirely valid. It excludes a corrupt/torn tail
+  // record or a partial atomic group at EOF, and is meant to include valid
+  // trailing framing/padding once a MANIFEST format has it.
+  //
+  // Intended for a lower-bound test -- "did recovery reach at least some point
+  // in the manifest?" (e.g. the DB::OpenAndCompact floor vs. a
+  // manifest_file_size captured on the primary). It is maximal, so a
+  // fully-recovered prefix never tests short; it excludes garbage, so a corrupt
+  // tail never tests long. It is not a safe append/truncate offset; use
+  // GetManifestAppendBoundary() for that.
+  //
+  // Immediately after recovery, this ==
+  // manifest_recovery_last_valid_record_end_ == a clean manifest_file_size_;
+  // a future padded/footered format may make manifest_last_valid_record_end_
+  // <= manifest_file_size_ <= this (changing only this accessor's body, not
+  // callers).
+  uint64_t manifest_recovery_maximal_valid_size() const {
+    return manifest_recovery_last_valid_record_end_;
+  }
+
+  // Returns the valid prefix length at which records can be appended to a
+  // copy of the current MANIFEST.
+  // REQUIRES: DB mutex held, or the DB is not yet visible to other threads.
+  Status GetManifestAppendBoundary(uint64_t* manifest_size) const;
 
   Status GetMetadataForFile(uint64_t number, int* filelevel,
                             FileMetaData** metadata, ColumnFamilyData** cfd);
@@ -1609,6 +1808,20 @@ class VersionSet {
     offpeak_time_option_.SetFromOffpeakTimeString(daily_offpeak_time_utc);
   }
 
+  // Thin forwarder to periodic_compaction_phaser_.ParamsForCf(cf_id): the
+  // per-CF phasing params (DB base phase from the DB ID, golden-ratio CF
+  // spread, anchor, and recovery percent). Returns disabled params when phasing
+  // is off.
+  PeriodicCompactionPhaseParams GetPeriodicCompactionPhaseParams(
+      uint32_t cf_id) const;
+
+  // (Re)anchor periodic-compaction phasing to now and refresh the cached phase
+  // params on every column family's current Version. Called when a CF's
+  // periodic_compaction_seconds changes via SetOptions, so a turn-down's newly
+  // past-due cohort is spread (over the phase grid within ~N/4 of now) instead
+  // of firing all at once. Caller must hold the DB mutex.
+  void ReanchorCompactionPhase();
+
   const ImmutableDBOptions* db_options() const { return db_options_; }
 
   static uint64_t GetNumLiveVersions(Version* dummy_versions);
@@ -1644,9 +1857,24 @@ class VersionSet {
   unsigned TEST_GetMaxManifestSpaceAmpPct() {
     return max_manifest_space_amp_pct_;
   }
+  void TEST_ClearCommittedOptionsFileNumber() {
+    has_committed_options_file_number_ = false;
+  }
   size_t TEST_GetManifestPreallocationSize() {
     return manifest_preallocation_size_;
   }
+
+  // Appends a kColumnFamilyDrop record for each id in cf_ids to the MANIFEST
+  // file at manifest_path, whose valid content length is manifest_size bytes.
+  // Column-family drops ensure CFs whose files were not copied are not opened
+  // during recovery. When committed_options_file_number is nonzero, it is
+  // committed in the last appended record so the copied MANIFEST also matches
+  // the subset-specific OPTIONS snapshot.
+  Status AppendColumnFamilyDropsToManifest(
+      const std::string& manifest_path, uint64_t manifest_size,
+      const std::vector<uint32_t>& cf_ids, const WriteOptions& write_options,
+      uint64_t manifest_preallocation_size,
+      uint64_t committed_options_file_number);
 
  protected:
   struct ManifestWriter;
@@ -1695,13 +1923,43 @@ class VersionSet {
   Status WriteCurrentStateToManifest(
       const WriteOptions& write_options,
       const std::unordered_map<uint32_t, MutableCFState>& curr_state,
-      const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s);
+      const VersionEdit& wal_additions,
+      const OptionsFileManifestState& options_file_manifest_state,
+      log::Writer* log, IOStatus& io_s);
+
+  // Reopen the existing MANIFEST file for append at the end of Recover()
+  // when reuse_manifest_on_open is set, so the next LogAndApply appends
+  // to it instead of creating a fresh MANIFEST. Falls back to OK
+  // (descriptor_log_ stays null, next LogAndApply creates a fresh
+  // MANIFEST as before) if ReopenWritableFile fails.
+  Status ReopenManifestForAppend(const std::string& manifest_path);
+
+  // FileOptions for MANIFEST writes -- applies the FS's
+  // OptimizeForManifestWrite tuning, then re-applies the user-configured
+  // temperature so a custom FS can't override it.
+  FileOptions GetFileOptionsForManifestWrite() const;
+
+  // Create a log::Writer over the given FSWritableFile with all standard
+  // MANIFEST setup applied (preallocation block size, checksum-handoff
+  // classification, listeners, etc.). preallocation_size should be a
+  // snapshot of manifest_preallocation_size_ taken under the DB mutex
+  // (the fresh-path call site reads the field before releasing mu).
+  // When initial_file_size > 0 the writer is treated as resuming over
+  // an already-populated file: WritableFileWriter is constructed with the
+  // existing size so size accounting is correct, and the log writer's
+  // initial_block_offset aligns to the existing file's tail within the
+  // current 32 KiB block.
+  std::unique_ptr<log::Writer> CreateManifestWriter(
+      std::unique_ptr<FSWritableFile> file, const std::string& fname,
+      const FileOptions& opts, uint64_t preallocation_size,
+      uint64_t initial_file_size = 0) const;
 
   void AppendVersion(ColumnFamilyData* column_family_data, Version* v);
 
   ColumnFamilyData* CreateColumnFamily(const ColumnFamilyOptions& cf_options,
                                        const ReadOptions& read_options,
-                                       const VersionEdit* edit, bool read_only);
+                                       const VersionEdit* edit, bool read_only,
+                                       bool options_are_sanitized);
 
   Status VerifyFileMetadata(const ReadOptions& read_options,
                             ColumnFamilyData* cfd, const std::string& fpath,
@@ -1722,6 +1980,9 @@ class VersionSet {
   SystemClock* const clock_;
   const std::string dbname_;
   std::string db_id_;
+  // Periodic-compaction phasing. Declared right after db_id_ because it holds a
+  // live reference to it (the DB base phase is hashed from the DB ID).
+  PeriodicCompactionPhaser periodic_compaction_phaser_{db_id_};
   const ImmutableDBOptions* const db_options_;
   std::atomic<uint64_t> next_file_number_;
   // Any WAL number smaller than this should be ignored during recovery,
@@ -1730,6 +1991,7 @@ class VersionSet {
   uint64_t manifest_file_number_;
   uint64_t options_file_number_;
   uint64_t options_file_size_;
+  bool has_committed_options_file_number_;
   uint64_t pending_manifest_file_number_;
   // The last seq visible to reads. It normally indicates the last sequence in
   // the memtable but when using two write queues it could also indicate the
@@ -1765,6 +2027,35 @@ class VersionSet {
 
   // Current size of manifest file
   uint64_t manifest_file_size_;
+
+  // File offset at the end of the last successfully completed logical unit
+  // during MANIFEST recovery. For atomic groups, this advances only after the
+  // whole group is buffered and applied. Unlike manifest_file_size_ (the
+  // reader's I/O high-water mark, which includes any tolerated tail garbage),
+  // this value points to the byte after the last valid record. Set only by
+  // recovery -- NOT live-updated on the write path (hence the recovery_
+  // prefix); ProcessManifestWrites keeps manifest_file_size_ current instead.
+  // Used by ReopenManifestForAppend to detect intra-block tail corruption that
+  // doesn't extend the physical file size, as well as partial atomic groups at
+  // EOF.
+  // manifest_file_size_ is kept separate because it is used for
+  // rotation decisions (ProcessManifestWrites), close-time verification
+  // (Close), and backup metadata.
+  uint64_t manifest_recovery_last_valid_record_end_;
+
+  // Safe append boundary for a copy of the current MANIFEST. Initialized from
+  // the recovery boundary and advanced after every successful MANIFEST write.
+  // Unlike manifest_file_size_, it excludes any tolerated tail garbage.
+  uint64_t manifest_last_valid_record_end_;
+
+  // MANIFEST file number associated with manifest_last_valid_record_end_.
+  uint64_t manifest_last_valid_record_end_file_number_;
+
+  // True when reuse_manifest_on_open was requested but the recovered MANIFEST
+  // could not be safely reopened for append. DB open must install a fresh
+  // MANIFEST before returning so normal writable operation never appends to
+  // the old tail.
+  bool force_new_manifest_on_open_;
 
   // Size of the populated manifest file last time it was re-written from
   // scratch.
@@ -1813,8 +2104,19 @@ class VersionSet {
                                FSDirectory* dir_contains_current_file,
                                bool new_descriptor_log,
                                const ColumnFamilyOptions* new_cf_options,
+                               bool new_cf_options_are_sanitized,
                                const ReadOptions& read_options,
                                const WriteOptions& write_options);
+
+  Status LogAndApplyImpl(
+      const autovector<ColumnFamilyData*>& column_family_datas,
+      const ReadOptions& read_options, const WriteOptions& write_options,
+      const autovector<autovector<VersionEdit*>>& edit_lists,
+      InstrumentedMutex* mu, FSDirectory* dir_contains_current_file,
+      bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
+      bool new_cf_options_are_sanitized,
+      const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
+      const std::function<Status()>& pre_cb, int max_file_opening_threads);
 
   void LogAndApplyCFHelper(VersionEdit* edit,
                            SequenceNumber* max_last_sequence);
@@ -1838,13 +2140,19 @@ class ReactiveVersionSet : public VersionSet {
                      const FileOptions& _file_options, Cache* table_cache,
                      WriteBufferManager* write_buffer_manager,
                      WriteController* write_controller,
-                     const std::shared_ptr<IOTracer>& io_tracer);
+                     const std::shared_ptr<IOTracer>& io_tracer,
+                     const std::string& db_id, const std::string& db_session_id,
+                     bool defer_sst_file_opening);
 
   ~ReactiveVersionSet() override;
 
   Status Close(FSDirectory* /*db_dir*/, InstrumentedMutex* /*mu*/) override {
     return Status::OK();
   }
+
+  // Secondary and follower live-file snapshots keep their legacy behavior.
+  // They do not publish an OPTIONS file selected from primary MANIFEST state.
+  void ApplyCommittedOptionsFileNumber(uint64_t /*number*/) override {}
 
   Status ReadAndApply(
       InstrumentedMutex* mu,
@@ -1857,6 +2165,27 @@ class ReactiveVersionSet : public VersionSet {
                  std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
                  std::unique_ptr<log::Reader::Reporter>* manifest_reporter,
                  std::unique_ptr<Status>* manifest_reader_status);
+
+  // Must be called before Recover(). When set, Recover() trusts the MANIFEST
+  // and reconstructs the version from FileMetaData without stat-ing/opening SST
+  // or blob files. Only used by the DB::OpenAndCompact remote-compaction path.
+  void SetTrustManifestRecovery(bool v) { trust_manifest_recovery_ = v; }
+
+  // Returns the column family's log number as of the Version currently
+  // installed for it, i.e. the log number that the MANIFEST records that
+  // Version was built from had put in effect. Data written to WALs older than
+  // the returned number has been flushed by the primary into files the
+  // installed Version references, so it is readable without those WALs.
+  //
+  // This is not the same as ColumnFamilyData::GetLogNumber(), which advances as
+  // soon as a flush record is read from the MANIFEST even when no Version
+  // reflecting that record could be installed.
+  //
+  // Returns 0 if no Version has been installed for `cf_id`.
+  //
+  // REQUIRES: db mutex
+  uint64_t GetInstalledVersionLogNumber(uint32_t cf_id) const;
+
 #ifndef NDEBUG
   uint64_t TEST_read_edits_in_atomic_group() const;
 #endif  //! NDEBUG
@@ -1875,6 +2204,14 @@ class ReactiveVersionSet : public VersionSet {
 
  private:
   std::unique_ptr<ManifestTailer> manifest_tailer_;
+  // When true, MANIFEST recovery trusts the manifest and does not stat/open SST
+  // or blob files (see
+  // VersionEditHandlerPointInTime::trust_manifest_recovery_). Set only for the
+  // DB::OpenAndCompact remote-compaction path.
+  bool trust_manifest_recovery_ = false;
+  // Defers initial SecondaryDB SST validation and opening until after
+  // OpenAsSecondary returns. Catch-up remains synchronous.
+  const bool defer_sst_file_opening_;
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options_;
   using VersionSet::LogAndApply;
@@ -1888,13 +2225,16 @@ class ReactiveVersionSet : public VersionSet {
       InstrumentedMutex* /*mu*/, FSDirectory* /*dir_contains_current_file*/,
       bool /*new_descriptor_log*/, const ColumnFamilyOptions* /*new_cf_option*/,
       const std::vector<std::function<void(const Status&)>>& /*manifest_wcbs*/,
-      const std::function<Status()>& /*pre_cb*/) override {
+      const std::function<Status()>& /*pre_cb*/,
+      int /*max_file_opening_threads*/) override {
     return Status::NotSupported("not supported in reactive mode");
   }
 
   // No copy allowed
-  ReactiveVersionSet(const ReactiveVersionSet&);
-  ReactiveVersionSet& operator=(const ReactiveVersionSet&);
+  ReactiveVersionSet(const ReactiveVersionSet&) = delete;
+  ReactiveVersionSet& operator=(const ReactiveVersionSet&) = delete;
+  ReactiveVersionSet(ReactiveVersionSet&&) = delete;
+  ReactiveVersionSet& operator=(ReactiveVersionSet&&) = delete;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

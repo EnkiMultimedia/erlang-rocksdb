@@ -122,6 +122,7 @@ PERC_PATTERN+="P99: ([0-9\.]+) P99.9: ([0-9\.]+) P99.99: ([0-9\.]+)"
 function main {
   TEST_ROOT_DIR=${TEST_PATH:-"/tmp/rocksdb/regression_test"}
   init_arguments $TEST_ROOT_DIR
+  arm_cleanup_trap $TEST_ROOT_DIR
 
   build_db_bench_and_ldb
 
@@ -147,9 +148,22 @@ function main {
       run_db_bench "multireadrandom"
   fi
 
-  cleanup_test_directory $TEST_ROOT_DIR
+  finalize_cleanup $TEST_ROOT_DIR
   echo ""
   echo "Benchmark completed!  Results are available in $RESULT_PATH"
+}
+
+############################################################################
+function arm_cleanup_trap {
+  CLEANUP_DONE=0
+  trap 'finalize_cleanup "$TEST_ROOT_DIR"' EXIT
+}
+
+function finalize_cleanup {
+  if [ "${CLEANUP_DONE:-0}" -eq 0 ]; then
+    cleanup_test_directory "$1"
+    CLEANUP_DONE=1
+  fi
 }
 
 ############################################################################
@@ -332,12 +346,11 @@ function set_async_io_parameters {
 function build_checkpoint {
     echo "NUM_MULTI_DB=$NUM_MULTI_DB"
     if [ $NUM_MULTI_DB -gt 1 ]; then
+        run_remote "rm -rf $DB_PATH"
         run_remote "mkdir -p $DB_PATH"
-        run_remote "find $ORIGIN_PATH -type d -links 2"
-        dirs=$?
-        for dir in $dirs; do
-            db_index=$(basename $dir)
-            echo "Building checkpoints: $ORIGIN_PATH/$db_index -> $DB_PATH/$db_index ..."
+        for ((db_index = 0; db_index < NUM_MULTI_DB; db_index++)); do
+            run_remote "test -d $ORIGIN_PATH/$db_index"
+            echo "Building checkpoint: $ORIGIN_PATH/$db_index -> $DB_PATH/$db_index ..."
             run_remote "$DB_BENCH_DIR/ldb checkpoint --checkpoint_dir=$DB_PATH/$db_index --db=$ORIGIN_PATH/$db_index --try_load_options 2>&1"
             exit_on_error $?
         done

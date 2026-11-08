@@ -82,10 +82,15 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 message(STATUS "CMAKE_BUILD_TYPE is set to ${CMAKE_BUILD_TYPE}")
 
+# Use ccache for compilation if available. Use CMAKE_C/CXX_COMPILER_LAUNCHER
+# instead of RULE_LAUNCH_COMPILE to avoid double-wrapping when ccache is also
+# injected via PATH (e.g., /usr/lib/ccache or brew --prefix ccache/libexec).
+# Note: we intentionally do NOT set RULE_LAUNCH_LINK because ccache cannot
+# cache link operations -- it only adds overhead.
 find_program(CCACHE_FOUND ccache)
 if(CCACHE_FOUND)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
+  set(CMAKE_C_COMPILER_LAUNCHER ccache)
+  set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
 endif(CCACHE_FOUND)
 
 option(WITH_JEMALLOC "build with JeMalloc" OFF)
@@ -415,13 +420,6 @@ if(WITH_NUMA)
   list(APPEND THIRDPARTY_LIBS NUMA::NUMA)
 endif()
 
-option(WITH_TBB "build with Threading Building Blocks (TBB)" OFF)
-if(WITH_TBB)
-  find_package(TBB REQUIRED)
-  add_definitions(-DTBB)
-  list(APPEND THIRDPARTY_LIBS TBB::TBB)
-endif()
-
 # Stall notifications eat some performance from inserts
 option(DISABLE_STALL_NOTIF "Build with stall notifications" OFF)
 if(DISABLE_STALL_NOTIF)
@@ -515,6 +513,15 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "iOS")
   add_definitions(-DOS_MACOSX -DIOS_CROSS_COMPILE)
 elseif(CMAKE_SYSTEM_NAME MATCHES "Linux")
   add_definitions(-DOS_LINUX)
+  # Use lld linker if available for faster linking (12x faster than ld.bfd)
+  if(NOT ROCKSDB_NO_FAST_LINKER)
+    execute_process(COMMAND ${CMAKE_CXX_COMPILER} -fuse-ld=lld -Wl,--version
+      OUTPUT_VARIABLE LLD_VERSION_OUTPUT ERROR_QUIET RESULT_VARIABLE LLD_RESULT)
+    if(LLD_RESULT EQUAL 0 AND LLD_VERSION_OUTPUT MATCHES "LLD")
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")
+      set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fuse-ld=lld")
+    endif()
+  endif()
 elseif(CMAKE_SYSTEM_NAME MATCHES "SunOS")
   add_definitions(-DOS_SOLARIS)
 elseif(CMAKE_SYSTEM_NAME MATCHES "kFreeBSD")
@@ -640,30 +647,114 @@ if(USE_FOLLY)
     FMT_INST_PATH)
     exec_program(ls ARGS -d ${FOLLY_INST_PATH}/../gflags* OUTPUT_VARIABLE
     GFLAGS_INST_PATH)
+    exec_program(ls ARGS -d ${FOLLY_INST_PATH}/../glog* OUTPUT_VARIABLE
+    GLOG_INST_PATH)
     set(Boost_DIR ${BOOST_INST_PATH}/lib/cmake/Boost-1.83.0)
+    # Boost's per-library CMake configs find their dependencies (e.g.
+    # boost_assert) only through the package search path.
+    set(CMAKE_PREFIX_PATH ${BOOST_INST_PATH} ${CMAKE_PREFIX_PATH})
     if(EXISTS ${FMT_INST_PATH}/lib64)
       set(fmt_DIR ${FMT_INST_PATH}/lib64/cmake/fmt)
     else()
       set(fmt_DIR ${FMT_INST_PATH}/lib/cmake/fmt)
     endif()
     set(gflags_DIR ${GFLAGS_INST_PATH}/lib/cmake/gflags)
+    if(EXISTS ${GLOG_INST_PATH}/lib64/cmake/glog)
+      set(GLOG_CMAKE_DIR ${GLOG_INST_PATH}/lib64/cmake/glog)
+    elseif(EXISTS ${GLOG_INST_PATH}/lib/cmake/glog)
+      set(GLOG_CMAKE_DIR ${GLOG_INST_PATH}/lib/cmake/glog)
+    endif()
+    if(NOT GLOG_CMAKE_DIR)
+      find_library(GETDEPS_GLOG_LIBRARY NAMES glogd glog
+        PATHS ${GLOG_INST_PATH}/lib64 ${GLOG_INST_PATH}/lib
+        NO_DEFAULT_PATH)
+      if(NOT GETDEPS_GLOG_LIBRARY OR
+         NOT EXISTS ${GLOG_INST_PATH}/include/glog/logging.h)
+        message(FATAL_ERROR "Could not find getdeps glog under "
+          "${GLOG_INST_PATH}")
+      endif()
+      set(GLOG_CMAKE_DIR ${CMAKE_CURRENT_BINARY_DIR}/getdeps-glog-cmake)
+      file(MAKE_DIRECTORY ${GLOG_CMAKE_DIR})
+      file(WRITE ${GLOG_CMAKE_DIR}/glog-config.cmake
+        "if(NOT TARGET glog::glog)\n"
+        "  add_library(glog::glog UNKNOWN IMPORTED)\n"
+        "  set_target_properties(glog::glog PROPERTIES\n"
+        "    IMPORTED_LOCATION \"${GETDEPS_GLOG_LIBRARY}\"\n"
+        "    INTERFACE_INCLUDE_DIRECTORIES \"${GLOG_INST_PATH}/include\")\n"
+        "endif()\n"
+        "set(glog_FOUND TRUE)\n"
+        "set(Glog_FOUND TRUE)\n"
+        "set(GLOG_FOUND TRUE)\n"
+        "set(GLOG_LIBRARY \"${GETDEPS_GLOG_LIBRARY}\")\n"
+        "set(GLOG_LIBRARIES \"${GETDEPS_GLOG_LIBRARY}\")\n"
+        "set(GLOG_INCLUDE_DIR \"${GLOG_INST_PATH}/include\")\n")
+    endif()
+    set(glog_DIR ${GLOG_CMAKE_DIR})
+    set(Glog_DIR ${GLOG_CMAKE_DIR})
+    # Unlike gflags, glog may also be installed system-wide. Pre-resolve the
+    # getdeps copy so folly-config.cmake cannot fall back to another version.
+    find_package(glog CONFIG REQUIRED PATHS ${GLOG_CMAKE_DIR}
+                 NO_DEFAULT_PATH)
 
     exec_program(sed ARGS -i 's/gflags_shared//g'
     ${FOLLY_INST_PATH}/lib/cmake/folly/folly-targets.cmake)
 
+    # folly-config.cmake only checks for gflags under a target name that this
+    # install doesn't define, then falls back to our Findgflags.cmake, which
+    # mistakes the gflags_static target name for a library path. gflags is
+    # resolved below instead.
+    set(CMAKE_DISABLE_FIND_PACKAGE_gflags TRUE)
     include(${FOLLY_INST_PATH}/lib/cmake/folly/folly-config.cmake)
+    unset(CMAKE_DISABLE_FIND_PACKAGE_gflags)
 
-    # Fix gflags library name for debug builds
+    # Fix gflags library name for debug builds. The getdeps gflags shared
+    # library is versioned (e.g. libgflags_debug.so.2.3), so resolve the
+    # actual file by glob rather than hard-coding a version.
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+      file(GLOB GFLAGS_DEBUG_SHARED_LIBS
+        "${GFLAGS_INST_PATH}/lib/libgflags_debug.so.*")
+      if(NOT GFLAGS_DEBUG_SHARED_LIBS)
+        message(FATAL_ERROR
+          "Could not find getdeps libgflags_debug.so under ${GFLAGS_INST_PATH}/lib")
+      endif()
+      list(GET GFLAGS_DEBUG_SHARED_LIBS 0 GFLAGS_DEBUG_SHARED_LIB)
       set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-rpath=${GFLAGS_INST_PATH}/lib")
-      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${GFLAGS_INST_PATH}/lib/libgflags_debug.so.2.2")
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${GFLAGS_DEBUG_SHARED_LIB}")
     endif()
+  endif()
+
+  # Folly itself uses gflags transitively, but RocksDB tools and benchmarks
+  # also call gflags APIs directly, so they need an explicit link dependency.
+  if(WITH_GFLAGS)
+    if(NOT TARGET gflags::gflags AND NOT TARGET gflags_shared AND
+       NOT gflags_LIBRARIES)
+      find_package(gflags CONFIG QUIET)
+      if(NOT gflags_FOUND)
+        find_package(gflags REQUIRED)
+      endif()
+    endif()
+    if(TARGET gflags::gflags)
+      set(GFLAGS_LIB gflags::gflags)
+    elseif(TARGET gflags_shared)
+      set(GFLAGS_LIB gflags_shared)
+    elseif(DEFINED GFLAGS_TARGET AND TARGET ${GFLAGS_TARGET})
+      set(GFLAGS_LIB ${GFLAGS_TARGET})
+    elseif(gflags_LIBRARIES)
+      set(GFLAGS_LIB ${gflags_LIBRARIES})
+    else()
+      message(FATAL_ERROR
+        "WITH_GFLAGS is enabled, but no gflags library could be resolved")
+    endif()
+    list(APPEND THIRDPARTY_LIBS ${GFLAGS_LIB})
   endif()
 
   add_compile_definitions(USE_FOLLY FOLLY_NO_CONFIG HAVE_CXX11_ATOMIC)
   list(APPEND THIRDPARTY_LIBS Folly::folly)
   set(FOLLY_LIBS Folly::folly)
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--copy-dt-needed-entries")
+  # --copy-dt-needed-entries is ld.bfd-specific; lld handles DT_NEEDED transitively
+  if(NOT CMAKE_EXE_LINKER_FLAGS MATCHES "fuse-ld=lld")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--copy-dt-needed-entries")
+  endif()
 endif()
 find_package(Threads REQUIRED)
 
@@ -690,14 +781,17 @@ set(SOURCES
         db/blob/blob_file_addition.cc
         db/blob/blob_file_builder.cc
         db/blob/blob_file_cache.cc
+        db/blob/blob_file_partition_manager.cc
         db/blob/blob_file_garbage.cc
         db/blob/blob_file_meta.cc
         db/blob/blob_file_reader.cc
         db/blob/blob_garbage_meter.cc
+        db/blob/blob_gen2_format.cc
         db/blob/blob_log_format.cc
         db/blob/blob_log_sequential_reader.cc
         db/blob/blob_log_writer.cc
         db/blob/blob_source.cc
+        db/blob/blob_write_batch_transformer.cc
         db/blob/prefetch_buffer_collection.cc
         db/builder.cc
         db/c.cc
@@ -716,6 +810,7 @@ set(SOURCES
         db/compaction/sst_partitioner.cc
         db/compaction/subcompaction_state.cc
         db/convenience.cc
+        db/coro_db.cc
         db/db_filesnapshot.cc
         db/db_impl/compacted_db_impl.cc
         db/db_impl/db_impl.cc
@@ -752,6 +847,7 @@ set(SOURCES
         db/merge_operator.cc
         db/multi_scan.cc
         db/output_validator.cc
+        db/periodic_compaction_phaser.cc
         db/periodic_task_scheduler.cc
         db/range_del_aggregator.cc
         db/range_tombstone_fragmenter.cc
@@ -760,7 +856,6 @@ set(SOURCES
         db/snapshot_impl.cc
         db/table_cache.cc
         db/table_properties_collector.cc
-        db/transaction_log_impl.cc
         db/trim_history_scheduler.cc
         db/version_builder.cc
         db/version_edit.cc
@@ -768,7 +863,10 @@ set(SOURCES
         db/version_set.cc
         db/version_util.cc
         db/wal_edit.cc
+        db/wal_iterator_impl.cc
         db/wal_manager.cc
+        db/wide/lazy_wide_columns.cc
+        db/wide/read_path_blob_resolver.cc
         db/wide/wide_column_serialization.cc
         db/wide/wide_columns.cc
         db/wide/wide_columns_helper.cc
@@ -849,6 +947,7 @@ set(SOURCES
         table/block_based/block_cache.cc
         table/block_based/block_prefetcher.cc
         table/block_based/block_prefix_index.cc
+        table/block_based/builtin_index_factory.cc
         table/block_based/data_block_hash_index.cc
         table/block_based/data_block_footer.cc
         table/block_based/filter_block_reader_common.cc
@@ -882,6 +981,7 @@ set(SOURCES
         table/plain/plain_table_index.cc
         table/plain/plain_table_key_coding.cc
         table/plain/plain_table_reader.cc
+        table/range_del_block.cc
         table/sst_file_dumper.cc
         table/sst_file_reader.cc
         table/sst_file_writer.cc
@@ -916,6 +1016,7 @@ set(SOURCES
         util/simple_mixed_compressor.cc
         util/compression_context_cache.cc
         util/concurrent_task_limiter_impl.cc
+        util/coro_stats_util.cc
         util/crc32c.cc
         util/data_structure.cc
         util/dynamic_bloom.cc
@@ -937,6 +1038,7 @@ set(SOURCES
         util/xxhash.cc
         utilities/agg_merge/agg_merge.cc
         utilities/backup/backup_engine.cc
+        utilities/copy_engine/copy_engine.cc
         utilities/blob_db/blob_compaction_filter.cc
         utilities/blob_db/blob_db.cc
         utilities/blob_db/blob_db_impl.cc
@@ -950,6 +1052,7 @@ set(SOURCES
         utilities/cassandra/merge_operator.cc
         utilities/checkpoint/checkpoint_impl.cc
         utilities/compaction_filters.cc
+        utilities/sorted_run_builder/sorted_run_builder.cc
         utilities/compaction_filters/remove_emptyvalue_compactionfilter.cc
         utilities/counted_fs.cc
         utilities/debug.cc
@@ -1119,8 +1222,23 @@ if(USE_FOLLY_LITE)
   FMT_INCLUDE_DIR)
   include_directories(${FMT_INCLUDE_DIR})
 
+  exec_program(python3 ${PROJECT_SOURCE_DIR}/third-party/folly ARGS
+  build/fbcode_builder/getdeps.py show-inst-dir glog OUTPUT_VARIABLE
+  GLOG_INST_PATH)
+  if(EXISTS ${GLOG_INST_PATH}/lib64)
+    set(GLOG_LIB_DIR ${GLOG_INST_PATH}/lib64)
+  else()
+    set(GLOG_LIB_DIR ${GLOG_INST_PATH}/lib)
+  endif()
+
   add_definitions(-DUSE_FOLLY -DFOLLY_NO_CONFIG)
-  list(APPEND THIRDPARTY_LIBS glog)
+  find_library(GLOG_LIBRARY NAMES glog PATHS ${GLOG_LIB_DIR} NO_DEFAULT_PATH)
+  if(NOT GLOG_LIBRARY)
+    find_library(GLOG_LIBRARY NAMES glog)
+  endif()
+  if(GLOG_LIBRARY)
+    list(APPEND THIRDPARTY_LIBS ${GLOG_LIBRARY})
+  endif()
 endif()
 
 set(ROCKSDB_STATIC_LIB rocksdb${ARTIFACT_SUFFIX})
@@ -1366,6 +1484,7 @@ if(WITH_TESTS)
         db/blob/blob_garbage_meter_test.cc
         db/blob/blob_source_test.cc
         db/blob/db_blob_basic_test.cc
+        db/blob/db_blob_direct_write_test.cc
         db/blob/db_blob_compaction_test.cc
         db/blob/db_blob_corruption_test.cc
         db/blob/db_blob_index_test.cc
@@ -1391,6 +1510,7 @@ if(WITH_TESTS)
         db/db_clip_test.cc
         db/db_dynamic_level_test.cc
         db/db_encryption_test.cc
+        db/db_etc2_test.cc
         db/db_etc3_test.cc
         db/db_flush_test.cc
         db/db_inplace_update_test.cc
@@ -1403,6 +1523,7 @@ if(WITH_TESTS)
         db/db_memtable_test.cc
         db/db_merge_operator_test.cc
         db/db_merge_operand_test.cc
+        db/db_open_with_config_test.cc
         db/db_options_test.cc
         db/db_properties_test.cc
         db/db_range_del_test.cc
@@ -1413,7 +1534,6 @@ if(WITH_TESTS)
         db/db_table_properties_test.cc
         db/db_tailing_iter_test.cc
         db/db_test.cc
-        db/db_test2.cc
         db/db_logical_block_size_cache_test.cc
         db/db_universal_compaction_test.cc
         db/db_wal_test.cc
@@ -1454,7 +1574,9 @@ if(WITH_TESTS)
         db/version_set_test.cc
         db/wal_manager_test.cc
         db/wal_edit_test.cc
+        db/wide/db_lazy_entity_test.cc
         db/wide/db_wide_basic_test.cc
+        db/wide/db_wide_blob_direct_write_test.cc
         db/wide/wide_column_serialization_test.cc
         db/wide/wide_columns_helper_test.cc
         db/write_batch_test.cc
@@ -1484,6 +1606,7 @@ if(WITH_TESTS)
         options/options_test.cc
         table/block_based/block_based_table_reader_test.cc
         table/block_based/block_test.cc
+        table/block_based/builtin_index_factory_test.cc
         table/block_based/data_block_hash_index_test.cc
         table/block_based/full_filter_block_test.cc
         table/block_based/partitioned_filter_block_test.cc
@@ -1535,6 +1658,8 @@ if(WITH_TESTS)
         utilities/cassandra/cassandra_row_merge_test.cc
         utilities/cassandra/cassandra_serialize_test.cc
         utilities/checkpoint/checkpoint_test.cc
+        utilities/copy_engine/copy_engine_test.cc
+        utilities/sorted_run_builder/sorted_run_builder_test.cc
         utilities/env_timed_test.cc
         utilities/fault_injection_fs_test.cc
         utilities/memory/memory_test.cc
@@ -1573,6 +1698,7 @@ if(WITH_TESTS)
       db/db_with_timestamp_test_util.cc
       monitoring/thread_status_updater_debug.cc
       table/mock_table.cc
+      test_util/simple_external_table_factory.cc
       utilities/agg_merge/test_agg_merge.cc
       utilities/cassandra/test_utils.cc
   )
@@ -1601,7 +1727,21 @@ if(WITH_TESTS)
       )
       target_link_libraries(${exename}${ARTIFACT_SUFFIX} testutillib${ARTIFACT_SUFFIX} testharness gtest ${THIRDPARTY_LIBS} ${ROCKSDB_LIB})
       if(NOT "${exename}" MATCHES "db_sanity_test")
-        gtest_discover_tests(${exename} DISCOVERY_TIMEOUT 120)
+        if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.18)
+          # Discover tests at ctest time instead of during the parallel build.
+          # POST_BUILD discovery (the default) runs each freshly-built test
+          # binary while the -j build is still compiling; on resource-constrained
+          # CI (notably the arm64 macOS runners) that discovery run can yield
+          # empty output, and CMake's JSON parser then aborts the whole build
+          # with "Syntax error: value, object or array expected". PRE_TEST moves
+          # discovery out of the build phase so a slow/empty enumeration no
+          # longer fails the build.
+          gtest_discover_tests(${exename}
+                               DISCOVERY_TIMEOUT 120
+                               DISCOVERY_MODE PRE_TEST)
+        else()
+          gtest_discover_tests(${exename} DISCOVERY_TIMEOUT 120)
+        endif()
         add_dependencies(rocksdb_check ${exename}${ARTIFACT_SUFFIX})
       endif()
   endforeach(sourcefile ${TESTS})

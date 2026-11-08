@@ -31,6 +31,12 @@ class StackableDB : public DB {
   explicit StackableDB(std::unique_ptr<DB>&& db)
       : db_(db.get()), shared_db_ptr_(std::move(db)) {}
 
+  // No copying allowed
+  StackableDB(const StackableDB&) = delete;
+  StackableDB& operator=(const StackableDB&) = delete;
+  StackableDB(StackableDB&&) = delete;
+  StackableDB& operator=(StackableDB&&) = delete;
+
   ~StackableDB() override {
     if (shared_db_ptr_ == nullptr) {
       delete db_;
@@ -45,6 +51,10 @@ class StackableDB : public DB {
   virtual DB* GetBaseDB() { return db_; }
 
   DB* GetRootDB() override { return db_->GetRootDB(); }
+
+  // Wrappers must explicitly opt in so coroutine reads do not bypass their
+  // synchronous Get() and MultiGet() overrides.
+  CoroDB* GetCoroDB() override { return nullptr; }
 
   Status CreateColumnFamily(const ColumnFamilyOptions& options,
                             const std::string& column_family_name,
@@ -106,6 +116,16 @@ class StackableDB : public DB {
     return db_->Get(options, column_family, key, value, timestamp);
   }
 
+  using DB::GetAsync;
+  using DB::GetWithMetadata;
+  Status GetWithMetadata(const ReadOptions& options,
+                         ColumnFamilyHandle* column_family, const Slice& key,
+                         PinnableSlice* value,
+                         OutputMetadata* output_metadata) override {
+    return db_->GetWithMetadata(options, column_family, key, value,
+                                output_metadata);
+  }
+
   using DB::GetEntity;
 
   Status GetEntity(const ReadOptions& options,
@@ -117,6 +137,13 @@ class StackableDB : public DB {
   Status GetEntity(const ReadOptions& options, const Slice& key,
                    PinnableAttributeGroups* result) override {
     return db_->GetEntity(options, key, result);
+  }
+
+  using DB::GetEntityLazy;
+  Status GetEntityLazy(const ReadOptions& options,
+                       ColumnFamilyHandle* column_family, const Slice& key,
+                       LazyWideColumns* result) override {
+    return db_->GetEntityLazy(options, column_family, key, result);
   }
 
   using DB::GetMergeOperands;
@@ -137,6 +164,18 @@ class StackableDB : public DB {
                 Status* statuses, const bool sorted_input = false) override {
     return db_->MultiGet(options, num_keys, column_families, keys, values,
                          timestamps, statuses, sorted_input);
+  }
+
+  using DB::MultiGetAsync;
+  using DB::MultiGetWithMetadata;
+  void MultiGetWithMetadata(const ReadOptions& options, const size_t num_keys,
+                            ColumnFamilyHandle* const* column_families,
+                            const Slice* keys, PinnableSlice* values,
+                            Status* statuses,
+                            MultiGetOutputMetadata* output_metadata,
+                            const bool sorted_input = false) override {
+    db_->MultiGetWithMetadata(options, num_keys, column_families, keys, values,
+                              statuses, output_metadata, sorted_input);
   }
 
   using DB::MultiGetEntity;
@@ -163,6 +202,15 @@ class StackableDB : public DB {
     db_->MultiGetEntity(options, num_keys, keys, results);
   }
 
+  using DB::MultiGetEntityLazy;
+  void MultiGetEntityLazy(const ReadOptions& options,
+                          ColumnFamilyHandle* column_family, size_t num_keys,
+                          const Slice* keys, LazyWideColumnsBatch* result,
+                          Status* statuses, bool sorted_input) override {
+    db_->MultiGetEntityLazy(options, column_family, num_keys, keys, result,
+                            statuses, sorted_input);
+  }
+
   using DB::IngestExternalFile;
   Status IngestExternalFile(ColumnFamilyHandle* column_family,
                             const std::vector<std::string>& external_files,
@@ -174,6 +222,19 @@ class StackableDB : public DB {
   Status IngestExternalFiles(
       const std::vector<IngestExternalFileArg>& args) override {
     return db_->IngestExternalFiles(args);
+  }
+
+  using DB::PrepareFileIngestion;
+  Status PrepareFileIngestion(
+      const std::vector<IngestExternalFileArg>& args,
+      std::unique_ptr<FileIngestionHandle>* handle) override {
+    return db_->PrepareFileIngestion(args, handle);
+  }
+
+  using DB::CommitFileIngestionHandles;
+  Status CommitFileIngestionHandles(
+      std::vector<std::unique_ptr<FileIngestionHandle>> handles) override {
+    return db_->CommitFileIngestionHandles(std::move(handles));
   }
 
   using DB::CreateColumnFamilyWithImport;
@@ -273,6 +334,12 @@ class StackableDB : public DB {
                       const std::vector<ColumnFamilyHandle*>& column_families,
                       std::vector<Iterator*>* iterators) override {
     return db_->NewIterators(options, column_families, iterators);
+  }
+
+  Status NewIterators(const std::vector<ReadOptions>& read_options,
+                      const std::vector<ColumnFamilyHandle*>& column_families,
+                      std::vector<Iterator*>* iterators) override {
+    return db_->NewIterators(read_options, column_families, iterators);
   }
 
   using DB::NewCoalescingIterator;
@@ -377,6 +444,12 @@ class StackableDB : public DB {
   }
   void AbortAllCompactions() override { return db_->AbortAllCompactions(); }
   void ResumeAllCompactions() override { return db_->ResumeAllCompactions(); }
+  void AbortCompactions(ColumnFamilyHandle* column_family) override {
+    return db_->AbortCompactions(column_family);
+  }
+  void ResumeCompactions(ColumnFamilyHandle* column_family) override {
+    return db_->ResumeCompactions(column_family);
+  }
 
   Status WaitForCompact(
       const WaitForCompactOptions& wait_for_compact_options) override {
@@ -446,6 +519,13 @@ class StackableDB : public DB {
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override {
     return db_->GetLiveFilesStorageInfo(opts, files);
+  }
+
+  Status GetPreparedFileInfoForExternalSstIngestion(
+      const std::string& file_path,
+      std::shared_ptr<const PreparedFileInfo>* file_info) override {
+    return db_->GetPreparedFileInfoForExternalSstIngestion(file_path,
+                                                           file_info);
   }
 
   void GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
@@ -583,8 +663,8 @@ class StackableDB : public DB {
   }
 
   Status GetUpdatesSince(
-      SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
-      const TransactionLogIterator::ReadOptions& read_options) override {
+      SequenceNumber seq_number, std::unique_ptr<WalIterator>* iter,
+      const WalIterator::ReadOptions& read_options) override {
     return db_->GetUpdatesSince(seq_number, iter, read_options);
   }
 

@@ -1,4 +1,4 @@
-name: facebook/rocksdb/nightly
+name: facebook/rocksdb/nightly-candidate
 on: workflow_dispatch
 permissions: {}
 jobs:
@@ -10,7 +10,7 @@ jobs:
       labels: arm64large
     container:
       image: ubuntu-2004:202111-02
-      options: --shm-size=16gb
+      options: --shm-size=8gb
     steps:
     - uses: actions/checkout@v4.1.0
     - uses: "./.github/actions/pre-steps"

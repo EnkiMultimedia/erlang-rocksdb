@@ -25,7 +25,8 @@ static auto bytewise_icmp = InternalKeyComparator(BytewiseComparator());
 
 std::unique_ptr<InternalIterator> MakeRangeDelIter(
     const std::vector<RangeTombstone>& range_dels) {
-  std::vector<std::string> keys, values;
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
   for (const auto& range_del : range_dels) {
     auto key_and_value = range_del.Serialize();
     keys.push_back(key_and_value.first.Encode().ToString());
@@ -164,7 +165,8 @@ void VerifyIsRangeOverlapped(
     const std::vector<IsRangeOverlappedTestCase>& test_cases) {
   for (const auto& test_case : test_cases) {
     EXPECT_EQ(test_case.result,
-              range_del_agg->IsRangeOverlapped(test_case.start, test_case.end));
+              range_del_agg->IsRangeOverlapped(test_case.start, test_case.end,
+                                               /*end_exclusive=*/false));
   }
 }
 
@@ -386,6 +388,7 @@ TEST_F(RangeDelAggregatorTest, SingleIterInAggregator) {
                                            {"a", "c", true},
                                            {"d", "f", true},
                                            {"g", "l", false}});
+  EXPECT_FALSE(range_del_agg.IsRangeOverlapped("_", "a", true));
 }
 
 TEST_F(RangeDelAggregatorTest, MultipleItersInAggregator) {

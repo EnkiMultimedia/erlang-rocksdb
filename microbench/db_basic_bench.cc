@@ -147,7 +147,8 @@ static void SetupDB(benchmark::State& state, Options& options,
 
 static void TeardownDB(benchmark::State& state, const std::unique_ptr<DB>& db,
                        const Options& options, KeyGenerator& kg) {
-  char min_buff[256], max_buff[256];
+  char min_buff[256];
+  char max_buff[256];
   const Range r(kg.MinKey(min_buff), kg.MaxKey(max_buff));
   uint64_t size;
   Status s = db->GetApproximateSizes(&r, 1, &size);
@@ -1055,8 +1056,12 @@ static void DataBlockSeek(benchmark::State& state) {
   Random rnd(301);
   Options options = Options();
 
-  BlockBuilder builder(16, true, false,
-                       BlockBasedTableOptions::kDataBlockBinarySearch);
+  BlockBuilder builder(
+      16, true, false, BlockBasedTableOptions::kDataBlockBinarySearch,
+      0.75 /* data_block_hash_table_util_ratio */, 0 /* ts_sz */,
+      true /* persist_user_defined_timestamps */, false /* is_user_key */,
+      false /* use_separated_kv_storage */, nullptr /* statistics */,
+      -1.0 /* uniform_cv_threshold */, false /* use_common_prefix */);
 
   int num_records = 500;
   std::vector<std::string> keys;
@@ -1587,7 +1592,7 @@ static void RandomAccessFileReaderRead(benchmark::State& state) {
   Slice result;
   uint64_t idx = 0;
   for (auto _ : state) {
-    s = readers[idx++ % kFileNum]->Read(io_options, 0, kDefaultPageSize / 3,
+    s = readers[idx++ % kFileNum]->Read(0, kDefaultPageSize / 3, io_options,
                                         &result, scratch.get(), nullptr);
     if (!s.ok()) {
       state.SkipWithError(s.ToString().c_str());

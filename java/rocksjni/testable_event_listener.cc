@@ -51,12 +51,11 @@ static TableProperties newTablePropertiesForTest() {
   table_properties.format_version = UINT64_MAX;
   table_properties.fixed_key_len = UINT64_MAX;
   table_properties.column_family_id = UINT64_MAX;
-  table_properties.creation_time = UINT64_MAX;
+  table_properties.oldest_ancestor_time = UINT64_MAX;
   table_properties.oldest_key_time = UINT64_MAX;
   table_properties.file_creation_time = UINT64_MAX;
   table_properties.slow_compression_estimated_data_size = UINT64_MAX;
   table_properties.fast_compression_estimated_data_size = UINT64_MAX;
-  table_properties.external_sst_file_global_seqno_offset = UINT64_MAX;
   table_properties.db_id = "dbId";
   table_properties.db_session_id = "sessionId";
   table_properties.column_family_name = "columnFamilyName";

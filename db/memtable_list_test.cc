@@ -59,7 +59,8 @@ class MemTableListTest : public testing::Test {
       Status s = DB::Open(options, dbname, cf_descs, &handles, &db);
       EXPECT_OK(s);
 
-      ColumnFamilyOptions cf_opt1, cf_opt2;
+      ColumnFamilyOptions cf_opt1;
+      ColumnFamilyOptions cf_opt2;
       cf_opt1.cf_paths.emplace_back(dbname + "_one_1",
                                     std::numeric_limits<uint64_t>::max());
       cf_opt2.cf_paths.emplace_back(dbname + "_two_1",
@@ -267,7 +268,8 @@ TEST_F(MemTableListTest, GetTest) {
 
   WriteBufferManager wb(options.db_write_buffer_size);
   MemTable* mem = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb,
-                               kMaxSequenceNumber, 0 /* column_family_id */);
+                               kMaxSequenceNumber, 0 /* column_family_id */,
+                               nullptr /* flush_initiator */);
   mem->Ref();
 
   // Write some keys to this memtable.
@@ -335,7 +337,8 @@ TEST_F(MemTableListTest, GetTest) {
   // Create another memtable and write some keys to it
   WriteBufferManager wb2(options.db_write_buffer_size);
   MemTable* mem2 = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb2,
-                                kMaxSequenceNumber, 0 /* column_family_id */);
+                                kMaxSequenceNumber, 0 /* column_family_id */,
+                                nullptr /* flush_initiator */);
   mem2->SetID(2);
   mem2->Ref();
 
@@ -432,7 +435,8 @@ TEST_F(MemTableListTest, GetFromHistoryTest) {
 
   WriteBufferManager wb(options.db_write_buffer_size);
   MemTable* mem = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb,
-                               kMaxSequenceNumber, 0 /* column_family_id */);
+                               kMaxSequenceNumber, 0 /* column_family_id */,
+                               nullptr /* flush_initiator */);
   mem->Ref();
 
   // Write some keys to this memtable.
@@ -536,7 +540,8 @@ TEST_F(MemTableListTest, GetFromHistoryTest) {
   // Create another memtable and write some keys to it
   WriteBufferManager wb2(options.db_write_buffer_size);
   MemTable* mem2 = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb2,
-                                kMaxSequenceNumber, 0 /* column_family_id */);
+                                kMaxSequenceNumber, 0 /* column_family_id */,
+                                nullptr /* flush_initiator */);
   mem2->Ref();
 
   ASSERT_OK(
@@ -566,7 +571,8 @@ TEST_F(MemTableListTest, GetFromHistoryTest) {
   // Add a third memtable to push the first memtable out of the history
   WriteBufferManager wb3(options.db_write_buffer_size);
   MemTable* mem3 = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb3,
-                                kMaxSequenceNumber, 0 /* column_family_id */);
+                                kMaxSequenceNumber, 0 /* column_family_id */,
+                                nullptr /* flush_initiator */);
   mem3->Ref();
   // This is to make assert(memtable->IsFragmentedRangeTombstonesConstructed())
   // in MemTableListVersion::GetFromList work.
@@ -660,8 +666,9 @@ TEST_F(MemTableListTest, FlushPendingTest) {
   std::vector<MemTable*> tables;
   MutableCFOptions mutable_cf_options(options);
   for (int i = 0; i < num_tables; i++) {
-    MemTable* mem = new MemTable(cmp, ioptions, mutable_cf_options, &wb,
-                                 kMaxSequenceNumber, 0 /* column_family_id */);
+    MemTable* mem =
+        new MemTable(cmp, ioptions, mutable_cf_options, &wb, kMaxSequenceNumber,
+                     0 /* column_family_id */, nullptr /* flush_initiator */);
     mem->SetID(memtable_id++);
     mem->Ref();
 
@@ -890,8 +897,8 @@ TEST_F(MemTableListTest, FlushPendingTest) {
   ASSERT_TRUE(to_flush5.empty());
   ASSERT_EQ(1, list.NumNotFlushed());
   ASSERT_TRUE(list.imm_flush_needed.load(std::memory_order_acquire));
-  ASSERT_FALSE(list.IsFlushPending());
-  ASSERT_FALSE(list.HasFlushRequested());
+  ASSERT_TRUE(list.IsFlushPending());
+  ASSERT_TRUE(list.HasFlushRequested());
 
   // Pick tables to flush. The tables to pick must have ID smaller than or
   // equal to 5. Therefore, only tables[5] will be selected.
@@ -918,6 +925,113 @@ TEST_F(MemTableListTest, FlushPendingTest) {
     delete m;
   }
   to_delete.clear();
+}
+
+TEST_F(MemTableListTest, FlushRequestPersistsAfterPartialPick) {
+  SequenceNumber seq = 1;
+
+  auto factory = std::make_shared<SkipListFactory>();
+  options.memtable_factory = factory;
+  ImmutableOptions ioptions(options);
+  InternalKeyComparator cmp(BytewiseComparator());
+  WriteBufferManager wb(options.db_write_buffer_size);
+  MutableCFOptions mutable_cf_options(options);
+  autovector<ReadOnlyMemTable*> to_delete;
+
+  MemTableList list(10 /* min_write_buffer_number_to_merge */,
+                    0 /* max_write_buffer_size_to_maintain */);
+
+  for (uint64_t memtable_id = 0; memtable_id < 2; ++memtable_id) {
+    MemTable* mem =
+        new MemTable(cmp, ioptions, mutable_cf_options, &wb, kMaxSequenceNumber,
+                     0 /* column_family_id */, nullptr /* flush_initiator */);
+    mem->SetID(memtable_id);
+    mem->Ref();
+    ASSERT_OK(mem->Add(++seq, kTypeValue, "key" + std::to_string(memtable_id),
+                       "value", nullptr /* kv_prot_info */));
+    list.Add(mem, &to_delete);
+  }
+
+  list.FlushRequested();
+  ASSERT_TRUE(list.IsFlushPending());
+
+  autovector<ReadOnlyMemTable*> to_flush;
+  list.PickMemtablesToFlush(0 /* max_memtable_id */, &to_flush);
+  ASSERT_EQ(1, to_flush.size());
+  ASSERT_TRUE(list.IsFlushPending());
+  ASSERT_TRUE(list.HasFlushRequested());
+
+  autovector<ReadOnlyMemTable*> to_flush2;
+  list.PickMemtablesToFlush(1 /* max_memtable_id */, &to_flush2);
+  ASSERT_EQ(1, to_flush2.size());
+  ASSERT_FALSE(list.IsFlushPending());
+  ASSERT_FALSE(list.HasFlushRequested());
+
+  list.current()->Unref(&to_delete);
+  ASSERT_EQ(2, to_delete.size());
+  for (ReadOnlyMemTable* m : to_delete) {
+    delete m;
+  }
+}
+
+TEST_F(MemTableListTest, RemoveOldMemTablesTest) {
+  // Covers the predicate that lets a caller skip RemoveOldMemTables(), and
+  // checks that it agrees with what the removal itself does. Both are used only
+  // by the secondary instance, which collects memtables by the log number that
+  // follows their contents rather than by flushing them.
+  auto factory = std::make_shared<SkipListFactory>();
+  options.memtable_factory = factory;
+  ImmutableOptions ioptions(options);
+  InternalKeyComparator cmp(BytewiseComparator());
+  WriteBufferManager wb(options.db_write_buffer_size);
+  MutableCFOptions mutable_cf_options(options);
+  autovector<ReadOnlyMemTable*> to_delete;
+
+  MemTableList list(/*min_write_buffer_number_to_merge=*/1,
+                    /*max_write_buffer_size_to_maintain=*/0);
+
+  // An empty list has nothing to remove, whatever the log number.
+  ASSERT_FALSE(list.HasOldMemTablesToRemove(0));
+  ASSERT_FALSE(
+      list.HasOldMemTablesToRemove(std::numeric_limits<uint64_t>::max()));
+
+  // Two sealed memtables, the older one followed by WAL 10 and the newer one by
+  // WAL 20.
+  SequenceNumber seq = 1;
+  for (uint64_t next_log_number : {10, 20}) {
+    MemTable* mem =
+        new MemTable(cmp, ioptions, mutable_cf_options, &wb, kMaxSequenceNumber,
+                     0 /* column_family_id */, nullptr /* flush_initiator */);
+    mem->Ref();
+    ASSERT_OK(mem->Add(++seq, kTypeValue, "key", "value",
+                       nullptr /* kv_prot_info */));
+    mem->SetNextLogNumber(next_log_number);
+    mem->ConstructFragmentedRangeTombstones();
+    list.Add(mem, &to_delete);
+  }
+  ASSERT_EQ(2, list.NumNotFlushed());
+
+  // Neither memtable is superseded by a WAL older than the one following it.
+  ASSERT_FALSE(list.HasOldMemTablesToRemove(9));
+  list.RemoveOldMemTables(9, &to_delete);
+  ASSERT_EQ(2, list.NumNotFlushed());
+
+  // The older memtable is collected at exactly its own next log number.
+  ASSERT_TRUE(list.HasOldMemTablesToRemove(10));
+  list.RemoveOldMemTables(10, &to_delete);
+  ASSERT_EQ(1, list.NumNotFlushed());
+
+  ASSERT_FALSE(list.HasOldMemTablesToRemove(19));
+  ASSERT_TRUE(list.HasOldMemTablesToRemove(20));
+  list.RemoveOldMemTables(20, &to_delete);
+  ASSERT_EQ(0, list.NumNotFlushed());
+  ASSERT_FALSE(
+      list.HasOldMemTablesToRemove(std::numeric_limits<uint64_t>::max()));
+
+  list.current()->Unref(&to_delete);
+  for (ReadOnlyMemTable* m : to_delete) {
+    delete m;
+  }
 }
 
 TEST_F(MemTableListTest, EmptyAtomicFlushTest) {
@@ -960,9 +1074,9 @@ TEST_F(MemTableListTest, AtomicFlushTest) {
     mutable_cf_options_list.emplace_back(new MutableCFOptions(options));
     uint64_t memtable_id = 0;
     for (int i = 0; i != num_tables_per_cf; ++i) {
-      MemTable* mem =
-          new MemTable(cmp, ioptions, *(mutable_cf_options_list.back()), &wb,
-                       kMaxSequenceNumber, cf_id);
+      MemTable* mem = new MemTable(
+          cmp, ioptions, *(mutable_cf_options_list.back()), &wb,
+          kMaxSequenceNumber, cf_id, nullptr /* flush_initiator */);
       mem->SetID(memtable_id++);
       mem->Ref();
 
@@ -1113,8 +1227,9 @@ TEST_F(MemTableListWithTimestampTest, GetTableNewestUDT) {
   std::string key;
   std::string write_ts;
   for (int i = 0; i < num_tables; i++) {
-    MemTable* mem = new MemTable(cmp, ioptions, mutable_cf_options, &wb,
-                                 kMaxSequenceNumber, 0 /* column_family_id */);
+    MemTable* mem =
+        new MemTable(cmp, ioptions, mutable_cf_options, &wb, kMaxSequenceNumber,
+                     0 /* column_family_id */, nullptr /* flush_initiator */);
     mem->SetID(memtable_id++);
     mem->Ref();
 
@@ -1151,6 +1266,64 @@ TEST_F(MemTableListWithTimestampTest, GetTableNewestUDT) {
     delete m;
   }
   to_delete.clear();
+}
+
+TEST_F(MemTableListWithTimestampTest, ConcurrentGetTableNewestUDT) {
+  const int num_threads = 4;
+  const int num_entries_per_thread = 100;
+
+  auto factory = std::make_shared<SkipListFactory>();
+  options.memtable_factory = factory;
+  options.persist_user_defined_timestamps = false;
+  ImmutableOptions ioptions(options);
+  const Comparator* ucmp = test::BytewiseComparatorWithU64TsWrapper();
+  InternalKeyComparator cmp(ucmp);
+  WriteBufferManager wb(options.db_write_buffer_size);
+  MutableCFOptions mutable_cf_options(options);
+
+  MemTable* mem =
+      new MemTable(cmp, ioptions, mutable_cf_options, &wb, kMaxSequenceNumber,
+                   0 /* column_family_id */, nullptr /* flush_initiator */);
+  mem->Ref();
+
+  std::atomic<uint64_t> next_seq{1};
+  uint64_t max_ts = num_threads * num_entries_per_thread - 1;
+
+  std::vector<port::Thread> threads;
+  threads.reserve(num_threads);
+
+  for (int t = 0; t < num_threads; t++) {
+    threads.emplace_back([&, t]() {
+      MemTablePostProcessInfo post_process_info;
+      for (int j = 0; j < num_entries_per_thread; j++) {
+        uint64_t ts = t * num_entries_per_thread + j;
+        std::string key = "key" + std::to_string(ts);
+        std::string write_ts;
+        PutFixed64(&write_ts, ts);
+        key.append(write_ts);
+
+        SequenceNumber seq = next_seq.fetch_add(1);
+        ASSERT_OK(mem->Add(seq, kTypeValue, key, "val",
+                           nullptr /* kv_prot_info */,
+                           true /* allow_concurrent */, &post_process_info));
+      }
+      mem->BatchPostProcess(post_process_info);
+    });
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  ASSERT_EQ(num_threads * num_entries_per_thread, mem->NumEntries());
+
+  Slice newest_udt = mem->GetNewestUDT();
+  ASSERT_EQ(sizeof(uint64_t), newest_udt.size());
+  uint64_t got_ts = DecodeFixed64(newest_udt.data());
+  ASSERT_EQ(max_ts, got_ts);
+
+  ReadOnlyMemTable* m = mem->Unref();
+  delete m;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

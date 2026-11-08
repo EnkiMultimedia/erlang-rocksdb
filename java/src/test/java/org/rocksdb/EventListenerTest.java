@@ -276,22 +276,21 @@ public class EventListenerTest {
         TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL,
         TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL,
         TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL,
-        TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, "columnFamilyName".getBytes(),
-        "filterPolicyName", "comparatorName", "mergeOperatorName", "prefixExtractorName",
-        "propertyCollectorsNames", "compressionName", userCollectedPropertiesTestData,
-        readablePropertiesTestData);
+        TEST_LONG_VAL, TEST_LONG_VAL, "columnFamilyName".getBytes(), "filterPolicyName",
+        "comparatorName", "mergeOperatorName", "prefixExtractorName", "propertyCollectorsNames",
+        "compressionName", userCollectedPropertiesTestData, readablePropertiesTestData);
     final FlushJobInfo flushJobInfoTestData = new FlushJobInfo(Integer.MAX_VALUE,
         "testColumnFamily", "/file/path", TEST_LONG_VAL, Integer.MAX_VALUE, true, true,
         TEST_LONG_VAL, TEST_LONG_VAL, tablePropertiesTestData, (byte) 0x0a);
     final Status statusTestData = new Status(Status.Code.Incomplete, Status.SubCode.NoSpace, null);
     final TableFileDeletionInfo tableFileDeletionInfoTestData =
         new TableFileDeletionInfo("dbName", "/file/path", Integer.MAX_VALUE, statusTestData);
-    final TableFileCreationInfo tableFileCreationInfoTestData =
-        new TableFileCreationInfo(TEST_LONG_VAL, tablePropertiesTestData, statusTestData, "dbName",
-            "columnFamilyName", "/file/path", Integer.MAX_VALUE, (byte) 0x03);
+    final TableFileCreationInfo tableFileCreationInfoTestData = new TableFileCreationInfo(
+        TEST_LONG_VAL, tablePropertiesTestData, statusTestData, "dbName", "columnFamilyName",
+        "/file/path", Integer.MAX_VALUE, TableFileCreationReason.MISC.getValue());
     final TableFileCreationBriefInfo tableFileCreationBriefInfoTestData =
-        new TableFileCreationBriefInfo(
-            "dbName", "columnFamilyName", "/file/path", Integer.MAX_VALUE, (byte) 0x03);
+        new TableFileCreationBriefInfo("dbName", "columnFamilyName", "/file/path",
+            Integer.MAX_VALUE, TableFileCreationReason.MISC.getValue());
     final MemTableInfo memTableInfoTestData = new MemTableInfo(
         "columnFamilyName", TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL);
     final FileOperationInfo fileOperationInfoTestData = new FileOperationInfo("/file/path",

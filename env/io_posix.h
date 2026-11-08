@@ -10,7 +10,12 @@
 #include <errno.h>
 #if defined(ROCKSDB_IOURING_PRESENT)
 #include <liburing.h>
+#include <pthread.h>
 #include <sys/uio.h>
+
+#include <cstdio>
+
+#include "util/string_util.h"
 
 // Compatibility defines for io_uring flags that may not be present in older
 // kernel headers. These values are fixed and won't change, so it's safe to
@@ -22,13 +27,17 @@
 #define IORING_SETUP_DEFER_TASKRUN (1U << 13)
 #endif
 #endif
+#if !defined(OS_WIN)
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 
+#include "port/lang.h"
 #include "port/port.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
@@ -36,6 +45,14 @@
 #include "test_util/sync_point.h"
 #include "util/mutexlock.h"
 #include "util/thread_local.h"
+
+#if USE_COROUTINES
+#include "folly/io/async/Liburing.h"
+
+namespace folly {
+class EventBaseManager;
+}  // namespace folly
+#endif  // USE_COROUTINES
 
 // For non linux platform, the following macros are used only as place
 // holder.
@@ -60,6 +77,40 @@ std::string IOErrorMsg(const std::string& context,
 // file_name can be left empty if it is not unkown.
 IOStatus IOError(const std::string& context, const std::string& file_name,
                  int err_number);
+#if USE_COROUTINES && FOLLY_HAS_LIBURING
+void SetCurrentThreadReadIOUringBackendAvailable();
+bool IsCurrentThreadReadIOUringBackendAvailable();
+#endif  // USE_COROUTINES && FOLLY_HAS_LIBURING
+#if !defined(OS_WIN)
+bool PosixPositionedWrite(int fd, const char* buf, size_t nbyte, off_t offset);
+#endif
+
+// SyncPoint payload used by deterministic TSAN regression tests to observe
+// which virtual address range a freshly created mapping occupies.
+struct TsanMappedMemoryInfo {
+  const void* addr;
+  size_t size;
+};
+
+#ifdef __SANITIZE_THREAD__
+extern "C" void AnnotateNewMemory(const char* file, int line,
+                                  const volatile void* mem, long size);
+#endif  // __SANITIZE_THREAD__
+
+inline void TsanAnnotateMappedMemory(const volatile void* mem, size_t size) {
+  TsanMappedMemoryInfo info{const_cast<const void*>(mem), size};
+  TEST_SYNC_POINT_CALLBACK("TsanAnnotateMappedMemory", &info);
+  (void)info;
+#ifdef __SANITIZE_THREAD__
+  if (mem != nullptr && size != 0) {
+    // TSAN does not understand that a new mmap or io_uring setup can legally
+    // reuse a virtual address from an unrelated, previously unmapped region.
+    // Reset the shadow state as soon as the new mapping exists so later
+    // accesses are not reported against stale accesses from the old mapping.
+    AnnotateNewMemory(__FILE__, __LINE__, mem, static_cast<long>(size));
+  }
+#endif  // __SANITIZE_THREAD__
+}
 
 class PosixHelper {
  public:
@@ -309,7 +360,7 @@ class PosixSequentialFile : public FSSequentialFile {
  public:
   PosixSequentialFile(const std::string& fname, FILE* file, int fd,
                       size_t logical_block_size, const EnvOptions& options);
-  virtual ~PosixSequentialFile();
+  ~PosixSequentialFile() override;
 
   IOStatus Read(size_t n, const IOOptions& opts, Slice* result, char* scratch,
                 IODebugContext* dbg) override;
@@ -328,8 +379,19 @@ class PosixSequentialFile : public FSSequentialFile {
 // io_uring instance queue depth
 const unsigned int kIoUringDepth = 256;
 
+inline void TsanAnnotateIOUringMemory(struct io_uring* iu) {
+  TsanAnnotateMappedMemory(iu->sq.ring_ptr, iu->sq.ring_sz);
+  // CQ and SQ can share the same mmap region.
+  if (iu->cq.ring_ptr != iu->sq.ring_ptr) {
+    TsanAnnotateMappedMemory(iu->cq.ring_ptr, iu->cq.ring_sz);
+  }
+  TsanAnnotateMappedMemory(
+      iu->sq.sqes, static_cast<size_t>(kIoUringDepth) * sizeof(io_uring_sqe));
+}
+
 inline void DeleteIOUring(void* p) {
   struct io_uring* iu = static_cast<struct io_uring*>(p);
+  io_uring_queue_exit(iu);
   delete iu;
 }
 
@@ -340,8 +402,13 @@ inline struct io_uring* CreateIOUring() {
   flags |= IORING_SETUP_DEFER_TASKRUN;
   int ret = io_uring_queue_init(kIoUringDepth, new_io_uring, flags);
   if (ret) {
+    fprintf(stdout, "CreateIOUring failed: %s (errno=%d), thread=%lu\n",
+            errnoStr(-ret).c_str(), -ret,
+            static_cast<unsigned long>(pthread_self()));
     delete new_io_uring;
     new_io_uring = nullptr;
+  } else {
+    TsanAnnotateIOUringMemory(new_io_uring);
   }
   return new_io_uring;
 }
@@ -353,6 +420,9 @@ class PosixRandomAccessFile : public FSRandomAccessFile {
   int fd_;
   bool use_direct_io_;
   size_t logical_sector_size_;
+#if USE_COROUTINES && FOLLY_HAS_LIBURING
+  folly::EventBaseManager* read_event_base_manager_;
+#endif  // USE_COROUTINES && FOLLY_HAS_LIBURING
 #if defined(ROCKSDB_IOURING_PRESENT)
   ThreadLocalPtr* thread_local_async_read_io_urings_;
   ThreadLocalPtr* thread_local_multi_read_io_urings_;
@@ -360,14 +430,18 @@ class PosixRandomAccessFile : public FSRandomAccessFile {
 
  public:
   PosixRandomAccessFile(const std::string& fname, int fd,
-                        size_t logical_block_size, const EnvOptions& options
+                        size_t logical_block_size, const FileOptions& options
+#if USE_COROUTINES && FOLLY_HAS_LIBURING
+                        ,
+                        folly::EventBaseManager* read_event_base_manager
+#endif
 #if defined(ROCKSDB_IOURING_PRESENT)
                         ,
                         ThreadLocalPtr* thread_local_async_read_io_urings,
                         ThreadLocalPtr* thread_local_multi_read_io_urings
 #endif
   );
-  virtual ~PosixRandomAccessFile();
+  ~PosixRandomAccessFile() override;
 
   IOStatus Read(uint64_t offset, size_t n, const IOOptions& opts, Slice* result,
                 char* scratch, IODebugContext* dbg) const override;
@@ -388,13 +462,18 @@ class PosixRandomAccessFile : public FSRandomAccessFile {
     return logical_sector_size_;
   }
 
-  virtual IOStatus ReadAsync(FSReadRequest& req, const IOOptions& opts,
-                             std::function<void(FSReadRequest&, void*)> cb,
-                             void* cb_arg, void** io_handle,
-                             IOHandleDeleter* del_fn,
-                             IODebugContext* dbg) override;
+  IOStatus ReadAsync(FSReadRequest& req, const IOOptions& opts,
+                     std::function<void(FSReadRequest&, void*)> cb,
+                     void* cb_arg, void** io_handle, IOHandleDeleter* del_fn,
+                     IODebugContext* dbg) override;
 
-  virtual IOStatus GetFileSize(uint64_t* result) override;
+#if USE_COROUTINES && FOLLY_HAS_LIBURING
+  bool SubmitReadAsync(FSReadRequest& req, const IOOptions& opts,
+                       std::function<void(FSReadRequest&)> cb,
+                       IODebugContext* dbg) override;
+#endif  // USE_COROUTINES && FOLLY_HAS_LIBURING
+
+  IOStatus GetFileSize(uint64_t* result) override;
 };
 
 class PosixWritableFile : public FSWritableFile {
@@ -419,7 +498,7 @@ class PosixWritableFile : public FSWritableFile {
                              size_t logical_block_size,
                              const EnvOptions& options,
                              uint64_t initial_file_size);
-  virtual ~PosixWritableFile();
+  ~PosixWritableFile() override;
 
   // Need to implement this so the file is truncated correctly
   // with direct I/O
@@ -475,12 +554,12 @@ class PosixMmapReadableFile : public FSRandomAccessFile {
  public:
   PosixMmapReadableFile(const int fd, const std::string& fname, void* base,
                         size_t length, const EnvOptions& options);
-  virtual ~PosixMmapReadableFile();
+  ~PosixMmapReadableFile() override;
   IOStatus Read(uint64_t offset, size_t n, const IOOptions& opts, Slice* result,
                 char* scratch, IODebugContext* dbg) const override;
   void Hint(AccessPattern pattern) override;
   IOStatus InvalidateCache(size_t offset, size_t length) override;
-  virtual IOStatus GetFileSize(uint64_t* result) override;
+  IOStatus GetFileSize(uint64_t* result) override;
 };
 
 class PosixMmapFile : public FSWritableFile {
@@ -515,7 +594,7 @@ class PosixMmapFile : public FSWritableFile {
  public:
   PosixMmapFile(const std::string& fname, int fd, size_t page_size,
                 const EnvOptions& options, uint64_t initial_file_size);
-  ~PosixMmapFile();
+  ~PosixMmapFile() override;
 
   // Means Close() will properly take care of truncate
   // and it does not need any additional information
@@ -546,7 +625,7 @@ class PosixRandomRWFile : public FSRandomRWFile {
  public:
   explicit PosixRandomRWFile(const std::string& fname, int fd,
                              const EnvOptions& options);
-  virtual ~PosixRandomRWFile();
+  ~PosixRandomRWFile() override;
 
   IOStatus Write(uint64_t offset, const Slice& data, const IOOptions& opts,
                  IODebugContext* dbg) override;
@@ -567,13 +646,13 @@ class PosixRandomRWFile : public FSRandomRWFile {
 struct PosixMemoryMappedFileBuffer : public MemoryMappedFileBuffer {
   PosixMemoryMappedFileBuffer(void* _base, size_t _length)
       : MemoryMappedFileBuffer(_base, _length) {}
-  virtual ~PosixMemoryMappedFileBuffer();
+  ~PosixMemoryMappedFileBuffer() override;
 };
 
 class PosixDirectory : public FSDirectory {
  public:
   explicit PosixDirectory(int fd, const std::string& directory_name);
-  ~PosixDirectory();
+  ~PosixDirectory() override;
   IOStatus Fsync(const IOOptions& opts, IODebugContext* dbg) override;
 
   IOStatus Close(const IOOptions& opts, IODebugContext* dbg) override;

@@ -11,10 +11,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
 #include "cache/cache_reservation_manager.h"
+#include "db/blob/same_file_blob_reader.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/seqno_to_time_mapping.h"
 #include "file/filename.h"
@@ -27,12 +29,14 @@
 #include "table/block_based/cachable_entry.h"
 #include "table/block_based/filter_block.h"
 #include "table/block_based/uncompression_dict_reader.h"
+#include "table/embedded_blob_sst.h"
 #include "table/format.h"
 #include "table/persistent_cache_options.h"
 #include "table/table_properties_internal.h"
 #include "table/table_reader.h"
 #include "table/two_level_iterator.h"
 #include "trace_replay/block_cache_tracer.h"
+#include "util/aligned_buffer.h"
 #include "util/atomic.h"
 #include "util/cast_util.h"
 #include "util/coro_utils.h"
@@ -50,12 +54,63 @@ class FSRandomAccessFile;
 class TableCache;
 class TableReader;
 class WritableFile;
+class BlobIndex;
+class BlobSource;
 struct BlockBasedTableOptions;
 struct EnvOptions;
 struct ReadOptions;
 class GetContext;
 
 using KVPairBlock = std::vector<std::pair<std::string, std::string>>;
+
+// Calls the provider and checks that a successful allocation returned a lease
+// satisfying RocksDB's size, alignment, data pointer, and cleanup contract.
+Status AllocateReadScopedBlockBuffer(
+    ReadScopedBlockBufferProvider& block_buffer_provider, size_t requested_size,
+    size_t requested_alignment, ReadScopedBlockBufferProvider::Lease* lease);
+
+// Allocates a read-scoped provider lease and exposes it as an AlignedBuffer
+// external allocation. The AlignedBuffer owner keeps a cleanup reference so the
+// provider allocation remains valid while direct I/O can write into it.
+Status AllocateReadScopedAlignedBuffer(
+    ReadScopedBlockBufferProvider& block_buffer_provider, size_t size,
+    size_t alignment, ReadScopedBlockBufferProvider::Lease* lease,
+    AlignedBuffer::ExternalAllocation* out);
+
+// Returns an allocator whose direct-I/O allocation comes from the read-scoped
+// provider. The caller must keep `lease` alive until the file reader
+// synchronously invokes the allocator.
+AlignedBuffer::Allocator MakeReadScopedAlignedBufferAllocator(
+    ReadScopedBlockBufferProviderRef block_buffer_provider,
+    ReadScopedBlockBufferProvider::Lease* lease);
+
+// Resolves the read-scoped provider configured for this read. Returns
+// std::nullopt when no provider is configured, or when mmap reads are enabled
+// because mmap file reads can ignore RocksDB-provided scratch buffers.
+ReadScopedBlockBufferProviderRef GetReadScopedBlockBufferProvider(
+    const ReadOptions& ro, bool allow_mmap_reads);
+
+// Centralizes the data-block cache decision for iterator and MultiScan paths.
+// A read-scoped provider skips data-block cache lookup and insertion because it
+// supplies alternate read-scope backing for supported data-block reads.
+bool ShouldUseDataBlockCacheForIterator(
+    const BlockBasedTableOptions& table_options, const ReadOptions& ro,
+    bool allow_mmap_reads);
+
+// Copies block bytes into RocksDB-owned heap storage and records that ownership
+// in BlockContents. `src` may include a block trailer while `data_size` is the
+// payload size.
+Status CopyBufferToHeapBlockContents(Slice src, size_t data_size,
+                                     MemoryAllocator* allocator,
+                                     BlockContents* out_contents);
+
+// Copies block bytes into read-scoped provider storage and records that
+// cleanup in BlockContents. `src` may include a block trailer while
+// `data_size` is the payload size.
+Status CopyBufferToReadScopedBlockContents(
+    Slice src, size_t data_size,
+    ReadScopedBlockBufferProvider& block_buffer_provider,
+    BlockContents* out_contents);
 
 // Reader class for BlockBasedTable format.
 // For the format of BlockBasedTable refer to
@@ -68,7 +123,7 @@ using KVPairBlock = std::vector<std::pair<std::string, std::string>>;
 // memory, and finally search that record within the block. Of course, to avoid
 // frequent reads of the same block, we introduced the block cache to keep the
 // loaded blocks in the memory.
-class BlockBasedTable : public TableReader {
+class BlockBasedTable : public TableReader, public SameFileBlobReader {
  public:
   static const std::string kObsoleteFilterBlockPrefix;
   static const std::string kFullFilterBlockPrefix;
@@ -95,6 +150,8 @@ class BlockBasedTable : public TableReader {
   //    are set.
   // @param force_direct_prefetch if true, always prefetching to RocksDB
   //    buffer, rather than calling RandomAccessFile::Prefetch().
+  // @param avoid_shared_metadata_cache if true, open-time index/filter/
+  //    dictionary reads must not insert into the shared block cache.
   static Status Open(
       const ReadOptions& ro, const ImmutableOptions& ioptions,
       const EnvOptions& env_options,
@@ -116,7 +173,9 @@ class BlockBasedTable : public TableReader {
       size_t max_file_size_for_l0_meta_pin = 0,
       const std::string& cur_db_session_id = "", uint64_t cur_file_num = 0,
       UniqueId64x2 expected_unique_id = {},
-      const bool user_defined_timestamps_persisted = true);
+      const bool user_defined_timestamps_persisted = true,
+      bool avoid_shared_metadata_cache = false,
+      BlobSource* blob_source = nullptr);
 
   bool PrefixRangeMayMatch(const Slice& internal_key,
                            const ReadOptions& read_options,
@@ -146,9 +205,125 @@ class BlockBasedTable : public TableReader {
       SequenceNumber read_seqno, const Slice* timestamp) override;
 
   // @param skip_filters Disables loading/accessing the filter block
-  Status Get(const ReadOptions& readOptions, const Slice& key,
-             GetContext* get_context, const SliceTransform* prefix_extractor,
-             bool skip_filters = false) override;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(Status, Get, const ReadOptions& readOptions,
+                                  const Slice& key, GetContext* get_context,
+                                  const SliceTransform* prefix_extractor,
+                                  bool skip_filters = false);
+
+  // Whether this SST contains embedded (same-file) blob records, as advertised
+  // by the embedded blob stats property.
+  bool HasEmbeddedBlobRecords() const;
+
+  // Reads a single same-file blob record referenced by `blob_index`.
+  Status ResolveEmbeddedBlob(const ReadOptions& read_options,
+                             const BlobIndex& blob_index,
+                             std::string* value) const;
+
+  // Like ResolveEmbeddedBlob, but reads the payload into a heap buffer owned by
+  // `value` (via a registered cleanup) and pins it, avoiding a copy. Use on the
+  // Get()/MultiGet() path so the resolved value can be pinned into the output.
+  Status ResolveEmbeddedBlobPinned(const ReadOptions& read_options,
+                                   const BlobIndex& blob_index,
+                                   PinnableSlice* value) const;
+
+  // Like ResolveEmbeddedBlobPinned, but routes the read through the CFD's
+  // BlobSource so the payload is served from / inserted into the blob value
+  // cache and BLOB_DB_* statistics are recorded. BlobSource derives the cache
+  // key from the SimpleGen2Blob format (the same offset scheme as the SST's
+  // data blocks; see GetSimpleGen2BlobCacheKey), so embedded blob records stay
+  // collision-free with data blocks even when the blob cache and block cache
+  // are shared. Must only be called when rep_->blob_source_ is non-null.
+  Status ResolveEmbeddedBlobCached(const ReadOptions& read_options,
+                                   const BlobIndex& blob_index,
+                                   PinnableSlice* value) const;
+
+  // Range-read counterpart of ResolveEmbeddedBlobCached: resolve only
+  // [range_offset, range_offset + range_length) of an uncompressed same-file
+  // payload (skipping the trailer + checksum verification, and never inserting
+  // into the blob cache). The caller must ensure range_offset + range_length <=
+  // blob_index.size(). Requires a BlobSource (rep_->blob_source_ != nullptr):
+  // byte-range embedded reads are only issued on the lazy read path, which
+  // always has one, so there is no direct-pinned range variant.
+  Status ResolveEmbeddedBlobRangeCached(const ReadOptions& read_options,
+                                        const BlobIndex& blob_index,
+                                        uint64_t range_offset,
+                                        size_t range_length,
+                                        PinnableSlice* value) const;
+
+  // SameFileBlobReader: resolve a same-file blob reference (whole value or a
+  // sub-range) for GetContext's zero-copy wide-column resolution on the
+  // Get()/MultiGet() path and for the lazy read path. A whole-value read routes
+  // through the blob cache (ResolveEmbeddedBlobCached) when a BlobSource is
+  // wired, else a direct pinned read (ResolveEmbeddedBlobPinned); a sub-range
+  // read routes through ResolveEmbeddedBlobRangeCached (requires a BlobSource).
+  // See BlobVerifyPolicy / kWholeBlobLength for the range + verify semantics.
+  Status GetSameFileBlob(const ReadOptions& read_options,
+                         const BlobIndex& blob_index, uint64_t range_offset,
+                         size_t range_length, BlobVerifyPolicy verify_policy,
+                         PinnableSlice* value) const override;
+
+  // Batched counterpart of GetSameFileBlob: coalesces the cache-miss reads of
+  // multiple embedded (same-file) records in this SST into a single MultiRead
+  // (one for whole records, one for sub-ranges). Force-verify reads
+  // (kVerifyIfPresent) fall back to per-record GetSameFileBlob.
+  void MultiGetSameFileBlob(const ReadOptions& read_options, size_t num_reads,
+                            SameFileBlobReadRequest* reqs) const override;
+
+  // If `value` is a same-file BlobIndex, materializes the referenced payload
+  // and updates `resolved_internal_key` to the corresponding value type. Leaves
+  // `resolved`. When `pinned_value` is non-null, a whole-value same-file blob
+  // is pinned into it without a copy (and `*value_pinned` is set); otherwise
+  // the value is built into `resolved_value`. Wide-column entities are always
+  // built into `resolved_value`.
+  //
+  // When `skip_wide_column_entities` is true, wide-column entities are left
+  // unresolved (returned raw, `resolved` stays false) so the Get()/MultiGet()
+  // path can hand the raw entity to GetContext for zero-copy same-file column
+  // resolution. The iterator path leaves it false to keep re-serializing.
+  Status MaybeResolveEmbeddedValue(
+      const ReadOptions& read_options, const Slice& internal_key,
+      const Slice& value, std::string* resolved_internal_key,
+      std::string* resolved_value, bool* resolved,
+      PinnableSlice* pinned_value = nullptr, bool* value_pinned = nullptr,
+      bool skip_wide_column_entities = false) const;
+
+  // Reusable scratch for resolving embedded values across a Get()/MultiGet()
+  // loop, so the hot loop performs no per-entry allocation. Construct one per
+  // Get()/MultiGet() call and pass it to ResolveEmbeddedValueForGet().
+  struct EmbeddedValueGetScratch {
+    std::string key_buf;
+    std::string value_buf;
+    PinnableSlice pinned_value;
+  };
+
+  // Resolves the embedded blob / wide-column value for one Get()/MultiGet()
+  // entry and selects the Cleanable to hand to GetContext::SaveValue.
+  // `block_pinner` is the data block iterator's value pinner (or nullptr). On
+  // return, *key_to_save / *value_to_save are the slices to save and
+  // *value_pinner is the pinner to use: the zero-copy blob payload pinner (in
+  // `scratch`), nullptr for a copied wide-column value, or `block_pinner` when
+  // nothing needed resolving. Only call this when the table actually has
+  // embedded blob records (see Rep::has_embedded_blobs); the common
+  // non-embedded path should skip it entirely.
+  //
+  // When `defer_wide_column_entities` is true, a wide-column entity is returned
+  // raw (not pre-resolved / re-serialized) so GetContext can resolve its
+  // same-file blob columns zero-copy via an EmbeddedAwareBlobFetcher. Callers
+  // must then pass this table as the SameFileBlobReader to
+  // GetContext::SaveValue. Whole-value same-file blobs are still resolved here.
+  Status ResolveEmbeddedValueForGet(const ReadOptions& read_options,
+                                    const Slice& key, const Slice& value,
+                                    EmbeddedValueGetScratch* scratch,
+                                    Cleanable* block_pinner, Slice* key_to_save,
+                                    Slice* value_to_save,
+                                    Cleanable** value_pinner,
+                                    bool defer_wide_column_entities) const;
+
+  // Validates a same-file `blob_index` and returns the payload and full record
+  // (payload + trailer) sizes. Shared by the ResolveEmbeddedBlob* variants.
+  Status ValidateEmbeddedBlobIndex(const BlobIndex& blob_index,
+                                   size_t* payload_size,
+                                   size_t* record_size) const;
 
   Status MultiGetFilter(const ReadOptions& read_options,
                         const SliceTransform* prefix_extractor,
@@ -217,7 +392,7 @@ class BlockBasedTable : public TableReader {
 
   void MarkObsolete(uint32_t uncache_aggressiveness) override;
 
-  ~BlockBasedTable();
+  ~BlockBasedTable() override;
 
   bool TEST_FilterBlockInCache() const;
   bool TEST_IndexBlockInCache() const;
@@ -322,19 +497,20 @@ class BlockBasedTable : public TableReader {
   const Rep* get_rep() const { return rep_; }
 
   // input_iter: if it is not null, update this one and return it as Iterator
-  template <typename TBlockIter>
-  TBlockIter* NewDataBlockIterator(
+  DECLARE_SYNC_AND_ASYNC_TEMPLATE_CONST(
+      template <typename TBlockIter>, TBlockIter*, NewDataBlockIterator,
       const ReadOptions& ro, const BlockHandle& block_handle,
       TBlockIter* input_iter, BlockType block_type, GetContext* get_context,
       BlockCacheLookupContext* lookup_context,
       FilePrefetchBuffer* prefetch_buffer, bool for_compaction, bool async_read,
-      Status& s, bool use_block_cache_for_lookup) const;
+      Status& s, bool use_block_cache_for_lookup);
 
   // input_iter: if it is not null, update this one and return it as Iterator
-  template <typename TBlockIter>
-  TBlockIter* NewDataBlockIterator(const ReadOptions& ro,
-                                   CachableEntry<Block>& block,
-                                   TBlockIter* input_iter, Status s) const;
+  DECLARE_SYNC_AND_ASYNC_TEMPLATE_CONST(template <typename TBlockIter>,
+                                        TBlockIter*, NewDataBlockIterator,
+                                        const ReadOptions& ro,
+                                        CachableEntry<Block>& block,
+                                        TBlockIter* input_iter, Status s);
 
   class PartitionedIndexIteratorState;
 
@@ -379,25 +555,25 @@ class BlockBasedTable : public TableReader {
   // @param block_entry value is set to the uncompressed block if found. If
   //    in uncompressed block cache, also sets cache_handle to reference that
   //    block.
-  template <typename TBlocklike>
-  WithBlocklikeCheck<Status, TBlocklike> MaybeReadBlockAndLoadToCache(
-      FilePrefetchBuffer* prefetch_buffer, const ReadOptions& ro,
-      const BlockHandle& handle, UnownedPtr<Decompressor> decomp,
-      bool for_compaction, CachableEntry<TBlocklike>* block_entry,
-      GetContext* get_context, BlockCacheLookupContext* lookup_context,
-      BlockContents* contents, bool async_read,
-      bool use_block_cache_for_lookup) const;
+  DECLARE_SYNC_AND_ASYNC_TEMPLATE_CONST(
+      template <typename TBlocklike>, BlocklikeStatus<TBlocklike>,
+      MaybeReadBlockAndLoadToCache, FilePrefetchBuffer* prefetch_buffer,
+      const ReadOptions& ro, const BlockHandle& handle,
+      UnownedPtr<Decompressor> decomp, bool for_compaction,
+      CachableEntry<TBlocklike>* block_entry, GetContext* get_context,
+      BlockCacheLookupContext* lookup_context, BlockContents* contents,
+      bool async_read, bool use_block_cache_for_lookup);
 
   // Similar to the above, with one crucial difference: it will retrieve the
   // block from the file even if there are no caches configured (assuming the
   // read options allow I/O).
-  template <typename TBlocklike>
-  WithBlocklikeCheck<Status, TBlocklike> RetrieveBlock(
-      FilePrefetchBuffer* prefetch_buffer, const ReadOptions& ro,
+  DECLARE_SYNC_AND_ASYNC_TEMPLATE_CONST(
+      template <typename TBlocklike>, BlocklikeStatus<TBlocklike>,
+      RetrieveBlock, FilePrefetchBuffer* prefetch_buffer, const ReadOptions& ro,
       const BlockHandle& handle, UnownedPtr<Decompressor> decomp,
       CachableEntry<TBlocklike>* block_entry, GetContext* get_context,
       BlockCacheLookupContext* lookup_context, bool for_compaction,
-      bool use_cache, bool async_read, bool use_block_cache_for_lookup) const;
+      bool use_cache, bool async_read, bool use_block_cache_for_lookup);
 
   template <typename TBlocklike>
   WithBlocklikeCheck<void, TBlocklike> SaveLookupContextOrTraceRecord(
@@ -519,12 +695,15 @@ class BlockBasedTable : public TableReader {
                            const InternalKeyComparator& internal_comparator,
                            BlockCacheLookupContext* lookup_context);
   // If index and filter blocks do not need to be pinned, `prefetch_all`
-  // determines whether they will be read and add to cache.
+  // determines whether they will be read and added to cache. When
+  // `avoid_shared_metadata_cache` is set, open-time metadata reads avoid the
+  // shared block cache regardless of pinning/prefetch policy.
   Status PrefetchIndexAndFilterBlocks(
       const ReadOptions& ro, FilePrefetchBuffer* prefetch_buffer,
       InternalIterator* meta_iter, BlockBasedTable* new_table,
       bool prefetch_all, const BlockBasedTableOptions& table_options,
       const int level, size_t file_size, size_t max_file_size_for_l0_meta_pin,
+      bool avoid_shared_metadata_cache,
       BlockCacheLookupContext* lookup_context);
 
   static BlockType GetBlockTypeForMetaBlockByName(const Slice& meta_block_name);
@@ -623,6 +802,12 @@ struct BlockBasedTable::Rep {
         user_defined_timestamps_persisted(_user_defined_timestamps_persisted),
         fs_prefetch_support(CheckFSFeatureSupport(
             _ioptions.fs.get(), FSSupportedOps::kFSPrefetch)) {}
+  // No copying allowed
+  Rep(const Rep&) = delete;
+  Rep& operator=(const Rep&) = delete;
+  Rep(Rep&&) = delete;
+  Rep& operator=(Rep&&) = delete;
+
   ~Rep() { status.PermitUncheckedError(); }
   const ImmutableOptions& ioptions;
   const EnvOptions& env_options;
@@ -700,6 +885,18 @@ struct BlockBasedTable::Rep {
 
   // If true, then data blocks have keys and values separated.
   bool separate_key_value_in_data_block = false;
+  // Whether this SST contains embedded (same-file) blob records, detected from
+  // the presence of the embedded blob stats property. Same-file BlobIndex
+  // references are only valid when this is true.
+  bool has_embedded_blobs = false;
+
+  // BlobSource for routing same-file ("embedded") blob reads through the blob
+  // value cache + BLOB_DB_* statistics. Owned by the ColumnFamilyData; this
+  // reader is owned (via TableCache) by the same CFD, so the raw pointer is
+  // lifetime-safe. nullptr for non-DB openers (SstFileReader, sst_dump,
+  // repair, external-file ingestion prevalidation, etc.); in that case
+  // embedded reads fall back to a direct (uncached) read.
+  BlobSource* blob_source_ = nullptr;
 
   // Whether block checksums in metadata blocks were verified on open.
   // This is only to mostly maintain current dubious behavior of VerifyChecksum

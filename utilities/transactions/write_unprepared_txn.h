@@ -68,7 +68,16 @@ class WriteUnpreparedTxnReadCallback : public ReadCallback {
     (void)backed_by_snapshot_;  // to silence unused private field warning
   }
 
-  virtual ~WriteUnpreparedTxnReadCallback() {
+  // No copying allowed
+  WriteUnpreparedTxnReadCallback(const WriteUnpreparedTxnReadCallback&) =
+      delete;
+  WriteUnpreparedTxnReadCallback& operator=(
+      const WriteUnpreparedTxnReadCallback&) = delete;
+  WriteUnpreparedTxnReadCallback(WriteUnpreparedTxnReadCallback&&) = delete;
+  WriteUnpreparedTxnReadCallback& operator=(WriteUnpreparedTxnReadCallback&&) =
+      delete;
+
+  ~WriteUnpreparedTxnReadCallback() override {
     // If it is not backed by snapshot, the caller must check validity
     assert(valid_checked_ || backed_by_snapshot_ == kBackedByDBSnapshot);
   }
@@ -113,7 +122,7 @@ class WriteUnpreparedTxn : public WritePreparedTxn {
                      const WriteOptions& write_options,
                      const TransactionOptions& txn_options);
 
-  virtual ~WriteUnpreparedTxn();
+  ~WriteUnpreparedTxn() override;
 
   using TransactionBaseImpl::Put;
   Status Put(ColumnFamilyHandle* column_family, const Slice& key,
@@ -173,8 +182,8 @@ class WriteUnpreparedTxn : public WritePreparedTxn {
   Status RollbackToSavePoint() override;
   Status PopSavePoint() override;
 
-  // Get and GetIterator needs to be overridden so that a ReadCallback to
-  // handle read-your-own-write is used.
+  // Read APIs need to be overridden so that a ReadCallback handles
+  // read-your-own-write.
   using Transaction::Get;
   Status Get(const ReadOptions& _read_options,
              ColumnFamilyHandle* column_family, const Slice& key,
@@ -204,6 +213,15 @@ class WriteUnpreparedTxn : public WritePreparedTxn {
   using Transaction::GetImpl;
   Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
                  const Slice& key, PinnableSlice* value) override;
+
+  Status GetEntityImpl(const ReadOptions& options,
+                       ColumnFamilyHandle* column_family, const Slice& key,
+                       PinnableWideColumns* columns) override;
+
+  void MultiGetEntityImpl(const ReadOptions& options,
+                          ColumnFamilyHandle* column_family, size_t num_keys,
+                          const Slice* keys, PinnableWideColumns* results,
+                          Status* statuses, bool sorted_input) override;
 
   Status WriteRollbackKeys(const LockTracker& tracked_keys,
                            WriteBatchWithIndex* rollback_batch,

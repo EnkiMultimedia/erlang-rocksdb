@@ -36,10 +36,10 @@
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/rate_limiter.h"
 #include "rocksdb/statistics.h"
-#include "rocksdb/transaction_log.h"
 #include "rocksdb/types.h"
 #include "rocksdb/utilities/options_util.h"
 #include "rocksdb/utilities/stackable_db.h"
+#include "rocksdb/wal_iterator.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -3436,7 +3436,7 @@ TEST_F(BackupEngineTest, FileDetailsHaveCorrectFileType) {
   bool found_options = false;
 
   for (const auto& file_info : backup_info.file_details) {
-    // No file should have the default kTempFile type — ParseFileName should
+    // No file should have the default kTempFile type -- ParseFileName should
     // have successfully identified all backup files.
     EXPECT_NE(file_info.file_type, kTempFile)
         << "Unexpected kTempFile for: " << file_info.relative_filename;

@@ -246,51 +246,13 @@ Status WritePreparedTxnDB::WriteInternal(const WriteOptions& write_options_orig,
   return s;
 }
 
-Status WritePreparedTxnDB::Get(const ReadOptions& _read_options,
-                               ColumnFamilyHandle* column_family,
-                               const Slice& key, PinnableSlice* value,
-                               std::string* timestamp) {
-  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
-      _read_options.io_activity != Env::IOActivity::kGet) {
-    return Status::InvalidArgument(
-        "Can only call Get with `ReadOptions::io_activity` is "
-        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kGet`");
-  }
-  if (timestamp) {
-    return Status::NotSupported(
-        "Get() that returns timestamp is not implemented");
-  }
-  ReadOptions read_options(_read_options);
-  if (read_options.io_activity == Env::IOActivity::kUnknown) {
-    read_options.io_activity = Env::IOActivity::kGet;
-  }
-
-  return GetImpl(read_options, column_family, key, value);
-}
-
-Status WritePreparedTxnDB::GetImpl(const ReadOptions& options,
-                                   ColumnFamilyHandle* column_family,
-                                   const Slice& key, PinnableSlice* value) {
-  SequenceNumber min_uncommitted, snap_seq;
-  const SnapshotBackup backed_by_snapshot =
-      AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
-  WritePreparedTxnReadCallback callback(this, snap_seq, min_uncommitted,
-                                        backed_by_snapshot);
-  bool* dont_care = nullptr;
-  DBImpl::GetImplOptions get_impl_options;
-  get_impl_options.column_family = column_family;
-  get_impl_options.value = value;
-  get_impl_options.value_found = dont_care;
-  get_impl_options.callback = &callback;
-  auto res = db_impl_->GetImpl(options, key, get_impl_options);
-  if (LIKELY(callback.valid() && ValidateSnapshot(callback.max_visible_seq(),
-                                                  backed_by_snapshot))) {
-    return res;
-  } else {
-    res.PermitUncheckedError();
-    WPRecordTick(TXN_GET_TRY_AGAIN);
-    return Status::TryAgain();
-  }
+Status WritePreparedTxnDB::GetWithMetadata(const ReadOptions& options,
+                                           ColumnFamilyHandle* column_family,
+                                           const Slice& key,
+                                           PinnableSlice* value,
+                                           OutputMetadata* output_metadata) {
+  return DB::GetWithMetadata(options, column_family, key, value,
+                             output_metadata);
 }
 
 void WritePreparedTxnDB::UpdateCFComparatorMap(
@@ -329,45 +291,13 @@ void WritePreparedTxnDB::UpdateCFComparatorMap(ColumnFamilyHandle* h) {
   handle_map_.reset(handle_map);
 }
 
-void WritePreparedTxnDB::MultiGet(const ReadOptions& _read_options,
-                                  const size_t num_keys,
-                                  ColumnFamilyHandle** column_families,
-                                  const Slice* keys, PinnableSlice* values,
-                                  std::string* timestamps, Status* statuses,
-                                  const bool /*sorted_input*/) {
-  assert(values);
-
-  Status s;
-  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
-      _read_options.io_activity != Env::IOActivity::kMultiGet) {
-    s = Status::InvalidArgument(
-        "Can only call MultiGet with `ReadOptions::io_activity` is "
-        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kMultiGet`");
-  }
-
-  if (s.ok()) {
-    if (timestamps) {
-      s = Status::NotSupported(
-          "MultiGet() returning timestamps not implemented.");
-    }
-  }
-
-  if (!s.ok()) {
-    for (size_t i = 0; i < num_keys; ++i) {
-      statuses[i] = s;
-    }
-    return;
-  }
-
-  ReadOptions read_options(_read_options);
-  if (read_options.io_activity == Env::IOActivity::kUnknown) {
-    read_options.io_activity = Env::IOActivity::kMultiGet;
-  }
-
-  for (size_t i = 0; i < num_keys; ++i) {
-    statuses[i] =
-        this->GetImpl(read_options, column_families[i], keys[i], &values[i]);
-  }
+void WritePreparedTxnDB::MultiGetWithMetadata(
+    const ReadOptions& options, const size_t num_keys,
+    ColumnFamilyHandle* const* column_families, const Slice* keys,
+    PinnableSlice* values, Status* statuses,
+    MultiGetOutputMetadata* output_metadata, const bool sorted_input) {
+  DB::MultiGetWithMetadata(options, num_keys, column_families, keys, values,
+                           statuses, output_metadata, sorted_input);
 }
 
 // Struct to hold ownership of snapshot and read callback for iterator cleanup.
@@ -436,47 +366,121 @@ Status WritePreparedTxnDB::NewIterators(
     const ReadOptions& _read_options,
     const std::vector<ColumnFamilyHandle*>& column_families,
     std::vector<Iterator*>* iterators) {
-  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
+  if (column_families.empty() &&
+      _read_options.io_activity != Env::IOActivity::kUnknown &&
       _read_options.io_activity != Env::IOActivity::kDBIterator) {
     return Status::InvalidArgument(
         "Can only call NewIterator with `ReadOptions::io_activity` is "
         "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`");
   }
+  return NewIterators(
+      std::vector<ReadOptions>(column_families.size(), _read_options),
+      column_families, iterators);
+}
 
-  ReadOptions read_options(_read_options);
-  if (read_options.io_activity == Env::IOActivity::kUnknown) {
-    read_options.io_activity = Env::IOActivity::kDBIterator;
+Status WritePreparedTxnDB::NewIterators(
+    const std::vector<ReadOptions>& read_options,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::vector<Iterator*>* iterators) {
+  if (read_options.size() != column_families.size()) {
+    return Status::InvalidArgument(
+        "read_options and column_families must have the same size");
   }
-  constexpr bool expose_blob_index = false;
-  constexpr bool allow_refresh = false;
-  std::shared_ptr<ManagedSnapshot> own_snapshot = nullptr;
-  SequenceNumber snapshot_seq = kMaxSequenceNumber;
-  SequenceNumber min_uncommitted = 0;
-  if (read_options.snapshot != nullptr) {
-    snapshot_seq = read_options.snapshot->GetSequenceNumber();
-    min_uncommitted =
-        static_cast_with_check<const SnapshotImpl>(read_options.snapshot)
-            ->min_uncommitted_;
-  } else {
-    auto* snapshot = GetSnapshot();
-    // We take a snapshot to make sure that the related data in the commit map
-    // are not deleted.
-    snapshot_seq = snapshot->GetSequenceNumber();
-    own_snapshot = std::make_shared<ManagedSnapshot>(db_impl_, snapshot);
-    min_uncommitted =
-        static_cast_with_check<const SnapshotImpl>(snapshot)->min_uncommitted_;
+  if (iterators == nullptr) {
+    return Status::InvalidArgument("iterators not allowed to be nullptr");
   }
+
+  if (column_families.empty()) {
+    iterators->clear();
+    return Status::OK();
+  }
+
+  const Snapshot* const snapshot = read_options.front().snapshot;
+  const bool tailing = read_options.front().tailing;
+  std::vector<ReadOptions> normalized_read_options;
+  normalized_read_options.reserve(read_options.size());
+  for (const ReadOptions& options : read_options) {
+    if (options.io_activity != Env::IOActivity::kUnknown &&
+        options.io_activity != Env::IOActivity::kDBIterator) {
+      return Status::InvalidArgument(
+          "Can only call NewIterators with `ReadOptions::io_activity` is "
+          "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`");
+    }
+    if (options.read_tier == kPersistedTier) {
+      return Status::NotSupported(
+          "ReadTier::kPersistedData is not yet supported in iterators.");
+    }
+    if (options.snapshot != snapshot) {
+      return Status::InvalidArgument(
+          "All ReadOptions must use the same snapshot");
+    }
+    if (options.tailing != tailing) {
+      return Status::InvalidArgument(
+          "All ReadOptions must use the same tailing setting");
+    }
+
+    normalized_read_options.emplace_back(options);
+    if (normalized_read_options.back().io_activity ==
+        Env::IOActivity::kUnknown) {
+      normalized_read_options.back().io_activity = Env::IOActivity::kDBIterator;
+    }
+  }
+
+  if (tailing) {
+    return Status::NotSupported(
+        "tailing iterator not supported in write-prepared mode");
+  }
+
   iterators->clear();
   iterators->reserve(column_families.size());
+
+  std::shared_ptr<ManagedSnapshot> own_snapshot;
+  SequenceNumber snapshot_seq;
+  SequenceNumber min_uncommitted;
+  if (snapshot != nullptr) {
+    snapshot_seq = snapshot->GetSequenceNumber();
+    min_uncommitted =
+        static_cast_with_check<const SnapshotImpl>(snapshot)->min_uncommitted_;
+  } else {
+    const Snapshot* managed_snapshot = GetSnapshot();
+    snapshot_seq = managed_snapshot->GetSequenceNumber();
+    min_uncommitted =
+        static_cast_with_check<const SnapshotImpl>(managed_snapshot)
+            ->min_uncommitted_;
+    own_snapshot =
+        std::make_shared<ManagedSnapshot>(db_impl_, managed_snapshot);
+  }
+  assert(snapshot_seq != kMaxSequenceNumber);
+
+  autovector<SuperVersion*> super_versions;
   for (auto* column_family : column_families) {
     auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
-    auto* cfd = cfh->cfd();
+    super_versions.emplace_back(
+        cfh->cfd()->GetReferencedSuperVersion(db_impl_));
+  }
+  const auto cleanup_super_versions = [&]() {
+    for (auto* super_version : super_versions) {
+      db_impl_->CleanupSuperVersion(super_version);
+    }
+  };
+  for (size_t i = 0; i < column_families.size(); ++i) {
+    const Status s = db_impl_->FailIfTableFilterWithRangeConversion(
+        normalized_read_options[i], super_versions[i]->mutable_cf_options);
+    if (!s.ok()) {
+      cleanup_super_versions();
+      return s;
+    }
+  }
+
+  for (size_t i = 0; i < column_families.size(); ++i) {
+    auto* cfh =
+        static_cast_with_check<ColumnFamilyHandleImpl>(column_families[i]);
     auto* state =
         new IteratorState(this, snapshot_seq, own_snapshot, min_uncommitted);
-    SuperVersion* super_version = cfd->GetReferencedSuperVersion(db_impl_);
-    auto* db_iter = db_impl_->NewIteratorImpl(read_options, cfh, super_version,
-                                              snapshot_seq, &state->callback,
-                                              expose_blob_index, allow_refresh);
+    auto* db_iter = db_impl_->NewIteratorImpl(
+        normalized_read_options[i], cfh, super_versions[i], snapshot_seq,
+        &state->callback, /* expose_blob_index */ false,
+        /* allow_refresh */ false);
     db_iter->RegisterCleanup(CleanupWritePreparedTxnDBIterator, state, nullptr);
     iterators->push_back(db_iter);
   }
@@ -1097,3 +1101,12 @@ void SubBatchCounter::AddKey(const uint32_t cf, const Slice& key) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
+
+// clang-format off
+#define WITHOUT_COROUTINES
+#include "utilities/transactions/write_prepared_txn_db_sync_and_async.h"
+#undef WITHOUT_COROUTINES
+#define WITH_COROUTINES
+#include "utilities/transactions/write_prepared_txn_db_sync_and_async.h"
+#undef WITH_COROUTINES
+// clang-format on

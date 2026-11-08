@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -51,7 +52,14 @@ class MemMapping {
   ~MemMapping();
 
   inline void* Get() const { return addr_; }
+  // The requested length of the mapping, which may be smaller than the
+  // actual usable length
   inline size_t Length() const { return length_; }
+
+  // Return the mapping as a Slice (zero-copy view of the mapped memory)
+  inline Slice AsSlice() const {
+    return Slice(static_cast<const char*>(addr_), length_);
+  }
 
  private:
   MemMapping() {}
@@ -79,6 +87,7 @@ class TypedMemMapping : public MemMapping {
   TypedMemMapping& operator=(MemMapping&& v) noexcept {
     MemMapping& base = *this;
     base = std::move(v);
+    return *this;
   }
 
   inline T* Get() const { return static_cast<T*>(MemMapping::Get()); }

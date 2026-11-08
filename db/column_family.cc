@@ -11,12 +11,14 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "db/blob/blob_file_cache.h"
+#include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/compaction/compaction_picker_fifo.h"
@@ -31,6 +33,7 @@
 #include "db/write_controller.h"
 #include "file/sst_file_manager_impl.h"
 #include "logging/logging.h"
+#include "memtable/flush_initiator.h"
 #include "monitoring/thread_status_util.h"
 #include "options/options_helper.h"
 #include "port/port.h"
@@ -495,6 +498,15 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
       result.memtable_avg_op_scan_flush_trigger = 0;
     }
   }
+  if (result.enable_blob_direct_write && !result.enable_blob_files) {
+    ROCKS_LOG_WARN(db_options.info_log.get(),
+                   "enable_blob_direct_write requires enable_blob_files=true. "
+                   "Disabling blob direct write.");
+    result.enable_blob_direct_write = false;
+  }
+  if (result.blob_direct_write_partitions == 0) {
+    result.blob_direct_write_partitions = 1;
+  }
   return result;
 }
 
@@ -601,7 +613,8 @@ ColumnFamilyData::ColumnFamilyData(
     const FileOptions* file_options, ColumnFamilySet* column_family_set,
     BlockCacheTracer* const block_cache_tracer,
     const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
-    const std::string& db_session_id, bool read_only)
+    const std::string& db_session_id, bool read_only,
+    bool options_are_sanitized, bool fast_sst_open)
     : id_(id),
       name_(name),
       dummy_versions_(_dummy_versions),
@@ -611,7 +624,10 @@ ColumnFamilyData::ColumnFamilyData(
       dropped_(false),
       flush_skip_reschedule_(false),
       internal_comparator_(cf_options.comparator),
-      initial_cf_options_(SanitizeCfOptions(db_options, read_only, cf_options)),
+      initial_cf_options_(
+          options_are_sanitized
+              ? cf_options
+              : SanitizeCfOptions(db_options, read_only, cf_options)),
       ioptions_(db_options, initial_cf_options_),
       mutable_cf_options_(initial_cf_options_),
       is_delete_range_supported_(
@@ -661,12 +677,15 @@ ColumnFamilyData::ColumnFamilyData(
         new InternalStats(ioptions_.num_levels, ioptions_.clock, this));
     table_cache_.reset(new TableCache(ioptions_, file_options, _table_cache,
                                       block_cache_tracer, io_tracer,
-                                      db_session_id));
+                                      db_session_id, fast_sst_open, name_));
     blob_file_cache_.reset(
         new BlobFileCache(_table_cache, &ioptions(), soptions(), id_,
                           internal_stats_->GetBlobFileReadHist(), io_tracer));
     blob_source_.reset(new BlobSource(ioptions_, mutable_cf_options_, db_id,
                                       db_session_id, blob_file_cache_.get()));
+    // Let the table cache route same-file ("embedded") blob reads through the
+    // blob value cache + stats. Both objects share this CFD's lifetime.
+    table_cache_->SetBlobSource(blob_source_.get());
 
     if (ioptions_.compaction_style == kCompactionStyleLevel) {
       compaction_picker_.reset(
@@ -782,6 +801,11 @@ ColumnFamilyData::~ColumnFamilyData() {
   }
 }
 
+void ColumnFamilyData::SetBlobPartitionManager(
+    std::shared_ptr<BlobFilePartitionManager> mgr) {
+  blob_partition_manager_ = std::move(mgr);
+}
+
 bool ColumnFamilyData::UnrefAndTryDelete() {
   int old_refs = refs_.fetch_sub(1);
   assert(old_refs > 0);
@@ -815,6 +839,11 @@ void ColumnFamilyData::SetDropped() {
   // can't drop default CF
   assert(id_ != 0);
   dropped_ = true;
+  // A tracker can still contain accounting published while a different WBM
+  // policy was active. Cleanup therefore cannot depend on the current policy.
+  if (mem_ != nullptr) {
+    mem_->StopWBMTracking();
+  }
   write_controller_token_.reset();
 
   // remove from column_family_set
@@ -1227,7 +1256,10 @@ uint64_t ColumnFamilyData::GetLiveSstFilesSize() const {
 MemTable* ColumnFamilyData::ConstructNewMemtable(
     const MutableCFOptions& mutable_cf_options, SequenceNumber earliest_seq) {
   return new MemTable(internal_comparator_, ioptions_, mutable_cf_options,
-                      write_buffer_manager_, earliest_seq, id_);
+                      write_buffer_manager_, earliest_seq, id_,
+                      column_family_set_ != nullptr
+                          ? column_family_set_->flush_initiator()
+                          : nullptr);
 }
 
 void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
@@ -1262,15 +1294,15 @@ Compaction* ColumnFamilyData::PickCompaction(
 }
 
 bool ColumnFamilyData::RangeOverlapWithCompaction(
-    const Slice& smallest_user_key, const Slice& largest_user_key,
-    int level) const {
+    const Slice& smallest_user_key, const Slice& largest_user_key, int level,
+    bool range_limit_exclusive) const {
   return compaction_picker_->RangeOverlapWithCompaction(
-      smallest_user_key, largest_user_key, level);
+      smallest_user_key, largest_user_key, level, range_limit_exclusive);
 }
 
 Status ColumnFamilyData::RangesOverlapWithMemtables(
     const autovector<UserKeyRange>& ranges, SuperVersion* super_version,
-    bool allow_data_in_errors, bool* overlap) {
+    bool allow_data_in_errors, bool* overlap, bool range_limit_exclusive) {
   assert(overlap != nullptr);
   *overlap = false;
   // Create an InternalIterator over all unflushed memtables
@@ -1315,12 +1347,15 @@ Status ColumnFamilyData::RangesOverlapWithMemtables(
     }
 
     if (status.ok()) {
+      const int limit_cmp = memtable_iter->Valid()
+                                ? ucmp->CompareWithoutTimestamp(
+                                      seek_result.user_key, ranges[i].limit)
+                                : 1;
       if (memtable_iter->Valid() &&
-          ucmp->CompareWithoutTimestamp(seek_result.user_key,
-                                        ranges[i].limit) <= 0) {
+          (range_limit_exclusive ? limit_cmp < 0 : limit_cmp <= 0)) {
         *overlap = true;
-      } else if (range_del_agg.IsRangeOverlapped(ranges[i].start,
-                                                 ranges[i].limit)) {
+      } else if (range_del_agg.IsRangeOverlapped(
+                     ranges[i].start, ranges[i].limit, range_limit_exclusive)) {
         *overlap = true;
       }
     }
@@ -1523,6 +1558,32 @@ Status ColumnFamilyData::ValidateOptions(
 
   const auto* ucmp = cf_options.comparator;
   assert(ucmp);
+  if (cf_options.enable_blob_direct_write) {
+    if (db_options.enable_pipelined_write) {
+      return Status::NotSupported(
+          "Blob direct write v1 does not support pipelined writes.");
+    }
+    if (db_options.allow_concurrent_memtable_write) {
+      return Status::NotSupported(
+          "Blob direct write v1 does not support concurrent memtable writes.");
+    }
+    if (db_options.unordered_write) {
+      return Status::NotSupported(
+          "Blob direct write v1 does not support unordered writes.");
+    }
+    if (db_options.two_write_queues) {
+      return Status::NotSupported(
+          "Blob direct write v1 does not support two write queues.");
+    }
+    if (cf_options.experimental_mempurge_threshold > 0.0) {
+      return Status::NotSupported(
+          "Blob direct write does not support MemPurge.");
+    }
+    if (ucmp->timestamp_size() > 0) {
+      return Status::NotSupported(
+          "Blob direct write does not support user-defined timestamps.");
+    }
+  }
   if (ucmp->timestamp_size() > 0 &&
       !cf_options.persist_user_defined_timestamps) {
     if (db_options.atomic_flush) {
@@ -1561,6 +1622,14 @@ Status ColumnFamilyData::ValidateOptions(
           "The garbage ratio threshold for forcing blob garbage collection "
           "should be in the range [0.0, 1.0].");
     }
+  }
+
+  if (cf_options.read_triggered_compaction_threshold < 0.0 ||
+      std::isnan(cf_options.read_triggered_compaction_threshold) ||
+      std::isinf(cf_options.read_triggered_compaction_threshold)) {
+    return Status::InvalidArgument(
+        "read_triggered_compaction_threshold must be >= 0.0 and finite. "
+        "Use 0.0 to disable.");
   }
 
   if (cf_options.compaction_style == kCompactionStyleFIFO &&
@@ -1759,23 +1828,21 @@ void ColumnFamilyData::RecoverEpochNumbers() {
   vstorage->RecoverEpochNumbers(this);
 }
 
-ColumnFamilySet::ColumnFamilySet(const std::string& dbname,
-                                 const ImmutableDBOptions* db_options,
-                                 const FileOptions& file_options,
-                                 Cache* table_cache,
-                                 WriteBufferManager* _write_buffer_manager,
-                                 WriteController* _write_controller,
-                                 BlockCacheTracer* const block_cache_tracer,
-                                 const std::shared_ptr<IOTracer>& io_tracer,
-                                 const std::string& db_id,
-                                 const std::string& db_session_id)
+ColumnFamilySet::ColumnFamilySet(
+    const std::string& dbname, const ImmutableDBOptions* db_options,
+    const FileOptions& file_options, Cache* table_cache,
+    WriteBufferManager* _write_buffer_manager,
+    WriteController* _write_controller,
+    BlockCacheTracer* const block_cache_tracer,
+    const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
+    const std::string& db_session_id, bool fast_sst_open)
     : max_column_family_(0),
       file_options_(file_options),
       dummy_cfd_(new ColumnFamilyData(
           ColumnFamilyData::kDummyColumnFamilyDataId, "", nullptr, nullptr,
           nullptr, ColumnFamilyOptions(), *db_options, &file_options_, nullptr,
           block_cache_tracer, io_tracer, db_id, db_session_id,
-          /*read_only*/ true)),
+          /*read_only=*/true, /*options_are_sanitized=*/false)),
       default_cfd_cache_(nullptr),
       db_name_(dbname),
       db_options_(db_options),
@@ -1785,7 +1852,8 @@ ColumnFamilySet::ColumnFamilySet(const std::string& dbname,
       block_cache_tracer_(block_cache_tracer),
       io_tracer_(io_tracer),
       db_id_(db_id),
-      db_session_id_(db_session_id) {
+      db_session_id_(db_session_id),
+      fast_sst_open_(fast_sst_open) {
   // initialize linked list
   dummy_cfd_->prev_ = dummy_cfd_;
   dummy_cfd_->next_ = dummy_cfd_;
@@ -1844,15 +1912,112 @@ size_t ColumnFamilySet::NumberOfColumnFamilies() const {
   return column_families_.size();
 }
 
+void ColumnFamilySet::RefreshFlushableMemAccounting() {
+  if (flush_initiator_ == nullptr || write_buffer_manager_ == nullptr ||
+      !write_buffer_manager_->ShouldTrackFlushInitiator()) {
+    return;
+  }
+
+  if (bulk_flushable_mem_accounting_depth_ > 0) {
+    bulk_flushable_mem_accounting_dirty_ = true;
+    flush_initiator_->InvalidateLargestFlushableCFMem();
+    return;
+  }
+
+  // Keep candidate readers from consuming a mixture of the previous snapshot
+  // and the values published by this rebuild.
+  flush_initiator_->InvalidateLargestFlushableCFMem();
+  constexpr int kMaxRefreshAttempts = 3;
+  for (int attempt = 0; attempt < kMaxRefreshAttempts; ++attempt) {
+    const uint64_t update_seq =
+        flush_initiator_->GetFlushableMemUpdateSequence();
+    bool has_mutable_mem = false;
+    bool has_ineligible_cf = false;
+    size_t largest = 0;
+    size_t waiting_immutable_mem = 0;
+    for (auto cfd : *this) {
+      if (cfd->IsDropped() || !cfd->initialized()) {
+        continue;
+      }
+      const bool mutable_not_empty = !cfd->mem()->IsEmpty();
+      if (mutable_not_empty) {
+        cfd->mem()->RefreshWBMTracking();
+      }
+      const bool has_mutable =
+          mutable_not_empty && cfd->mem()->IsWBMTrackingActive();
+      has_mutable_mem = has_mutable_mem || has_mutable;
+      if (flush_initiator_->UsesTotalMutableMem()) {
+        waiting_immutable_mem +=
+            cfd->imm()->WBMTrackedUnstartedMemTablesMemoryUsage();
+        continue;
+      }
+      if (cfd->imm()->IsFlushPendingOrRunning()) {
+        has_ineligible_cf = true;
+        continue;
+      }
+      const size_t mutable_mem =
+          has_mutable ? cfd->mem()->WBMTrackedMemoryUsage() : 0;
+      const size_t immutable_mem =
+          cfd->imm()->WBMTrackedUnflushedMemTablesMemoryUsage();
+      waiting_immutable_mem += immutable_mem;
+      largest = std::max(largest, mutable_mem + immutable_mem);
+    }
+    if (flush_initiator_->UsesTotalMutableMem()) {
+      flush_initiator_->SetHasIneligibleCF(false);
+      flush_initiator_->SetHasFlushableCF(has_mutable_mem ||
+                                          waiting_immutable_mem > 0);
+      if (flush_initiator_->TrySetLargestFlushableCFMem(
+              0, waiting_immutable_mem, update_seq)) {
+        write_buffer_manager_->NotifyFlushInitiatorChanged();
+        return;
+      }
+      continue;
+    }
+    flush_initiator_->SetHasIneligibleCF(has_ineligible_cf);
+    flush_initiator_->SetHasFlushableCF(largest > 0);
+    if (flush_initiator_->TrySetLargestFlushableCFMem(
+            largest, waiting_immutable_mem, update_seq)) {
+      write_buffer_manager_->NotifyFlushInitiatorChanged();
+      return;
+    }
+  }
+  flush_initiator_->InvalidateLargestFlushableCFMem();
+}
+
+void ColumnFamilySet::BeginBulkFlushableMemAccountingUpdate() {
+  ++bulk_flushable_mem_accounting_depth_;
+  if (bulk_flushable_mem_accounting_depth_ == 1) {
+    bulk_flushable_mem_accounting_dirty_ = true;
+    if (flush_initiator_ != nullptr && write_buffer_manager_ != nullptr &&
+        write_buffer_manager_->ShouldTrackFlushInitiator()) {
+      flush_initiator_->InvalidateLargestFlushableCFMem();
+      write_buffer_manager_->NotifyFlushInitiatorChanged();
+    }
+  }
+}
+
+void ColumnFamilySet::EndBulkFlushableMemAccountingUpdate() {
+  assert(bulk_flushable_mem_accounting_depth_ > 0);
+  --bulk_flushable_mem_accounting_depth_;
+  if (bulk_flushable_mem_accounting_depth_ == 0 &&
+      bulk_flushable_mem_accounting_dirty_) {
+    bulk_flushable_mem_accounting_dirty_ = false;
+    TEST_SYNC_POINT(
+        "ColumnFamilySet::EndBulkFlushableMemAccountingUpdate:Refresh");
+    RefreshFlushableMemAccounting();
+  }
+}
+
 // under a DB mutex AND write thread
 ColumnFamilyData* ColumnFamilySet::CreateColumnFamily(
     const std::string& name, uint32_t id, Version* dummy_versions,
-    const ColumnFamilyOptions& options, bool read_only) {
+    const ColumnFamilyOptions& options, bool read_only,
+    bool options_are_sanitized) {
   assert(column_families_.find(name) == column_families_.end());
   ColumnFamilyData* new_cfd = new ColumnFamilyData(
       id, name, dummy_versions, table_cache_, write_buffer_manager_, options,
       *db_options_, &file_options_, this, block_cache_tracer_, io_tracer_,
-      db_id_, db_session_id_, read_only);
+      db_id_, db_session_id_, read_only, options_are_sanitized, fast_sst_open_);
   column_families_.insert({name, id});
   column_family_data_.insert({id, new_cfd});
   auto ucmp = new_cfd->user_comparator();
@@ -1884,6 +2049,15 @@ void ColumnFamilySet::RemoveColumnFamily(ColumnFamilyData* cfd) {
   column_families_.erase(cfd->GetName());
   running_ts_sz_.erase(cf_id);
   ts_sz_for_record_.erase(cf_id);
+  if (bulk_flushable_mem_accounting_depth_ > 0) {
+    bulk_flushable_mem_accounting_dirty_ = true;
+    if (flush_initiator_ != nullptr) {
+      flush_initiator_->InvalidateLargestFlushableCFMem();
+    }
+    return;
+  }
+  TEST_SYNC_POINT("ColumnFamilySet::RemoveColumnFamily:Refresh");
+  RefreshFlushableMemAccounting();
 }
 
 // under a DB mutex OR from a write thread

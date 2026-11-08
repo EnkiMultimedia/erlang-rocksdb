@@ -696,6 +696,22 @@ public class OptionsTest {
       opt.setWriteBufferManager(writeBufferManager);
       assertThat(opt.writeBufferManager()).isEqualTo(writeBufferManager);
       assertThat(opt.writeBufferManager().allowStall()).isEqualTo(true);
+      assertThat(writeBufferManager.flushPolicy())
+          .isEqualTo(WriteBufferManagerFlushPolicy.FLUSH_OLDEST);
+    }
+  }
+
+  @Test
+  public void writeBufferManagerFlushPolicy() {
+    try (final Cache cache = new LRUCache(1024 * 1024);
+        final WriteBufferManager writeBufferManager = new WriteBufferManager(
+            2000L, cache, true, WriteBufferManagerFlushPolicy.FLUSH_LARGEST_ACROSS_DBS)) {
+      assertThat(writeBufferManager.flushPolicy())
+          .isEqualTo(WriteBufferManagerFlushPolicy.FLUSH_LARGEST_ACROSS_DBS);
+
+      writeBufferManager.setFlushPolicy(WriteBufferManagerFlushPolicy.FLUSH_LARGEST);
+      assertThat(writeBufferManager.flushPolicy())
+          .isEqualTo(WriteBufferManagerFlushPolicy.FLUSH_LARGEST);
     }
   }
 
@@ -1355,6 +1371,15 @@ public class OptionsTest {
   }
 
   @Test
+  public void trackOptionsFileNumberInManifest() {
+    try (final Options options = new Options()) {
+      assertThat(options.trackOptionsFileNumberInManifest()).isFalse();
+      assertThat(options.setTrackOptionsFileNumberInManifest(true)).isEqualTo(options);
+      assertThat(options.trackOptionsFileNumberInManifest()).isTrue();
+    }
+  }
+
+  @Test
   public void logReadaheadSize() {
     try (final Options options = new Options()) {
       assertThat(options.logReadaheadSize()).isEqualTo(0);
@@ -1410,6 +1435,16 @@ public class OptionsTest {
       final int val = 32;
       assertThat(options.setMemtableMaxRangeDeletions(val)).isEqualTo(options);
       assertThat(options.memtableMaxRangeDeletions()).isEqualTo(val);
+    }
+  }
+
+  @Test
+  public void minTombstonesForRangeConversion() {
+    try (final Options options = new Options()) {
+      assertThat(options.minTombstonesForRangeConversion()).isEqualTo(0);
+      final int val = 100;
+      assertThat(options.setMinTombstonesForRangeConversion(val)).isEqualTo(options);
+      assertThat(options.minTombstonesForRangeConversion()).isEqualTo(val);
     }
   }
 

@@ -10,7 +10,10 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 
 #include "file/file_prefetch_buffer.h"
@@ -19,6 +22,7 @@
 #include "options/cf_options.h"
 #include "port/malloc.h"
 #include "port/port.h"  // noexcept
+#include "rocksdb/cleanable.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
@@ -28,6 +32,9 @@ namespace ROCKSDB_NAMESPACE {
 
 class RandomAccessFile;
 struct ReadOptions;
+
+using ReadScopedBlockBufferProviderRef =
+    std::optional<std::reference_wrapper<ReadScopedBlockBufferProvider>>;
 
 bool ShouldReportDetailedTime(Env* env, Statistics* stats);
 
@@ -117,13 +124,24 @@ struct IndexValue {
 
   // have_first_key indicates whether the `first_internal_key` is used.
   // If previous_handle is not null, delta encoding is used;
-  // in this case, the two handles must point to consecutive blocks:
+  // in this case, the two handles normally point to consecutive blocks:
   // handle.offset() ==
   //     previous_handle->offset() + previous_handle->size() + kBlockTrailerSize
+  //
+  // use_value_delta_escape enables the format_version >= 8 value-delta codec:
+  // genuine size deltas are remapped (zigzag(delta)+1, always >= 1) so that the
+  // varint 0 is free to act as an escape meaning "a full BlockHandle follows."
+  // The escape is emitted (only) for a non-contiguous handle, so such an entry
+  // does not have to be forced to a restart. When use_value_delta_escape is
+  // false (format_version <= 7), the encoding is byte-identical to the legacy
+  // PutVarsignedint64(size delta). Only meaningful when previous_handle !=
+  // null.
   void EncodeTo(std::string* dst, bool have_first_key,
-                const BlockHandle* previous_handle) const;
+                const BlockHandle* previous_handle,
+                bool use_value_delta_escape = false) const;
   Status DecodeFrom(Slice* input, bool have_first_key,
-                    const BlockHandle* previous_handle);
+                    const BlockHandle* previous_handle,
+                    bool use_value_delta_escape = false);
 
   std::string ToString(bool hex, bool have_first_key) const;
 };
@@ -162,7 +180,11 @@ inline uint32_t ChecksumModifierForContext(uint32_t base_context_checksum,
   return modifier & all_or_nothing;
 }
 
-constexpr uint32_t kLatestBbtFormatVersion = 7;
+// Sentinel for "no format_version known yet," e.g. a Footer that has not been
+// populated by DecodeFrom. Deliberately larger than any real version so that
+// accidentally treating it as one is caught by the FormatVersionUses*
+// predicates below rather than silently reading as "newest of everything."
+constexpr uint32_t kInvalidFormatVersion = 0xffffffffU;
 
 // Minimum format version supported for reading SST files in block-based format.
 //
@@ -184,7 +206,7 @@ static_assert(kMinSupportedBbtFormatVersionForWrite >=
 inline bool IsSupportedFormatVersionForRead(uint64_t magic, uint32_t version) {
   if (magic == kBlockBasedTableMagicNumber) {
     return version >= kMinSupportedBbtFormatVersionForRead &&
-           version <= kLatestBbtFormatVersion;
+           version <= BlockBasedTableOptions::kLatestSupportedFormatVersion;
   } else if (magic == kPlainTableMagicNumber) {
     return version == 0;
   } else if (magic == kCuckooTableMagicNumber) {
@@ -197,7 +219,7 @@ inline bool IsSupportedFormatVersionForRead(uint64_t magic, uint32_t version) {
 inline bool IsSupportedFormatVersionForWrite(uint64_t magic, uint32_t version) {
   if (magic == kBlockBasedTableMagicNumber) {
     return version >= kMinSupportedBbtFormatVersionForWrite &&
-           version <= kLatestBbtFormatVersion;
+           version <= BlockBasedTableOptions::kLatestSupportedFormatVersion;
   } else if (magic == kPlainTableMagicNumber) {
     return version == 0;
   } else if (magic == kCuckooTableMagicNumber) {
@@ -207,17 +229,68 @@ inline bool IsSupportedFormatVersionForWrite(uint64_t magic, uint32_t version) {
   }
 }
 
+// The FormatVersionUses* predicates below answer "does this (known) format
+// version use feature X". Every one of them is a `version >= N` test, so
+// kInvalidFormatVersion would satisfy all of them and quietly report "uses the
+// newest of everything." Callers must therefore pass a real version -- from
+// BlockBasedTableOptions, or from a Footer that has actually been decoded.
+inline void AssertKnownFormatVersion(uint32_t version) {
+  assert(version != kInvalidFormatVersion);
+  (void)version;
+}
+
 // Same as having a unique id in footer.
 inline bool FormatVersionUsesContextChecksum(uint32_t version) {
+  AssertKnownFormatVersion(version);
   return version >= 6;
 }
 
 inline bool FormatVersionUsesIndexHandleInFooter(uint32_t version) {
+  AssertKnownFormatVersion(version);
   return version < 6;
 }
 
 inline bool FormatVersionUsesCompressionManagerName(uint32_t version) {
+  AssertKnownFormatVersion(version);
   return version >= 7;
+}
+
+// format_version >= 8 decouples the index block's value-delta encoding from the
+// key "shared" sentinel by reserving an in-value escape codepoint that means "a
+// full BlockHandle follows" (see IndexValue::EncodeTo/DecodeFrom). This lets a
+// non-contiguous index entry (whose block handle does NOT start where the
+// previous one ended, e.g. because of super_block_alignment padding or
+// interleaved embedded blob records) remain a normal key-delta-encoded,
+// on-cadence index entry instead of being forced to a restart (shared==0).
+inline bool FormatVersionUsesValueDeltaEscape(uint32_t version) {
+  AssertKnownFormatVersion(version);
+  return version >= 8;
+}
+
+// format_version >= 8 repurposes the top 16 bits of the footer's 4-byte
+// "metaindex block size" field to record the number of bytes of gap between the
+// end of the metaindex block (including its trailer) and the start of the
+// footer (space reserved for future file checksum data). The low 16 bits hold
+// the metaindex block size. For format_version < 8 the whole field is the
+// metaindex block size and the metaindex is assumed adjacent to the footer.
+// See Footer format documentation in format.cc. (Note: fv < 6 allowed an
+// arbitrary gap due to inefficient metaindex handle encoding, but that's
+// obsolete.)
+inline bool FormatVersionUsesMetaindexGap(uint32_t version) {
+  AssertKnownFormatVersion(version);
+  return version >= 8;
+}
+
+// format_version >= 8 allows blocks with sorted keys (data and index blocks) to
+// store the common user-key prefix of all keys in the block once (in the
+// leading bytes, before restarts[0]) instead of re-storing it at every restart
+// point. Only used for (reverse-)bytewise comparators without user-defined
+// timestamps; signaled per-block by a nonzero stored prefix length
+// (restarts[0] > 0), not by a footer bit. Older readers reject format_version 8
+// at footer decode (fail-safe).
+inline bool FormatVersionUsesCommonKeyPrefix(uint32_t version) {
+  AssertKnownFormatVersion(version);
+  return version >= 8;
 }
 
 // Footer encapsulates the fixed information stored at the tail end of every
@@ -257,6 +330,13 @@ class Footer {
   // unnecessary complexity to separate footer versions and
   // BBTO::format_version.)
   uint32_t format_version() const { return format_version_; }
+
+  // Test-only: set just the format_version, for unit tests that construct a
+  // BlockBasedTable::Rep without a real file to decode a footer from.
+  // Production code must populate the whole footer via DecodeFrom.
+  void TEST_SetFormatVersion(uint32_t format_version) {
+    format_version_ = format_version;
+  }
 
   // See ChecksumModifierForContext()
   uint32_t base_context_checksum() const { return base_context_checksum_; }
@@ -299,8 +379,6 @@ class Footer {
   static constexpr uint32_t kMaxEncodedLength = kNewVersionsEncodedLength;
 
   static constexpr uint64_t kNullTableMagicNumber = 0;
-
-  static constexpr uint32_t kInvalidFormatVersion = 0xffffffffU;
 
  private:
   static constexpr int kInvalidChecksumType =
@@ -404,12 +482,21 @@ struct BlockContents {
   // Points to block payload (without trailer)
   Slice data;
   CacheAllocationPtr allocation;
+  // Optional shared lifetime token for block bytes not owned through
+  // `allocation`, such as bytes backed by a read-scoped provider.
+  SharedCleanablePtr cleanup;
+  // Usable byte size of the provider/external backing allocation.
+  size_t backing_size = 0;
 
 #ifndef NDEBUG
   // Whether there is a known trailer after what is pointed to by `data`.
   // See BlockBasedTable::GetCompressionType.
   bool has_trailer = false;
 #endif  // NDEBUG
+
+  void AssertSingleOwner() const {
+    assert(allocation.get() == nullptr || cleanup.get() == nullptr);
+  }
 
   BlockContents() {}
 
@@ -427,10 +514,14 @@ struct BlockContents {
   }
 
   // Returns whether the object has ownership of the underlying data bytes.
-  bool own_bytes() const { return allocation.get() != nullptr; }
+  bool own_bytes() const {
+    AssertSingleOwner();
+    return allocation.get() != nullptr || cleanup.get() != nullptr;
+  }
 
   // The additional memory space taken by the block data.
   size_t usable_size() const {
+    AssertSingleOwner();
     // FIXME: doesn't account for possible block trailer
     if (allocation.get() != nullptr) {
       auto allocator = allocation.get_deleter().allocator;
@@ -442,12 +533,15 @@ struct BlockContents {
 #else
       return data.size();
 #endif  // ROCKSDB_MALLOC_USABLE_SIZE
+    } else if (cleanup.get() != nullptr) {
+      return backing_size;
     } else {
       return 0;  // no extra memory is occupied by the data
     }
   }
 
   size_t ApproximateMemoryUsage() const {
+    AssertSingleOwner();
     return usable_size() + sizeof(*this);
   }
 
@@ -456,29 +550,33 @@ struct BlockContents {
   BlockContents& operator=(BlockContents&& other) {
     data = std::move(other.data);
     allocation = std::move(other.allocation);
+    cleanup = std::move(other.cleanup);
+    backing_size = other.backing_size;
 #ifndef NDEBUG
     has_trailer = other.has_trailer;
 #endif  // NDEBUG
+    AssertSingleOwner();
     return *this;
   }
+
+  ~BlockContents() = default;
 };
 
 // The `data` points to serialized block contents read in from file, which
 // must be compressed and include a trailer beyond `size`. A new buffer is
 // allocated with the given allocator (or default) and the uncompressed
 // contents are returned in `out_contents`. Statistics updated.
-Status DecompressSerializedBlock(const char* data, size_t size,
-                                 CompressionType type,
-                                 Decompressor& decompressor,
-                                 BlockContents* out_contents,
-                                 const ImmutableOptions& ioptions,
-                                 MemoryAllocator* allocator = nullptr);
+Status DecompressSerializedBlock(
+    const char* data, size_t size, CompressionType type,
+    Decompressor& decompressor, BlockContents* out_contents,
+    const ImmutableOptions& ioptions, MemoryAllocator* allocator = nullptr,
+    ReadScopedBlockBufferProviderRef block_buffer_provider = std::nullopt);
 
-Status DecompressSerializedBlock(Decompressor::Args& args,
-                                 Decompressor& decompressor,
-                                 BlockContents* out_contents,
-                                 const ImmutableOptions& ioptions,
-                                 MemoryAllocator* allocator = nullptr);
+Status DecompressSerializedBlock(
+    Decompressor::Args& args, Decompressor& decompressor,
+    BlockContents* out_contents, const ImmutableOptions& ioptions,
+    MemoryAllocator* allocator = nullptr,
+    ReadScopedBlockBufferProviderRef block_buffer_provider = std::nullopt);
 
 // This is a variant of DecompressSerializedBlock that does not expect a
 // block trailer beyond `size`. (CompressionType is passed in.)

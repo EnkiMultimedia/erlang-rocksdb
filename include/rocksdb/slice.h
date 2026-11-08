@@ -140,6 +140,7 @@ class OptSlice {
   /*implicit*/ OptSlice(const std::string& s) : slice_(s) {}
   /*implicit*/ OptSlice(const std::string_view& sv) : slice_(sv) {}
   /*implicit*/ OptSlice(const char* c_str) : slice_(c_str) {}
+  OptSlice(const char* d, size_t n) : slice_(d, n) {}
   // For easier migrating from APIs uing Slice* as an optional type.
   // CAUTION: OptSlice{nullptr} is "no value" while Slice{nullptr} is "empty"
   /*implicit*/ OptSlice(std::nullptr_t) : OptSlice() {}
@@ -187,6 +188,8 @@ class PinnableSlice : public Slice, public Cleanable {
   // No copy constructor and copy assignment allowed.
   PinnableSlice(PinnableSlice&) = delete;
   PinnableSlice& operator=(PinnableSlice&) = delete;
+
+  ~PinnableSlice() = default;
 
   inline void PinSlice(const Slice& s, CleanupFunction f, void* arg1,
                        void* arg2) {
@@ -285,19 +288,50 @@ inline int Slice::compare(const Slice& b) const {
   const size_t min_len = (size_ < b.size_) ? size_ : b.size_;
   int r = memcmp(data_, b.data_, min_len);
   if (r == 0) {
-    if (size_ < b.size_)
+    if (size_ < b.size_) {
       r = -1;
-    else if (size_ > b.size_)
+    } else if (size_ > b.size_) {
       r = +1;
+    }
   }
   return r;
 }
 
 inline size_t Slice::difference_offset(const Slice& b) const {
-  size_t off = 0;
   const size_t len = (size_ < b.size_) ? size_ : b.size_;
+  size_t off = 0;
+  // ==> Word-wise scan optimization, 8 bytes per iteration <==
+  // This could only use some internal helpers like GetUnaligned,
+  // CountTrailingZeroBits, EndianSwapValue, port::kLittleEndian if implemented
+  // out-of-line in slice.cc, which incurs a measurable overhead (at least
+  // without LTO). So here in a very common public header we live with a
+  // slightly ugly but largely effective implementation of the optimization.
+  // (This could be made more general if the need/interest arises.)
+#if /* ODR-SAFE */ !defined(_MSC_VER) && defined(__BYTE_ORDER__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  for (; off + sizeof(uint64_t) <= len; off += sizeof(uint64_t)) {
+    uint64_t x;
+    uint64_t y;
+    memcpy(&x, data_ + off, sizeof(x));
+    memcpy(&y, b.data_ + off, sizeof(y));
+    if (x != y) {
+      // On little-endian the lowest-address byte is the least-significant, so
+      // __builtin_ctzll(x ^ y) >> 3 is the index of the first differing byte
+      // (x != y guarantees the operand is nonzero).
+      return off + (static_cast<size_t>(__builtin_ctzll(x ^ y)) >> 3);
+    }
+  }
+#endif
+  // ==> Byte-wise tail and fallback <==
+  // When the word-wise scan is applicable, this is rarely reached: only when
+  // the shared prefix runs into the final partial word. For sorted distinct
+  // keys, and especially internal keys (which carry an 8-byte seqno+type
+  // trailer), the words differ well before the end. A final-overlapping word
+  // optimization was tested here but found unhelpful.
   for (; off < len; off++) {
-    if (data_[off] != b.data_[off]) break;
+    if (data_[off] != b.data_[off]) {
+      break;
+    }
   }
   return off;
 }

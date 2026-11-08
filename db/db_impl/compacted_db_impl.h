@@ -18,6 +18,8 @@ class CompactedDBImpl : public DBImpl {
   // No copying allowed
   CompactedDBImpl(const CompactedDBImpl&) = delete;
   void operator=(const CompactedDBImpl&) = delete;
+  CompactedDBImpl(CompactedDBImpl&&) = delete;
+  void operator=(CompactedDBImpl&&) = delete;
 
   ~CompactedDBImpl() override;
 
@@ -26,18 +28,35 @@ class CompactedDBImpl : public DBImpl {
 
   // Implementations of the DB interface
   using DB::Get;
-  Status Get(const ReadOptions& options, ColumnFamilyHandle* column_family,
-             const Slice& key, PinnableSlice* value,
-             std::string* timestamp) override;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(Status, Get, const ReadOptions& options,
+                                  ColumnFamilyHandle* column_family,
+                                  const Slice& key, PinnableSlice* value,
+                                  std::string* timestamp);
+
+  using DB::GetWithMetadata;
+  Status GetWithMetadata(const ReadOptions& options,
+                         ColumnFamilyHandle* column_family, const Slice& key,
+                         PinnableSlice* value,
+                         OutputMetadata* output_metadata) override;
 
   using DB::MultiGet;
   // Note that CompactedDBImpl::MultiGet is not the optimized version of
   // MultiGet to use.
   // TODO: optimize CompactedDBImpl::MultiGet, see DBImpl::MultiGet for details.
-  void MultiGet(const ReadOptions& options, size_t num_keys,
-                ColumnFamilyHandle** column_families, const Slice* keys,
-                PinnableSlice* values, std::string* timestamps,
-                Status* statuses, const bool sorted_input) override;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(void, MultiGet, const ReadOptions& options,
+                                  size_t num_keys,
+                                  ColumnFamilyHandle** column_families,
+                                  const Slice* keys, PinnableSlice* values,
+                                  std::string* timestamps, Status* statuses,
+                                  const bool sorted_input);
+
+  using DB::MultiGetWithMetadata;
+  void MultiGetWithMetadata(const ReadOptions& options, size_t num_keys,
+                            ColumnFamilyHandle* const* column_families,
+                            const Slice* keys, PinnableSlice* values,
+                            Status* statuses,
+                            MultiGetOutputMetadata* output_metadata,
+                            const bool sorted_input) override;
 
   using DBImpl::Put;
   Status Put(const WriteOptions& /*options*/,
@@ -129,7 +148,7 @@ class CompactedDBImpl : public DBImpl {
   // Share with DBImplReadOnly?
 
  protected:
-  Status FlushForGetLiveFiles() override {
+  Status FlushForGetLiveFiles(bool /*force_atomic_flush*/) override {
     // No-op for read-only DB
     return Status::OK();
   }

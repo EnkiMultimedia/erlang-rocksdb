@@ -29,13 +29,40 @@ static void TestEncodeDecode(const VersionEdit& edit) {
   // enable all other test cases continue to verify this invariant, while the
   // special case is separately covered in test
   // `EncodeDecodeNewFile4HandleFileBoundary`.
-  std::string encoded, encoded2;
+  std::string encoded;
+  std::string encoded2;
   edit.EncodeTo(&encoded, 0 /* ts_sz */);
   VersionEdit parsed;
   Status s = parsed.DecodeFrom(encoded);
   ASSERT_TRUE(s.ok()) << s.ToString();
   parsed.EncodeTo(&encoded2, 0 /* ts_sz */);
   ASSERT_EQ(encoded, encoded2);
+}
+
+static void TestOptionsFileNumberField(const char* field_name,
+                                       uint64_t file_number,
+                                       void (VersionEdit::*set)(uint64_t),
+                                       bool (VersionEdit::*has)() const,
+                                       uint64_t (VersionEdit::*get)() const) {
+  SCOPED_TRACE(field_name);
+  VersionEdit edit;
+  ASSERT_FALSE((edit.*has)());
+  (edit.*set)(file_number);
+
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded));
+
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_TRUE((decoded.*has)());
+  ASSERT_EQ(file_number, (decoded.*get)());
+  ASSERT_TRUE(decoded.ShouldEmitPerColumnFamilyRecoveryEdit(0));
+  const std::string expected =
+      std::string(field_name) + ": " + std::to_string(file_number);
+  ASSERT_NE(std::string::npos, decoded.DebugString().find(expected));
+  const std::string expected_json =
+      "\"" + std::string(field_name) + "\": " + std::to_string(file_number);
+  ASSERT_NE(std::string::npos, decoded.DebugJSON(1).find(expected_json));
 }
 
 class VersionEditTest : public testing::Test {};
@@ -72,13 +99,13 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
   edit.AddFile(3, 300, 3, 100, InternalKey("foo", kBig + 500, kTypeValue),
                InternalKey("zoo", kBig + 600, kTypeDeletion), kBig + 500,
                kBig + 600, true, Temperature::kUnknown, kInvalidBlobFileNumber,
-               kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
                300 /* epoch_number */, kUnknownFileChecksum,
                kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
   edit.AddFile(4, 301, 3, 100, InternalKey("foo", kBig + 501, kTypeValue),
                InternalKey("zoo", kBig + 601, kTypeDeletion), kBig + 501,
                kBig + 601, false, Temperature::kUnknown, kInvalidBlobFileNumber,
-               kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
                301 /* epoch_number */, kUnknownFileChecksum,
                kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, false);
   edit.AddFile(5, 302, 0, 100, InternalKey("foo", kBig + 502, kTypeValue),
@@ -89,7 +116,7 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
   edit.AddFile(5, 303, 0, 100, InternalKey("foo", kBig + 503, kTypeBlobIndex),
                InternalKey("zoo", kBig + 603, kTypeBlobIndex), kBig + 503,
                kBig + 603, true, Temperature::kUnknown, 1001,
-               kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
                303 /* epoch_number */, kUnknownFileChecksum,
                kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
 
@@ -102,7 +129,8 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
   edit.SetLastSequence(kBig + 1000);
   TestEncodeDecode(edit);
 
-  std::string encoded, encoded2;
+  std::string encoded;
+  std::string encoded2;
   edit.EncodeTo(&encoded, 0 /* ts_sz */);
   VersionEdit parsed;
   Status s = parsed.DecodeFrom(encoded);
@@ -145,7 +173,7 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4HandleFileBoundary) {
       3, 300, 3, 100, InternalKey(smallest + min_ts, kBig + 500, kTypeValue),
       InternalKey(largest + min_ts, kBig + 600, kTypeDeletion), kBig + 500,
       kBig + 600, true, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime,
       300 /* epoch_number */, kUnknownFileChecksum,
       kUnknownFileChecksumFuncName, kNullUniqueId64x2,
       0 /* compensated_range_deletion_size */, 0 /* tail_size */,
@@ -154,7 +182,7 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4HandleFileBoundary) {
                InternalKey(smallest + min_ts, kBig + 500, kTypeValue),
                InternalKey(largest + min_ts, kBig + 600, kTypeDeletion),
                kBig + 500, kBig + 600, true, Temperature::kUnknown,
-               kInvalidBlobFileNumber, kUnknownOldestAncesterTime,
+               kInvalidBlobFileNumber, kUnknownOldestAncestorTime,
                kUnknownFileCreationTime, 300 /* epoch_number */,
                kUnknownFileChecksum, kUnknownFileChecksumFuncName,
                kNullUniqueId64x2, 0 /* compensated_range_deletion_size */,
@@ -187,7 +215,7 @@ TEST_F(VersionEditTest, ForwardCompatibleNewFile4) {
   edit.AddFile(3, 300, 3, 100, InternalKey("foo", kBig + 500, kTypeValue),
                InternalKey("zoo", kBig + 600, kTypeDeletion), kBig + 500,
                kBig + 600, true, Temperature::kUnknown, kInvalidBlobFileNumber,
-               kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
                300 /* epoch_number */, kUnknownFileChecksum,
                kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
   edit.AddFile(4, 301, 3, 100, InternalKey("foo", kBig + 501, kTypeValue),
@@ -243,7 +271,7 @@ TEST_F(VersionEditTest, NewFile4NotSupportedField) {
   edit.AddFile(3, 300, 3, 100, InternalKey("foo", kBig + 500, kTypeValue),
                InternalKey("zoo", kBig + 600, kTypeDeletion), kBig + 500,
                kBig + 600, true, Temperature::kUnknown, kInvalidBlobFileNumber,
-               kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
                300 /* epoch_number */, kUnknownFileChecksum,
                kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, false);
 
@@ -275,7 +303,7 @@ TEST_F(VersionEditTest, EncodeEmptyFile) {
   VersionEdit edit;
   edit.AddFile(0, 0, 0, 0, InternalKey(), InternalKey(), 0, 0, false,
                Temperature::kUnknown, kInvalidBlobFileNumber,
-               kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
                1 /*epoch_number*/, kUnknownFileChecksum,
                kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
   std::string buffer;
@@ -616,6 +644,13 @@ TEST_F(VersionEditTest, FullHistoryTsLow) {
   TestEncodeDecode(edit);
 }
 
+TEST_F(VersionEditTest, OptionsFileNumbers) {
+  TestOptionsFileNumberField("CommittedOptionsFileNumber", 12345,
+                             &VersionEdit::SetCommittedOptionsFileNumber,
+                             &VersionEdit::HasCommittedOptionsFileNumber,
+                             &VersionEdit::GetCommittedOptionsFileNumber);
+}
+
 // Tests that if RocksDB is downgraded, the new types of VersionEdits
 // that have a tag larger than kTagSafeIgnoreMask can be safely ignored.
 TEST_F(VersionEditTest, IgnorableTags) {
@@ -637,6 +672,7 @@ TEST_F(VersionEditTest, IgnorableTags) {
     edit.AddWal(i + 1, WalMetadata(i + 2));
   }
   edit.SetDBId("db_id");
+  edit.SetCommittedOptionsFileNumber(12345);
   // Add unignorable entries.
   edit.SetPrevLogNumber(kPrevLogNumber);
   edit.SetLogNumber(kLogNumber);
@@ -658,6 +694,7 @@ TEST_F(VersionEditTest, IgnorableTags) {
   // Check that all ignorable entries are ignored.
   ASSERT_FALSE(decoded.HasDbId());
   ASSERT_FALSE(decoded.HasFullHistoryTsLow());
+  ASSERT_FALSE(decoded.HasCommittedOptionsFileNumber());
   ASSERT_FALSE(decoded.IsWalAddition());
   ASSERT_FALSE(decoded.IsWalDeletion());
   ASSERT_TRUE(decoded.GetWalAdditions().empty());
@@ -799,7 +836,7 @@ class SubcompactionProgressTest : public VersionEditTest {
   static constexpr uint64_t kTestFileSize = 1024;
   static constexpr SequenceNumber kTestSmallestSeq = 50;
   static constexpr SequenceNumber kTestLargestSeq = 150;
-  static constexpr uint64_t kTestOldestAncesterTime = 12345;
+  static constexpr uint64_t kTestOldestAncestorTime = 12345;
   static constexpr uint64_t kTestFileCreationTime = 67890;
   static constexpr uint64_t kTestEpochNumber = 10;
   static const std::string kTestChecksumFuncName;
@@ -810,7 +847,7 @@ class SubcompactionProgressTest : public VersionEditTest {
                              kTestLargestSeq);
     file.smallest = InternalKey(prefix + "a", kTestSmallestSeq, kTypeValue);
     file.largest = InternalKey(prefix + "z", kTestLargestSeq, kTypeValue);
-    file.oldest_ancester_time = kTestOldestAncesterTime;
+    file.oldest_ancestor_time = kTestOldestAncestorTime;
     file.file_creation_time = kTestFileCreationTime;
     file.epoch_number = kTestEpochNumber;
     file.file_checksum = "checksum_" + std::to_string(file_number);
@@ -878,7 +915,7 @@ class SubcompactionProgressTest : public VersionEditTest {
     ASSERT_EQ(actual.fd.GetFileSize(), expected.fd.GetFileSize());
     ASSERT_EQ(actual.smallest.Encode(), expected.smallest.Encode());
     ASSERT_EQ(actual.largest.Encode(), expected.largest.Encode());
-    ASSERT_EQ(actual.oldest_ancester_time, expected.oldest_ancester_time);
+    ASSERT_EQ(actual.oldest_ancestor_time, expected.oldest_ancestor_time);
     ASSERT_EQ(actual.file_creation_time, expected.file_creation_time);
     ASSERT_EQ(actual.epoch_number, expected.epoch_number);
     ASSERT_EQ(actual.file_checksum, expected.file_checksum);
@@ -1125,6 +1162,93 @@ TEST_F(SubcompactionProgressTest, UnknownTags) {
   Status critical_status = critical_progress.DecodeFrom(&critical_input);
   ASSERT_NOK(critical_status);
   ASSERT_TRUE(critical_status.IsNotSupported());
+}
+
+TEST_F(VersionEditTest, FileOpenMetadataEncodeDecode) {
+  static const uint64_t kBig = 1ull << 50;
+
+  // Test 1: File with file_open_metadata set
+  VersionEdit edit;
+  edit.AddFile(3, 300, 0, 100, InternalKey("foo", kBig + 500, kTypeValue),
+               InternalKey("zoo", kBig + 600, kTypeDeletion), kBig + 500,
+               kBig + 600, false, Temperature::kUnknown, kInvalidBlobFileNumber,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+               300 /* epoch_number */, kUnknownFileChecksum,
+               kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
+  // Set file_open_metadata on the added file
+  auto& new_files = edit.GetMutableNewFiles();
+  ASSERT_EQ(1u, new_files.size());
+  new_files[0].second.file_open_metadata = "test_metadata_content_12345";
+
+  // Test 2: File without file_open_metadata (empty)
+  edit.AddFile(4, 301, 0, 200, InternalKey("bar", kBig + 501, kTypeValue),
+               InternalKey("zap", kBig + 601, kTypeDeletion), kBig + 501,
+               kBig + 601, false, Temperature::kUnknown, kInvalidBlobFileNumber,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+               301 /* epoch_number */, kUnknownFileChecksum,
+               kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
+
+  // Encode and decode
+  std::string encoded;
+  edit.EncodeTo(&encoded, 0 /* ts_sz */);
+  VersionEdit parsed;
+  Status s = parsed.DecodeFrom(encoded);
+  ASSERT_TRUE(s.ok()) << s.ToString();
+
+  auto& parsed_files = parsed.GetNewFiles();
+  ASSERT_EQ(2u, parsed_files.size());
+
+  // First file should have metadata
+  ASSERT_EQ("test_metadata_content_12345",
+            parsed_files[0].second.file_open_metadata);
+
+  // Second file should have empty metadata
+  ASSERT_TRUE(parsed_files[1].second.file_open_metadata.empty());
+}
+
+TEST_F(VersionEditTest, FileOpenMetadataForwardCompatibility) {
+  // Test that a VersionEdit with kFileOpenMetadata can be decoded even if the
+  // reader doesn't know the tag. Tag 17 < kCustomTagNonSafeIgnoreMask (64),
+  // so it should be safely ignored.
+  static const uint64_t kBig = 1ull << 50;
+
+  VersionEdit edit;
+  edit.AddFile(3, 300, 0, 100, InternalKey("foo", kBig + 500, kTypeValue),
+               InternalKey("zoo", kBig + 600, kTypeDeletion), kBig + 500,
+               kBig + 600, false, Temperature::kUnknown, kInvalidBlobFileNumber,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+               300 /* epoch_number */, kUnknownFileChecksum,
+               kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
+  auto& new_files = edit.GetMutableNewFiles();
+  new_files[0].second.file_open_metadata = std::string(1024, 'x');
+
+  // Encode
+  std::string encoded;
+  edit.EncodeTo(&encoded, 0 /* ts_sz */);
+
+  // Decode should succeed
+  VersionEdit parsed;
+  ASSERT_OK(parsed.DecodeFrom(encoded));
+  ASSERT_EQ(1u, parsed.GetNewFiles().size());
+  ASSERT_EQ(std::string(1024, 'x'),
+            parsed.GetNewFiles()[0].second.file_open_metadata);
+
+  // Verify the tag value is safe-to-ignore
+  ASSERT_EQ(0u, NewFileCustomTag::kFileOpenMetadata &
+                    NewFileCustomTag::kCustomTagNonSafeIgnoreMask);
+}
+
+TEST_F(VersionEditTest, FileOpenMetadataInApproximateMemoryUsage) {
+  // Use heap allocation because ApproximateMemoryUsage uses
+  // malloc_usable_size which requires heap-allocated memory
+  std::unique_ptr<FileMetaData> meta(new FileMetaData());
+  size_t base_usage = meta->ApproximateMemoryUsage();
+
+  meta->file_open_metadata = std::string(500, 'z');
+  size_t with_metadata_usage = meta->ApproximateMemoryUsage();
+
+  // The metadata should add to the memory usage
+  ASSERT_GE(with_metadata_usage, base_usage + 500);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

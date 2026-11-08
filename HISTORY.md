@@ -1,18 +1,293 @@
 # Rocksdb Change Log
 > NOTE: Entries for next release do not go here. Follow instructions in `unreleased_history/README.txt`
 
-## 11.1.2 (06/24/2026)
+## 11.13.2 (10/28/2026)
 ### Bug Fixes
+* Fixed a secondary instance with `open_files_async = true` getting stuck after `TryCatchUpWithPrimary()` returned `PathNotFound` for a table file that the primary deleted before the background opener reached it.
+* Fixed blob direct write with more than one concurrent flush of a column family: a later flush sealed and published the blob files of the oldest pending memtable instead of its own, so flushes failed with `Corruption: VersionBuilder: Blob file #N already added` and the database stopped.
+
+## 11.13.1 (10/23/2026)
+### Bug Fixes
+* Fixed data loss with `min_tombstones_for_range_conversion` and external file ingestion. An iterator whose view predated the ingestion could convert the deleted keys around the ingested keys into a range tombstone that deleted them. This happened when the file got no new sequence number (sequence number zero, `ingest_behind`, or `allow_db_generated_files`), and when an iterator was created during the ingestion.
+* Fixed a data loss bug where an iterator with `ReadOptions::read_tier = kMemtableTier` could, with `min_tombstones_for_range_conversion` enabled, insert a range tombstone that deleted live keys stored only in SST files. Read-path range tombstone conversion now runs only for iterators with `read_tier = kReadAllTier`.
+
+## 11.13.0 (10/21/2026)
+### New Features
+* Added `FileSystem::IsPreallocationSupported()`. A `FileSystem` that never preallocates file space can return false so that DB open skips reopening and truncating the last WAL file.
+
+### Public API Changes
+* Added the experimental `DBOptions::track_options_file_number_in_manifest`
+rollout option (with C and Java bindings). The option is persisted in each
+OPTIONS file. When enabled, RocksDB durably creates an OPTIONS file and then
+commits its file number in MANIFEST. Column-family create/drop commits the
+configuration snapshot and membership in one MANIFEST record. A newer tracked
+OPTIONS file without a commit is ignored after a crash, while a newer OPTIONS
+file written with tracking disabled retains the legacy highest-numbered-file
+behavior. Batched column-family changes publish one snapshot; after partial
+success it can be a safe superset that persisted-options APIs filter against
+live MANIFEST membership. Ordinary `DB::Open` continues to use caller-supplied
+options and does not depend on the operational snapshot.
+* Added `EncodeEntry()`, `PackSequenceAndType()`, and `UnPackSequenceAndType()` in `rocksdb/utilities/types_util.h` to construct internal keys and pack or unpack their sequence numbers and entry types. `kInternalKeyFooterSize` exposes the footer size in bytes.
+* Added `ldb update_manifest --rebind_options_file --options_file=OPTIONS-<number>` for offline repair of a committed MANIFEST OPTIONS file number. Operators must select a trusted snapshot that has MANIFEST tracking enabled and provide any external DB/CF allocation roots that are not serialized in OPTIONS.
+
+### Behavior Changes
+* With `max_bgerror_resume_count <= 0` (auto resume disabled), a retryable or file-scoped IO error during compaction or flush is now a hard background error that stops writes until `DB::Resume()` is called. Previously, compaction errors were silently retried, and flush errors with a healthy WAL were soft errors that let writes continue while flushes were stopped.
+
+### Bug Fixes
+* Fixed two more `SstFileManager` trash accounting leaks: retrying a failed trash deletion immediately (for example with rate limiting disabled) after the file had disappeared, and a trash file that was deleted but whose directory sync then failed. In both cases the file's size stayed in the total trash size and tracked size until restart.
+* Fixed `SstFileManager` trash accounting leaking the size of a queued trash file that disappeared before deletion (for example because its directory was renamed). The leaked bytes stayed in the total trash size until restart, which could push every later deletion past `max_trash_db_ratio` and make it immediate instead of rate limited.
+* Fixed `MultiGet` with `ReadOptions::async_io` returning `NotSupported` when io_uring initialization or an asynchronous read submission fails. It now checks async I/O support on the reading thread and falls back to synchronous reads when needed.
+* Fixed subset checkpoints so their newest OPTIONS file lists only the column
+families retained by the checkpoint. This applies with both legacy
+highest-numbered OPTIONS selection and MANIFEST-tracked OPTIONS selection, and
+prevents `LoadLatestOptions` from recreating column families that the subset
+checkpoint intentionally dropped from its copied MANIFEST.
+
+### Performance Improvements
+* Perf context counters and timers no longer call the thread-local init function of `perf_context` on every update. With `kEnableCount`, a counter update costs about 60% less.
+
+## 11.12.0 (10/07/2026)
+### New Features
+* Added `FullExternalTableFactory` and related full-mode external table APIs that preserve RocksDB internal keys, enabling external tables to support nonzero sequence numbers, point and single deletions, merge operands, blob indexes, wide-column entities, snapshots, live DB writes, and multi-level compactions.
+
+### Public API Changes
+* Added experimental coroutine capability interfaces for basic and full `ExternalTableReader` implementations. Coroutine-capable external readers can initiate file reads through `FSRandomAccessFile::SubmitReadAsync()`.
+* `ExternalTableFactory::NewTableReader()` now receives an already-opened `FSRandomAccessFile` and its file size instead of requiring implementations to reopen `file_path`. The supplied file preserves RocksDB's direct-I/O alignment handling, rate limiting, read statistics and listener notifications, prefetching, and synchronous, asynchronous, and batched reads.
+* Added `PutRangeDeletionBlock()`, `GetRangeDeletionBlock()`, and `IsDeleteRangeSupported()` to the external table interfaces so formats can opt in to range deletions using RocksDB's raw range-deletion metadata block.
+* Opaque `PreparedFileInfo` metadata can now be serialized to a checksummed representation with `SerializePreparedFileInfo()` and restored with `DeserializePreparedFileInfo()` for reuse across processes.
+* Removed the deprecated `IngestExternalFileOptions::write_global_seqno` option and its C, Java, and `ldb` APIs, `TableProperties::external_sst_file_global_seqno_offset`, and the `file_offset` output from `ExternalTableReader::GetPropertiesBlock()`. Existing external SST files whose global sequence number was rewritten without updating the properties-block checksum remain readable.
+* `TablePropertiesNames` has no apparent use in the public API so has been deprecated there.
+* `TableProperties::creation_time` is renamed to `oldest_ancestor_time`, which better describes its meaning, along with `TablePropertiesNames::kCreationTime` to `kOldestAncestorTime`. The misspelled `SstFileMetaData::oldest_ancester_time` is renamed to `oldest_ancestor_time`. The old names remain available as deprecated aliases and will be removed in a future release.
+* Added `WriteBufferFlushPolicy` and `WriteBufferManager` policy selection for flushing the oldest or largest column family, including configurable batched flushing of the largest column families across DBs sharing a manager, with C and Java bindings.
+
+### Behavior Changes
+* When `ExternalTableBuilderBase::PutPropertiesBlock()` returns `NotSupported`, RocksDB now overrides `num_entries`, `raw_key_size`, and `raw_value_size` from `ExternalTableBuilderBase::GetTableProperties()` with the logical totals tracked by the external-table adapter. Format-specific properties such as `data_size` remain unchanged.
+* The `FSWritableFile` passed to `ExternalTableFactory::NewTableBuilder()` now reports logical file size including RocksDB-buffered data and exposes the underlying file's direct-I/O mode and required buffer alignment.
+* `Iterator::Refresh()` now returns `NotSupported` on iterators from a secondary DB's `DB::NewIterators()` only, because those iterators are pinned to one cross-column-family read view. Iterators from `DB::NewIterator()` are unaffected; to advance a batch, call `DB::NewIterators()` again after `TryCatchUpWithPrimary()`.
+* `SstFileReader` now reports standard SST read statistics and file I/O listener notifications, and honors the configured read rate limiter.
+
+### Bug Fixes
+* Fixed full recovery from retryable background errors to atomically advance WAL replay boundaries for all column families, preventing partial recovery of multi-column-family write batches after a failed recovery flush.
+* Fixed RocksDB builds on big-endian architectures such as s390x by disabling the optional persistent fault-injection log, whose binary format is little-endian-only.
+* Fixed `DB::ClipColumnFamily()` deleting a non-L0 SST file whose largest key equals `begin_key`, which lost keys at the start of the kept range.
+* Fixed swapped `oldest_key_time` and `newest_key_time` values in the `table_file_creation` event log entry.
+* Fixed `ExternalTableReader::VerifyChecksum()` results not being honored by the external table adapter.
+* Fixed a bug in manifest handling that could lead to a hang or memory corruption in the case of LSM sanity checks being fatally violated (exceptional; see `force_consistency_checks`).
+* Fixed `MultiGet()` with `ReadOptions::read_tier == kBlockCacheTier` reading data blocks from disk when `allow_mmap_reads` is false. Keys whose data block is not in the block cache now return `Status::Incomplete()`, the same as `Get()`.
+* Fixed trace replay (`DB::NewDefaultReplayer()`, db_bench `replay`) failing every read record (Get, MultiGet, iterator seek) on the default column family with `Corruption: Invalid Column Family ID` when the default column family handle was not passed, which is always the case in db_bench with `--num_column_families=1`.
+* Fixed multi-threaded `Replayer::Replay()` ignoring errors from executing trace records and returning OK. It now stops and returns the error, including `Status::NotSupported()` from executing a record, as single-threaded replay does.
+* Fixed secondary DB `NewIterators()` returning iterators from different database states or blocking for `TryCatchUpWithPrimary()` by serving the last completed catch-up view.
+
+### Performance Improvements
+* Single Get coroutine reads using non-mmap, non-direct I/O on a `kFSBuffer`-capable `FileSystem` now use `FSRandomAccessFile::SubmitReadAsync()` instead of falling back to synchronous `Read()`. When rate-limited, these reads acquire their full token budget before submission to preserve a single filesystem-owned buffer, which can make physical I/O burstier than reads using caller-provided buffers.
+
+
+## 11.11.0 (09/21/2026)
+### New Features
+* External tables now support DB-assigned global sequence numbers when `IngestExternalFileOptions::allow_global_seqno` is enabled, allowing overlapping external tables to be ingested across multiple levels when compactions are disabled. This includes the deprecated `write_global_seqno` path when the reader supplies the properties block's file offset.
+* Added checksum handoff support for SST file writes when `BlockBasedTableOptions::checksum` is `kCRC32c`, allowing block and trailer CRC32C checksums to be passed from the table builder to the file writer for buffered-data validation and filesystem in-flight write protection.
+* Enhanced `sst_dump --command=recompress` to be more powerful for benchmarking, including through automation with a new `--json` option for machine-readable output.
+
+### Public API Changes
+* Changed the experimental async read statistics API by removing `DB::AsyncCallback::EnableStats()` and changing `OnComplete(const PerfContext*, const IOStatsContext*)` to `OnComplete()`. Callers must configure TLS statistics before each async or coroutine read. `DB::GetAsync()` and `DB::MultiGetAsync()` callbacks must copy per-operation statistics from TLS during `OnComplete()`; coroutine users must copy them from inside a `CoroStackableDB` hook before suspending again. Each operation leaves TLS statistics collection disabled.
+* Added `Compressor::MaybeOverrideCompressionOptions()` (EXPERIMENTAL), an omnibus hook letting a custom compressor adjust the subset of `CompressionOptions` that the SST builder applies rather than the compressor itself: `parallel_threads`, `max_compressed_bytes_per_kb`, `auto_skip`, and `auto_skip_min_sample_every` (and potentially more in the future). This deprecates `Compressor::GetRecommendedParallelThreads()`, which it subsumes; the default implementation still honors an overridden `GetRecommendedParallelThreads()` for compatibility.
+* Added experimental `CoroDB::CoGet()` and `CoroDB::CoMultiGet()` overloads for point reads from an `SstFileReader`.
+* Added experimental `DB::GetWithMetadata()` and `DB::MultiGetWithMetadata()` APIs with opt-in output metadata for key timestamps and explicit-snapshot newer-version detection.
+* Added a `DB::NewIterators()` overload that accepts parallel vectors of `ReadOptions` and column family handles, allowing each returned iterator to use independent read settings while sharing a consistent database state. The vectors must have the same size, all snapshots must be null or identical, and all `tailing` settings must match.
+* Added `ReadOptions::custom_context`, an opaque, non-owning pointer passed through table reads so external table implementations can consume application-defined read options.
+
+### Behavior Changes
+* `ExternalTableReader::MultiGet()` is now used by RocksDB's `DB::MultiGet()` path. Previously, the external table adapter used `TableReader`'s fallback, which called `ExternalTableReader::Get()` separately for each key.
+* `DB::OpenAndCompact()` now requires `output_directory` to be a simple name for a new subdirectory when the new `use_session_tmp_dir_for_remote_compaction` DB option is enabled. The option places that subdirectory under the canonical `<dbname>/session_tmp/` root, and `DB::Open()` deletes stale contents under the root after recovery. The disabled default preserves the existing `<dbname>/<output_directory>` layout without automatic cleanup. Previously, remote-compaction output directories were created directly under `<dbname>`, which made it challenging to safely identify and delete obsolete files.
+* Several block-based SST table properties now better support compression benchmarking and optimization: `uncompressed_data_size` is now persisted in the file (previously it was computed only at write time and read back as 0); a new `lsm_info_at_creation` property records the LSM level and "bottommost" status at the file's creation, distinguishing "not applicable" (e.g. SstFileWriter files) from "unknown" (older files); and the `compression_options` property now records the full compression manager configuration instead of only its name.
+
+### Bug Fixes
+* Fixed a usually-minor performance bug where `Cache::ApplyToAllEntries()` used single-entry batches instead of the intended 256-entry default for `ApplyToAllEntriesOptions::average_entries_per_lock`. All of the Cache implementations (LRU and HCC) benefit from the fix, but the disfavored LRU cache was especially impacted by repeated mutex acquisition and release.
+* Fixed stats-disabled coroutine and asynchronous reads inheriting enabled TLS statistics state when interleaved with stats-enabled reads on the same executor. Each read now uses its captured per-call configuration, while enabled request counters remain isolated across suspensions.
+* Fixed a bug where a remote compaction (`CompactionService` / `DB::OpenAndCompact`) requested with `OpenAndCompactOptions::allow_resumption=true` but for which resumption was internally disabled (incompatible with `paranoid_file_checks` or output-iteration verification) could fail a retried attempt, because the output directory was not cleaned before starting fresh and output files left by a previously interrupted attempt collided with the reused file numbers.
+* Fixed a bug where a remote compaction (`CompactionService` / `DB::OpenAndCompact`) could fail when the primary rotated its MANIFEST while the worker was opening the primary's directory read-only. The open reads `CURRENT`, and the primary publishes a new MANIFEST by renaming a freshly written `CURRENT` over the old one; on file systems without POSIX read-after-unlink semantics (remote/object stores) the replaced object is then reported as gone (`PathNotFound`/`NotFound`, or `TryAgain` for the MANIFEST equivalent) instead of remaining readable. `DB::OpenAndCompact()` now retries the secondary open a bounded, configurable number of times for those transient statuses, so a concurrent rotation no longer fails the compaction (which, for a `CompactionService` that does not fall back to a local compaction, became a background error on the primary).
+* Fixed secondary DB `NewIterators()` returning iterators from different database states when `TryCatchUpWithPrimary()` runs concurrently.
+* Fixed a bug where a `SeekToFirst()` on an iterator previously used for a `Seek()` could end the scan early and silently omit keys with `ReadOptions::async_io`, or otherwise run with readahead effectively disabled. Affects scans using `ReadOptions::prefix_same_as_start` together with `ReadOptions::auto_readahead_size` (enabled by default); memory-mapped reads are unaffected.
+
+### Performance Improvements
+* `DB::MultiGetEntityLazy()` now reads all keys of a batch under a single shared per-column-family SuperVersion pin, and a single `LazyWideColumnsBatch::MultiResolve()` coalesces the resulting blob reads across keys: one read per blob file (and one per SST for embedded blobs), for whole-column and byte-range reads alike, instead of reading each key's blobs separately.
+
+
+## 11.10.0 (08/28/2026)
+### New Features
+* Added `BlockBasedTableOptions::optimize_key_common_prefix` as part of new `format_version=8`. When enabled, each data block and index block stores the common user-key prefix of its keys once instead of at every restart point, reducing block size and block-cache footprint for prefix-heavy data and speeding up Seek for bytewise-ordered keys.
+* A new experimental feature spreads out periodic (time-based) compaction trigger times across a fleet of similarly-configured DBs to avoid recurring "thundering herd" triggers, especially with remote compaction. See the new experimental DB option `periodic_compaction_phase_recovery_percent`.
+
+### Public API Changes
+* `IngestExternalFileArg::atomic_replace_range` now supports a range that only partially overlaps existing files, instead of failing. Requires universal compaction and a table factory that supports range deletion; other configurations still fail on partial overlap. The range is also now specified as half-open (`start` inclusive, `limit` exclusive), resolving a previously documented ambiguity in the upper bound.
+* Added an immutable `external_table_config` option that is persisted in OPTIONS files and passed to external table factories during bootstrap.
+
+### Bug Fixes
+* Fixed a liveness bug where RocksDB could remain indefinitely in recovery from a soft background error when concurrent writes continuously generated normal flush requests.
+* Fixed a race in online error recovery where a concurrent higher-severity I/O error could leave a stale retry-flush plan active, prevent the required WAL switch, and create duplicate internal WAL history detected on DB reopen.
+* Fix "bottommost files" infinite compaction loops (`kBottommostFiles`). This happens with the unsupported combination of leveled compaction and `preserve_internal_time_seconds` / `preclude_last_level_data_seconds`, and in an edge case with user-defined timestamps when `full_history_ts_low` is unset. The underlying logic is now more unified to reduce risk of a similar divergence in logic in the future.
+* Fixed `reuse_manifest_on_open` to create a fresh MANIFEST instead of appending after recovery sees an incomplete atomic group at the MANIFEST tail.
+* Starting remote compaction (`CompactionService` / `DB::OpenAndCompact`) is now more efficient and more reliable, by avoiding unnecessary file operations (latency) while using more accurate consistency / precondition checks, both avoiding some spurious failures and rejecting more legitimate inconsistencies. New DBOption `remote_compaction_manifest_floor` can be disabled in case of unexpected problems with the change.
+* Fixed unbounded retention of recovered transaction state by a long-lived secondary opened with `allow_2pc`.
+* Fixed stale reads on secondary instances, where entries replayed from a WAL that the primary had already flushed could shadow the newer values in the flushed files indefinitely. Also fixed a case where a secondary could stop returning such a key altogether while the primary's flushed file holding it was unreadable.
+* Fixed subset checkpoints to discard tolerated MANIFEST tail corruption before appending column-family drop records.
+
+### Performance Improvements
+* Improved compaction CPU efficiency for column families using an `SstPartitioner` (such as the built-in `SstPartitionerFixedPrefix`): when the partitioner can express its next boundary as a key prefix via the new `SstPartitioner::ShouldPartitionByPrefix()` API, compaction now checks that cached prefix inline instead of copying every user key and making a virtual `ShouldPartition()` call for each key-value written to an SST.
+
+## 11.9.0 (08/14/2026)
+### New Features
+* Added an integrated and improved compression auto-skip feature (new CompressionOptions, still experimental) that saves CPU by skipping compression when and where the overall ratio is inadequate. This improves on the previous auto-skip compression manager by (a) taking achieved compression ratios into account, (b) using a continuously evolving payoff estimate, and (c) combining natively with parallel compression.
+* Added the `blob_file_writable_file_max_buffer_size` mutable column family option. When set to a non-zero value, blob-file writers use it as their `WritableFileWriter` max buffer size instead of inheriting `DBOptions::writable_file_max_buffer_size`.
+* Added an experimental lazy wide-column read API, `DB::GetEntityLazy()` / `DB::MultiGetEntityLazy()` (see `include/rocksdb/lazy_wide_columns.h`). The returned `LazyWideColumns` leaves blob-backed columns as unresolved references and, like an iterator, stays valid after the call returns, so the caller resolves only the columns -- and only the byte ranges -- it needs; a byte-range read of an uncompressed blob (separate-file or embedded) reads just those bytes from storage. Adds `Env::IOActivity::kLazyResolve` and `rocksdb.blobdb.lazy.*` statistics. Requires `max_open_files == -1`.
+* Added DB property `rocksdb.num-running-remote-compactions`, reporting the number of compaction service jobs currently waiting in `CompactionService::Wait()`.
+* Added DB property `rocksdb.num-unscheduled-compactions`, reporting compactions waiting in the DB's internal compaction queue but not yet assigned to a background job.
+* Added `DB::AbortCompactions()` and `DB::ResumeCompactions()` for per-column-family compaction abort and resume, with the same active-abort semantics as the DB-wide `AbortAllCompactions()`/`ResumeAllCompactions()` but scoped to a single column family. Calls are reference-counted independently per column family and compose with the DB-wide abort.
+
+### Public API Changes
+* Add IndexFactory compatibility names for the existing user-defined index API.
+* Added the experimental `CoroDB` capability, exposed by `DB::GetCoroDB()`, with lazy native coroutine variants of `Get` and `MultiGet`. The existing `DB::GetAsync()` and `DB::MultiGetAsync()` APIs dispatch through it.
+* Added `rocksdb_batched_multi_get_pinned_cf()` to return batch-owned pinned MultiGet values and per-key errors without allocating one wrapper per found value.
+* Add `DBOptions::read_io_executor_threads` to increase the maximum thread count of the shared filesystem read I/O executor used for asynchronous reads when opening a DB. Opening a DB never reduces the shared executor thread count. Change the experimental `FSRandomAccessFile::SubmitReadAsync()` API to return whether the asynchronous path was used, and add the `FILE_SUBMIT_ASYNC_READ_FALLBACK` ticker to count calls that fall back to synchronous reads.
+* `ReadOptions::table_filter` is now a *pointer* to a caller-owned `std::function` instead of a `std::function` value, to improve efficiency in copying and destroying `ReadOptions` objects (which RocksDB does internally). This is a breaking change for users of this relatively obscure option, who will now need to declare a `std::function` that outlives the read. As a side effect of `ReadOptions` being trivially copyable, new but legitimate compiler warnings may surface.
+* Removed the experimental `CreateAutoSkipCompressionManager()`. Auto-skip compression is now a first-class feature of the block-based table builder, controlled by the new experimental `CompressionOptions::auto_skip`.
+* Added `CoroStackableDB` for implementing wrappers over native coroutine reads and used it to add coroutine `Get` and `MultiGet` support to `DBWithTTL` and WritePrepared `TransactionDB`. A stackable wrapper advertises coroutine support only when its wrapped DB supports it; TTL value decoding and transaction visibility semantics are preserved.
+* Added a `kSstFileWriter` value to `TableFileCreationReason`, which `SstFileWriter` now reports instead of the catch-all `kMisc`. This, along with new `db_name` and `is_remote_compaction` fields in `FilterBuildingContext`, improves the contextual information available to custom filter and compression strategies.
+* Renamed `TransactionLogIterator` to `WalIterator` (and `include/rocksdb/transaction_log.h` to `include/rocksdb/wal_iterator.h`), because it iterates the write-ahead log and is unrelated to `TransactionDB`. The old names still work. `DB::GetUpdatesSince()` is unchanged. In Java, `WalIterator` is the new name and `TransactionLogIterator` remains as a subclass. Also documented existing behavior that was previously unstated: only writes that reached the WAL are visible (so `WriteOptions::disableWAL` and `IngestExternalFile()` leave holes that end iteration), what each iterator state means, and that `GetUpdatesSince()` silently starts later when the requested sequence number is unavailable.
+
+### Bug Fixes
+* Fixed a bug where `BlobFileBuilder` passed an SST path to `OnBlobFileCompleted()` instead of the completed blob path during BlobDB garbage-collection compactions, causing incorrect `SstFileManager` accounting and compaction failures on filesystems where the SST was not yet pathname-visible.
+
+### Performance Improvements
+* When `DBOptions::avoid_unnecessary_blocking_io` is true, obsolete `OPTIONS-*` files found during DB open are deleted by background purge instead of synchronously on the opening thread.
+
+## 11.8.0 (07/28/2026)
+### Public API Changes
+* Add callback-based asynchronous read APIs, `DB::GetAsync()` and `DB::MultiGetAsync()`. The idea is that when IO is required, RocksDB can suspend its internal coroutine read path, allowing the read executor thread to do other work. When the IO is complete, RocksDB invokes the user callback. This requires filesystem support for full performance benefits. A new filesystem API `FSRandomAccessFile::SubmitReadAsync()` is introduced for this. Unlike `ReadAsync`, the filesystem is responsible for eventually calling the callback. `FileSystem::GetReadExecutor()` returns the IO executor whose EventBases run coroutine read processing. In the Posix filesystem, an IO-uring based event loop is used to complete the IO.
+* Added `FlushOptions::listener_wait` (default `false`). When set together with `FlushOptions::wait == true`, `DB::Flush()` will not return until the registered `EventListener::OnFlushCompleted` callbacks for the flushed memtables have finished running. By default (`false`), `Flush(wait=true)` may return as soon as the flush result is committed, which can be before (or while) the `OnFlushCompleted` callbacks execute on the background flush thread. Also added the corresponding C API `rocksdb_flushoptions_set_listener_wait()` / `rocksdb_flushoptions_get_listener_wait()`.
+* Deprecated `PinnableWideColumns::serialized_size()` in favor of the new `PinnableWideColumns::payload_size()`, which returns the total size of the columns' names and values (for a plain value this equals the value size). Relatedly, wide-column read accounting changed subtly: read statistics for entities (`BYTES_READ`, `BYTES_PER_READ`, and the per-key byte counts for `GetEntity`/`MultiGetEntity`) and the `ReadOptions::value_size_soft_limit` threshold now measure entities by this payload size instead of the serialized entity size. This drops serialization framing bytes from those measurements (so reported/limited sizes for entity reads are slightly smaller than before) and makes plain-value and wide-column accounting consistent.
+
+### Behavior Changes
+* `ReadOptions::value_size_soft_limit` now also bounds the blob values resolved from pre-flush blob direct write references during `MultiGet`/`MultiGetEntity` (previously these were resolved after the limit check and read without bound). Enforcement is "always make progress": at least one key is read even if its value alone exceeds the limit, and only once the returned size exceeds the limit do subsequent keys get `Status::Aborted` -- so a caller retrying the aborted keys cannot loop forever on a single value that by itself exceeds the limit.
+
+### Performance Improvements
+* Reduced copying when reading wide-column entities that have blob-referenced columns, whether stored in separate blob files or embedded (same-file) as blob records in the same SST. On the point-lookup (`GetEntity`/`MultiGetEntity`) and blob-backed memtable/direct-write read paths, resolving these columns no longer re-serializes the whole entity into a fresh buffer: inline columns are referenced in place in the pinned entity and each resolved blob value is referenced in place from its fetched buffer. This is enabled by an internal change to `PinnableWideColumns` that lets its columns reference multiple backing buffers.
+
+## 11.7.0 (07/16/2026)
+### Public API Changes
+* Added `RangeLockManagerHandle::SetIsKilledCallback()`, a `std::function<bool()>` predicate polled during range-lock waits. When it returns true, a blocked `GetRangeLock()` wait returns promptly with `Status::Aborted()` instead of waiting for the lock timeout. Range-lock users that install no callback keep the original wait-until-grant-or-timeout behavior.
+* Added `MultiScanArgs::reverse` to support reverse MultiScan reads over bounded scan ranges.
+
+### Behavior Changes
+* When using `LockWAL()`, live-file capture APIs such as checkpoint and backup now flush WAL-disabled unpersisted data; they can block until `UnlockWAL()` or return `Aborted` when called from the same thread that holds `LockWAL()` to avoid deadlock. `UnlockWAL()` must now also be called from the same thread that called `LockWAL()`.
+
+### Performance Improvements
+* Fixed slow DB open with `best_efforts_recovery`, and slow catch-up of secondary and follower (read-only) instances, in which time and memory grew quadratically with the number of files in the DB (so the slowdown was worst for large DBs with long history).
+
+## 11.6.0 (07/02/2026)
+### New Features
+* Added EXPERIMENTAL embedded blob SST support through `SstFileWriter::OpenWithEmbeddedBlobs()`, storing eligible large values as same-file blob records in block-based SST files and resolving them transparently for reads. This niche feature currently supports uncompressed embedded blobs only; compression options are placeholders and compression support is deferred to follow-up work.
+
+### Public API Changes
+* Expanded the C API (`include/rocksdb/c.h`) with a large set of new `rocksdb_*` functions, mostly option getters/setters plus table-properties, job/event-listener, and metadata accessors, a WAL filter, a ReadOptions table filter, and a backup exclude-files callback. Many are now produced by a new semi-automated generator (`tools/c_api_gen/`) from the C++ headers; `include/rocksdb/c.h` remains a single self-contained header and the signatures of pre-existing functions are unchanged.
+
+### Bug Fixes
+* Reverted PR14831 that made range_lock_manager aware of reverse-order CF
+* Fixed a bug in `RandomAccessFileReader::ReadAsync` where an already-aligned direct-IO read request with a null `scratch` and a caller-provided `aligned_buf` would take the "already aligned" fast path and submit the null buffer to the underlying async read (e.g. a null iovec base to io_uring, failing with EFAULT). This could surface as spurious iterator failures during async prefetch (MultiScan with async IO) on direct-IO databases. The async path now allocates a backing buffer in this case, matching the synchronous `Read` path.
 * Fixed a bug where closing a read-only DB instance could delete live SST files created by a concurrent read-write DB sharing the same directory.
 
-## 11.1.1 (04/10/2026)
+## 11.5.0 (06/16/2026)
+### New Features
+* External table readers that open files through `ExternalTableOptions::fs` now update RocksDB SST/file-read statistics and file IO listener callbacks, making external file IO activity visible in existing read metrics.
+* Added `DB::PrepareFileIngestion()`, a two-phase form of `IngestExternalFile`/`IngestExternalFiles`. `PrepareFileIngestion()` performs all of the work that does not require the DB mutex (validating the arguments, reading each external file's metadata, and linking/copying the files into the DB) and returns an opaque `FileIngestionHandle`. `DB::CommitFileIngestionHandle()` (or `DB::CommitFileIngestionHandles()` for several handles at once) then makes the prepared files visible; multiple handles are committed atomically in a single MANIFEST write, or none are. `FileIngestionHandle::Abort()` (or simply destroying the handle) cancels a prepared ingestion and rolls it back. This gives flexibility to the application to Prepare a file separately from when its committed, and may shorten an applications critical path on `IngestExternalFile`.
+* Added two stats histograms reporting the per-call latency (in microseconds) of each successful `IngestExternalFile`/`IngestExternalFiles` call, split by phase: `rocksdb.ingest.external.file.prepare.micros` (argument validation and reading/validating/linking the external files, which does not block live writes) and `rocksdb.ingest.external.file.run.micros` (the ingestion performed under the DB mutex while live writes are blocked). Failed ingestions are not recorded.
+* Added `DBOptions::use_direct_io_for_compaction_reads` (default false). When enabled, compaction-input SST reads use `O_DIRECT` while user reads remain buffered, avoiding page-cache eviction of hot user-read data by sequential compaction scans. Pair with `use_direct_io_for_flush_and_compaction = true` on write-heavy workloads for direct I/O on both compaction inputs and outputs. Rejected at Open when combined with `allow_mmap_reads = true`. No-op when `use_direct_reads = true` is already set (since all reads are already direct).
+
 ### Public API Changes
-* Changed experimental feature `ExternalTableReader::Get` and `ExternalTableReader::MultiGet` to use `PinnableSlice` instead of `std::string` for output values, enabling zero-copy pinning. This will break existing implementations.
-* Added `SstFileReader::Get` and `SstFileReader::MultiGet` overloads that accept `PinnableSlice`/`std::vector<PinnableSlice>*`, enabling zero-copy reads when the underlying `TableReader` supports pinning.
-* Added block_decompress_count to PerfContext
+* `DB::GetPreparedFileInfoForExternalSstIngestion()` can now prepare metadata for a live DB-generated SST file so it can be passed to `IngestExternalFileArg::file_infos`. The input path must exactly match a live table file owned by the source DB, and the returned metadata handle must outlive the ingestion.
+* `ExternalSstFileInfo` gained a `prepared_file_info` member produced by `SstFileWriter::Finish`, and `IngestExternalFileArg` gained a `file_infos` field: a vector of borrowed `const PreparedFileInfo*` pointers, parallel to `external_files`. The owning `ExternalSstFileInfo::prepared_file_info` handle must outlive the ingestion. When set, `IngestExternalFiles()` reuses the supplied per-file metadata instead of re-opening and scanning each file to recompute it, avoiding that extra I/O.
+* Corrected the public C++ option spelling from `memtable_veirfy_per_key_checksum_on_seek` to `memtable_verify_per_key_checksum_on_seek`. RocksDB continues to accept the old misspelled OPTIONS-file key for compatibility, while newly serialized OPTIONS files use the corrected key.
+* Added experimental read-scoped block buffer provider API, configured through `ReadOptions::read_scoped_block_buffer_provider`, for supported block-based table iterator scans and MultiScan reads to use caller-provided read-scoped storage for final data-block contents. When configured, supported provider-backed scan data-block reads bypass the data-block cache. The provider is ignored when mmap reads are enabled. RocksDB may still use ordinary temporary scratch for serialized block bytes, such as when a block may be compressed. Get and MultiGet do not currently provide API guarantees for this provider.
+* Added `FileSystem::SyncFile()` and `Env::SyncFile()` public APIs for syncing or fsyncing a file by name without requiring callers to reopen it as writable.
+
+### Behavior Changes
+* The default `compression` for column families is now `kLZ4Compression` rather than `kSnappyCompression`. This affects only column families that do not explicitly set `compression`, and only newly-written SST files. The change is fully compatible: existing data remains readable with no migration needed, as RocksDB selects the decompressor per block. LZ4 offers slightly better compression ratios and decompression CPU efficiency vs. Snappy and similar compression CPU, tested across various server CPUs. When support is not compiled in, the fallback path for default compression is LZ4 -> Snappy -> NoCompression.
+* Disable parallel compression (ignore `CompressionOptions::parallel_threads`) for fast built-in compressors: Snappy, LZ4 (accelerated, not LZ4HC), and accelerated levels of ZSTD (level < 0). These do not generally benefit from parallel compression. This behavior can be overridden with a custom Compressor from a custom CompressionManager.
+* `PosixFileSystem::OptimizeForCompactionTableRead` now delegates to the base `FileSystem::OptimizeForCompactionTableRead` implementation before applying its Linux-only compaction-readahead clamp (added for #12038). The returned `FileOptions::use_direct_reads` therefore reflects `DBOptions::use_direct_reads`, consistent with the base class and with other `FileSystem` implementations. Previously the override ignored the base implementation and keyed both the returned options and the Linux readahead clamp off the incoming `FileOptions` rather than `DBOptions`. At the in-tree call site the incoming `FileOptions::use_direct_reads` already matches `DBOptions::use_direct_reads`, so this is effectively a no-op for existing configurations; it removes a latent inconsistency where a caller passing `FileOptions` whose `use_direct_reads` disagreed with `DBOptions` would have had the global flag silently ignored for compaction-input reads on Linux. (Note: the `#12038` readahead clamp still keys off the global `use_direct_reads`; it is not skipped for the compaction-only `use_direct_io_for_compaction_reads` path, since that flag enables O_DIRECT after this hook runs.)
+* Brought more unity to `kLZ4Compression` and `kLZ4HCCompression` by giving each access to the other's compression levels. Negative (fast) values previously only available to LZ4 and positive (slow) values previously only available to LZ4HC are now available to both, so configuring a non-default `compression_opts.level` now selects the LZ4 compressor variant. This is a behavior change for previously tolerated but dubious configurations such as positive compression level with `kLZ4Compression`. `kLZ4Compression` and `kLZ4HCCompression` keep their effective default levels, equivalent to -1 and 9 respectively.
+* Removed a discontinuity in `kZSTD` compression levels at `compression_opts.level == 0` by mapping that setting to `level = -1` rather than to `level = 3` as the ZSTD library does internally. This improves the compression auto-tuning landscape.
 
 ### Bug Fixes
+* Fixed a bug where the range lock manager would crash with an assertion failure when using a reverse comparator column family.
+
+### Performance Improvements
+* Reduced commit latency when ingesting many external files by allowing `IngestExternalFileOptions::file_opening_threads` to open table readers for committed ingested files using multiple threads.
+* Reduced commit latency for large external file ingestions into the last level by adding `IngestExternalFileOptions::prefetch_lmax_index_and_filter_blocks`, which can skip commit-time index and filter block prefetching for cache-backed table metadata.
+
+## 11.4.0 (06/02/2026)
+### Public API Changes
+* Added `rocksdb_options_set_memtable_batch_lookup_optimization()` and `rocksdb_options_get_memtable_batch_lookup_optimization()` to the C API, exposing the existing `AdvancedColumnFamilyOptions::memtable_batch_lookup_optimization` field. This allows C API users (and downstream language bindings) to enable the skip-list memtable's batch-lookup optimization for `MultiGet`, which caches the search path between consecutive keys and reduces per-key cost from O(log N) to O(log d) where d is the distance between consecutive keys.
+* Added `rocksdb_readoptions_set_optimize_multiget_for_io()` and `rocksdb_readoptions_get_optimize_multiget_for_io()` to the C API, exposing the existing `ReadOptions::optimize_multiget_for_io` field. This allows C API users (and downstream language bindings) to opt out of the multi-level parallel MultiGet path, which only takes effect when the library is built with `USE_COROUTINES`.
+* Added `rocksdb_block_based_table_index_block_search_type_auto` enum constant and the `rocksdb_block_based_options_set_uniform_cv_threshold()` setter to the C API. The constant exposes `BlockSearchType::kAuto`, and the setter exposes `BlockBasedTableOptions::uniform_cv_threshold`. Both are required for `kAuto` index-block search to take effect from the C API: without setting `uniform_cv_threshold >= 0`, the per-block `is_uniform` footer bit is never written, and `kAuto` falls back to binary search at read time.
+* Added `EventListener::OnDBShutdownBegin`, a callback that fires once when a DB begins shutdown, including when RocksDB cleans up a failed `DB::Open()` attempt.
+* Added a new PerfContext counter `blob_cache_read_byte` for blob cache bytes read.
+
+### Behavior Changes
+* Remote compaction now falls back to local compaction when the primary cannot deserialize a successful `CompactionServiceResult` before installing any remote output files.
+* StringToMap (rocksdb/convenience.h) now preserves the outer braces of nested values so each map entry is in self-contained form and can be embedded directly into another `key=value;` string (e.g. SetOptions) without losing inner ';' delimiters. A new symmetric MapToString utility is provided.
+
+### Bug Fixes
+* Fixed a bug where `AbortAllCompactions()` could leave automatic compaction work unscheduled when aborting before the background worker picked it, causing compaction and write stalls until DB restart.
+* Fix a bug where db had a false positive compaction corruption error due to remote compaction service result with `has_accurate_num_input_records=false` not being serialized.
+* Fixed WritePrepared TransactionDB cleanup after retryable commit or rollback write failures so prepared transactions remain rollbackable instead of leaving unresolved prepared state.
+* Fix a rare corruption bug for tiered compaction that incorrectly moved last level range tombstones into proximal level. This corruption error is surfaced when force_consistency_checks is enabled.
+
+### Performance Improvements
+* Reduce the likelihood of user-facing metadata operations blocking on MANIFEST rotation when file creation is slow, such as on remote storage. MANIFEST write batches containing foreground edits from `CreateColumnFamily()`, `DropColumnFamily()`, `CreateColumnFamilyWithImport()`, `IngestExternalFile()`, and `DeleteFilesInRanges()` now get a relaxed file size threshold for triggering MANIFEST rotation; background-only MANIFEST write batches, such as compaction and flush, continue to use the normal threshold. This change should make auto-tuning manifest file size more attractive (see `max_manifest_file_size` and `max_manifest_space_amp_pct` options).
+
+
+## 11.3.0 (05/15/2026)
+### New Features
+* Add experimental DB option `async_wal_precreate` to precreate the next WAL file in a background thread and reduce foreground WAL rotation latency. The option is sanitized to false when WAL recycling is enabled.
+* Added a new `EventListener::OnCompactionPreCommit` callback that fires after a compaction job finishes but before its input files are released (i.e. while `FileMetaData::being_compacted` is still true). Listeners that maintain bookkeeping of which files are currently being compacted can clean up such state in this new callback to avoid races with concurrent compaction picking, where another thread might pick up the same files for a new compaction immediately after `being_compacted` is flipped back to false but before `OnCompactionCompleted` fires. The default implementation is a no-op so this is not a breaking change.
+* Add mutable DBOption `optimize_manifest_for_recovery` (default false). When enabled, RocksDB can reduce recovery work after a clean shutdown, which may lower DB::Open latency on warm reopens.
+* Added public utility APIs `ParseCompressionNameForDisplay()` to convert `TableProperties::compression_name` into a human-readable compression name for both legacy and format_version 7+ SST metadata, including custom `CompressionManager`-provided display names for custom compression types.
+* Add `reuse_manifest_on_open` DBOption (default false). When enabled, DB::Open reuses the existing MANIFEST file for append instead of creating a fresh one, avoiding the cost of serializing the entire database state into a new MANIFEST on the first post-open write. To prevent this feature from interfering with manifest file size auto-tuning, an extra forward-compatible field is now always added to the MANIFEST (to track the last "compacted" size).
+
+### Behavior Changes
+* Read-only open with `error_if_wal_file_exists=true` now tolerates empty WAL files so empty precreated WALs do not prevent inspection.
+* WriteCommitted TransactionDB now matches WritePrepared and WriteUnprepared compaction filtering in both single- and two-write-queue modes: a compaction filter's FilterMergeOperand will not be invoked on merge operands at or below the latest published sequence number.
+
+### Bug Fixes
+* Fixed blob-backed wide-column merge reads to preserve correct status
+propagation and resolution across memtable, read-only, and secondary DB
+paths.
+* Fixed a bug where `DB::GetCreationTimeOfOldestFile()` could return inaccurate results instead of the real creation time when called shortly after opening a legacy DB (one whose manifest lacks `file_creation_time`) with `open_files_async = true`. The API now waits for background SST file loading to complete only when needed; modern DBs are unaffected.
+* Fixed merge reads against wide-column/blob-backed base values to preserve precise failure statuses, including `GetMergeOperands()` and direct-write memtable reads.
+* Fix bug in range tombstone synthesis that covers live keys added during an IngestExternalFile
+* Reject the empty string as a column family name in `DB::CreateColumnFamily` / `DB::CreateColumnFamilies`. Previously such calls returned OK and a usable handle, but the column family was not persisted in the manifest, so any data written to it was silently lost on DB reopen.
+* Fixed a bug where a WriteCommitted TransactionDB using commit-bypass WBWI ingestion could drop an entry that is still visible at the published sequence boundary.
+
+## 11.2.0 (04/18/2026)
+### New Features
+* Added experimental `DBOptions::fast_sst_open` option. When enabled, RocksDB retrieves opaque file system metadata for SST files after flush, compaction, and external file ingestion, persists it in the MANIFEST, and passes it back to the file system on subsequent file opens to accelerate DB open time.
+* Added new option `min_tombstones_for_range_conversion` in `AdvancedColumnFamilyOptions`. When set to a non-zero value N, forward or reverse iteration will convert N or more contiguous point tombstones into a range tombstone in the mutable memtable. Future read operations will then be able to benefit from range tombstone optimizations. There are some limitations when it comes to table_filters, prefix_filters, and UDTs. See header comments for more details.
+* Added read-triggered compaction: a new column family option `read_triggered_compaction_threshold` (default 0, disabled) that marks SST files for compaction when their read frequency (`num_collapsible_entry_reads_sampled / file_size`) exceeds the threshold. This helps reduce read amplification for frequently-read ("hot") keys. A new DB option `max_compaction_trigger_wakeup_seconds` (default 43200s / 12 hours) controls the maximum interval for periodic compaction score re-evaluation, which is necessary for this feature to work on quiet (no-write) databases.
+
+### Public API Changes
+* Added new `WideColumnBlobResolver` interface and `CompactionFilter::FilterV4()` method, including `ResolveColumn()` / `ResolveColumns()` helpers for lazy loading blob column values in wide-column entities during compaction. This allows compaction filters to resolve blob values on-demand, avoiding unnecessary I/O for blob columns they don't need to access.
+* Changed experimental feature `ExternalTableReader::Get` and `ExternalTableReader::MultiGet` to use `PinnableSlice` instead of `std::string` for output values, enabling zero-copy pinning. This will break existing implementations.
+* Added `SstFileReader::Get` and `SstFileReader::MultiGet` overloads that accept `PinnableSlice`/`std::vector<PinnableSlice>*`, enabling zero-copy reads when the underlying `TableReader` supports pinning.
+
+### Behavior Changes
+* Prefix filter changes - when seeking to a key that is out of domain, and total_order_seek is false, total_order_seek is treated as if it were true. When prefix_same_as_start = true, now iterating past a key that is out of domain invalidates the iterator. The existing behavior does not check for InDomain in the DBIter, so Transform() can produce undefined behavior (e.g. key of size 3 on FixedPrefixTransform(4)).
+* Wide-column entities with blob-backed columns now use a new V2 on-disk encoding; older RocksDB versions that do not support wide-column blob separation will reject DBs or SSTs containing those entities.
+
+### Bug Fixes
+* Fix blob garbage accounting for blob direct-write flushes so flush-time filtering and overwrite elision correctly register obsolete blob bytes in blob metadata.
 * Fix a memory accounting leak in IODispatcher where ReadIndex() moved block values out of ReadSet without releasing the associated prefetch memory, causing subsequent prefetches to be blocked when max_prefetch_memory_bytes was set.
+* Fix MultiScan to fall back to synchronous coalesced reads when async I/O is unsupported at runtime.
+
 
 ## 11.1.0 (03/23/2026)
 ### New Features

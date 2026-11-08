@@ -14,6 +14,7 @@
 #include "db/wide/wide_columns_helper.h"
 #include "rocksdb/slice.h"
 #include "util/autovector.h"
+#include "util/cast_util.h"
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -101,6 +102,20 @@ Status WideColumnSerialization::Serialize(const WideColumns& columns,
   return Status::OK();
 }
 
+size_t WideColumnSerialization::SerializedSizeV1(const WideColumns& columns) {
+  size_t size = VarintLength(kVersion1) +
+                VarintLength(static_cast<uint32_t>(columns.size()));
+
+  for (const auto& column : columns) {
+    const size_t name_size = column.name().size();
+    const size_t value_size = column.value().size();
+    size += VarintLength(name_size) + name_size + VarintLength(value_size) +
+            value_size;
+  }
+
+  return size;
+}
+
 template <typename GetName, typename GetValue>
 Status WideColumnSerialization::SerializeV2Impl(
     size_t num_columns,
@@ -115,18 +130,23 @@ Status WideColumnSerialization::SerializeV2Impl(
 
   // First pass: validate column ordering, compute sizes, serialize blob
   // indices, and build column types.
-  std::vector<std::string> serialized_blob_indices(num_columns);
-  std::vector<uint32_t> name_sizes(num_columns);
-  std::vector<uint32_t> value_sizes(num_columns);
+  // Only allocate serialized blob index strings for actual blob columns
+  // (typically few) rather than all num_columns.
+  std::vector<std::string> serialized_blob_indices(blob_columns.size());
+  autovector<uint32_t, 16> name_sizes;
+  autovector<uint32_t, 16> value_sizes;
+  name_sizes.resize(num_columns);
+  value_sizes.resize(num_columns);
   std::string column_types;
   column_types.reserve(num_columns);
 
   Slice prev_name_storage;
   bool has_prev = false;
-  uint32_t name_sizes_bytes = 0;
-  uint32_t names_bytes = 0;
-  uint32_t total_value_sizes_bytes = 0;
-  uint32_t total_values_bytes = 0;
+  uint64_t name_sizes_bytes = 0;
+  uint64_t names_bytes = 0;
+  uint64_t total_value_sizes_bytes = 0;
+  uint64_t total_values_bytes = 0;
+  size_t blob_ser_idx = 0;
 
   for (size_t i = 0; i < num_columns; ++i) {
     const Slice name = get_name(i);
@@ -150,9 +170,11 @@ Status WideColumnSerialization::SerializeV2Impl(
 
     if (blob_index_map[i] != nullptr) {
       const BlobIndex* blob_idx = blob_index_map[i];
-      blob_idx->EncodeTo(&serialized_blob_indices[i]);
-      value_sizes[i] = static_cast<uint32_t>(serialized_blob_indices[i].size());
+      blob_idx->EncodeTo(&serialized_blob_indices[blob_ser_idx]);
+      value_sizes[i] =
+          static_cast<uint32_t>(serialized_blob_indices[blob_ser_idx].size());
       column_types.push_back(static_cast<char>(kTypeBlobIndex));
+      ++blob_ser_idx;
     } else {
       if (Status svl = ValidateWideColumnLimit(value.size(),
                                                "Wide column value too long");
@@ -170,15 +192,35 @@ Status WideColumnSerialization::SerializeV2Impl(
     has_prev = true;
   }
 
+  const uint64_t kMaxWideColumnComponent =
+      static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+  if (name_sizes_bytes > kMaxWideColumnComponent ||
+      total_value_sizes_bytes > kMaxWideColumnComponent) {
+    return Status::InvalidArgument("Wide column metadata too large");
+  }
+  if (names_bytes > kMaxWideColumnComponent) {
+    return Status::InvalidArgument("Wide column names too large");
+  }
+  if (total_values_bytes > kMaxWideColumnComponent) {
+    return Status::InvalidArgument("Wide column values too large");
+  }
+
+  const auto name_sizes_bytes32 = static_cast<uint32_t>(name_sizes_bytes);
+  const auto names_bytes32 = static_cast<uint32_t>(names_bytes);
+  const auto total_value_sizes_bytes32 =
+      static_cast<uint32_t>(total_value_sizes_bytes);
+  const auto total_values_bytes32 = static_cast<uint32_t>(total_values_bytes);
+
   // Second pass: write all V2 sections to output.
   // Pre-allocate output string.
-  const size_t total_size =
-      VarintLength(kVersion2) +
-      VarintLength(static_cast<uint32_t>(num_columns)) +
-      num_columns +  // column types
-      VarintLength(name_sizes_bytes) + VarintLength(total_value_sizes_bytes) +
-      VarintLength(names_bytes) + name_sizes_bytes + total_value_sizes_bytes +
-      names_bytes + total_values_bytes;
+  const size_t total_size = VarintLength(kVersion2) +
+                            VarintLength(static_cast<uint32_t>(num_columns)) +
+                            num_columns +  // column types
+                            VarintLength(name_sizes_bytes32) +
+                            VarintLength(total_value_sizes_bytes32) +
+                            VarintLength(names_bytes32) + name_sizes_bytes32 +
+                            total_value_sizes_bytes32 + names_bytes32 +
+                            total_values_bytes32;
 
   const size_t base_offset = output.size();
   output.reserve(base_offset + total_size);
@@ -186,9 +228,9 @@ Status WideColumnSerialization::SerializeV2Impl(
   // Sections 1-3: header, skip info, column types
   PutVarint32(&output, kVersion2);
   PutVarint32(&output, static_cast<uint32_t>(num_columns));
-  PutVarint32(&output, name_sizes_bytes);
-  PutVarint32(&output, total_value_sizes_bytes);
-  PutVarint32(&output, names_bytes);
+  PutVarint32(&output, name_sizes_bytes32);
+  PutVarint32(&output, total_value_sizes_bytes32);
+  PutVarint32(&output, names_bytes32);
   output.append(column_types);
 
   // Sections 4-7: resize to final size, then write all 4 sections in a
@@ -201,11 +243,12 @@ Status WideColumnSerialization::SerializeV2Impl(
   const size_t sec4_offset = output.size();
   output.resize(base_offset + total_size);
 
-  char* s4 = &output[sec4_offset];          // section 4: name sizes
-  char* s5 = s4 + name_sizes_bytes;         // section 5: value sizes
-  char* s6 = s5 + total_value_sizes_bytes;  // section 6: names
-  char* s7 = s6 + names_bytes;              // section 7: values
+  char* s4 = &output[sec4_offset];            // section 4: name sizes
+  char* s5 = s4 + name_sizes_bytes32;         // section 5: value sizes
+  char* s6 = s5 + total_value_sizes_bytes32;  // section 6: names
+  char* s7 = s6 + names_bytes32;              // section 7: values
 
+  size_t blob_write_idx = 0;
   for (size_t i = 0; i < num_columns; ++i) {
     s4 = EncodeVarint32(s4, name_sizes[i]);
     s5 = EncodeVarint32(s5, value_sizes[i]);
@@ -214,7 +257,9 @@ Status WideColumnSerialization::SerializeV2Impl(
     s6 += name_sizes[i];
 
     if (blob_index_map[i] != nullptr) {
-      memcpy(s7, serialized_blob_indices[i].data(), value_sizes[i]);
+      memcpy(s7, serialized_blob_indices[blob_write_idx].data(),
+             value_sizes[i]);
+      ++blob_write_idx;
     } else {
       memcpy(s7, get_value(i).data(), value_sizes[i]);
     }
@@ -287,6 +332,14 @@ Status WideColumnSerialization::DeserializeV1(
     columns[i].value() = Slice(data.data() + pos, value_size);
 
     pos += value_size;
+  }
+
+  // Reject any trailing bytes after the last value: a serialized entity must be
+  // exactly the whole input (V2 already enforces this via its section-size
+  // check; this keeps V1 consistent).
+  if (pos != data.size()) {
+    return Status::Corruption(
+        "Unexpected trailing data after wide column entity");
   }
 
   return Status::OK();
@@ -383,40 +436,35 @@ Status WideColumnSerialization::DeserializeV2Impl(
     value_pos += vs;
   }
 
-  return Status::OK();
-}
-
-Status WideColumnSerialization::Deserialize(Slice& input,
-                                            WideColumns& columns) {
-  assert(columns.empty());
-
-  // Reuse DeserializeV2, then reject any blob references.
-  std::vector<std::pair<size_t, BlobIndex>> blob_columns;
-  if (Status s = DeserializeV2(input, columns, blob_columns); !s.ok()) {
-    return s;
-  }
-
-  if (!blob_columns.empty()) {
-    return Status::NotSupported(
-        "Wide column contains blob references. Use DeserializeV2.");
+  // Validate that the consumed bytes match the declared section sizes. Because
+  // a V2 entity's values section is defined to extend to the end of `input`,
+  // this also rejects any trailing bytes after the entity.
+  const size_t total_values_bytes = static_cast<size_t>(input_end - s7);
+  if (s4 != s4_limit || s5 != s5_limit || name_pos != names_bytes ||
+      value_pos != total_values_bytes) {
+    return Status::Corruption("Wide column section size mismatch");
   }
 
   return Status::OK();
 }
 
-Status WideColumnSerialization::DeserializeV2(
-    Slice& input, std::vector<WideColumn>& columns,
-    std::vector<std::pair<size_t, BlobIndex>>& blob_columns) {
+Status WideColumnSerialization::Deserialize(
+    const Slice& entity, WideColumns& columns,
+    std::vector<std::pair<size_t, BlobIndex>>* blob_columns) {
   assert(columns.empty());
-  assert(blob_columns.empty());
+  assert(!blob_columns || blob_columns->empty());
 
+  Slice input = entity;
   uint32_t version = 0;
   if (!GetVarint32(&input, &version)) {
     return Status::Corruption("Error decoding wide column version");
   }
 
+  // A version newer than kVersion2 is reported as Corruption, consistent with
+  // how the rest of the codebase classifies an unrecognized serialized
+  // version/type (BlobIndex, blob log header, table footer).
   if (version > kVersion2) {
-    return Status::NotSupported("Unsupported wide column version");
+    return Status::Corruption("Corrupt or unsupported wide column version");
   }
 
   uint32_t num_columns = 0;
@@ -424,34 +472,44 @@ Status WideColumnSerialization::DeserializeV2(
     return Status::Corruption("Error decoding number of wide columns");
   }
 
-  if (!num_columns) {
-    return Status::OK();
+  // A zero-column entity is still dispatched to the version-specific parser
+  // below (rather than returning OK here) so that trailing bytes after an empty
+  // entity are rejected as Corruption too -- both parsers handle num_columns==0
+  // and validate that the input is exactly one serialized entity.
+  if (version < kVersion2) {
+    return DeserializeV1(input, num_columns, columns);
   }
 
-  if (version >= kVersion2) {
-    // V2 layout: parse columns and extract blob column info
-    std::vector<ValueType> column_types;
+  // V2 layout: parse columns and extract any blob column info.
+  std::vector<ValueType> column_types;
+  if (Status s = DeserializeV2Impl(input, num_columns, columns, column_types);
+      !s.ok()) {
+    return s;
+  }
+  assert(column_types.size() == num_columns);
+  assert(columns.size() == num_columns);
 
-    if (Status s = DeserializeV2Impl(input, num_columns, columns, column_types);
-        !s.ok()) {
-      return s;
+  for (uint32_t i = 0; i < num_columns; ++i) {
+    if (column_types[i] != kTypeBlobIndex) {
+      continue;
     }
-    assert(column_types.size() == num_columns);
-    assert(columns.size() == num_columns);
 
-    // Decode blob indices from value data
-    for (uint32_t i = 0; i < num_columns; ++i) {
-      if (column_types[i] == kTypeBlobIndex) {
-        BlobIndex blob_idx;
-        Slice blob_slice = columns[i].value();
-        if (Status bs = blob_idx.DecodeFrom(blob_slice); !bs.ok()) {
-          return Status::Corruption("Error decoding blob index in wide column");
-        }
-        blob_columns.emplace_back(i, blob_idx);
-      }
+    if (!blob_columns) {
+      // The caller promised a fully resolved entity; a blob reference here is
+      // unexpected and may indicate corruption (or a logic error)
+      return Status::Corruption(
+          "Wide column blob reference in a context where it is not expected.");
     }
-  } else {
-    return DeserializeV1(input, num_columns, columns);
+
+    BlobIndex blob_idx;
+    Slice blob_slice = columns[i].value();
+    if (blob_slice.empty()) {
+      return Status::Corruption("Empty blob index in wide column");
+    }
+    if (Status bs = blob_idx.DecodeFrom(blob_slice); !bs.ok()) {
+      return Status::Corruption("Error decoding blob index in wide column");
+    }
+    blob_columns->emplace_back(i, blob_idx);
   }
 
   return Status::OK();
@@ -471,6 +529,9 @@ Status WideColumnSerialization::HasBlobColumns(const Slice& input,
   // Version 1 never has blob columns
   if (version < kVersion2) {
     return Status::OK();
+  }
+  if (version > kVersion2) {
+    return Status::Corruption("Corrupt or unsupported wide column version");
   }
 
   uint32_t num_columns = 0;
@@ -494,7 +555,132 @@ Status WideColumnSerialization::HasBlobColumns(const Slice& input,
   if (input_ref.size() < num_columns) {
     return Status::Corruption("Error decoding wide column types");
   }
+  for (uint32_t i = 0; i < num_columns; ++i) {
+    if (!IsValidColumnValueType(static_cast<ValueType>(input_ref[i]))) {
+      return Status::Corruption("Unsupported wide column ValueType");
+    }
+  }
   has_blob_columns = ContainsBlobType(input_ref.data(), num_columns);
+
+  return Status::OK();
+}
+
+Status WideColumnSerialization::ForEachBlobFileNumber(
+    const Slice& input,
+    const std::function<Status(const BlobIndex&)>& callback) {
+  Slice input_ref = input;
+
+  uint32_t version = 0;
+  if (!GetVarint32(&input_ref, &version)) {
+    return Status::Corruption("Error decoding wide column version");
+  }
+
+  if (version < kVersion2) {
+    return Status::OK();
+  }
+  if (version > kVersion2) {
+    return Status::Corruption("Corrupt or unsupported wide column version");
+  }
+
+  uint32_t num_columns = 0;
+  if (!GetVarint32(&input_ref, &num_columns)) {
+    return Status::Corruption("Error decoding number of wide columns");
+  }
+
+  if (!num_columns) {
+    return Status::OK();
+  }
+
+  // Read SKIP INFO
+  uint32_t name_sizes_bytes = 0;
+  uint32_t value_sizes_bytes = 0;
+  uint32_t names_bytes = 0;
+  if (!GetVarint32(&input_ref, &name_sizes_bytes) ||
+      !GetVarint32(&input_ref, &value_sizes_bytes) ||
+      !GetVarint32(&input_ref, &names_bytes)) {
+    return Status::Corruption("Error decoding wide column skip info");
+  }
+
+  // Read COLUMN TYPES
+  if (input_ref.size() < num_columns) {
+    return Status::Corruption("Error decoding wide column types");
+  }
+
+  // Validate every column type, and note whether any blob columns are present.
+  // An unrecognized/unsupported type byte is Corruption (consistent with
+  // Deserialize() and HasBlobColumns()) rather than silently treated as a
+  // non-blob column.
+  bool has_any_blob = false;
+  for (uint32_t i = 0; i < num_columns; ++i) {
+    const auto type = lossless_cast<ValueType>(input_ref[i]);
+    if (!IsValidColumnValueType(type)) {
+      return Status::Corruption("Unsupported wide column ValueType");
+    }
+    if (type == kTypeBlobIndex) {
+      has_any_blob = true;
+    }
+  }
+
+  if (!has_any_blob) {
+    return Status::OK();
+  }
+
+  // Need to skip to value sizes to find blob column value offsets,
+  // then skip to the values section to decode blob indices.
+  const char* type_bytes = input_ref.data();
+  input_ref.remove_prefix(num_columns);
+
+  // Skip NAME SIZES section
+  if (input_ref.size() < name_sizes_bytes) {
+    return Status::Corruption("Error decoding wide column name sizes");
+  }
+  input_ref.remove_prefix(name_sizes_bytes);
+
+  // Read VALUE SIZES section to find blob column value offsets
+  if (input_ref.size() < value_sizes_bytes) {
+    return Status::Corruption("Error decoding wide column value sizes");
+  }
+  const char* vs_ptr = input_ref.data();
+  const char* vs_limit = vs_ptr + value_sizes_bytes;
+  input_ref.remove_prefix(value_sizes_bytes);
+
+  // Skip NAMES section
+  if (input_ref.size() < names_bytes) {
+    return Status::Corruption("Error decoding wide column names");
+  }
+  input_ref.remove_prefix(names_bytes);
+
+  // Now input_ref points to VALUES section. Walk through value sizes
+  // and decode only blob column values.
+  size_t value_pos = 0;
+  for (uint32_t i = 0; i < num_columns; ++i) {
+    uint32_t vs = 0;
+    const char* vs_next = GetVarint32Ptr(vs_ptr, vs_limit, &vs);
+    if (vs_next == nullptr) {
+      return Status::Corruption("Error decoding wide column value size");
+    }
+    vs_ptr = vs_next;
+
+    if (static_cast<uint8_t>(type_bytes[i]) == kTypeBlobIndex) {
+      if (value_pos + vs > input_ref.size()) {
+        return Status::Corruption("Error decoding wide column blob index");
+      }
+      Slice blob_slice(input_ref.data() + value_pos, vs);
+      if (blob_slice.empty()) {
+        return Status::Corruption("Empty blob index in wide column");
+      }
+      BlobIndex blob_idx;
+      Status s = blob_idx.DecodeFrom(blob_slice);
+      if (!s.ok()) {
+        return Status::Corruption("Error decoding blob index in wide column");
+      }
+      Status cb_s = callback(blob_idx);
+      if (!cb_s.ok()) {
+        return cb_s;
+      }
+    }
+    value_pos += vs;
+  }
 
   return Status::OK();
 }
@@ -511,8 +697,10 @@ Status WideColumnSerialization::GetVersion(const Slice& input,
   return Status::OK();
 }
 
-Status WideColumnSerialization::GetValueOfDefaultColumn(Slice& input,
-                                                        Slice& value) {
+Status WideColumnSerialization::GetValueOfDefaultColumn(
+    const Slice& input, Slice& value, bool& is_blob_reference) {
+  is_blob_reference = false;
+
   Slice input_ref = input;
 
   uint32_t version = 0;
@@ -520,8 +708,9 @@ Status WideColumnSerialization::GetValueOfDefaultColumn(Slice& input,
     return Status::Corruption("Error decoding wide column version");
   }
 
+  // See Deserialize(): a too-new version is Corruption, not NotSupported.
   if (version > kVersion2) {
-    return Status::NotSupported("Unsupported wide column version");
+    return Status::Corruption("Corrupt or unsupported wide column version");
   }
 
   uint32_t num_columns = 0;
@@ -552,15 +741,19 @@ Status WideColumnSerialization::GetValueOfDefaultColumn(Slice& input,
       return Status::Corruption("Error decoding wide column names bytes");
     }
 
-    // Read COLUMN TYPES (N bytes)
+    // Read COLUMN TYPES (N bytes). We only need column 0's type here (it is the
+    // default column's type only if column 0 is actually the default column,
+    // checked via its name size below), but validate it is a recognized type so
+    // a corrupt/unsupported type byte is reported as Corruption rather than
+    // silently treated as an inline value.
     if (input_ref.size() < num_columns) {
       return Status::Corruption("Error decoding wide column types");
     }
-    // Check if default column (index 0) is a blob reference
-    if (static_cast<uint8_t>(input_ref[0]) == kTypeBlobIndex) {
-      return Status::NotSupported(
-          "Wide column contains blob references. Use DeserializeV2.");
+    const auto column0_type = lossless_cast<ValueType>(input_ref[0]);
+    if (!IsValidColumnValueType(column0_type)) {
+      return Status::Corruption("Unsupported wide column ValueType");
     }
+    const bool column0_is_blob = column0_type == kTypeBlobIndex;
     input_ref.remove_prefix(num_columns);
 
     // Peek first name size from NAME SIZES section
@@ -598,18 +791,20 @@ Status WideColumnSerialization::GetValueOfDefaultColumn(Slice& input,
     }
     input_ref.remove_prefix(names_bytes);
 
-    // Read the first value from VALUES section
+    // Read the first value from VALUES section. For a blob-referenced default
+    // column these are the raw serialized BlobIndex bytes.
     if (input_ref.size() < first_value_size) {
       return Status::Corruption("Error decoding wide column value payload");
     }
     value = Slice(input_ref.data(), first_value_size);
+    is_blob_reference = column0_is_blob;
     return Status::OK();
   }
 
-  // V1 fallback: full deserialization
+  // V1 fallback: full deserialization. V1 has no blob references.
   WideColumns columns;
 
-  if (Status s = Deserialize(input, columns); !s.ok()) {
+  if (Status s = DeserializeSimple(input, columns); !s.ok()) {
     return s;
   }
 
@@ -628,15 +823,31 @@ Status WideColumnSerialization::ResolveEntityBlobColumns(
     const BlobFetcher* blob_fetcher, PrefetchBufferCollection* prefetch_buffers,
     std::string& resolved_entity, bool& resolved, uint64_t* total_bytes_read,
     uint64_t* num_blobs_resolved) {
-  assert(blob_fetcher);
+  // Resolve into zero-copy columns backed by fetched blob buffers, then
+  // serialize that result as a V1 (all-inline) entity.
+  WideColumns resolved_columns;
+  std::forward_list<PinnableSlice> extra_buffers;
+  Status s = ResolveEntityBlobColumnsMultiBuffer(
+      entity_value, user_key, blob_fetcher, prefetch_buffers, resolved_columns,
+      extra_buffers, resolved, total_bytes_read, num_blobs_resolved);
+  if (s.ok() && resolved) {
+    s = Serialize(resolved_columns, resolved_entity);
+  }
+  return s;
+}
 
+Status WideColumnSerialization::ResolveEntityBlobColumnsMultiBuffer(
+    const Slice& entity_value, const Slice& user_key,
+    const BlobFetcher* blob_fetcher, PrefetchBufferCollection* prefetch_buffers,
+    WideColumns& resolved_columns,
+    std::forward_list<PinnableSlice>& extra_buffers, bool& resolved,
+    uint64_t* total_bytes_read, uint64_t* num_blobs_resolved) {
   resolved = false;
 
   std::vector<WideColumn> columns;
   std::vector<std::pair<size_t, BlobIndex>> blob_columns;
 
-  Slice input_copy = entity_value;
-  if (Status s = DeserializeV2(input_copy, columns, blob_columns); !s.ok()) {
+  if (Status s = Deserialize(entity_value, columns, &blob_columns); !s.ok()) {
     return s;
   }
 
@@ -646,17 +857,24 @@ Status WideColumnSerialization::ResolveEntityBlobColumns(
 
   resolved = true;
 
-  // Fetch each blob value
-  std::vector<std::string> resolved_blob_values;
-  resolved_blob_values.reserve(blob_columns.size());
-
   for (const auto& blob_col : blob_columns) {
+    const size_t column_idx = blob_col.first;
     const BlobIndex& blob_idx = blob_col.second;
 
     if (blob_idx.IsInlined()) {
-      resolved_blob_values.emplace_back(blob_idx.value().data(),
-                                        blob_idx.value().size());
+      // The inlined value bytes live in `entity_value`; point the column value
+      // at them directly (zero copy). The caller keeps `entity_value` alive.
+      columns[column_idx].value() = blob_idx.value();
       continue;
+    }
+
+    if (blob_fetcher == nullptr) {
+      // A blob-backed entity reached a read context with no blob fetcher (a
+      // reader without blob support, e.g. SstFileReader, or corrupt/legacy
+      // data). This is the single place entity blob resolution reports that
+      // condition; callers no longer pre-check the fetcher.
+      return Status::Corruption(
+          "Cannot resolve blob columns in entity without a blob fetcher");
     }
 
     FilePrefetchBuffer* prefetch_buffer =
@@ -666,14 +884,17 @@ Status WideColumnSerialization::ResolveEntityBlobColumns(
 
     uint64_t bytes_read = 0;
 
-    PinnableSlice blob_value;
+    // Fetch the blob value into a fresh, address-stable backing node.
+    extra_buffers.emplace_front();
+    PinnableSlice& blob_value = extra_buffers.front();
     const Status fetch_s = blob_fetcher->FetchBlob(
         user_key, blob_idx, prefetch_buffer, &blob_value, &bytes_read);
     if (!fetch_s.ok()) {
       return fetch_s;
     }
 
-    resolved_blob_values.emplace_back(blob_value.data(), blob_value.size());
+    // Zero-copy Slice into the node we just added.
+    columns[column_idx].value() = blob_value;
 
     if (total_bytes_read) {
       *total_bytes_read += bytes_read;
@@ -684,84 +905,66 @@ Status WideColumnSerialization::ResolveEntityBlobColumns(
     *num_blobs_resolved += blob_columns.size();
   }
 
-  return SerializeResolvedEntity(columns, blob_columns, resolved_blob_values,
-                                 resolved_entity);
-}
+  resolved_columns = std::move(columns);
 
-Status WideColumnSerialization::GetValueOfDefaultColumnResolvingBlobs(
-    const Slice& entity_value, const Slice& user_key,
-    const BlobFetcher* blob_fetcher, PinnableSlice& result, bool& resolved) {
-  assert(blob_fetcher);
-
-  resolved = false;
-
-  std::vector<WideColumn> columns;
-  std::vector<std::pair<size_t, BlobIndex>> blob_columns;
-
-  Slice input_copy = entity_value;
-  if (Status s = DeserializeV2(input_copy, columns, blob_columns); !s.ok()) {
-    return s;
-  }
-
-  // The default column (empty name) is always at index 0 when present
-  // (columns are sorted by name).
-  if (columns.empty() || columns[0].name() != kDefaultWideColumnName) {
-    result.PinSelf(Slice());
-    return Status::OK();
-  }
-
-  // Check if the default column (index 0) is a blob reference
-  for (const auto& blob_col : blob_columns) {
-    if (blob_col.first == 0) {
-      const BlobIndex& blob_idx = blob_col.second;
-
-      resolved = true;
-
-      if (blob_idx.IsInlined()) {
-        result.PinSelf(blob_idx.value());
-        return Status::OK();
-      }
-
-      return blob_fetcher->FetchBlob(user_key, blob_idx,
-                                     nullptr /* prefetch_buffer */, &result,
-                                     nullptr /* bytes_read */);
-    }
-  }
-
-  // Default column is inline
-  result.PinSelf(columns[0].value());
   return Status::OK();
 }
 
-Status WideColumnSerialization::SerializeResolvedEntity(
-    const std::vector<WideColumn>& columns,
-    const std::vector<std::pair<size_t, BlobIndex>>& blob_columns,
-    const std::vector<std::string>& resolved_blob_values, std::string& output) {
-  assert(blob_columns.size() == resolved_blob_values.size());
-
-  // blob_columns is sorted by column index and typically small, so use a
-  // linear scan with a cursor instead of an unordered_map.
-  size_t blob_cursor = 0;
-
-  // Build result columns with resolved blob values
-  WideColumns result_columns;
-  result_columns.reserve(columns.size());
-
-  for (size_t i = 0; i < columns.size(); ++i) {
-    if (blob_cursor < blob_columns.size() &&
-        blob_columns[blob_cursor].first == i) {
-      // This is a blob column - use the resolved value
-      result_columns.emplace_back(columns[i].name(),
-                                  Slice(resolved_blob_values[blob_cursor]));
-      ++blob_cursor;
-    } else {
-      // This is an inline column - use the original value
-      result_columns.emplace_back(columns[i].name(), columns[i].value());
-    }
+Status WideColumnSerialization::ResolveDefaultColumnBlobReference(
+    const Slice& blob_index, const Slice& user_key,
+    const BlobFetcher* blob_fetcher, PinnableSlice& value) {
+  if (blob_index.empty()) {
+    return Status::Corruption("Empty blob index in wide column default value");
   }
 
-  // Serialize using V1 format (all values inline)
-  return Serialize(result_columns, output);
+  BlobIndex blob_idx;
+  if (Status s = blob_idx.DecodeFrom(blob_index); !s.ok()) {
+    return Status::Corruption(
+        "Error decoding blob index in wide column default value");
+  }
+
+  if (blob_idx.IsInlined()) {
+    value.PinSelf(blob_idx.value());
+    return Status::OK();
+  }
+
+  if (blob_fetcher == nullptr) {
+    // A blob-backed default column reached a read context with no blob fetcher
+    // (a reader without blob support, e.g. SstFileReader, or corrupt/legacy
+    // data). This is the single place default-column blob resolution reports
+    // that condition; callers no longer pre-check the fetcher.
+    return Status::Corruption(
+        "Cannot resolve blob-backed default column without a blob fetcher");
+  }
+
+  return blob_fetcher->FetchBlob(user_key, blob_idx,
+                                 nullptr /* prefetch_buffer */, &value,
+                                 nullptr /* bytes_read */);
+}
+
+Status WideColumnSerialization::ResolveEntityForMerge(
+    const Slice& entity_value, const Slice& user_key,
+    const BlobFetcher* blob_fetcher, PrefetchBufferCollection* prefetch_buffers,
+    std::string& resolved_entity, Slice& effective_entity) {
+  bool has_blob_columns = false;
+  Status status = HasBlobColumns(entity_value, has_blob_columns);
+  if (status.ok()) {
+    if (!has_blob_columns) {
+      effective_entity = entity_value;
+    } else {
+      // A null blob_fetcher with blob columns present is reported as Corruption
+      // inside ResolveEntityBlobColumns -> ResolveEntityBlobColumnsMultiBuffer.
+      bool resolved = false;
+      status = ResolveEntityBlobColumns(
+          entity_value, user_key, blob_fetcher, prefetch_buffers,
+          resolved_entity, resolved, nullptr /* total_bytes_read */,
+          nullptr /* num_blobs_resolved */);
+      if (status.ok()) {
+        effective_entity = resolved ? Slice(resolved_entity) : entity_value;
+      }
+    }
+  }
+  return status;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -102,8 +102,8 @@ Status FilePrefetchBuffer::Read(BufferInfo* buf, const IOOptions& opts,
                            read_len, result);
   } else {
     to_buf = buf->buffer_.BufferStart() + aligned_useful_len;
-    s = reader->Read(opts, start_offset + aligned_useful_len, read_len, &result,
-                     to_buf, /*aligned_buf=*/nullptr);
+    s = reader->Read(start_offset + aligned_useful_len, read_len, opts, &result,
+                     to_buf, /*dbg=*/nullptr);
   }
 
 #ifndef NDEBUG
@@ -153,7 +153,8 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
   buf->async_req_len_ = req.len;
 
   Status s = reader->ReadAsync(req, opts, fp, buf, &(buf->io_handle_),
-                               &(buf->del_fn_), /*aligned_buf =*/nullptr);
+                               &(buf->del_fn_), /*aligned_buf=*/nullptr,
+                               /*dbg=*/nullptr);
   req.status.PermitUncheckedError();
   if (s.ok()) {
     if (usage_ == FilePrefetchBufferUsage::kUserScanPrefetch) {
@@ -164,8 +165,8 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
     // Async IO is not available (e.g., io_uring failed to initialize).
     // Fall back to synchronous read so the buffer is populated inline
     // and callers proceed transparently.
-    s = reader->Read(opts, start_offset, read_len, &result,
-                     buf->buffer_.BufferStart(), /*aligned_buf=*/nullptr);
+    s = reader->Read(start_offset, read_len, opts, &result,
+                     buf->buffer_.BufferStart(), /*dbg=*/nullptr);
     if (s.ok()) {
       buf->buffer_.Size(buf->CurrentSize() + result.size());
       if (usage_ == FilePrefetchBufferUsage::kUserScanPrefetch) {
@@ -196,7 +197,9 @@ Status FilePrefetchBuffer::Prefetch(const IOOptions& opts,
   }
 
   size_t alignment = GetRequiredBufferAlignment(reader);
-  uint64_t rounddown_offset = offset, roundup_end = 0, aligned_useful_len = 0;
+  uint64_t rounddown_offset = offset;
+  uint64_t roundup_end = 0;
+  uint64_t aligned_useful_len = 0;
   size_t read_len = 0;
   // TODO: Enable file system buffer reuse optimization. Need to incorporate
   // overlap buffer logic here (similar to what is done in PrefetchInternal).
@@ -583,7 +586,8 @@ Status FilePrefetchBuffer::HandleOverlappingAsyncData(
       AllocateBuffer();
       BufferInfo* new_buf = GetLastBuffer();
       size_t read_len = 0;
-      uint64_t end_offset = start_offset, aligned_useful_len = 0;
+      uint64_t end_offset = start_offset;
+      uint64_t aligned_useful_len = 0;
 
       ReadAheadSizeTuning(new_buf, /*read_curr_block=*/false,
                           /*refit_tail=*/false, /*use_fs_buffer=*/false,
@@ -739,7 +743,9 @@ Status FilePrefetchBuffer::PrefetchInternal(const IOOptions& opts,
 
   // Go for ReadAsync and Read (if needed).
   // offset and size alignment for first buffer with synchronous prefetching
-  uint64_t start_offset1 = offset, end_offset1 = 0, aligned_useful_len1 = 0;
+  uint64_t start_offset1 = offset;
+  uint64_t end_offset1 = 0;
+  uint64_t aligned_useful_len1 = 0;
   size_t read_len1 = 0;
 
   // For length == 0, skip the synchronous prefetching. read_len1 will be 0.
@@ -1014,7 +1020,9 @@ Status FilePrefetchBuffer::PrefetchAsync(const IOOptions& opts,
   size_t alignment = GetRequiredBufferAlignment(reader);
   size_t readahead_size = is_eligible_for_prefetching ? readahead_size_ / 2 : 0;
   size_t offset_to_read = static_cast<size_t>(offset);
-  uint64_t start_offset1 = offset, end_offset1 = 0, aligned_useful_len1 = 0;
+  uint64_t start_offset1 = offset;
+  uint64_t end_offset1 = 0;
+  uint64_t aligned_useful_len1 = 0;
   size_t read_len1 = 0;
 
   AllocateBufferIfEmpty();
@@ -1088,7 +1096,8 @@ Status FilePrefetchBuffer::PrefetchRemBuffers(const IOOptions& opts,
     AllocateBuffer();
     BufferInfo* new_buf = GetLastBuffer();
 
-    uint64_t end_offset2 = start_offset2, aligned_useful_len2 = 0;
+    uint64_t end_offset2 = start_offset2;
+    uint64_t aligned_useful_len2 = 0;
     size_t read_len2 = 0;
     ReadAheadSizeTuning(new_buf, /*read_curr_block=*/false,
                         /*refit_tail=*/false, /*use_fs_buffer=*/false,

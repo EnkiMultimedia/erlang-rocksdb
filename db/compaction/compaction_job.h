@@ -40,7 +40,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/memtablerep.h"
-#include "rocksdb/transaction_log.h"
+#include "rocksdb/wal_iterator.h"
 #include "util/autovector.h"
 #include "util/stop_watch.h"
 #include "util/thread_local.h"
@@ -166,7 +166,8 @@ class CompactionJob {
                 std::string full_history_ts_low = "", std::string trim_ts = "",
                 BlobFileCompletionCallback* blob_callback = nullptr,
                 int* bg_compaction_scheduled = nullptr,
-                int* bg_bottom_compaction_scheduled = nullptr);
+                int* bg_bottom_compaction_scheduled = nullptr,
+                std::atomic<int>* num_running_remote_compactions = nullptr);
 
   virtual ~CompactionJob();
 
@@ -174,6 +175,7 @@ class CompactionJob {
   CompactionJob(CompactionJob&& job) = delete;
   CompactionJob(const CompactionJob& job) = delete;
   CompactionJob& operator=(const CompactionJob& job) = delete;
+  CompactionJob& operator=(CompactionJob&& job) = delete;
 
   // REQUIRED: mutex held
   // Prepare for the compaction by setting up boundaries for each subcompaction
@@ -462,6 +464,8 @@ class CompactionJob {
   FileSystemPtr fs_;
   // env_option optimized for compaction table reads
   FileOptions file_options_for_read_;
+  // file_options_for_read_ plus compaction-input-only overrides.
+  FileOptions file_options_for_compaction_input_read_;
   VersionSet* versions_;
   const std::atomic<bool>* shutting_down_;
   const std::atomic<bool>& manual_compaction_canceled_;
@@ -498,8 +502,14 @@ class CompactionJob {
   int* bg_compaction_scheduled_;
   int* bg_bottom_compaction_scheduled_;
 
+  // Stores the pointer to DBImpl::num_running_remote_compactions_, backing the
+  // public rocksdb.num-running-remote-compactions property. Null when the job
+  // has no owning DBImpl to report to (compaction service workers, unit tests).
+  // Updated without the DB mutex held.
+  std::atomic<int>* num_running_remote_compactions_;
+
   // Stores the sequence number to time mapping gathered from all input files
-  // it also collects the smallest_seqno -> oldest_ancester_time from the SST.
+  // it also collects the smallest_seqno -> oldest_ancestor_time from the SST.
   SeqnoToTimeMapping seqno_to_time_mapping_;
 
   // Max seqno that can be zeroed out in last level, including for preserving
@@ -515,12 +525,23 @@ class CompactionJob {
   // Setting this requires DBMutex.
   uint64_t options_file_number_ = 0;
 
+  // MANIFEST position (file number and size, in bytes) captured in Prepare()
+  // (mutex held) to send to the remote worker as a floor. Zero when
+  // DBOptions::remote_compaction_manifest_floor is off (or this is not a remote
+  // compaction), meaning no floor is sent. Setting these requires DBMutex.
+  uint64_t min_manifest_file_number_ = 0;
+  uint64_t min_manifest_file_size_ = 0;
+
   // Writer for persisting compaction progress during compaction
   log::Writer* compaction_progress_writer_ = nullptr;
 
   // Get table file name in where it's outputting to, which should also be in
   // `output_directory_`.
   virtual std::string GetTableFileName(uint64_t file_number);
+
+  // True if this job builds output files as a remote (offloaded)
+  // CompactionService worker. Overridden by CompactionServiceCompactionJob.
+  virtual bool IsRemoteCompaction() const { return false; }
   // The rate limiter priority (io_priority) is determined dynamically here.
   // The Compaction Read and Write priorities are the same for different
   // scenarios, such as write stalled.
@@ -571,6 +592,7 @@ class CompactionJob {
 struct CompactionServiceInput {
   std::string cf_name;
 
+  // Snapshot sequence numbers in strictly increasing order.
   std::vector<SequenceNumber> snapshots;
 
   // SST files for compaction, it should already be expended to include all the
@@ -590,6 +612,18 @@ struct CompactionServiceInput {
 
   uint64_t options_file_number = 0;
 
+  // MANIFEST position (file number and size, in bytes) the primary scheduled
+  // this compaction from, used as a floor by the remote worker: it refuses to
+  // reconstruct the compaction against an older MANIFEST view (an older file
+  // number, or the same file number read to a smaller size) and falls back to
+  // local compaction. A non-zero min_manifest_file_number also signals the
+  // worker to use "trust the MANIFEST" recovery. Zero means the primary did not
+  // provide a floor (kill switch off, or an older primary); the worker then
+  // uses the original recovery with no floor check.
+  // See DBOptions::remote_compaction_manifest_floor.
+  uint64_t min_manifest_file_number = 0;
+  uint64_t min_manifest_file_size = 0;
+
   // serialization interface to read and write the object
   static Status Read(const std::string& data_str, CompactionServiceInput* obj);
   Status Write(std::string* output);
@@ -608,7 +642,7 @@ struct CompactionServiceOutputFile {
   SequenceNumber largest_seqno{};
   std::string smallest_internal_key;
   std::string largest_internal_key;
-  uint64_t oldest_ancester_time = kUnknownOldestAncesterTime;
+  uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
   uint64_t file_creation_time = kUnknownFileCreationTime;
   uint64_t epoch_number = kUnknownEpochNumber;
   std::string file_checksum = kUnknownFileChecksum;
@@ -624,7 +658,7 @@ struct CompactionServiceOutputFile {
   CompactionServiceOutputFile(
       const std::string& name, uint64_t size, SequenceNumber smallest,
       SequenceNumber largest, std::string _smallest_internal_key,
-      std::string _largest_internal_key, uint64_t _oldest_ancester_time,
+      std::string _largest_internal_key, uint64_t _oldest_ancestor_time,
       uint64_t _file_creation_time, uint64_t _epoch_number,
       const std::string& _file_checksum,
       const std::string& _file_checksum_func_name, uint64_t _paranoid_hash,
@@ -637,7 +671,7 @@ struct CompactionServiceOutputFile {
         largest_seqno(largest),
         smallest_internal_key(std::move(_smallest_internal_key)),
         largest_internal_key(std::move(_largest_internal_key)),
-        oldest_ancester_time(_oldest_ancester_time),
+        oldest_ancestor_time(_oldest_ancestor_time),
         file_creation_time(_file_creation_time),
         epoch_number(_epoch_number),
         file_checksum(_file_checksum),
@@ -728,6 +762,7 @@ class CompactionServiceCompactionJob : private CompactionJob {
  private:
   // Get table file name in output_path
   std::string GetTableFileName(uint64_t file_number) override;
+  bool IsRemoteCompaction() const override { return true; }
   // Specific the compaction output path, otherwise it uses default DB path
   const std::string output_path_;
 

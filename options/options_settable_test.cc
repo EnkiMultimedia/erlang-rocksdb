@@ -184,7 +184,9 @@ TEST_F(OptionsSettableTest, BlockBasedTableOptionsAllFieldsSettable) {
       "index_type=kHashSearch;"
       "index_block_search_type=kBinary;"
       "data_block_index_type=kDataBlockBinaryAndHash;"
+      "optimize_key_common_prefix=kEnabled;"
       "index_shortening=kNoShortening;"
+      "index_mode=kCustomDefault;"
       "data_block_hash_table_util_ratio=0.75;"
       "checksum=kxxHash;no_block_cache=1;"
       "block_cache=1M;block_cache_compressed=1k;block_size=1024;"
@@ -208,6 +210,7 @@ TEST_F(OptionsSettableTest, BlockBasedTableOptionsAllFieldsSettable) {
       "initial_auto_readahead_size=0;"
       "num_file_reads_for_auto_readahead=0;"
       "fail_if_no_udi_on_open=true;"
+      "use_udi_as_primary_index=true;"
       "separate_key_value_in_data_block=true;"
       "uniform_cv_threshold=0.2",
       new_bbto));
@@ -279,7 +282,9 @@ TEST_F(OptionsSettableTest, TablePropertiesAllFieldsSettable) {
       "7265616461626C655F76616C7565;};compression_options=;compression_name=;"
       "property_collectors_names=;prefix_extractor_name=;db_host_id="
       "64625F686F73745F6964;db_session_id=64625F73657373696F6E5F6964;creation_"
-      "time=0;num_data_blocks=123;index_value_is_delta_encoded=0;top_level_"
+      "time=0;num_data_blocks=123;num_data_blocks_compression_rejected=42;"
+      "num_data_blocks_compression_bypassed=7;"
+      "index_value_is_delta_encoded=0;top_level_"
       "index_size=0;data_size=100;uncompressed_data_size=1234;"
       "merge_operator_name=;index_partitions=0;file_"
       "creation_time=0;raw_value_size=0;index_size=200;user_collected_"
@@ -288,15 +293,18 @@ TEST_F(OptionsSettableTest, TablePropertiesAllFieldsSettable) {
       "size=0;filter_size=0;orig_file_number=3;num_deletions=0;num_range_"
       "deletions=0;format_version=0;comparator_name="
       "636F6D70617261746F725F6E616D65;num_filter_entries=0;db_id="
-      "64625F686F73745F6964;column_family_id=2147483647;fixed_key_len=0;fast_"
+      "64625F686F73745F6964;"
+      "column_family_id=2147483647;fixed_key_len=0;fast_"
       "compression_estimated_data_size=0;filter_policy_name="
       "66696C7465725F706F6C6963795F6E616D65;oldest_key_time=0;newest_key_time="
       "0;column_family_"
       "name=64656661756C74;user_defined_timestamps_persisted=1;num_entries=100;"
-      "external_sst_file_global_seqno_offset=0;num_merge_operands=0;index_key_"
-      "is_user_key=0;key_largest_seqno=18446744073709551615;key_smallest_seqno="
+      "num_merge_operands=0;index_key_is_user_key=0;key_largest_seqno="
+      "18446744073709551615;key_smallest_seqno="
       "18;data_block_restart_interval=16;index_block_restart_interval=1;"
-      "separate_key_value_in_data_block=0;",
+      "separate_key_value_in_data_block=0;num_uniform_blocks=0;"
+      "lsm_info_at_creation=513;"
+      "udi_is_primary_index=0;",
       new_tp));
 
   // All bytes are set from the parse
@@ -351,6 +359,8 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
        sizeof(FileTypeSet)},
       {offsetof(struct DBOptions, compaction_service),
        sizeof(std::shared_ptr<CompactionService>)},
+      {offsetof(struct DBOptions, use_session_tmp_dir_for_remote_compaction),
+       sizeof(bool)},
       {offsetof(struct DBOptions, daily_offpeak_time_utc), sizeof(std::string)},
       {offsetof(struct DBOptions, calculate_sst_write_lifetime_hint_set),
        sizeof(CompactionStyleSet)},
@@ -402,6 +412,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "table_cache_numshardbits=28;"
       "max_open_files=72;"
       "max_file_opening_threads=35;"
+      "read_io_executor_threads=7;"
       "max_background_jobs=8;"
       "max_background_compactions=33;"
       "use_fsync=true;"
@@ -421,11 +432,13 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "track_and_verify_wals_in_manifest=true;"
       "track_and_verify_wals=true;"
       "verify_sst_unique_id_in_manifest=true;"
+      "fast_sst_open=true;"
       "is_fd_close_on_exec=false;"
       "bytes_per_sync=4295013613;"
       "strict_bytes_per_sync=true;"
       "enable_thread_tracking=false;"
       "recycle_log_file_num=0;"
+      "async_wal_precreate=true;"
       "create_missing_column_families=true;"
       "log_file_time_to_roll=3097;"
       "max_background_flushes=35;"
@@ -441,6 +454,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "allow_fallocate=true;"
       "allow_mmap_reads=false;"
       "use_direct_reads=false;"
+      "use_direct_io_for_compaction_reads=false;"
       "use_direct_io_for_flush_and_compaction=false;"
       "max_log_file_size=4607;"
       "advise_random_on_open=true;"
@@ -468,6 +482,8 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "avoid_unnecessary_blocking_io=false;"
       "log_readahead_size=0;"
       "write_dbid_to_manifest=false;"
+      "track_options_file_number_in_manifest=true;"
+      "optimize_manifest_for_recovery=false;"
       "best_efforts_recovery=false;"
       "max_bgerror_resume_count=2;"
       "bgerror_resume_retry_interval=1000000;"
@@ -476,6 +492,8 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "allow_data_in_errors=false;"
       "enforce_single_del_contracts=false;"
       "daily_offpeak_time_utc=08:30-19:00;"
+      "max_compaction_trigger_wakeup_seconds=43200;"
+      "periodic_compaction_phase_recovery_percent=25;"
       "follower_refresh_catchup_period_ms=123;"
       "follower_catchup_retry_count=456;"
       "follower_catchup_retry_wait_ms=789;"
@@ -483,9 +501,14 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "wal_write_temperature=kHot;"
       "background_close_inactive_wals=true;"
       "write_dbid_to_manifest=true;"
+      "optimize_manifest_for_recovery=true;"
       "write_identity_file=true;"
       "verify_manifest_content_on_close=false;"
-      "prefix_seek_opt_in_only=true;",
+      "prefix_seek_opt_in_only=true;"
+      "fast_sst_open=true;"
+      "remote_compaction_manifest_floor=false;"
+      "use_session_tmp_dir_for_remote_compaction=true;"
+      "reuse_manifest_on_open=true;",
       new_options));
 
   ASSERT_EQ(unset_bytes_base, NumUnsetBytes(new_options_ptr, sizeof(DBOptions),
@@ -534,8 +557,13 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
        sizeof(uint64_t)},
       {offsetof(struct ColumnFamilyOptions, preserve_internal_time_seconds),
        sizeof(uint64_t)},
+      {offsetof(struct ColumnFamilyOptions, blob_compression_opts),
+       sizeof(CompressionOptions)},
       {offsetof(struct ColumnFamilyOptions, blob_cache),
        sizeof(std::shared_ptr<Cache>)},
+      {offsetof(struct ColumnFamilyOptions,
+                blob_direct_write_partition_strategy),
+       sizeof(std::shared_ptr<BlobFilePartitionStrategy>)},
       {offsetof(struct ColumnFamilyOptions, comparator), sizeof(Comparator*)},
       {offsetof(struct ColumnFamilyOptions, merge_operator),
        sizeof(std::shared_ptr<MergeOperator>)},
@@ -627,11 +655,13 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "compression_opts={max_dict_buffer_bytes=5;use_zstd_dict_trainer=true;"
       "enabled=false;parallel_threads=6;zstd_max_train_bytes=7;strategy=8;max_"
       "dict_bytes=9;level=10;window_bits=11;max_compressed_bytes_per_kb=987;"
+      "auto_skip=true;auto_skip_min_sample_every=17;"
       "checksum=true};"
       "bottommost_compression_opts={max_dict_buffer_bytes=4;use_zstd_dict_"
       "trainer=true;enabled=true;parallel_threads=5;zstd_max_train_bytes=6;"
       "strategy=7;max_dict_bytes=8;level=9;window_bits=10;max_compressed_bytes_"
-      "per_kb=876;checksum=true};"
+      "per_kb=876;auto_skip=true;auto_skip_min_sample_"
+      "every=23;checksum=true};"
       "bottommost_compression=kDisableCompressionOption;"
       "compression_manager=BuiltinV2;"
       "level0_stop_writes_trigger=33;"
@@ -662,16 +692,26 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "disallow_memtable_writes=true;"
       "ttl=60;"
       "periodic_compaction_seconds=3600;"
+      "read_triggered_compaction_threshold=0.5;"
       "sample_for_compression=0;"
       "enable_blob_files=true;"
+      "enable_blob_direct_write=true;"
       "min_blob_size=256;"
       "blob_file_size=1000000;"
+      "blob_file_writable_file_max_buffer_size=131072;"
       "blob_compression_type=kBZip2Compression;"
+      "blob_compression_opts={window_bits=-14;level=1;strategy=0;max_dict_"
+      "bytes=0;"
+      "zstd_max_train_bytes=0;enabled=true;parallel_threads=1;"
+      "max_dict_buffer_bytes=0;use_zstd_dict_trainer=true;"
+      "max_compressed_bytes_per_kb=896;auto_skip=false;"
+      "auto_skip_min_sample_every=0;checksum=false};"
       "enable_blob_garbage_collection=true;"
       "blob_garbage_collection_age_cutoff=0.5;"
       "blob_garbage_collection_force_threshold=0.75;"
       "blob_compaction_readahead_size=262144;"
       "blob_file_starting_level=1;"
+      "blob_direct_write_partitions=3;"
       "prepopulate_blob_cache=kDisable;"
       "bottommost_temperature=kWarm;"
       "last_level_temperature=kWarm;"
@@ -691,9 +731,10 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "bottommost_file_compaction_delay=7200;"
       "uncache_aggressiveness=1234;"
       "paranoid_memory_checks=1;"
-      "memtable_veirfy_per_key_checksum_on_seek=1;"
+      "memtable_verify_per_key_checksum_on_seek=1;"
       "memtable_op_scan_flush_trigger=123;"
       "memtable_avg_op_scan_flush_trigger=12;"
+      "min_tombstones_for_range_conversion=8;"
       "cf_allow_ingest_behind=1;"
       "memtable_batch_lookup_optimization=1;"
       "verify_output_flags=2053;",
@@ -707,6 +748,9 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
 
   // Custom verification since compaction_options_fifo was in
   // kColumnFamilyOptionsExcluded
+  ASSERT_TRUE(new_options->enable_blob_direct_write);
+  ASSERT_EQ(new_options->blob_direct_write_partitions, 3U);
+  ASSERT_EQ(new_options->blob_file_writable_file_max_buffer_size, 131072U);
   ASSERT_EQ(new_options->compaction_options_fifo.max_table_files_size, 3);
   ASSERT_EQ(new_options->compaction_options_fifo.allow_compaction, true);
   ASSERT_EQ(new_options->compaction_options_fifo.file_temperature_age_thresholds
