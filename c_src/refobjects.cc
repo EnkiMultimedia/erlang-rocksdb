@@ -103,7 +103,11 @@ ErlRefObject::InitiateCloseRequest(
 
     // special handling since destructor may have been called
     if (NULL!=Object && 0==Object->m_CloseRequested)
+    {
+        // same lock as TryRefInc, see there
+        std::lock_guard<std::mutex> lk(*Object->m_CloseMutex);
         ret_flag=erocksdb::compare_and_swap(Object->m_CloseRequested, 0u, 1u);
+    }
 
     // vtable is still good, this thread is initiating close
     //   ask object to clean-up
@@ -115,6 +119,17 @@ ErlRefObject::InitiateCloseRequest(
     return(ret_flag);
 
 }   // ErlRefObject::InitiateCloseRequest
+
+
+bool
+ErlRefObject::TryRefInc()
+{
+    std::lock_guard<std::mutex> lk(*m_CloseMutex);
+    if (0!=m_CloseRequested)
+        return false;
+    RefInc();
+    return true;
+}   // ErlRefObject::TryRefInc
 
 
 void
@@ -941,6 +956,12 @@ ItrObject::~ItrObject() {
     delete m_Iterator;
     //m_Iterator = nullptr;
 
+    // the snapshot is released only once the iterator is gone
+    SnapshotObject * snapshot = m_SnapshotPtr.get();
+    m_SnapshotPtr.assign(NULL);
+    if (snapshot != nullptr)
+        enif_release_resource(snapshot);
+
     // release any resources (column family, transaction) pinned for this
     // iterator's lifetime. Done after deleting the iterator, which still
     // references them.
@@ -951,6 +972,15 @@ ItrObject::~ItrObject() {
     return;
 
 }   // ItrObject::~ItrObject
+
+
+void
+ItrObject::KeepSnapshot(SnapshotObject * Snapshot) {
+    if (Snapshot == nullptr || m_SnapshotPtr.get() != nullptr)
+        return;
+    enif_keep_resource(Snapshot);
+    m_SnapshotPtr.assign(Snapshot);
+}   // ItrObject::KeepSnapshot
 
 
 void

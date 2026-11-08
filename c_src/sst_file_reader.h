@@ -20,6 +20,7 @@
 #include <memory>
 
 #include "erl_nif.h"
+#include "env.h"
 
 namespace rocksdb {
     class SstFileReader;
@@ -32,6 +33,8 @@ namespace erocksdb {
       static ErlNifResourceType* m_SstFileReader_RESOURCE;
 
     public:
+      // Declared before reader_ so the env outlives the reader.
+      EnvRef m_Env;
 
       explicit SstFileReaderObject(std::unique_ptr<rocksdb::SstFileReader> reader);
 

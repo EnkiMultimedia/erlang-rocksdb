@@ -164,20 +164,7 @@ parse_db_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::DBOptions& opts)
 
         if (option[0] == erocksdb::ATOM_ENV)
         {
-            if (enif_is_atom(env, option[1]))
-            {
-                if(option[1] == erocksdb::ATOM_MEMENV)
-                {
-                    auto memenv = rocksdb::NewMemEnv(rocksdb::Env::Default());
-                    memenv->CreateDir("test");
-                    opts.env = memenv;
-                    opts.create_if_missing = true;
-                }
-            } else {
-                erocksdb::ManagedEnv* env_ptr = erocksdb::ManagedEnv::RetrieveEnvResource(env, option[1]);
-                if(NULL!=env_ptr)
-                    opts.env = (rocksdb::Env*)env_ptr->env();
-            }
+            // handled by ResolveEnvOption, which ties the env lifetime to its user
         }
         else if (option[0] == erocksdb::ATOM_STATISTICS)
         {
@@ -386,13 +373,7 @@ parse_db_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::DBOptions& opts)
         }
         else if (option[0] == erocksdb::ATOM_IN_MEMORY)
         {
-            if (option[1] == erocksdb::ATOM_TRUE)
-            {
-                auto memenv = rocksdb::NewMemEnv(rocksdb::Env::Default());
-                memenv->CreateDir("test");
-                opts.env = memenv;
-                opts.create_if_missing = true;
-            }
+            // handled by ResolveEnvOption, which ties the env lifetime to its user
         }
         else if (option[0] == erocksdb::ATOM_RATE_LIMITER)
         {
@@ -1117,13 +1098,7 @@ ERL_NIF_TERM parse_read_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ReadO
             opts.total_order_seek = (option[1] == erocksdb::ATOM_TRUE);
         else if (option[0] == erocksdb::ATOM_SNAPSHOT)
         {
-            erocksdb::ReferencePtr<erocksdb::SnapshotObject> snapshot_ptr;
-            snapshot_ptr.assign(erocksdb::SnapshotObject::RetrieveSnapshotObject(env, option[1]));
-
-            if(NULL==snapshot_ptr.get())
-                return erocksdb::ATOM_BADARG;
-
-            opts.snapshot = snapshot_ptr->m_Snapshot;
+            // set by pin_read_snapshot, which keeps the snapshot alive
         }
         else if (option[0] == erocksdb::ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT)
             opts.auto_refresh_iterator_with_snapshot = (option[1] == erocksdb::ATOM_TRUE);
@@ -1138,6 +1113,26 @@ ERL_NIF_TERM parse_read_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ReadO
     }
 
     return erocksdb::ATOM_OK;
+}
+
+bool
+pin_read_snapshot(ErlNifEnv* env, ERL_NIF_TERM options, rocksdb::ReadOptions& opts,
+                  erocksdb::ReferencePtr<erocksdb::SnapshotObject>* pin)
+{
+    ERL_NIF_TERM head, tail = options;
+    while (enif_get_list_cell(env, tail, &head, &tail))
+    {
+        int arity;
+        const ERL_NIF_TERM* option;
+        if (enif_get_tuple(env, head, &arity, &option) && 2 == arity
+            && option[0] == erocksdb::ATOM_SNAPSHOT)
+        {
+            if (!pin->try_assign(erocksdb::SnapshotObject::RetrieveSnapshotObject(env, option[1])))
+                return false;
+            opts.snapshot = (*pin)->m_Snapshot;
+        }
+    }
+    return true;
 }
 
 ERL_NIF_TERM parse_write_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::WriteOptions& opts)
@@ -1279,6 +1274,8 @@ Open(
     // parse db options
     rocksdb::DBOptions *db_opts = new rocksdb::DBOptions;
     fold(env, argv[1], parse_db_option, *db_opts);
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[1], *db_opts, &env_ref);
 
     // parse column family options
     rocksdb::ColumnFamilyOptions *cf_opts = new rocksdb::ColumnFamilyOptions;
@@ -1304,6 +1301,7 @@ Open(
 
     db = db_uptr.release();
     db_ptr = DbObject::CreateDbObject(std::move(db));
+    db_ptr->m_Env.Swap(env_ref);
     ERL_NIF_TERM result = enif_make_resource(env, db_ptr);
     enif_release_resource(db_ptr);
     return enif_make_tuple2(env, ATOM_OK, result);
@@ -1349,6 +1347,8 @@ OpenWithCf(
     // read db options
     rocksdb::DBOptions db_opts;
     fold(env, argv[1], parse_db_option, db_opts);
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[1], db_opts, &env_ref);
 
     std::vector<rocksdb::ColumnFamilyDescriptor> column_families;
     ERL_NIF_TERM head, tail = argv[2];
@@ -1377,6 +1377,7 @@ OpenWithCf(
 
     db = db_uptr.release();
     db_ptr = DbObject::CreateDbObject(std::move(db));
+    db_ptr->m_Env.Swap(env_ref);
 
     ERL_NIF_TERM result = enif_make_resource(env, db_ptr);
 
@@ -1453,6 +1454,8 @@ OpenWithTTL(
     // parse db options
     rocksdb::DBOptions *db_opts = new rocksdb::DBOptions;
     fold(env, argv[1], parse_db_option, *db_opts);
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[1], *db_opts, &env_ref);
 
     // parse column family options
     rocksdb::ColumnFamilyOptions *cf_opts = new rocksdb::ColumnFamilyOptions;
@@ -1469,6 +1472,8 @@ OpenWithTTL(
         return error_tuple(env, ATOM_ERROR_DB_OPEN, status);
 
     db_ptr = DbObject::CreateDbObject(std::move(db), false, true);  // IsPessimistic=false, IsTTL=true
+
+    db_ptr->m_Env.Swap(env_ref);
     ERL_NIF_TERM result = enif_make_resource(env, db_ptr);
     enif_release_resource(db_ptr);
     return enif_make_tuple2(env, ATOM_OK, result);
@@ -1494,6 +1499,8 @@ OpenOptimisticTransactionDB(
     // read db options
     rocksdb::DBOptions db_opts;
     fold(env, argv[1], parse_db_option, db_opts);
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[1], db_opts, &env_ref);
 
     std::vector<rocksdb::ColumnFamilyDescriptor> column_families;
     ERL_NIF_TERM head, tail = argv[2];
@@ -1514,6 +1521,8 @@ OpenOptimisticTransactionDB(
         return error_tuple(env, ATOM_ERROR_DB_OPEN, status);
 
     db_ptr = DbObject::CreateDbObject(std::move(db));
+
+    db_ptr->m_Env.Swap(env_ref);
 
     ERL_NIF_TERM result = enif_make_resource(env, db_ptr);
 
@@ -1571,7 +1580,7 @@ GetProperty(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ReferencePtr<DbObject> db_ptr;
     ReferencePtr<ColumnFamilyObject> cf_ptr;
 
-    db_ptr.assign(DbObject::RetrieveDbObject(env, argv[0]));
+    db_ptr.try_assign(DbObject::RetrieveDbObject(env, argv[0]));
     if(NULL==db_ptr.get())
         return enif_make_badarg(env);
 
@@ -1579,7 +1588,7 @@ GetProperty(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     {
       name_ref = argv[2];
       // we use a column family assign the value
-      cf_ptr.assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, argv[1]));
+      cf_ptr.try_assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, argv[1]));
     }
     else
     {
@@ -1632,6 +1641,12 @@ Get(
 
     rocksdb::ReadOptions *opts = new rocksdb::ReadOptions();
     fold(env, argv[i+1], parse_read_option, *opts);
+    ReferencePtr<SnapshotObject> snapshot_pin;
+    if (!pin_read_snapshot(env, argv[i+1], *opts, &snapshot_pin))
+    {
+        delete opts;
+        return enif_make_badarg(env);
+    }
 
     rocksdb::Status status;
     rocksdb::PinnableSlice pvalue;
@@ -1728,6 +1743,11 @@ MultiGet(
     // Parse read options
     rocksdb::ReadOptions opts;
     fold(env, argv[opts_idx], parse_read_option, opts);
+    ReferencePtr<SnapshotObject> snapshot_pin;
+    if (!pin_read_snapshot(env, argv[opts_idx], opts, &snapshot_pin))
+    {
+        return enif_make_badarg(env);
+    }
 
     // Call MultiGet
     db_ptr->m_Db->MultiGet(opts, cfh, num_keys, keys.data(), values.data(), statuses.data());
@@ -1973,6 +1993,8 @@ Destroy(
     rocksdb::DBOptions db_opts;
     rocksdb::ColumnFamilyOptions cf_opts;
     fold(env, argv[1], parse_db_option, db_opts);
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[1], db_opts, &env_ref);
     fold(env, argv[1], parse_cf_option, cf_opts);
     rocksdb::Options *opts = new rocksdb::Options(db_opts, cf_opts);
 
@@ -2002,6 +2024,8 @@ Repair(
     rocksdb::DBOptions db_opts;
     rocksdb::ColumnFamilyOptions cf_opts;
     fold(env, argv[1], parse_db_option, db_opts);
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[1], db_opts, &env_ref);
     fold(env, argv[1], parse_cf_option, cf_opts);
     rocksdb::Options opts(db_opts, cf_opts);
 
@@ -2707,6 +2731,11 @@ GetEntity(
 
     rocksdb::ReadOptions opts;
     fold(env, argv[opts_idx], parse_read_option, opts);
+    ReferencePtr<SnapshotObject> snapshot_pin;
+    if (!pin_read_snapshot(env, argv[opts_idx], opts, &snapshot_pin))
+    {
+        return enif_make_badarg(env);
+    }
 
     rocksdb::PinnableWideColumns columns;
     rocksdb::Status status;
@@ -2812,6 +2841,8 @@ OpenPessimisticTransactionDB(
     // Read DB options
     rocksdb::DBOptions db_opts;
     fold(env, argv[1], parse_db_option, db_opts);
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[1], db_opts, &env_ref);
 
     // Read TransactionDB options from the same list
     rocksdb::TransactionDBOptions txn_db_opts;
@@ -2851,6 +2882,7 @@ OpenPessimisticTransactionDB(
 
     // Create DbObject with IsPessimistic = true
     db_ptr = DbObject::CreateDbObject(db, true);
+    db_ptr->m_Env.Swap(env_ref);
 
     ERL_NIF_TERM result = enif_make_resource(env, db_ptr);
 
@@ -3206,7 +3238,7 @@ CommitIngestion(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
     std::vector<ReferencePtr<IngestionObject>> objects(terms.size());
     for (size_t n = 0; n < terms.size(); n++)
     {
-        objects[n].assign(IngestionObject::RetrieveIngestionObject(env, terms[n]));
+        objects[n].try_assign(IngestionObject::RetrieveIngestionObject(env, terms[n]));
         if (NULL == objects[n].get() || objects[n]->m_DbPtr.get() != db_ptr.get())
             return enif_make_badarg(env);
     }
@@ -3243,7 +3275,7 @@ ERL_NIF_TERM
 AbortIngestion(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
 {
     ReferencePtr<IngestionObject> ingestion_ptr;
-    ingestion_ptr.assign(IngestionObject::RetrieveIngestionObject(env, argv[0]));
+    ingestion_ptr.try_assign(IngestionObject::RetrieveIngestionObject(env, argv[0]));
     if (NULL == ingestion_ptr.get())
         return enif_make_badarg(env);
 
@@ -3270,18 +3302,16 @@ GetTtl(
     int /*argc*/,
     const ERL_NIF_TERM argv[])
 {
-    DbObject* db_ptr;
-    ColumnFamilyObject* cf_ptr;
+    ReferencePtr<DbObject> db_ptr;
+    ReferencePtr<ColumnFamilyObject> cf_ptr;
 
-    db_ptr = DbObject::RetrieveDbObject(env, argv[0]);
-    if (nullptr == db_ptr)
+    if (!enif_get_db(env, argv[0], &db_ptr))
         return enif_make_badarg(env);
 
     if (!db_ptr->m_IsTTL)
         return error_tuple(env, ATOM_ERROR, "not a TTL database");
 
-    cf_ptr = ColumnFamilyObject::RetrieveColumnFamilyObject(env, argv[1]);
-    if (nullptr == cf_ptr)
+    if (!enif_get_cf(env, argv[1], &cf_ptr))
         return enif_make_badarg(env);
 
     rocksdb::DBWithTTL* ttl_db = static_cast<rocksdb::DBWithTTL*>(db_ptr->m_Db);
@@ -3301,11 +3331,10 @@ SetTtl(
     int argc,
     const ERL_NIF_TERM argv[])
 {
-    DbObject* db_ptr;
+    ReferencePtr<DbObject> db_ptr;
     int ttl;
 
-    db_ptr = DbObject::RetrieveDbObject(env, argv[0]);
-    if (nullptr == db_ptr)
+    if (!enif_get_db(env, argv[0], &db_ptr))
         return enif_make_badarg(env);
 
     if (!db_ptr->m_IsTTL)
@@ -3321,8 +3350,8 @@ SetTtl(
         ttl_db->SetTtl(ttl);
     } else {
         // set_ttl(Db, CF, TTL) - set TTL for column family
-        ColumnFamilyObject* cf_ptr = ColumnFamilyObject::RetrieveColumnFamilyObject(env, argv[1]);
-        if (nullptr == cf_ptr)
+        ReferencePtr<ColumnFamilyObject> cf_ptr;
+        if (!enif_get_cf(env, argv[1], &cf_ptr))
             return enif_make_badarg(env);
 
         if (!enif_get_int(env, argv[2], &ttl))
@@ -3357,6 +3386,8 @@ OpenWithTTLCf(
     // parse db options
     rocksdb::DBOptions db_opts;
     fold(env, argv[1], parse_db_option, db_opts);
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[1], db_opts, &env_ref);
 
     // parse column families with TTLs
     std::vector<rocksdb::ColumnFamilyDescriptor> column_families;
@@ -3401,6 +3432,8 @@ OpenWithTTLCf(
 
     db_ptr = DbObject::CreateDbObject(db, false, true);  // IsPessimistic=false, IsTTL=true
 
+    db_ptr->m_Env.Swap(env_ref);
+
     // Create column family handles list
     ERL_NIF_TERM cf_list = enif_make_list(env, 0);
     for (auto it = handles.rbegin(); it != handles.rend(); ++it)
@@ -3424,12 +3457,11 @@ CreateColumnFamilyWithTtl(
     int /*argc*/,
     const ERL_NIF_TERM argv[])
 {
-    DbObject* db_ptr;
+    ReferencePtr<DbObject> db_ptr;
     char cf_name[4096];
     int ttl;
 
-    db_ptr = DbObject::RetrieveDbObject(env, argv[0]);
-    if (nullptr == db_ptr)
+    if (!enif_get_db(env, argv[0], &db_ptr))
         return enif_make_badarg(env);
 
     if (!db_ptr->m_IsTTL)
@@ -3455,7 +3487,7 @@ CreateColumnFamilyWithTtl(
     if (!status.ok())
         return error_tuple(env, ATOM_ERROR, status);
 
-    ColumnFamilyObject* cf_ptr = ColumnFamilyObject::CreateColumnFamilyObject(db_ptr, handle);
+    ColumnFamilyObject* cf_ptr = ColumnFamilyObject::CreateColumnFamilyObject(db_ptr.get(), handle);
     ERL_NIF_TERM cf_term = enif_make_resource(env, cf_ptr);
     enif_release_resource(cf_ptr);
 

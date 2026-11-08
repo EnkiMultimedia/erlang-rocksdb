@@ -43,6 +43,8 @@ ListColumnFamilies(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
     // parse main db options
     rocksdb::DBOptions db_opts;
     fold(env, argv[1], parse_db_option, db_opts);
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[1], db_opts, &env_ref);
 
     std::vector<std::string> column_family_names;
 

@@ -115,7 +115,7 @@ namespace erocksdb {
 
             bool is_tombstone = (flag != 0);
 
-            if (ptr + len > end) break;
+            if (static_cast<size_t>(len) > static_cast<size_t>(end - ptr)) break;
 
             std::string key(ptr, len);
             ptr += len;
@@ -136,7 +136,7 @@ namespace erocksdb {
         ptr += 1;
 
         // Read bitmap size
-        if (ptr + 4 > end) return;
+        if (static_cast<size_t>(4) > static_cast<size_t>(end - ptr)) return;
         uint32_t bitmap_size = (static_cast<uint8_t>(ptr[0]) << 24) |
                                (static_cast<uint8_t>(ptr[1]) << 16) |
                                (static_cast<uint8_t>(ptr[2]) << 8) |
@@ -144,11 +144,11 @@ namespace erocksdb {
         ptr += 4;
 
         // Skip bitmap data (we don't need it for parsing keys)
-        if (ptr + bitmap_size > end) return;
+        if (bitmap_size > static_cast<size_t>(end - ptr)) return;
         ptr += bitmap_size;
 
         // Read key count
-        if (ptr + 4 > end) return;
+        if (static_cast<size_t>(4) > static_cast<size_t>(end - ptr)) return;
         uint32_t key_count = (static_cast<uint8_t>(ptr[0]) << 24) |
                              (static_cast<uint8_t>(ptr[1]) << 16) |
                              (static_cast<uint8_t>(ptr[2]) << 8) |
@@ -163,7 +163,7 @@ namespace erocksdb {
                            static_cast<uint8_t>(ptr[3]);
             ptr += 4;
 
-            if (ptr + len > end) break;
+            if (static_cast<size_t>(len) > static_cast<size_t>(end - ptr)) break;
 
             std::string key(ptr, len);
             ptr += len;

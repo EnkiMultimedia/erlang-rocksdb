@@ -182,6 +182,11 @@ PessimisticTransactionGet(ErlNifEnv* env,
 
     rocksdb::ReadOptions opts;
     fold(env, argv[opts_idx], parse_read_option, opts);
+    ReferencePtr<SnapshotObject> snapshot_pin;
+    if (!pin_read_snapshot(env, argv[opts_idx], opts, &snapshot_pin))
+    {
+        return enif_make_badarg(env);
+    }
 
     rocksdb::PinnableSlice pvalue;
     rocksdb::Status status;
@@ -239,6 +244,11 @@ PessimisticTransactionGetForUpdate(ErlNifEnv* env,
 
     rocksdb::ReadOptions opts;
     fold(env, argv[opts_idx], parse_read_option, opts);
+    ReferencePtr<SnapshotObject> snapshot_pin;
+    if (!pin_read_snapshot(env, argv[opts_idx], opts, &snapshot_pin))
+    {
+        return enif_make_badarg(env);
+    }
 
     rocksdb::PinnableSlice pvalue;
     rocksdb::Status status;
@@ -334,6 +344,11 @@ PessimisticTransactionMultiGet(ErlNifEnv* env,
     // Parse read options
     rocksdb::ReadOptions opts;
     fold(env, argv[opts_idx], parse_read_option, opts);
+    ReferencePtr<SnapshotObject> snapshot_pin;
+    if (!pin_read_snapshot(env, argv[opts_idx], opts, &snapshot_pin))
+    {
+        return enif_make_badarg(env);
+    }
 
     // Call MultiGet on transaction (without locking)
     std::vector<rocksdb::ColumnFamilyHandle*> cfs(num_keys, cfh);
@@ -427,6 +442,11 @@ PessimisticTransactionMultiGetForUpdate(ErlNifEnv* env,
     // Parse read options
     rocksdb::ReadOptions opts;
     fold(env, argv[opts_idx], parse_read_option, opts);
+    ReferencePtr<SnapshotObject> snapshot_pin;
+    if (!pin_read_snapshot(env, argv[opts_idx], opts, &snapshot_pin))
+    {
+        return enif_make_badarg(env);
+    }
 
     // Call MultiGetForUpdate on transaction - acquires exclusive locks
     std::vector<rocksdb::ColumnFamilyHandle*> cfs(num_keys, cfh);
@@ -563,7 +583,7 @@ ReleasePessimisticTransaction(ErlNifEnv* env,
 {
     const ERL_NIF_TERM& handle_ref = argv[0];
     ReferencePtr<TransactionObject> tx_ptr;
-    tx_ptr.assign(TransactionObject::RetrieveTransactionObject(env, handle_ref));
+    tx_ptr.try_assign(TransactionObject::RetrieveTransactionObject(env, handle_ref));
 
     if(NULL == tx_ptr.get())
         return ATOM_OK;
@@ -620,6 +640,8 @@ PessimisticTransactionIterator(ErlNifEnv* env,
     }
 
     itr_ptr = ItrObject::CreateItrObject(tx_ptr->m_DbPtr.get(), itr_env, iterator);
+
+    itr_ptr->KeepSnapshot(bounds.snapshot.get());
 
     if(bounds.upper_bound_slice != nullptr)
         itr_ptr->SetUpperBoundSlice(bounds.upper_bound_slice);

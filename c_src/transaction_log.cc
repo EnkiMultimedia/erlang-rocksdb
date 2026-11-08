@@ -96,7 +96,7 @@ TransactionLogNextUpdate(
     const ERL_NIF_TERM& itr_handle_ref   = argv[0];
 
     ReferencePtr<TLogItrObject> itr_ptr;
-    itr_ptr.assign(TLogItrObject::RetrieveTLogItrObject(env, itr_handle_ref));
+    itr_ptr.try_assign(TLogItrObject::RetrieveTLogItrObject(env, itr_handle_ref));
 
     if(NULL==itr_ptr.get())
     {
@@ -142,7 +142,7 @@ TransactionLogNextBinaryUpdate(
     const ERL_NIF_TERM& itr_handle_ref = argv[0];
 
     ReferencePtr<TLogItrObject> itr_ptr;
-    itr_ptr.assign(TLogItrObject::RetrieveTLogItrObject(env, itr_handle_ref));
+    itr_ptr.try_assign(TLogItrObject::RetrieveTLogItrObject(env, itr_handle_ref));
 
     if(NULL==itr_ptr.get())
     {
