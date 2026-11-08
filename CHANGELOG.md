@@ -29,6 +29,8 @@
 
 ### Changes
 
+- the bundled zstd is now really used to build RocksDB: before, RocksDB looked for zstd on its own and could compile against the system headers while the NIF linked the bundled library. A clean parallel build could also fail when RocksDB started before the bundled zstd was ready (#21)
+- new build option `WITH_STATIC_ZSTD` links a static system zstd into the NIF, so it has no `libzstd` runtime dependency. Off by default, the system archive must be built with `-fPIC` (#21)
 - posting list functions run on a dirty scheduler when the posting list is large (over 64 KB, or over 4096 keys for a parsed one), so they no longer hold a normal scheduler for milliseconds. Small lists still run inline.
 - a compaction filter handler that does not answer in time is not asked again for the rest of that compaction, the remaining keys are kept. Before, every key waited the full timeout, so a stuck handler could stall compaction for hours. The handler is asked again at the next compaction.
 - the `batch_size` option of the compaction filter is now documented as having no effect: keys are always sent one per message
