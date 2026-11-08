@@ -182,6 +182,7 @@ SstFileWriterPut(
     if (nullptr == writer_ptr) {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
 
     ErlNifBinary key, value;
     if (!enif_inspect_binary(env, argv[1], &key) ||
@@ -214,6 +215,7 @@ SstFileWriterPutEntity(
     if (nullptr == writer_ptr) {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
 
     ErlNifBinary key;
     if (!enif_inspect_binary(env, argv[1], &key)) {
@@ -275,6 +277,7 @@ SstFileWriterMerge(
     if (nullptr == writer_ptr) {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
 
     ErlNifBinary key, value;
     if (!enif_inspect_binary(env, argv[1], &key) ||
@@ -306,6 +309,7 @@ SstFileWriterDelete(
     if (nullptr == writer_ptr) {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
 
     ErlNifBinary key;
     if (!enif_inspect_binary(env, argv[1], &key)) {
@@ -336,6 +340,7 @@ SstFileWriterDeleteRange(
     if (nullptr == writer_ptr) {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
 
     ErlNifBinary begin_key, end_key;
     if (!enif_inspect_binary(env, argv[1], &begin_key) ||
@@ -367,6 +372,7 @@ SstFileWriterFinish(
     if (nullptr == writer_ptr) {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
 
     bool with_file_info = false;
     if (argc > 1 && argv[1] == ATOM_WITH_FILE_INFO) {
@@ -446,6 +452,7 @@ SstFileWriterFileSize(
     if (nullptr == writer_ptr) {
         return enif_make_badarg(env);
     }
+    std::lock_guard<std::mutex> writer_lock(writer_ptr->m_Mutex);
 
     uint64_t file_size = writer_ptr->writer()->FileSize();
     return enif_make_uint64(env, file_size);

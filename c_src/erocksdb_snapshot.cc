@@ -44,6 +44,8 @@ Snapshot(
     // create snapshot
     snapshot = db_ptr->m_Db->GetSnapshot();
     snapshot_ptr = SnapshotObject::CreateSnapshotObject(db_ptr.get(), snapshot);
+    if (RefuseClosingChild(snapshot_ptr))   // the database is closing
+        return enif_make_badarg(env);
 
     // create a resource reference to send erlang
     ERL_NIF_TERM result = enif_make_resource(env, snapshot_ptr);

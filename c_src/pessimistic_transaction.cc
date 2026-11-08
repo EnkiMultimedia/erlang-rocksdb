@@ -96,6 +96,10 @@ NewPessimisticTransaction(ErlNifEnv* env,
 
     TransactionObject* tx_ptr = TransactionObject::CreateTransactionObject(db_ptr.get(), tx);
 
+    if (RefuseClosingChild(tx_ptr))   // the database is closing
+
+        return enif_make_badarg(env);
+
     ERL_NIF_TERM result = enif_make_resource(env, tx_ptr);
     enif_release_resource(tx_ptr);
 
@@ -112,6 +116,7 @@ PessimisticTransactionPut(ErlNifEnv* env,
 
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     ErlNifBinary key, value;
     rocksdb::Status status;
@@ -166,6 +171,7 @@ PessimisticTransactionGet(ErlNifEnv* env,
 
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     int key_idx = 1;
     int opts_idx = 2;
@@ -228,6 +234,7 @@ PessimisticTransactionGetForUpdate(ErlNifEnv* env,
 
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     int key_idx = 1;
     int opts_idx = 2;
@@ -296,6 +303,7 @@ PessimisticTransactionMultiGet(ErlNifEnv* env,
 
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     // Determine argument positions based on arity
     // argc == 3: pessimistic_transaction_multi_get(Txn, Keys, ReadOpts)
@@ -394,6 +402,7 @@ PessimisticTransactionMultiGetForUpdate(ErlNifEnv* env,
 
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     // Determine argument positions based on arity
     // argc == 3: pessimistic_transaction_multi_get_for_update(Txn, Keys, ReadOpts)
@@ -500,6 +509,7 @@ PessimisticTransactionDelete(ErlNifEnv* env,
 
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     ErlNifBinary key;
     rocksdb::Status status;
@@ -544,6 +554,7 @@ PessimisticTransactionCommit(ErlNifEnv* env,
     ReferencePtr<TransactionObject> tx_ptr;
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     rocksdb::Status status = tx_ptr->m_Tx->Commit();
 
@@ -567,6 +578,7 @@ PessimisticTransactionRollback(ErlNifEnv* env,
     ReferencePtr<TransactionObject> tx_ptr;
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     rocksdb::Status status = tx_ptr->m_Tx->Rollback();
 
@@ -602,6 +614,7 @@ PessimisticTransactionIterator(ErlNifEnv* env,
 
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     int opts_idx = argc - 1;
 
@@ -621,10 +634,10 @@ PessimisticTransactionIterator(ErlNifEnv* env,
 
     ItrObject* itr_ptr;
     rocksdb::Iterator* iterator;
+    ReferencePtr<ColumnFamilyObject> cf_ptr;
 
     if(argc == 3)
     {
-        ReferencePtr<ColumnFamilyObject> cf_ptr;
         if(!enif_get_cf(env, argv[1], &cf_ptr))
         {
             delete bounds.upper_bound_slice;
@@ -642,12 +655,22 @@ PessimisticTransactionIterator(ErlNifEnv* env,
     itr_ptr = ItrObject::CreateItrObject(tx_ptr->m_DbPtr.get(), itr_env, iterator);
 
     itr_ptr->KeepSnapshot(bounds.snapshot.get());
+    // the iterator reads the transaction and its column family
+    itr_ptr->KeepTransaction(tx_ptr.get());
+    if(cf_ptr.get() != nullptr)
+        itr_ptr->KeepColumnFamily(cf_ptr.get());
 
     if(bounds.upper_bound_slice != nullptr)
         itr_ptr->SetUpperBoundSlice(bounds.upper_bound_slice);
 
     if(bounds.lower_bound_slice != nullptr)
         itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
+
+    if (RefuseClosingChild(itr_ptr))   // the database is closing
+    {
+        delete opts;
+        return enif_make_badarg(env);
+    }
 
     ERL_NIF_TERM result = enif_make_resource(env, itr_ptr);
 
@@ -667,6 +690,7 @@ PessimisticTransactionSetSavepoint(ErlNifEnv* env,
     ReferencePtr<TransactionObject> tx_ptr;
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     tx_ptr->m_Tx->SetSavePoint();
 
@@ -681,6 +705,7 @@ PessimisticTransactionRollbackToSavepoint(ErlNifEnv* env,
     ReferencePtr<TransactionObject> tx_ptr;
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     rocksdb::Status status = tx_ptr->m_Tx->RollbackToSavePoint();
 
@@ -702,6 +727,7 @@ PessimisticTransactionPopSavepoint(ErlNifEnv* env,
     ReferencePtr<TransactionObject> tx_ptr;
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
     rocksdb::Status status = tx_ptr->m_Tx->PopSavePoint();
 
@@ -725,6 +751,8 @@ PessimisticTransactionGetId(ErlNifEnv* env,
     ReferencePtr<TransactionObject> tx_ptr;
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    // no transaction lock: RocksDB makes this safe to call while another
+    // process is blocked in the transaction waiting for a row lock
 
     uint64_t id = tx_ptr->m_Tx->GetID();
 
@@ -739,6 +767,8 @@ PessimisticTransactionGetWaitingTxns(ErlNifEnv* env,
     ReferencePtr<TransactionObject> tx_ptr;
     if(!enif_get_transaction(env, argv[0], &tx_ptr))
         return enif_make_badarg(env);
+    // no transaction lock: RocksDB makes this safe to call while another
+    // process is blocked in the transaction waiting for a row lock
 
     uint32_t column_family_id;
     std::string key;

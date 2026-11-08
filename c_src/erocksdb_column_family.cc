@@ -100,6 +100,8 @@ CreateColumnFamily(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[])
     if (status.ok())
     {
         ColumnFamilyObject * handle_ptr = ColumnFamilyObject::CreateColumnFamilyObject(db_ptr.get(), handle);
+        if (RefuseClosingChild(handle_ptr))   // the database is closing
+            return enif_make_badarg(env);
         ERL_NIF_TERM res = enif_make_resource(env, handle_ptr);
         enif_release_resource(handle_ptr);
         return enif_make_tuple2(env, ATOM_OK, res);
@@ -117,7 +119,9 @@ DropColumnFamily(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ColumnFamilyObject *cf;
     rocksdb::Status status;
     if (argc > 1) {
-        if (!enif_get_db(env, argv[0], &db_ptr) || !enif_get_cf(env, argv[1], &cf_ptr)) 
+        if (!enif_get_db(env, argv[0], &db_ptr) || !enif_get_cf(env, argv[1], &cf_ptr))
+            return enif_make_badarg(env);
+        if (cf_ptr->m_DbPtr.get() != db_ptr.get())
             return enif_make_badarg(env);
         cf = cf_ptr.get();
         status = db_ptr->m_Db->DropColumnFamily(cf->m_ColumnFamily);
@@ -142,31 +146,23 @@ DestroyColumnFamily(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     ReferencePtr<DbObject> db_ptr;
     ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
-    ColumnFamilyObject *cf;
-    rocksdb::Status status;
     if (argc > 1)
     {
         if (!enif_get_db(env, argv[0], &db_ptr) || !enif_get_cf(env, argv[1], &cf_ptr))
             return enif_make_badarg(env);
-        cf = cf_ptr.get();
-        status = db_ptr->m_Db->DestroyColumnFamilyHandle(cf->m_ColumnFamily);
+        if (cf_ptr->m_DbPtr.get() != db_ptr.get())
+            return enif_make_badarg(env);
     }
     else
     {
         if (!enif_get_cf(env, argv[0], &cf_ptr))
             return enif_make_badarg(env);
-        cf = cf_ptr.get();
-        status = cf->m_DbPtr->m_Db->DestroyColumnFamilyHandle(cf->m_ColumnFamily);
     }
-    cf->m_ColumnFamily = NULL;
-    if (status.ok())
-    {
-        // don't close it until someone calls destroy
-        // set closing flag
-        ErlRefObject::InitiateCloseRequest(cf);
-        return ATOM_OK;
-    }
-    return error_tuple(env, ATOM_ERROR, status);
+
+    // Only mark it closed: new calls are refused, and ~ColumnFamilyObject
+    // destroys the RocksDB handle once the calls still using it are done.
+    ErlRefObject::InitiateCloseRequest(cf_ptr.get());
+    return ATOM_OK;
 } // erocksdb::DropColumnFa
 
 }

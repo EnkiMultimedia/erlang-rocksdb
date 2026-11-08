@@ -42,6 +42,7 @@ static ErlNifResourceType* posting_list_resource_type = nullptr;
 struct PostingListResource {
     std::set<std::string> keys;                     // All keys (for exact lookup)
     std::vector<std::string> sorted_keys;           // For indexed access
+    size_t total_bytes = 0;                         // sum of key sizes, for scheduling
 #ifdef WITH_CROARING
     roaring64_bitmap_t* bitmap;                     // For fast hash lookup
 #endif
@@ -788,6 +789,7 @@ ERL_NIF_TERM PostingsOpen(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     res->keys = parse_posting_list(bin.data, bin.size);
     res->sorted_keys.reserve(res->keys.size());
     for (const auto& key : res->keys) {
+        res->total_bytes += key.size();
         res->sorted_keys.push_back(key);
     }
 
@@ -931,7 +933,7 @@ ERL_NIF_TERM PostingsToBinary(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
 // the common case, stay inline and avoid the cost of rescheduling.
 
 static const size_t kDirtyInputBytes = 64 * 1024;  // binary inputs
-static const size_t kDirtyKeyCount = 4096;         // keys in a postings resource
+static const size_t kDirtyKeyCount = 4096;         // keys in a postings resource (or bytes above)
 
 static size_t binary_args_size(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
@@ -944,12 +946,14 @@ static size_t binary_args_size(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     return total;
 }
 
-static size_t resource_key_count(ErlNifEnv* env, ERL_NIF_TERM term)
+// Large when it has many keys or many bytes: a few huge keys cost as much
+// to copy or serialize as many small ones.
+static bool resource_is_large(ErlNifEnv* env, ERL_NIF_TERM term)
 {
     PostingListResource* res;
     if (!enif_get_resource(env, term, posting_list_resource_type, (void**)&res))
-        return 0;
-    return res->keys.size();
+        return false;
+    return res->keys.size() > kDirtyKeyCount || res->total_bytes > kDirtyInputBytes;
 }
 
 #define SCHEDULE_BY_BINARY_SIZE(NAME, FUN)                                         \
@@ -961,10 +965,10 @@ static size_t resource_key_count(ErlNifEnv* env, ERL_NIF_TERM term)
         return FUN(env, argc, argv);                                               \
     }
 
-#define SCHEDULE_BY_KEY_COUNT(NAME, FUN)                                           \
+#define SCHEDULE_BY_RESOURCE_SIZE(NAME, FUN)                                           \
     ERL_NIF_TERM FUN##Nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])     \
     {                                                                              \
-        if (argc >= 1 && resource_key_count(env, argv[0]) > kDirtyKeyCount)        \
+        if (argc >= 1 && resource_is_large(env, argv[0]))                          \
             return enif_schedule_nif(env, NAME, ERL_NIF_DIRTY_JOB_CPU_BOUND,       \
                                      FUN, argc, argv);                             \
         return FUN(env, argc, argv);                                               \
@@ -981,7 +985,7 @@ SCHEDULE_BY_BINARY_SIZE("posting_list_difference", PostingListDifference)
 SCHEDULE_BY_BINARY_SIZE("posting_list_intersection_count", PostingListIntersectionCount)
 SCHEDULE_BY_BINARY_SIZE("posting_list_bitmap_contains", PostingListBitmapContains)
 SCHEDULE_BY_BINARY_SIZE("postings_open", PostingsOpen)
-SCHEDULE_BY_KEY_COUNT("postings_keys", PostingsKeys)
-SCHEDULE_BY_KEY_COUNT("postings_to_binary", PostingsToBinary)
+SCHEDULE_BY_RESOURCE_SIZE("postings_keys", PostingsKeys)
+SCHEDULE_BY_RESOURCE_SIZE("postings_to_binary", PostingsToBinary)
 
 } // namespace erocksdb

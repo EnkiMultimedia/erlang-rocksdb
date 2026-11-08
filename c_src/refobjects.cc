@@ -451,12 +451,16 @@ DbObject::Shutdown()
 
 }   // DbObject::Shutdown
 
-void
+bool
 DbObject::AddColumnFamilyReference(
-        ColumnFamilyObject *ColumnFamilyPtr) {
+        ColumnFamilyObject *ColumnFamilyPtr)
+{
+    // refused once closing started: Shutdown may already have drained the list
     std::lock_guard<std::mutex> lock(m_ColumnFamilyMutex);
+    if (0 != m_CloseRequested)
+        return false;
     m_ColumnFamilyList.push_back(ColumnFamilyPtr);
-    return;
+    return true;
 }   // DbObject::ColumnFamilyReference
 
 
@@ -493,14 +497,16 @@ DbObject::RemoveReference(
 
 }   // DbObject::RemoveReference
 
-void
+bool
 DbObject::AddSnapshotReference(
     SnapshotObject * SnapshotPtr)
 {
+    // refused once closing started: Shutdown may already have drained the list
     std::lock_guard<std::mutex> lock(m_SnapshotMutex);
+    if (0 != m_CloseRequested)
+        return false;
     m_SnapshotList.push_back(SnapshotPtr);
-    return;
-
+    return true;
 }   // DbObject::AddSnapshotReference
 
 
@@ -515,10 +521,15 @@ DbObject::RemoveSnapshotReference(
     return;
 }   // DbObject::RemoveSnapshotReference
 
-void
-DbObject::AddIngestionReference(IngestionObject *IngestionPtr) {
+bool
+DbObject::AddIngestionReference(IngestionObject *IngestionPtr)
+{
+    // refused once closing started: Shutdown may already have drained the list
     std::lock_guard<std::mutex> lock(m_IngestionMutex);
+    if (0 != m_CloseRequested)
+        return false;
     m_IngestionList.push_back(IngestionPtr);
+    return true;
 }   // DbObject::AddIngestionReference
 
 
@@ -529,14 +540,15 @@ DbObject::RemoveIngestionReference(IngestionObject *IngestionPtr) {
 }   // DbObject::RemoveIngestionReference
 
 
-void
-DbObject::AddTLogReference(TLogItrObject *TLogItrPtr) {
+bool
+DbObject::AddTLogReference(TLogItrObject *TLogItrPtr)
+{
+    // refused once closing started: Shutdown may already have drained the list
     std::lock_guard<std::mutex> lock(m_TLogItrMutex);
-
+    if (0 != m_CloseRequested)
+        return false;
     m_TLogItrList.push_back(TLogItrPtr);
-
-    return;
-
+    return true;
 }   // DbObject::AddTLogReference
 
 
@@ -550,14 +562,15 @@ DbObject::RemoveTLogReference(TLogItrObject *TLogItrPtr) {
 
 }   // DbObject::RemoveTLogReference
 
-void
-DbObject::AddTransactionReference(TransactionObject *TxPtr) {
+bool
+DbObject::AddTransactionReference(TransactionObject *TxPtr)
+{
+    // refused once closing started: Shutdown may already have drained the list
     std::lock_guard<std::mutex> lock(m_TransactionMutex);
-
+    if (0 != m_CloseRequested)
+        return false;
     m_TransactionList.push_back(TxPtr);
-
-    return;
-
+    return true;
 }   // DbObject::AddTransactioneference
 
 
@@ -657,7 +670,7 @@ ColumnFamilyObject::ColumnFamilyObject(
 
 
     if (NULL != DbPtr)
-        DbPtr->AddColumnFamilyReference(this);
+        m_Attached = DbPtr->AddColumnFamilyReference(this);
 }   // ColumnFamilyObject::ColumnFamilyObject
 
 
@@ -776,7 +789,7 @@ SnapshotObject::SnapshotObject(
     : m_Snapshot(Snapshot), m_DbPtr(DbPtr)
 {
     if (NULL!=DbPtr)
-        DbPtr->AddSnapshotReference(this);
+        m_Attached = DbPtr->AddSnapshotReference(this);
 
 }   // SnapshotObject::SnapshotObject
 
@@ -932,7 +945,7 @@ ItrObject::ItrObject(
 {
 
     if (NULL != DbPtr)
-        DbPtr->AddReference(this);
+        m_Attached = DbPtr->AddReference(this);
 
 }   // ItrObject::ItrObject
 
@@ -956,11 +969,23 @@ ItrObject::~ItrObject() {
     delete m_Iterator;
     //m_Iterator = nullptr;
 
-    // the snapshot is released only once the iterator is gone
+    // the snapshot, transaction and column families are released only once
+    // the iterator is gone
     SnapshotObject * snapshot = m_SnapshotPtr.get();
     m_SnapshotPtr.assign(NULL);
     if (snapshot != nullptr)
         enif_release_resource(snapshot);
+
+    TransactionObject * tx = m_TxPtr.get();
+    m_TxPtr.assign(NULL);
+    if (tx != nullptr)
+        enif_release_resource(tx);
+
+    for (ColumnFamilyObject * cf : m_PinnedColumnFamilies) {
+        cf->RefDec();
+        enif_release_resource(cf);
+    }
+    m_PinnedColumnFamilies.clear();
 
     // release any resources (column family, transaction) pinned for this
     // iterator's lifetime. Done after deleting the iterator, which still
@@ -981,6 +1006,24 @@ ItrObject::KeepSnapshot(SnapshotObject * Snapshot) {
     enif_keep_resource(Snapshot);
     m_SnapshotPtr.assign(Snapshot);
 }   // ItrObject::KeepSnapshot
+
+
+void
+ItrObject::KeepTransaction(TransactionObject * Tx) {
+    if (Tx == nullptr || m_TxPtr.get() != nullptr)
+        return;
+    enif_keep_resource(Tx);
+    m_TxPtr.assign(Tx);
+}   // ItrObject::KeepTransaction
+
+
+void
+ItrObject::KeepColumnFamily(ColumnFamilyObject * Cf) {
+    // the caller holds a reference, so the object is live
+    enif_keep_resource(Cf);
+    Cf->RefInc();
+    m_PinnedColumnFamilies.push_back(Cf);
+}   // ItrObject::KeepColumnFamily
 
 
 void
@@ -1085,7 +1128,7 @@ TLogItrObject::TLogItrObject(
         : m_Iter(Itr), m_DbPtr(DbPtr) {
 
     if (NULL != DbPtr)
-        DbPtr->AddTLogReference(this);
+        m_Attached = DbPtr->AddTLogReference(this);
 
 }   // TLogItrObject::TLogItrObject
 
@@ -1186,7 +1229,7 @@ IngestionObject::IngestionObject(
         : m_DbPtr(DbPtr), m_Handle(std::move(Handle)) {
 
     if (NULL != DbPtr)
-        DbPtr->AddIngestionReference(this);
+        m_Attached = DbPtr->AddIngestionReference(this);
 
 }   // IngestionObject::IngestionObject
 
@@ -1422,7 +1465,7 @@ TransactionObject::TransactionObject(
     {
 
       if (NULL!=DbPtr)
-        DbPtr->AddTransactionReference(this);
+        m_Attached = DbPtr->AddTransactionReference(this);
 
     }
 

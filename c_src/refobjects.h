@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <list>
 #include <mutex>
+#include <vector>
 #include <atomic>
 #include <condition_variable>
 
@@ -105,6 +106,10 @@ public:
     std::mutex *m_CloseMutex;                     //!< for erlang forced close
     std::condition_variable *m_CloseCond;         //!< for erlang forced close
 
+    // false when the object was created after its database started closing:
+    // the close will not reach it, see RefuseClosingChild
+    bool m_Attached = true;
+
 public:
     ErlRefObject();
 
@@ -129,6 +134,22 @@ public:
 
     static void AwaitCloseAndDestructor(ErlRefObject * Object);
 };  // class RefObject
+
+/**
+ * A child (column family, snapshot, iterator, transaction, ...) created while
+ * its database was closing is not attached to it, so closing the database
+ * would never close it and RocksDB would stay open. Close it now and refuse
+ * the call. Use before the child is turned into an Erlang term.
+ */
+inline bool
+RefuseClosingChild(ErlRefObject * Child)
+{
+    if (Child->m_Attached)
+        return false;
+    ErlRefObject::InitiateCloseRequest(Child);
+    enif_release_resource(Child);
+    return true;
+}
 
 
 /**
@@ -235,7 +256,7 @@ public:
     virtual void Shutdown();
 
     // manual back link to Snapshot ColumnFamilyObject holding reference to this
-    void AddColumnFamilyReference(class ColumnFamilyObject *);
+    bool AddColumnFamilyReference(class ColumnFamilyObject *);
 
     void RemoveColumnFamilyReference(class ColumnFamilyObject *);
 
@@ -245,22 +266,22 @@ public:
     void RemoveReference(class ItrObject *);
 
      // manual back link to Snapshot DbObjects holding reference to this
-    void AddSnapshotReference(class SnapshotObject *);
+    bool AddSnapshotReference(class SnapshotObject *);
 
     void RemoveSnapshotReference(class SnapshotObject *);
 
     // manual back link to ItrObjects holding reference to this
-    void AddTLogReference(class TLogItrObject *);
+    bool AddTLogReference(class TLogItrObject *);
 
     void RemoveTLogReference(class TLogItrObject *);
 
      // manual back link to  Transaction Objects holding reference to this
-    void AddTransactionReference(class TransactionObject *);
+    bool AddTransactionReference(class TransactionObject *);
 
     void RemoveTransactionReference(class TransactionObject *);
 
     // manual back link to prepared ingestions holding reference to this
-    void AddIngestionReference(class IngestionObject *);
+    bool AddIngestionReference(class IngestionObject *);
 
     void RemoveIngestionReference(class IngestionObject *);
 
@@ -341,6 +362,8 @@ public:
 };  // class SnapshotObject
 
 
+class TransactionObject;
+
 /**
  * Per Iterator object.  Created as erlang reference.
  */
@@ -348,6 +371,9 @@ class ItrObject : public ErlRefObject
 {
 public:
     ReferencePtr<SnapshotObject> m_SnapshotPtr; //!< read snapshot, alive as long as the iterator
+    ReferencePtr<TransactionObject> m_TxPtr;    //!< transaction iterated over, if any
+    std::vector<ColumnFamilyObject *> m_PinnedColumnFamilies; //!< one reference each, see KeepColumnFamily
+    std::mutex m_Mutex;                         //!< RocksDB iterators need external synchronization
     rocksdb::Iterator * m_Iterator;
     std::shared_ptr<erocksdb::ErlEnvCtr> env;
     ReferencePtr<DbObject> m_DbPtr;
@@ -397,6 +423,14 @@ public:
     //!< collection, whose cleanup would otherwise block a scheduler waiting
     //!< for this reference to go away.
     void KeepSnapshot(SnapshotObject * Snapshot);
+
+    //!< Same for the transaction an iterator reads: release_transaction must
+    //!< not delete it while the iterator still uses it.
+    void KeepTransaction(TransactionObject * Tx);
+
+    //!< Same for column families whose handles RocksDB keeps in the iterator
+    //!< (coalescing iterator): destroy_column_family must wait for it.
+    void KeepColumnFamily(ColumnFamilyObject * Cf);
 };  // class ItrObject
 
 /**
@@ -407,6 +441,7 @@ class TLogItrObject : public ErlRefObject
 public:
     rocksdb::WalIterator * m_Iter;
     ReferencePtr<DbObject> m_DbPtr;
+    std::mutex m_Mutex;   //!< RocksDB iterators need external synchronization
 
 protected:
     static ErlNifResourceType* m_TLogItr_RESOURCE;
@@ -522,6 +557,9 @@ class TransactionObject : public ErlRefObject
 public:
     rocksdb::Transaction* m_Tx;
     ReferencePtr<DbObject> m_DbPtr;
+    //!< RocksDB leaves it to the caller to synchronize access to a
+    //!< transaction: every NIF using m_Tx, and iterators over it, hold this.
+    std::mutex m_Mutex;
 
 protected:
     static ErlNifResourceType* m_Transaction_RESOURCE;

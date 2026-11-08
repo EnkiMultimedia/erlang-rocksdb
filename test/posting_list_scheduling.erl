@@ -60,6 +60,26 @@ large_inputs_use_dirty_schedulers_test_() ->
     ?assert(dirty_cpu_nif_time(Calls(Large, PLarge, 20)) > 0)
   end}.
 
+%% a postings resource with a few huge keys is as costly as one with many
+%% small keys: it is scheduled by bytes as well as by key count
+few_large_keys_use_dirty_schedulers_test_() ->
+  {timeout, 120, fun() ->
+    Dir = "erocksdb.posting_list_scheduling.big_keys.test",
+    ?rm_rf(Dir),
+    {ok, Db} = rocksdb:open(Dir, [{create_if_missing, true},
+                                  {merge_operator, posting_list_merge_operator}]),
+    [ok = rocksdb:merge(Db, <<"big">>, {posting_add, binary:copy(<<I>>, 100 * 1024)}, [])
+     || I <- [1, 2, 3]],
+    {ok, Big} = rocksdb:get(Db, <<"big">>, []),
+    ok = rocksdb:close(Db),
+    ?rm_rf(Dir),
+    {ok, P} = rocksdb:postings_open(Big),
+    ?assertEqual(3, rocksdb:postings_count(P)),
+    ?assert(dirty_cpu_nif_time(fun() ->
+      [rocksdb:postings_to_binary(P) || _ <- lists:seq(1, 20)]
+    end) > 0)
+  end}.
+
 check(List, N) ->
   Keys = [key(I) || I <- lists:seq(1, N)],
   ?assertEqual(lists:sort(Keys), rocksdb:posting_list_keys(List)),

@@ -64,6 +64,8 @@ namespace erocksdb {
 
         tx = db->BeginTransaction(write_options, transaction_options);
         tx_ptr = TransactionObject::CreateTransactionObject(db_ptr.get(), tx);
+        if (RefuseClosingChild(tx_ptr))   // the database is closing
+            return enif_make_badarg(env);
 
         ERL_NIF_TERM result = enif_make_resource(env, tx_ptr);
         enif_release_resource(tx_ptr);
@@ -82,6 +84,7 @@ namespace erocksdb {
 
         if(!enif_get_transaction(env, argv[0], &tx_ptr))
           return enif_make_badarg(env);
+        std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
         ErlNifBinary key, value;
         rocksdb::Status status;
@@ -126,6 +129,7 @@ namespace erocksdb {
 
         if(!enif_get_transaction(env, argv[0], &tx_ptr))
           return enif_make_badarg(env);
+        std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
         int i = 1;
         if(argc == 4) 
@@ -187,6 +191,7 @@ namespace erocksdb {
 
         if(!enif_get_transaction(env, argv[0], &tx_ptr))
           return enif_make_badarg(env);
+        std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
         int i = 1;
         if(argc == 4)
@@ -247,6 +252,7 @@ namespace erocksdb {
 
         if(!enif_get_transaction(env, argv[0], &tx_ptr))
             return enif_make_badarg(env);
+        std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
         // Determine argument positions based on arity
         // argc == 3: transaction_multi_get(Txn, Keys, ReadOpts)
@@ -345,6 +351,7 @@ namespace erocksdb {
 
         if(!enif_get_transaction(env, argv[0], &tx_ptr))
             return enif_make_badarg(env);
+        std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
         // Determine argument positions based on arity
         // argc == 3: transaction_multi_get_for_update(Txn, Keys, ReadOpts)
@@ -447,6 +454,7 @@ namespace erocksdb {
 
         if(!enif_get_transaction(env, argv[0], &tx_ptr))
           return enif_make_badarg(env);
+        std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
         ErlNifBinary key;
         rocksdb::Status status;
@@ -483,6 +491,7 @@ namespace erocksdb {
 
         if(!enif_get_transaction(env, argv[0], &tx_ptr))
           return enif_make_badarg(env);
+        std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
         int i = argc - 1;
 
@@ -523,9 +532,9 @@ namespace erocksdb {
         // pin the transaction (its write batch backs the iterator's delta) and
         // the column family so neither can be garbage collected and freed while
         // this iterator is still using them
-        itr_ptr->KeepResource(tx_ptr.get());
+        itr_ptr->KeepTransaction(tx_ptr.get());
         if(cf_ptr.get() != nullptr)
-            itr_ptr->KeepResource(cf_ptr.get());
+            itr_ptr->KeepColumnFamily(cf_ptr.get());
 
         if(bounds.upper_bound_slice != nullptr) {
             itr_ptr->SetUpperBoundSlice(bounds.upper_bound_slice);
@@ -533,6 +542,12 @@ namespace erocksdb {
 
         if(bounds.lower_bound_slice != nullptr) {
             itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
+        }
+
+        if (RefuseClosingChild(itr_ptr))   // the database is closing
+        {
+            delete opts;
+            return enif_make_badarg(env);
         }
 
         ERL_NIF_TERM result = enif_make_resource(env, itr_ptr);
@@ -554,6 +569,7 @@ namespace erocksdb {
         ReferencePtr<erocksdb::TransactionObject> tx_ptr;
         if(!enif_get_transaction(env, argv[0], &tx_ptr))
           return enif_make_badarg(env);
+        std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
         rocksdb::Status s = tx_ptr->m_Tx->Commit();
 
@@ -573,6 +589,7 @@ namespace erocksdb {
         ReferencePtr<erocksdb::TransactionObject> tx_ptr;
         if(!enif_get_transaction(env, argv[0], &tx_ptr))
           return enif_make_badarg(env);
+        std::lock_guard<std::mutex> tx_lock(tx_ptr->m_Mutex);
 
         rocksdb::Status s = tx_ptr->m_Tx->Rollback();
 

@@ -25,6 +25,11 @@
 - an SST file reader iterator dropped without `sst_file_reader_iterator_close/1` kept its reader forever, and closing it could free the reader while the iterator still used it
 - `posting_list_contains/2` trusted the sizes inside the binary, a malformed one could ask for gigabytes of memory
 - repeating `iterate_upper_bound` or `iterate_lower_bound` in iterator options leaked memory
+- sharing a transaction, an iterator, a WAL iterator or an SST file writer between processes could crash the VM or corrupt the transaction: RocksDB requires these calls to be serialized, they now are
+- an iterator over a transaction crashed the VM once the transaction was released, it now keeps the transaction until it is closed
+- `destroy_column_family/2` freed the column family while other calls, or iterators over several column families, still used it. The column family is now freed when the last of them is done.
+- handles created while the database was closing (snapshots, iterators, transactions, column families) were not closed with it, so RocksDB stayed open and locked after `close/1`. They are now refused with `badarg`.
+- a parsed posting list with a few very large keys still ran on a normal scheduler, it is now scheduled by size as well as by key count
 - the build no longer downloads anything from the network: the vendored CRoaring build fetched a CMake helper from GitHub at configure time, so offline builds failed
 
 ### Changes
