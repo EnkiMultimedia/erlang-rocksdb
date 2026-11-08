@@ -654,6 +654,8 @@ PessimisticTransactionIterator(ErlNifEnv* env,
 
     itr_ptr = ItrObject::CreateItrObject(tx_ptr->m_DbPtr.get(), itr_env, iterator);
 
+
+
     itr_ptr->KeepSnapshot(bounds.snapshot.get());
     // the iterator reads the transaction and its column family
     itr_ptr->KeepTransaction(tx_ptr.get());
@@ -666,6 +668,7 @@ PessimisticTransactionIterator(ErlNifEnv* env,
     if(bounds.lower_bound_slice != nullptr)
         itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
 
+    itr_ptr->Attach();
     if (RefuseClosingChild(itr_ptr))   // the database is closing
     {
         delete opts;

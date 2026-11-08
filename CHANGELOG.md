@@ -30,10 +30,12 @@
 - `destroy_column_family/2` freed the column family while other calls, or iterators over several column families, still used it. The column family is now freed when the last of them is done.
 - handles created while the database was closing (snapshots, iterators, transactions, column families) were not closed with it, so RocksDB stayed open and locked after `close/1`. They are now refused with `badarg`.
 - a parsed posting list with a few very large keys still ran on a normal scheduler, it is now scheduled by size as well as by key count
+- closing a database while another process dropped one of its handles could crash the VM, and the cleanup of every handle read the object after its destructor had run. Handles now free their RocksDB objects when the last user is done and are destroyed only when Erlang collects them.
 - the build no longer downloads anything from the network: the vendored CRoaring build fetched a CMake helper from GitHub at configure time, so offline builds failed
 
 ### Changes
 
+- `close/1` now returns once the database is really closed and its files are released, so the same path can be opened again right away. Before, a call still running in another process, or the cleanup of a handle, could keep RocksDB open a moment after `close/1` returned, and reopening failed on the lock file. As a consequence `close/1` now waits for calls still running on the database, such as a long `compact_range/4`.
 - the bundled zstd is now really used to build RocksDB: before, RocksDB looked for zstd on its own and could compile against the system headers while the NIF linked the bundled library. A clean parallel build could also fail when RocksDB started before the bundled zstd was ready (#21)
 - new build option `WITH_STATIC_ZSTD` links a static system zstd into the NIF, so it has no `libzstd` runtime dependency. Off by default, the system archive must be built with `-fPIC` (#21)
 - posting list functions run on a dirty scheduler when the posting list is large (over 64 KB, or over 4096 keys for a parsed one), so they no longer hold a normal scheduler for milliseconds. Small lists still run inline.

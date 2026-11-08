@@ -527,6 +527,8 @@ namespace erocksdb {
 
         itr_ptr = ItrObject::CreateItrObject(tx_ptr->m_DbPtr.get(), itr_env, iterator);
 
+
+
         itr_ptr->KeepSnapshot(bounds.snapshot.get());
 
         // pin the transaction (its write batch backs the iterator's delta) and
@@ -544,6 +546,7 @@ namespace erocksdb {
             itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
         }
 
+        itr_ptr->Attach();
         if (RefuseClosingChild(itr_ptr))   // the database is closing
         {
             delete opts;

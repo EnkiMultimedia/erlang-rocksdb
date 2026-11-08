@@ -238,6 +238,89 @@ collect_children(Acc) ->
   after 0 -> Acc
   end.
 
+%% close/1 waits for a call still running on the database: here a compaction
+%% blocked on a slow compaction filter handler. The path can be opened again
+%% as soon as close returns.
+close_waits_for_running_call_test_() ->
+  {timeout, 120, fun() ->
+    Dir = test_dir("close_waits"),
+    Path = filename:join(Dir, "db"),
+    Self = self(),
+    Handler = spawn_link(fun() -> slow_filter_handler(Self, first) end),
+    {ok, Db} = rocksdb:open(Path, [{create_if_missing, true},
+                                   {compaction_filter, #{handler => Handler,
+                                                         timeout => 10000}}]),
+    [ok = rocksdb:put(Db, <<I:32>>, <<"v">>, []) || I <- lists:seq(1, 100)],
+    ok = rocksdb:flush(Db, []),
+    spawn_link(fun() ->
+      R = rocksdb:compact_range(Db, <<0:32>>, <<101:32>>,
+                                [{bottommost_level_compaction, force}]),
+      Self ! {compacted, R}
+    end),
+    %% the compaction is now waiting for the handler, which answers in 300 ms
+    receive filtering -> ok after 10000 -> error(no_compaction) end,
+    T0 = erlang:monotonic_time(millisecond),
+    ok = rocksdb:close(Db),
+    Waited = erlang:monotonic_time(millisecond) - T0,
+    {ok, Db2} = rocksdb:open(Path, []),
+    {ok, <<"v">>} = rocksdb:get(Db2, <<1:32>>, []),
+    ok = rocksdb:close(Db2),
+    receive {compacted, _} -> ok end,
+    ?assert(Waited >= 200),
+    unlink(Handler),
+    exit(Handler, kill),
+    ?rm_rf(Dir)
+  end}.
+
+slow_filter_handler(Test, State) ->
+  receive
+    {compaction_filter, Ref, Keys} ->
+      case State of
+        first -> Test ! filtering, timer:sleep(300);
+        _ -> ok
+      end,
+      rocksdb:compaction_filter_reply(Ref, [keep || _ <- Keys]),
+      slow_filter_handler(Test, rest)
+  end.
+
+%% Handles dropped and garbage collected while their database closes: the
+%% Erlang cleanup of a handle and the database close both release it.
+gc_cleanup_during_close_test_() ->
+  {timeout, 120, fun() ->
+    [gc_cleanup_during_close(N) || N <- lists:seq(1, 20)]
+  end}.
+
+gc_cleanup_during_close(N) ->
+  Dir = test_dir("gc_close_" ++ integer_to_list(N)),
+  Path = filename:join(Dir, "db"),
+  {ok, Db, [_, Cf]} = open_with_cf(Dir),
+  ok = rocksdb:put(Db, Cf, <<"k">>, <<"v">>, []),
+  Workers = run_workers(?WORKERS, fun(I) -> drop_handles(Db, Cf, I, 0) end),
+  timer:sleep(N rem 5),
+  ok = rocksdb:close(Db),
+  %% close/1 returns once RocksDB is closed, even while the workers still run
+  %% and handle cleanups are pending on other threads
+  {ok, Db2, _} = rocksdb:open(Path, [], [{"default", []}, {"other", []}]),
+  ok = rocksdb:close(Db2),
+  wait_workers(Workers),
+  ?rm_rf(Dir).
+
+drop_handles(_Db, _Cf, _I, 300) -> ok;
+drop_handles(Db, Cf, I, K) ->
+  R = case (I + K) rem 3 of
+        0 -> catch rocksdb:snapshot(Db);
+        1 -> catch rocksdb:iterator(Db, Cf, []);
+        2 -> catch rocksdb:iterators(Db, [Cf], [])
+      end,
+  case R of
+    {ok, _} ->
+      %% drop the handle right away and let the cleanup run concurrently
+      erlang:garbage_collect(),
+      drop_handles(Db, Cf, I, K + 1);
+    {'EXIT', {badarg, _}} -> ok;
+    {error, _} -> ok
+  end.
+
 %% helpers
 
 open_with_cf(Dir) ->

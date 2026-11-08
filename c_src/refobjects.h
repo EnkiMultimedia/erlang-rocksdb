@@ -99,12 +99,11 @@ public:
     // these member objects are public to simplify
     //  access by statics and external APIs
     //  (yes, wrapper functions would be welcome)
-    std::atomic<uint32_t> m_CloseRequested;        // 1 once api close called, 2 once thread starts destructor, 3 destructor done
+    // 0 open, 1 close requested, 2 releasing native objects, 3 released
+    std::atomic<uint32_t> m_CloseRequested;
 
-    // DO NOT USE CONTAINER OBJECTS
-    //  ... these must be live after destructor called
-    std::mutex *m_CloseMutex;                     //!< for erlang forced close
-    std::condition_variable *m_CloseCond;         //!< for erlang forced close
+    std::mutex m_CloseMutex;                      //!< guards the close flag
+    std::condition_variable m_CloseCond;          //!< signals state 3
 
     // false when the object was created after its database started closing:
     // the close will not reach it, see RefuseClosingChild
@@ -123,8 +122,12 @@ public:
     // allows for secondary close actions IF InitiateCloseRequest returns true
     virtual void Shutdown()=0;
 
-    // the following will sometimes be called AFTER the
-    //  destructor ... in which case the vtable is not valid
+    // Free the RocksDB objects and drop the references to parent objects.
+    // Called once, when the last reference goes after a close request. The
+    // C++ object itself stays alive until its Erlang resource is destroyed
+    // (AwaitCloseAndDestructor), so the close state can always be read.
+    virtual void ReleaseNative()=0;
+
     static bool InitiateCloseRequest(ErlRefObject * Object);
 
     // Take a reference unless a close was requested. The check and the
@@ -132,7 +135,14 @@ public:
     // flag, so a concurrent close cannot destroy the object in between.
     bool TryRefInc();
 
+    // From the Erlang resource destructor only: wait for ReleaseNative to
+    // finish, then run the C++ destructor. Erlang frees the memory after.
     static void AwaitCloseAndDestructor(ErlRefObject * Object);
+
+    // Wait until ReleaseNative has finished, without destroying anything.
+    // The caller must keep the object alive (hold its Erlang term) and must
+    // not hold a reference itself, or the release could never happen.
+    void AwaitRelease();
 };  // class RefObject
 
 /**
@@ -253,6 +263,8 @@ public:
 
     virtual ~DbObject();
 
+    virtual void ReleaseNative() override;
+
     virtual void Shutdown();
 
     // manual back link to Snapshot ColumnFamilyObject holding reference to this
@@ -312,7 +324,9 @@ public:
     ColumnFamilyObject(const ColumnFamilyObject &) = delete;             // no copy
     ColumnFamilyObject & operator=(const ColumnFamilyObject &) = delete; // no assignment
 
-    virtual ~ColumnFamilyObject(); // needs to perform free_itr
+    virtual ~ColumnFamilyObject();
+
+    virtual void ReleaseNative() override;
 
     virtual void Shutdown();
 
@@ -348,7 +362,9 @@ public:
     SnapshotObject(const SnapshotObject &) = delete;             // no copy
     SnapshotObject & operator=(const SnapshotObject &) = delete; // no assignment
 
-    virtual ~SnapshotObject(); // needs to perform free_itr
+    virtual ~SnapshotObject();
+
+    virtual void ReleaseNative() override;
 
     virtual void Shutdown();
 
@@ -396,7 +412,9 @@ public:
     ItrObject(const ItrObject &) = delete;             // no copy
     ItrObject & operator=(const ItrObject &) = delete; // no assignment
 
-    virtual ~ItrObject(); // needs to perform free_itr
+    virtual ~ItrObject();
+
+    virtual void ReleaseNative() override;
 
     virtual void Shutdown();
 
@@ -431,6 +449,12 @@ public:
     //!< Same for column families whose handles RocksDB keeps in the iterator
     //!< (coalescing iterator): destroy_column_family must wait for it.
     void KeepColumnFamily(ColumnFamilyObject * Cf);
+
+    //!< Attach the iterator to its database once it is fully set up (snapshot,
+    //!< transaction and column families pinned, bounds set). Until then a
+    //!< database close cannot reach it. Returns false if the database is
+    //!< closing: the caller then refuses it with RefuseClosingChild.
+    bool Attach();
 };  // class ItrObject
 
 /**
@@ -453,7 +477,9 @@ public:
     TLogItrObject(const TLogItrObject &) = delete;             // no copy
     TLogItrObject & operator=(const TLogItrObject &) = delete; // no assignment
 
-    virtual ~TLogItrObject(); // needs to perform free_itr
+    virtual ~TLogItrObject();
+
+    virtual void ReleaseNative() override;
 
     virtual void Shutdown();
 
@@ -494,6 +520,8 @@ public:
     IngestionObject & operator=(const IngestionObject &) = delete;
 
     virtual ~IngestionObject();
+
+    virtual void ReleaseNative() override;
 
     virtual void Shutdown();
 
@@ -537,6 +565,8 @@ public:
 
     virtual ~BackupEngineObject();
 
+    virtual void ReleaseNative() override;
+
     virtual void Shutdown();
 
     static void CreateBackupEngineObjectType(ErlNifEnv * Env);
@@ -571,7 +601,9 @@ public:
     TransactionObject(const TransactionObject &) = delete;             // no copy
     TransactionObject & operator=(const TransactionObject &) = delete; // no assignment
 
-    virtual ~TransactionObject(); // needs to perform free_itr
+    virtual ~TransactionObject();
+
+    virtual void ReleaseNative() override;
 
     virtual void Shutdown();
 

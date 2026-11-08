@@ -200,6 +200,8 @@ Iterator(
 
     itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterator);
 
+
+
     itr_ptr->KeepSnapshot(bounds.snapshot.get());
 
     // pin the column family so GC of its handle cannot free it while this
@@ -217,6 +219,7 @@ Iterator(
         itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
     }
 
+    itr_ptr->Attach();
     if (RefuseClosingChild(itr_ptr))   // the database is closing
     {
         delete opts;
@@ -298,6 +301,7 @@ Iterators(
                     bounds.lower_bound_slice->data(), bounds.lower_bound_slice->size());
                 itr_ptr->SetLowerBoundSlice(lower_clone);
             }
+            itr_ptr->Attach();
             if (RefuseClosingChild(itr_ptr))
             {
                 // the database is closing: free the iterators not wrapped yet,
@@ -384,6 +388,8 @@ CoalescingIterator(
 
     ItrObject* itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterator.release());
 
+
+
     itr_ptr->KeepSnapshot(bounds.snapshot.get());
     for (auto& cf_ref : cf_refs)
         itr_ptr->KeepColumnFamily(cf_ref.get());
@@ -398,6 +404,7 @@ CoalescingIterator(
         itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
     }
 
+    itr_ptr->Attach();
     if (RefuseClosingChild(itr_ptr))   // the database is closing
         return enif_make_badarg(env);
 

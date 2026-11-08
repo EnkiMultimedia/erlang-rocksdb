@@ -1559,15 +1559,21 @@ Close(
     int /*argc*/,
     const ERL_NIF_TERM argv[])
 {
+    // No reference is taken: the term in argv[0] keeps the object alive for
+    // this call, and holding a reference would stop the release we wait for.
     DbObject * db_ptr;
     db_ptr = DbObject::RetrieveDbObject(env, argv[0]);
 
     if (NULL==db_ptr)
         return enif_make_badarg(env);
 
-    // set closing flag
     ErlRefObject::InitiateCloseRequest(db_ptr);
-    db_ptr=NULL;
+
+    // Return only once RocksDB is really closed. The last reference may be
+    // dropped just after the line above by a call still running in another
+    // process, or by the cleanup of a handle on another thread; without this
+    // wait, opening the same path right away could fail on the lock file.
+    db_ptr->AwaitRelease();
     return ATOM_OK;
 }  // erocksdb::Close
 
