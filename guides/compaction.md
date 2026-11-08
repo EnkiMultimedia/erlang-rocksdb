@@ -68,6 +68,18 @@ capacity-derived intra-L0 strategy, which requires `max_data_files_size > 0`).
 compactions; aborted work reports a `kCompactionAborted` status. Resume with
 `resume_all_compactions/1`, which must be called as many times as it was aborted.
 
+To stop the compactions of one column family only, use `abort_compactions/2`
+and `resume_compactions/2`. The other column families, and flushes, keep running.
+
+```erlang
+ok = rocksdb:abort_compactions(Db, Cf),
+%% compact_range on Cf now returns an error
+ok = rocksdb:resume_compactions(Db, Cf).
+```
+
+Calls are counted per column family and combine with `abort_all_compactions/1`:
+compactions resume once both counts are back to zero.
+
 Use `compact_range/4` or `compact_range/5` to trigger compaction manually.
 
 ### Full Database Compaction
@@ -185,6 +197,40 @@ Improve compaction performance on HDDs:
 {ok, Db} = rocksdb:open("mydb", [
     {create_if_missing, true},
     {compaction_readahead_size, 2 * 1024 * 1024}  %% 2MB read-ahead
+]).
+```
+
+### Keep Compaction Out of the Page Cache
+
+With `use_direct_io_for_compaction_reads`, compaction reads its input files with direct I/O while your reads stay buffered, so a large compaction does not push your hot data out of the page cache.
+
+```erlang
+{ok, Db} = rocksdb:open("mydb", [
+    {create_if_missing, true},
+    {use_direct_io_for_compaction_reads, true}
+]).
+```
+
+### Compact Files That Are Read Often
+
+`read_triggered_compaction_threshold` marks SST files for compaction when they are read a lot, which reduces read amplification for hot keys. On a database that receives no writes, also set `max_compaction_trigger_wakeup_seconds` so RocksDB re-evaluates files periodically.
+
+```erlang
+{ok, Db} = rocksdb:open("mydb", [
+    {create_if_missing, true},
+    {read_triggered_compaction_threshold, 0.01},
+    {max_compaction_trigger_wakeup_seconds, 3600}
+]).
+```
+
+### Periodic Compaction
+
+`periodic_compaction_seconds` recompacts files older than the given age, for example to make a compaction filter see every key at least that often.
+
+```erlang
+{ok, Db} = rocksdb:open("mydb", [
+    {create_if_missing, true},
+    {periodic_compaction_seconds, 7 * 24 * 3600}
 ]).
 ```
 

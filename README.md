@@ -3,7 +3,7 @@
 [![Build Status](https://github.com/EnkiMultimedia/erlang-rocksdb/workflows/build/badge.svg)](https://github.com/EnkiMultimedia/erlang-rocksdb/actions?query=workflow%3Abuild)
 [![Hex pm](http://img.shields.io/hexpm/v/rocksdb.svg?style=flat)](https://hex.pm/packages/rocksdb)
 
-**Current version: 3.1.2**
+**Current version: 3.2.0**
 
 Copyright (c) 2016-2026 Benoît Chesneau
 
@@ -27,7 +27,8 @@ Feedback and pull requests welcome! If a particular feature of RocksDB is import
 - Erlang merge operator
 - Posting list merge operator for inverted indexes
 - Compaction filters (declarative rules and Erlang callbacks)
-- SST file support (write, ingest, read)
+- SST file support (write, ingest, read) and two-phase ingestion
+- Encrypted env (AES-256-CTR)
 - Customized build support
 - Tested on macOS, FreeBSD, Solaris and Linux
 

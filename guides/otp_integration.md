@@ -110,5 +110,6 @@ Add one at runtime with `rocksdb:create_column_family/3`, and keep the returned 
 
 * Keep the handle reachable. If the last reference to it is garbage collected, the database is closed and its iterators and column families go with it.
 * After `rocksdb:close/1`, calls from any other holder of that handle raise `badarg`, they do not return an error tuple. Read the handle from `persistent_term` or ETS on each call rather than caching it in your own process state, so an owner restart does not leave you holding a dead handle.
-* An iterator does not support parallel operations. Create one per process that needs to iterate, and close it with `rocksdb:iterator_close/1` when you are done.
+* Calls on one iterator, transaction or SST file writer from several processes are safe, but they run one at a time. Create one iterator per process that needs to iterate, and close it with `rocksdb:iterator_close/1` when you are done.
 * Do not open the same directory twice. RocksDB takes a file lock, so while the first handle is alive a second `rocksdb:open/2` returns `{error, {db_open, "IO error: lock hold by current process..."}}`. One owner per directory.
+* `rocksdb:close/1` returns once the database is closed and its lock released, so you can open the same directory again right after. It waits for calls still running on the database, such as a long `rocksdb:compact_range/4`: give the owner a shutdown timeout long enough for them.

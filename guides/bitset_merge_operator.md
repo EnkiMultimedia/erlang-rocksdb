@@ -1,4 +1,13 @@
-The bitset operator allows you to maintain a bitmap. You can set or unset a bit at a oisutuib in a fixed bitmap. 
+The bitset operator maintains a fixed-size bitmap. Use it when you want to set and clear single bits with merges instead of reading and rewriting the whole value.
+
+`{bitset_merge_operator, Bits}` sizes the bitmap to `Bits` bits. Each merge operand is one of:
+
+* `<<"+N">>` sets bit `N`
+* `<<"-N">>` clears bit `N`
+* `<<>>` clears every bit
+
+`N` is a decimal position, starting at 0, and must be inside the bitmap. Any other operand makes the merge fail: reads of that key return `{error, {corruption, _}}`, the rest of the database is not affected.
+
 
 Ex:
 
