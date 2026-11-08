@@ -20,6 +20,7 @@
 #include <memory>
 
 #include "erl_nif.h"
+#include "env.h"
 
 namespace rocksdb {
     class SstFileWriter;
@@ -32,6 +33,8 @@ namespace erocksdb {
       static ErlNifResourceType* m_SstFileWriter_RESOURCE;
 
     public:
+      // Declared before writer_ so the env outlives the writer.
+      EnvRef m_Env;
 
       explicit SstFileWriterObject(std::unique_ptr<rocksdb::SstFileWriter> writer);
 

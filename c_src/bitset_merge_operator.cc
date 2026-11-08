@@ -18,6 +18,7 @@
 #include <memory>
 #include <list>
 #include <algorithm>
+#include <cstdint>
 #include <assert.h>
 
 #include "rocksdb/slice.h"
@@ -49,77 +50,57 @@ namespace erocksdb {
             const MergeOperationInput& merge_in,
             MergeOperationOutput* merge_out) const {
 
-    size_t size;
-    char* data = nullptr;
-    std::string s;
-    int pos;
+    const size_t max_size = cap_ / bits_per_char;
 
-    size_t max_size = cap_ / bits_per_char;
+    // A bad operand fails the reads of this key only. With the default scope
+    // a flush or compaction meeting it would make the DB read-only.
+    merge_out->op_failure_scope = OpFailureScope::kMustMerge;
 
+    // Work on our own copy: existing_value points into RocksDB memory
+    // (memtable, block cache) that other readers see and must not change.
+    std::string& data = merge_out->new_value;
     if (!merge_in.existing_value) {
-        size = max_size;
-        merge_out->new_value.reserve(size);
-        data = new cell_type[size];
-        std::fill_n(data, size, 0x00);
+        data.assign(max_size, '\0');
     } else {
-        size = merge_in.existing_value->size();
-        if (size < max_size)
+        if (merge_in.existing_value->size() < max_size)
             return false;
-        data = const_cast<char*>(merge_in.existing_value->data());
+        data.assign(merge_in.existing_value->data(),
+                    merge_in.existing_value->size());
     }
+    const size_t size = data.size();
 
-    auto it = merge_in.operand_list.begin();
-    while (it != merge_in.operand_list.end()) {
-        s = it->ToString();
-        if (s.empty()) {
-            std::fill_n(data, size, 0x00);
-            ++it;
+    for (const rocksdb::Slice& operand : merge_in.operand_list) {
+        if (operand.empty()) {
+            std::fill(data.begin(), data.end(), '\0');
             continue;
         }
 
-        try {
-            pos = std::stoi(s.substr(1));
-        } catch(...) {
-            if (!merge_in.existing_value) {
-                delete[] data;
-            }
+        const char op = operand[0];
+        if (op != '+' && op != '-')
             return false;
+
+        // bit position: decimal digits only
+        if (operand.size() < 2 || operand.size() > 21)
+            return false;
+        uint64_t pos = 0;
+        for (size_t i = 1; i < operand.size(); i++) {
+            const char c = operand[i];
+            if (c < '0' || c > '9')
+                return false;
+            pos = pos * 10 + static_cast<uint64_t>(c - '0');
+            if (pos >= static_cast<uint64_t>(size) * bits_per_char)
+                return false;
         }
 
-        size_t ofs = pos >> 3;
-
-        if (ofs > size) {
-            if (!merge_in.existing_value) {
-                delete[] data;
-            }
-            return false;
-        }
-
-        //char bytemask = (1 << ((1 << 3)) - (pos & ((1 << 3)))));
-        if (s[0] == '+') {
-            //data[(pos >> 3)] |= bytemask;
-            data[ofs] |= bit_mask[pos % bits_per_char];
-        } else if (s[0] == '-') {
-            //data[(pos >> 3)] &= ~bytemask;
-            data[ofs] &= ~bit_mask[pos % bits_per_char];
-        } else {
-            if (!merge_in.existing_value) {
-                delete[] data;
-            }
-            return false;
-        }
-
-        ++it;
+        const size_t ofs = static_cast<size_t>(pos / bits_per_char);
+        const unsigned char mask = bit_mask[pos % bits_per_char];
+        if (op == '+')
+            data[ofs] = static_cast<char>(static_cast<unsigned char>(data[ofs]) | mask);
+        else
+            data[ofs] = static_cast<char>(static_cast<unsigned char>(data[ofs]) & ~mask);
     }
 
-    //clear the new value for writing
-    merge_out->new_value.clear();
-    merge_out->new_value.append(reinterpret_cast<char*>(data), size);
-    if (!merge_in.existing_value) {
-        delete[] data;
-    }
     return true;
-
    }
 
    bool BitsetMergeOperator::PartialMergeMulti(

@@ -26,6 +26,8 @@
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/slice.h"
 
+#include <cstdint>
+
 #include "erl_nif.h"
 #include "atoms.h"
 #include "util.h"
@@ -55,6 +57,10 @@ namespace erocksdb {
 
         //clear the new value for writing
         merge_out->new_value.clear();
+
+        // A bad operand fails the reads of this key only. With the default
+        // scope a flush or compaction meeting it would make the DB read-only.
+        merge_out->op_failure_scope = OpFailureScope::kMustMerge;
 
         if (merge_in.existing_value) {
             if(!enif_binary_to_term(
@@ -94,7 +100,7 @@ namespace erocksdb {
                return on_error(env);
             }
 
-            if (!enif_get_tuple(env, term, &arity, &op))
+            if (!enif_get_tuple(env, term, &arity, &op) || arity != 2)
                 return on_error(env);
 
             if (op[0] == ATOM_MERGE_INT_ADD) {
@@ -145,11 +151,16 @@ namespace erocksdb {
                 return on_error(env);
             }
 
-            if (!enif_get_tuple(env, term, &arity, &op))
+            if (!enif_get_tuple(env, term, &arity, &op) || arity != 2)
                 return on_error(env);
 
             if ((op[0] != ATOM_MERGE_INT_ADD)
                     || !enif_get_int64(env, op[1], &val))
+                return on_error(env);
+
+            // the sum must fit in a 64-bit integer
+            if ((val > 0 && new_val > INT64_MAX - val)
+                    || (val < 0 && new_val < INT64_MIN - val))
                 return on_error(env);
 
             new_val += val;

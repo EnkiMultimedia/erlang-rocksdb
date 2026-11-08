@@ -73,6 +73,8 @@ parse_iterator_options(
                 ErlNifBinary upper_bound_bin;
                 if(!enif_inspect_binary(itr_env, upper_bound, &upper_bound_bin))
                     return 0;
+                // the option may be given more than once, the last one wins
+                delete bounds.upper_bound_slice;
                 bounds.upper_bound_slice = new rocksdb::Slice(
                         reinterpret_cast<char*>(upper_bound_bin.data),
                         upper_bound_bin.size);
@@ -89,6 +91,7 @@ parse_iterator_options(
                     bounds.upper_bound_slice = nullptr;
                     return 0;
                 }
+                delete bounds.lower_bound_slice;
                 bounds.lower_bound_slice = new rocksdb::Slice(
                         reinterpret_cast<char*>(lower_bound_bin.data),
                         lower_bound_bin.size);
@@ -102,10 +105,8 @@ parse_iterator_options(
                 opts.prefix_same_as_start = (option[1] == erocksdb::ATOM_TRUE);
             else if (option[0] == erocksdb::ATOM_SNAPSHOT)
             {
-                erocksdb::ReferencePtr<erocksdb::SnapshotObject> snapshot_ptr;
-                snapshot_ptr.assign(erocksdb::SnapshotObject::RetrieveSnapshotObject(env, option[1]));
-
-                if(NULL==snapshot_ptr.get())
+                // pinned in bounds, then by the iterator for its lifetime
+                if(!bounds.snapshot.try_assign(erocksdb::SnapshotObject::RetrieveSnapshotObject(env, option[1])))
                 {
                     // Clean up already allocated bound slices
                     delete bounds.upper_bound_slice;
@@ -115,7 +116,7 @@ parse_iterator_options(
                     return 0;
                 }
 
-                opts.snapshot = snapshot_ptr->m_Snapshot;
+                opts.snapshot = bounds.snapshot->m_Snapshot;
             }
             else if (option[0] == erocksdb::ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT)
                 opts.auto_refresh_iterator_with_snapshot = (option[1] == erocksdb::ATOM_TRUE);
@@ -185,6 +186,8 @@ Iterator(
 
     itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterator);
 
+    itr_ptr->KeepSnapshot(bounds.snapshot.get());
+
     // pin the column family so GC of its handle cannot free it while this
     // iterator is still using it
     if(cf_ptr.get() != nullptr)
@@ -236,7 +239,7 @@ Iterators(
     while(enif_get_list_cell(env, tail, &head, &tail))
     {
         ReferencePtr<ColumnFamilyObject> cf_ptr;
-        cf_ptr.assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
+        cf_ptr.try_assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
         ColumnFamilyObject* cf = cf_ptr.get();
         if(NULL == cf)
         {
@@ -257,6 +260,7 @@ Iterators(
     try {
         for (size_t i = 0; i < iterators.size(); i++) {
             itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterators[i]);
+            itr_ptr->KeepSnapshot(bounds.snapshot.get());
 
             // Clone slices for each iterator so each has independent ownership
             if(bounds.upper_bound_slice != nullptr)
@@ -323,7 +327,7 @@ CoalescingIterator(
     while(enif_get_list_cell(env, tail, &head, &tail))
     {
         ReferencePtr<ColumnFamilyObject> cf_ptr;
-        cf_ptr.assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
+        cf_ptr.try_assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
         if(NULL == cf_ptr.get())
         {
             delete bounds.upper_bound_slice;
@@ -344,6 +348,8 @@ CoalescingIterator(
     }
 
     ItrObject* itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterator.release());
+
+    itr_ptr->KeepSnapshot(bounds.snapshot.get());
 
     if(bounds.upper_bound_slice != nullptr)
     {
@@ -371,7 +377,7 @@ IteratorMove(
 
 
     ReferencePtr<ItrObject> itr_ptr;
-    itr_ptr.assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
+    itr_ptr.try_assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
 
     if(NULL==itr_ptr.get())
     {
@@ -455,7 +461,7 @@ IteratorRefresh(
     const ERL_NIF_TERM& itr_handle_ref = argv[0];
 
     ReferencePtr<ItrObject> itr_ptr;
-    itr_ptr.assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
+    itr_ptr.try_assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
 
     if(NULL==itr_ptr.get())
     {
@@ -482,7 +488,7 @@ IteratorPrepareValue(
     const ERL_NIF_TERM& itr_handle_ref = argv[0];
 
     ReferencePtr<ItrObject> itr_ptr;
-    itr_ptr.assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
+    itr_ptr.try_assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
 
     if(NULL==itr_ptr.get())
     {
@@ -539,7 +545,7 @@ IteratorColumns(
     const ERL_NIF_TERM& itr_handle_ref = argv[0];
 
     ReferencePtr<ItrObject> itr_ptr;
-    itr_ptr.assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
+    itr_ptr.try_assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
 
     if(NULL==itr_ptr.get())
     {

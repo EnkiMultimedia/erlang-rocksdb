@@ -31,6 +31,8 @@
 #include "rocksdb/db.h"
 #include "rocksdb/utilities/transaction.h"
 
+#include "env.h"
+
 namespace rocksdb {
     class DB;
     class ColumnFamilyHandle;
@@ -120,6 +122,11 @@ public:
     //  destructor ... in which case the vtable is not valid
     static bool InitiateCloseRequest(ErlRefObject * Object);
 
+    // Take a reference unless a close was requested. The check and the
+    // increment happen under m_CloseMutex, the same lock that sets the close
+    // flag, so a concurrent close cannot destroy the object in between.
+    bool TryRefInc();
+
     static void AwaitCloseAndDestructor(ErlRefObject * Object);
 };  // class RefObject
 
@@ -169,6 +176,18 @@ public:
         }   // if
     };
 
+    // Like assign() for objects retrieved from an Erlang term: only takes the
+    // reference if the object is not closing. Returns false otherwise.
+    bool try_assign(TargetT * _t)
+    {
+        if (NULL!=t)
+            t->RefDec();
+        t=NULL;
+        if (NULL!=_t && _t->TryRefInc())
+            t=_t;
+        return NULL!=t;
+    };
+
     TargetT * get() const { return t; }
 
     TargetT * operator->() const { return t; }
@@ -186,6 +205,7 @@ public:
     rocksdb::DB* m_Db;                             // NULL or rocksdb database object
     bool m_IsPessimistic;                          //!< true if opened as PessimisticTransactionDB
     bool m_IsTTL;                                  //!< true if opened as DBWithTTL
+    EnvRef m_Env;                                  //!< keeps the env alive until m_Db is deleted
     std::mutex m_ItrMutex;                         //!< mutex protecting m_ItrList
     std::mutex m_SnapshotMutex;                    //!< mutex protecting m_SnapshotList
     std::mutex m_ColumnFamilyMutex;                //!< mutex protecting m_ColumnFamily
@@ -327,6 +347,7 @@ public:
 class ItrObject : public ErlRefObject
 {
 public:
+    ReferencePtr<SnapshotObject> m_SnapshotPtr; //!< read snapshot, alive as long as the iterator
     rocksdb::Iterator * m_Iterator;
     std::shared_ptr<erocksdb::ErlEnvCtr> env;
     ReferencePtr<DbObject> m_DbPtr;
@@ -369,6 +390,13 @@ public:
     //!< Pin an erlang resource (e.g. column family, transaction) for this
     //!< iterator's lifetime so GC cannot free it while the iterator uses it.
     void KeepResource(void * Resource);
+
+    //!< Keep the read snapshot alive for this iterator's lifetime: RocksDB
+    //!< reads it again when the iterator refreshes. The reference stops an
+    //!< explicit release from freeing it; enif_keep_resource stops garbage
+    //!< collection, whose cleanup would otherwise block a scheduler waiting
+    //!< for this reference to go away.
+    void KeepSnapshot(SnapshotObject * Snapshot);
 };  // class ItrObject
 
 /**
