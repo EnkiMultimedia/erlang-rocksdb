@@ -91,7 +91,7 @@ Multiple rules are evaluated in order. A key is deleted if ANY rule matches.
 
 ## Erlang Callback Mode
 
-For complex filtering logic that can't be expressed with declarative rules, use the Erlang callback mode. Your Erlang process receives batches of keys during compaction and decides the fate of each one.
+For complex filtering logic that can't be expressed with declarative rules, use the Erlang callback mode. Your Erlang process receives the keys during compaction, one per message, and decides the fate of each one.
 
 ### Handler Process
 
@@ -136,7 +136,6 @@ HandlerPid = start_filter_handler(),
     {create_if_missing, true},
     {compaction_filter, #{
         handler => HandlerPid,   % PID of the handler process
-        batch_size => 100,       % Keys per batch (default: 100)
         timeout => 5000          % Timeout in ms (default: 5000)
     }}
 ]).
@@ -156,11 +155,13 @@ The handler must reply with a list of decisions, one per key:
 
 The compaction filter is designed to be robust:
 
-- **Timeout**: If the handler doesn't respond within the timeout, all keys in the batch are kept (safe fallback)
+- **Timeout**: If the handler doesn't respond within the timeout, the key is kept, and so are all the other keys of that compaction: the handler is not asked again until the next compaction
 - **Dead Handler**: If the handler process is dead, all keys are kept
 - **Invalid Response**: Keys with invalid decisions are kept
 
-This ensures that compaction never hangs or loses data due to handler issues.
+A handler that stops answering costs one timeout per compaction, not one per key, and no data is lost. Keep the timeout short: compaction waits for it.
+
+The handler receives one key per message: RocksDB asks for each key's decision before giving the next one, so keys cannot be batched. The `batch_size` option is accepted but has no effect.
 
 ### Example: Value Transformation
 
@@ -208,9 +209,8 @@ ok = rocksdb:compact_range(Db, undefined, undefined, [
 ## Performance Considerations
 
 1. **Prefer Declarative Rules**: They run in C++ without Erlang process overhead
-2. **Batch Size**: Larger batches reduce overhead but increase latency
-3. **Timeout**: Set appropriately for your workload - too short causes false keeps
-4. **Handler Process**: Use a dedicated process, don't block on slow operations
+2. **Timeout**: Set appropriately for your workload - too short causes false keeps, too long stalls a compaction when the handler is stuck
+3. **Handler Process**: Use a dedicated process, don't block on slow operations
 
 ## Use Cases
 

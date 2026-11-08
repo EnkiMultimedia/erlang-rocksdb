@@ -231,6 +231,21 @@ ERL_NIF_TERM PostingsCount(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PostingsKeys(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PostingsToBinary(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
+// posting list NIFs that move to a dirty scheduler for large inputs
+ERL_NIF_TERM PostingListKeysNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListContainsNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListFindNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListCountNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListToMapNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListIntersectionNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListUnionNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListDifferenceNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListIntersectionCountNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListBitmapContainsNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsOpenNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsKeysNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsToBinaryNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
 bool init_posting_list_resource(ErlNifEnv* env);
 
 void CreateBatchType(ErlNifEnv* env);

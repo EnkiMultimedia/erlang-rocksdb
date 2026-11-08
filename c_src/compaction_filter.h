@@ -141,9 +141,13 @@ private:
 
     // For Erlang callback mode
     ErlNifPid m_HandlerPid;
-    [[maybe_unused]] unsigned int m_BatchSize;  // Reserved for future batching implementation
+    // Not used: RocksDB asks for each key's decision before giving the next
+    // key, so keys cannot be sent in batches. Accepted for compatibility.
+    [[maybe_unused]] unsigned int m_BatchSize;
     unsigned int m_TimeoutMs;
-    mutable bool m_HandlerDead;  // Simple flag, one-way transition to true
+    // Set when the handler is dead or timed out: the rest of this compaction
+    // keeps its keys without asking. One filter is created per compaction.
+    mutable bool m_HandlerDead;
 
     // Helper methods
     FilterResult ApplyRules(const rocksdb::Slice& key,
