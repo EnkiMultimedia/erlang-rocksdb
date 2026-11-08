@@ -72,24 +72,12 @@ RefObject::RefDec()
 ErlRefObject::ErlRefObject()
     : m_CloseRequested(0)
 {
-    m_CloseMutex = new std::mutex();
-    m_CloseCond = new std::condition_variable();
-
-    return;
-
 }   // ErlRefObject::ErlRefObject
 
 
 ErlRefObject::~ErlRefObject()
 {
-
-    std::unique_lock<std::mutex> lk(*m_CloseMutex);
-    m_CloseRequested=3;
-    m_CloseCond->notify_all();
-    lk.unlock();
-
-    // DO NOT DESTROY m_CloseMutex or m_CloseCond here
-
+    // runs from AwaitCloseAndDestructor, after ReleaseNative
 }   // ErlRefObject::~ErlRefObject
 
 
@@ -101,11 +89,10 @@ ErlRefObject::InitiateCloseRequest(
 
     ret_flag=false;
 
-    // special handling since destructor may have been called
     if (NULL!=Object && 0==Object->m_CloseRequested)
     {
         // same lock as TryRefInc, see there
-        std::lock_guard<std::mutex> lk(*Object->m_CloseMutex);
+        std::lock_guard<std::mutex> lk(Object->m_CloseMutex);
         ret_flag=erocksdb::compare_and_swap(Object->m_CloseRequested, 0u, 1u);
     }
 
@@ -124,7 +111,7 @@ ErlRefObject::InitiateCloseRequest(
 bool
 ErlRefObject::TryRefInc()
 {
-    std::lock_guard<std::mutex> lk(*m_CloseMutex);
+    std::lock_guard<std::mutex> lk(m_CloseMutex);
     if (0!=m_CloseRequested)
         return false;
     RefInc();
@@ -136,30 +123,20 @@ void
 ErlRefObject::AwaitCloseAndDestructor(
     ErlRefObject * Object)
 {
-    // NOTE:  it is possible, actually likely, that this
-    //        routine is called AFTER the destructor is called
-    //        Don't panic.
+    if (NULL==Object)
+        return;
 
-    if (NULL!=Object)
+    // Always take the lock, even if state 3 is already visible: the thread
+    // that set it may still hold the mutex, which the destructor below frees.
     {
-        // quick test if any work pending
-        if (3!=Object->m_CloseRequested)
-        {
-            std::unique_lock<std::mutex> lk(*(Object->m_CloseMutex));
+        std::unique_lock<std::mutex> lk(Object->m_CloseMutex);
+        while (3!=Object->m_CloseRequested)
+            Object->m_CloseCond.wait(lk);
+    }
 
-            // retest after mutex helc
-            while (3!=Object->m_CloseRequested)
-            {
-                Object->m_CloseCond->wait(lk);
-            }   // while
-            lk.unlock();
-        }   // if
-
-        delete Object->m_CloseMutex;
-        delete Object->m_CloseCond;
-    }   // if
-
-    return;
+    // The native objects are released: run the C++ destructor. Erlang frees
+    // the memory once this callback returns.
+    Object->~ErlRefObject();
 
 }   // ErlRefObject::AwaitCloseAndDestructor
 
@@ -170,12 +147,15 @@ ErlRefObject::RefDec()
     uint32_t cur_count;
 
     cur_count = --m_RefCount;
-    // this the last active after close requested?
-    //  (atomic swap should be unnecessary ... but going for safety)
+    // last reference after a close request: release the native objects, the
+    // C++ object stays alive until its Erlang resource is destroyed
     if (0==cur_count && compare_and_swap(m_CloseRequested, 1u, 2u))
     {
-        // deconstruct, but let erlang deallocate memory later
-        this->~ErlRefObject();
+        ReleaseNative();
+
+        std::lock_guard<std::mutex> lk(m_CloseMutex);
+        m_CloseRequested=3;
+        m_CloseCond.notify_all();
     }   // if
 
     return(cur_count);
@@ -276,17 +256,22 @@ DbObject::DbObject(rocksdb::DB * DbPtr, bool IsPessimistic, bool IsTTL)
     {}   // DbObject::DbObject
 
 
-DbObject::~DbObject()
+void
+DbObject::ReleaseNative()
 {
 
     // close the db
     delete m_Db;
     m_Db=NULL;
 
-    // do not clean up m_CloseMutex and m_CloseCond
+    // the env must outlive the database
+    m_Env.Reset();
+}   // DbObject::ReleaseNative
 
-    return;
 
+DbObject::~DbObject()
+{
+    // everything was released by ReleaseNative
 }   // DbObject::~DbObject
 
 
@@ -295,6 +280,7 @@ DbObject::Shutdown()
 {
 #if 1
     bool again;
+    bool held = false;   // a child already closing is skipped
     ColumnFamilyObject *column_family_ptr;
     ItrObject * itr_ptr;
     SnapshotObject * snapshot_ptr;
@@ -316,13 +302,18 @@ DbObject::Shutdown()
                 again=true;
                 itr_ptr=m_ItrList.front();
                 m_ItrList.pop_front();
+                // a reference keeps the child alive once the list lock is released
+                held = itr_ptr->TryRefInc();
             }   // if
         }
 
         // must be outside lock so ItrObject can attempt
         //  RemoveReference
-        if (again)
+        if (again && held)
+        {
             ItrObject::InitiateCloseRequest(itr_ptr);
+            itr_ptr->RefDec();
+        }
 
     } while(again);
 
@@ -339,13 +330,18 @@ DbObject::Shutdown()
                 again = true;
                 column_family_ptr = m_ColumnFamilyList.front();
                 m_ColumnFamilyList.pop_front();
+                // a reference keeps the child alive once the list lock is released
+                held = column_family_ptr->TryRefInc();
             }   // if
         }
 
         // must be outside lock so SnapshotObject can attempt
         //  RemoveReference
-        if (again)
+        if (again && held)
+        {
             ColumnFamilyObject::InitiateCloseRequest(column_family_ptr);
+            column_family_ptr->RefDec();
+        }
 
     } while (again);
 
@@ -364,13 +360,18 @@ DbObject::Shutdown()
                 again=true;
                 snapshot_ptr=m_SnapshotList.front();
                 m_SnapshotList.pop_front();
+                // a reference keeps the child alive once the list lock is released
+                held = snapshot_ptr->TryRefInc();
             }   // if
         }
 
         // must be outside lock so SnapshotObject can attempt
         //  RemoveReference
-        if (again)
+        if (again && held)
+        {
             SnapshotObject::InitiateCloseRequest(snapshot_ptr);
+            snapshot_ptr->RefDec();
+        }
 
     } while(again);
 
@@ -387,13 +388,18 @@ DbObject::Shutdown()
                 again = true;
                 tlog_ptr = m_TLogItrList.front();
                 m_TLogItrList.pop_front();
+                // a reference keeps the child alive once the list lock is released
+                held = tlog_ptr->TryRefInc();
             }   // if
         }
 
         // must be outside lock so SnapshotObject can attempt
         //  RemoveReference
-        if (again)
+        if (again && held)
+        {
             TLogItrObject::InitiateCloseRequest(tlog_ptr);
+            tlog_ptr->RefDec();
+        }
 
     } while (again);
 
@@ -410,13 +416,18 @@ DbObject::Shutdown()
                 again = true;
                 tx_ptr = m_TransactionList.front();
                 m_TransactionList.pop_front();
+                // a reference keeps the child alive once the list lock is released
+                held = tx_ptr->TryRefInc();
             }   // if
         }
 
         // must be outside lock so SnapshotObject can attempt
         //  RemoveReference
-        if (again)
+        if (again && held)
+        {
             TransactionObject::InitiateCloseRequest(tx_ptr);
+            tx_ptr->RefDec();
+        }
 
     } while (again);
 
@@ -432,12 +443,17 @@ DbObject::Shutdown()
                 again = true;
                 ingestion_ptr = m_IngestionList.front();
                 m_IngestionList.pop_front();
+                // a reference keeps the child alive once the list lock is released
+                held = ingestion_ptr->TryRefInc();
             }   // if
         }
 
         // outside lock so IngestionObject can attempt RemoveIngestionReference
-        if (again)
+        if (again && held)
+        {
             IngestionObject::InitiateCloseRequest(ingestion_ptr);
+            ingestion_ptr->RefDec();
+        }
 
     } while (again);
 
@@ -674,14 +690,25 @@ ColumnFamilyObject::ColumnFamilyObject(
 }   // ColumnFamilyObject::ColumnFamilyObject
 
 
-ColumnFamilyObject::~ColumnFamilyObject() {
+void
+ColumnFamilyObject::ReleaseNative()
+{
     if (NULL != m_ColumnFamily) {
         m_DbPtr->m_Db->DestroyColumnFamilyHandle(m_ColumnFamily);
         m_ColumnFamily = NULL;
     }
     if (NULL != m_DbPtr.get())
         m_DbPtr->RemoveColumnFamilyReference(this);
-    return;
+
+    // release the parents now: closing the database must not wait for
+    // this object's Erlang term to be garbage collected
+    m_DbPtr.assign(NULL);
+}   // ColumnFamilyObject::ReleaseNative
+
+
+ColumnFamilyObject::~ColumnFamilyObject()
+{
+    // everything was released by ReleaseNative
 }   // ColumnFamilyObject::~ColumnFamilyObject
 
 
@@ -794,7 +821,8 @@ SnapshotObject::SnapshotObject(
 }   // SnapshotObject::SnapshotObject
 
 
-SnapshotObject::~SnapshotObject()
+void
+SnapshotObject::ReleaseNative()
 {
 
     if (NULL!=m_DbPtr.get())
@@ -808,10 +836,15 @@ SnapshotObject::~SnapshotObject()
 
     m_Snapshot=NULL;
 
-    // do not clean up m_CloseMutex and m_CloseCond
+    // release the parents now: closing the database must not wait for
+    // this object's Erlang term to be garbage collected
+    m_DbPtr.assign(NULL);
+}   // SnapshotObject::ReleaseNative
 
-    return;
 
+SnapshotObject::~SnapshotObject()
+{
+    // everything was released by ReleaseNative
 }   // SnapshotObject::~SnapshotObject
 
 
@@ -951,7 +984,9 @@ ItrObject::ItrObject(
 
 
 
-ItrObject::~ItrObject() {
+void
+ItrObject::ReleaseNative()
+{
     // not likely to have active reuse item since it would
     //  block destruction
 
@@ -959,15 +994,18 @@ ItrObject::~ItrObject() {
     if (nullptr != m_DbPtr.get())
         m_DbPtr->RemoveReference(this);
 
-    if(upper_bound_slice != nullptr)
-        delete upper_bound_slice;
+    delete upper_bound_slice;
+    upper_bound_slice = nullptr;
 
-    if(lower_bound_slice != nullptr)
-        delete lower_bound_slice;
+    delete lower_bound_slice;
+    lower_bound_slice = nullptr;
+
+    // the bound keys live in this env, free it with them
+    env.reset();
 
 
     delete m_Iterator;
-    //m_Iterator = nullptr;
+    m_Iterator = nullptr;
 
     // the snapshot, transaction and column families are released only once
     // the iterator is gone
@@ -994,8 +1032,15 @@ ItrObject::~ItrObject() {
         enif_release_resource(resource);
     m_KeptResources.clear();
 
-    return;
+    // release the parents now: closing the database must not wait for
+    // this object's Erlang term to be garbage collected
+    m_DbPtr.assign(NULL);
+}   // ItrObject::ReleaseNative
 
+
+ItrObject::~ItrObject()
+{
+    // everything was released by ReleaseNative
 }   // ItrObject::~ItrObject
 
 
@@ -1133,7 +1178,9 @@ TLogItrObject::TLogItrObject(
 }   // TLogItrObject::TLogItrObject
 
 
-TLogItrObject::~TLogItrObject() {
+void
+TLogItrObject::ReleaseNative()
+{
 
     if (NULL != m_DbPtr.get())
         m_DbPtr->RemoveTLogReference(this);
@@ -1142,10 +1189,15 @@ TLogItrObject::~TLogItrObject() {
     delete m_Iter;
     m_Iter = NULL;
 
-    // do not clean up m_CloseMutex and m_CloseCond
+    // release the parents now: closing the database must not wait for
+    // this object's Erlang term to be garbage collected
+    m_DbPtr.assign(NULL);
+}   // TLogItrObject::ReleaseNative
 
-    return;
 
+TLogItrObject::~TLogItrObject()
+{
+    // everything was released by ReleaseNative
 }   // TLogItrObject::~TLogItrObject
 
 
@@ -1234,7 +1286,9 @@ IngestionObject::IngestionObject(
 }   // IngestionObject::IngestionObject
 
 
-IngestionObject::~IngestionObject() {
+void
+IngestionObject::ReleaseNative()
+{
 
     if (NULL != m_DbPtr.get())
         m_DbPtr->RemoveIngestionReference(this);
@@ -1243,6 +1297,15 @@ IngestionObject::~IngestionObject() {
     // This must happen while m_DbPtr still keeps the database open.
     m_Handle.reset();
 
+    // release the parents now: closing the database must not wait for
+    // this object's Erlang term to be garbage collected
+    m_DbPtr.assign(NULL);
+}   // IngestionObject::ReleaseNative
+
+
+IngestionObject::~IngestionObject()
+{
+    // everything was released by ReleaseNative
 }   // IngestionObject::~IngestionObject
 
 
@@ -1355,14 +1418,19 @@ BackupEngineObject::BackupEngineObject(
     {}
 
 
-BackupEngineObject::~BackupEngineObject()
+void
+BackupEngineObject::ReleaseNative()
 {
 
     // close the db
     delete m_BackupEngine;
     m_BackupEngine=NULL;
-    return;
+}   // BackupEngineObject::ReleaseNative
 
+
+BackupEngineObject::~BackupEngineObject()
+{
+    // everything was released by ReleaseNative
 }   // BackupEngineObject::~BackupEngineObject
 
 
@@ -1470,7 +1538,8 @@ TransactionObject::TransactionObject(
     }
 
 
-TransactionObject::~TransactionObject()
+void
+TransactionObject::ReleaseNative()
 {
 
   if(NULL!=m_DbPtr.get())
@@ -1478,9 +1547,17 @@ TransactionObject::~TransactionObject()
   
   delete m_Tx;
   m_Tx=NULL;
-  return;
 
-}   // TransactionObject::~BackupEngineObject
+    // release the parents now: closing the database must not wait for
+    // this object's Erlang term to be garbage collected
+    m_DbPtr.assign(NULL);
+}   // TransactionObject::ReleaseNative
+
+
+TransactionObject::~TransactionObject()
+{
+    // everything was released by ReleaseNative
+}   // TransactionObject::~TransactionObject
 
 
 void

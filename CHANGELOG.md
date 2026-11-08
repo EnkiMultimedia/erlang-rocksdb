@@ -30,6 +30,7 @@
 - `destroy_column_family/2` freed the column family while other calls, or iterators over several column families, still used it. The column family is now freed when the last of them is done.
 - handles created while the database was closing (snapshots, iterators, transactions, column families) were not closed with it, so RocksDB stayed open and locked after `close/1`. They are now refused with `badarg`.
 - a parsed posting list with a few very large keys still ran on a normal scheduler, it is now scheduled by size as well as by key count
+- closing a database while another process dropped one of its handles could crash the VM, and the cleanup of every handle read the object after its destructor had run. Handles now free their RocksDB objects when the last user is done and are destroyed only when Erlang collects them.
 - the build no longer downloads anything from the network: the vendored CRoaring build fetched a CMake helper from GitHub at configure time, so offline builds failed
 
 ### Changes

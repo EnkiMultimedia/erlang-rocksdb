@@ -238,6 +238,44 @@ collect_children(Acc) ->
   after 0 -> Acc
   end.
 
+%% Handles dropped and garbage collected while their database closes: the
+%% Erlang cleanup of a handle and the database close both release it.
+gc_cleanup_during_close_test_() ->
+  {timeout, 120, fun() ->
+    [gc_cleanup_during_close(N) || N <- lists:seq(1, 20)]
+  end}.
+
+gc_cleanup_during_close(N) ->
+  Dir = test_dir("gc_close_" ++ integer_to_list(N)),
+  Path = filename:join(Dir, "db"),
+  {ok, Db, [_, Cf]} = open_with_cf(Dir),
+  ok = rocksdb:put(Db, Cf, <<"k">>, <<"v">>, []),
+  Workers = run_workers(?WORKERS, fun(I) -> drop_handles(Db, Cf, I, 0) end),
+  timer:sleep(N rem 5),
+  ok = rocksdb:close(Db),
+  wait_workers(Workers),
+  erlang:garbage_collect(),
+  %% every handle is gone, so the database must open again
+  {ok, Db2, _} = rocksdb:open(Path, [], [{"default", []}, {"other", []}]),
+  ok = rocksdb:close(Db2),
+  ?rm_rf(Dir).
+
+drop_handles(_Db, _Cf, _I, 300) -> ok;
+drop_handles(Db, Cf, I, K) ->
+  R = case (I + K) rem 3 of
+        0 -> catch rocksdb:snapshot(Db);
+        1 -> catch rocksdb:iterator(Db, Cf, []);
+        2 -> catch rocksdb:iterators(Db, [Cf], [])
+      end,
+  case R of
+    {ok, _} ->
+      %% drop the handle right away and let the cleanup run concurrently
+      erlang:garbage_collect(),
+      drop_handles(Db, Cf, I, K + 1);
+    {'EXIT', {badarg, _}} -> ok;
+    {error, _} -> ok
+  end.
+
 %% helpers
 
 open_with_cf(Dir) ->
