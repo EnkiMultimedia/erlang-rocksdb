@@ -31,6 +31,10 @@ namespace erocksdb {
         public:
             explicit CounterMergeOperator();
 
+            virtual bool FullMergeV2(
+                    const MergeOperationInput& merge_in,
+                    MergeOperationOutput* merge_out) const override;
+
             virtual bool Merge(
                     const rocksdb::Slice& key,
                     const rocksdb::Slice* existing_value,

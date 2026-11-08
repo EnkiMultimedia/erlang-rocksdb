@@ -152,7 +152,12 @@ class Cache : public Customizable {
 
     // For helpers without SecondaryCache support
     explicit CacheItemHelper(CacheEntryRole _role, DeleterFn _del_cb = nullptr)
-        : CacheItemHelper(_role, _del_cb, nullptr, nullptr, nullptr, this) {}
+        : del_cb(_del_cb),
+          size_cb(nullptr),
+          saveto_cb(nullptr),
+          create_cb(nullptr),
+          role(_role),
+          without_secondary_compat(this) {}
 
     // For helpers with SecondaryCache support
     explicit CacheItemHelper(CacheEntryRole _role, DeleterFn _del_cb,
@@ -186,9 +191,11 @@ class Cache : public Customizable {
   // No copying allowed
   Cache(const Cache&) = delete;
   Cache& operator=(const Cache&) = delete;
+  Cache(Cache&&) = delete;
+  Cache& operator=(Cache&&) = delete;
 
   // Destroys all remaining entries by calling the associated "deleter"
-  virtual ~Cache() {}
+  ~Cache() override {}
 
   static const char* Type() { return "Cache"; }
 
@@ -209,7 +216,7 @@ class Cache : public Customizable {
 
  public:  // functions
   // The type of the Cache
-  virtual const char* Name() const = 0;
+  const char* Name() const override = 0;
 
   // The Insert and Lookup APIs below are intended to allow cached objects
   // to be demoted/promoted between the primary block cache and a secondary
@@ -395,12 +402,17 @@ class Cache : public Customizable {
   }
 
   struct ApplyToAllEntriesOptions {
-    // If the Cache uses locks, setting `average_entries_per_lock` to
-    // a higher value suggests iterating over more entries each time a lock
-    // is acquired, likely reducing the time for ApplyToAllEntries but
-    // increasing latency for concurrent users of the Cache. Setting
-    // `average_entries_per_lock` to a smaller value could be helpful if
-    // callback is relatively expensive, such as using large data structures.
+    // Roughly how many entries to process as a batch between steps of
+    // iterating over the whole cache. Despite the name (kept for historical
+    // reasons), this is fundamentally a batch size and applies regardless of
+    // how a Cache implementation synchronizes: for a lock-based Cache a lock
+    // is held for the duration of each batch, but the same batching also
+    // benefits lock-free implementations by amortizing fixed per-batch
+    // overhead. A higher value means fewer, larger batches, likely reducing
+    // the total time for ApplyToAllEntries, but for a lock-based Cache it
+    // increases latency for concurrent users because a lock is held longer
+    // per batch. A smaller value could be helpful if the callback is
+    // relatively expensive, such as using large data structures.
     size_t average_entries_per_lock = 256;
   };
 
@@ -425,7 +437,7 @@ class Cache : public Customizable {
   // Prerequisite: no entry is referenced.
   virtual void EraseUnRefEntries() = 0;
 
-  virtual std::string GetPrintableOptions() const { return ""; }
+  std::string GetPrintableOptions() const override { return ""; }
 
   // Check for any warnings or errors in the operation of the cache and
   // report them to the logger. This is intended only to be called
@@ -646,7 +658,7 @@ class CacheWrapper : public Cache {
     target_->ApplyToAllEntries(callback, opts);
   }
 
-  virtual void ApplyToHandle(
+  void ApplyToHandle(
       Cache* cache, Handle* handle,
       const std::function<void(const Slice& key, ObjectPtr obj, size_t charge,
                                const CacheItemHelper* helper)>& callback)

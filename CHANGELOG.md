@@ -1,3 +1,42 @@
+## erlang-rocksdb (unreleased)
+
+### Upgrades
+
+- update vendored RocksDB to 11.13.2 (from 11.1.2)
+
+### New Features
+
+- two-phase ingestion: `prepare_ingestion/3,4` stages SST files without blocking writes, `commit_ingestion/2` makes one or several of them visible at once, and `abort_ingestion/1` cancels. See the SST files guide.
+- `abort_compactions/2` and `resume_compactions/2` stop and restart compactions of a single column family, leaving the others running
+- new column family options: `read_triggered_compaction_threshold` compacts files that are read often, `min_tombstones_for_range_conversion` speeds up reads over long runs of deleted keys, `periodic_compaction_seconds` and `blob_file_writable_file_max_buffer_size`
+- new database options: `use_direct_io_for_compaction_reads` keeps compaction scans out of the page cache, `max_compaction_trigger_wakeup_seconds`, and the experimental `optimize_manifest_for_recovery` and `reuse_manifest_on_open` for faster reopen
+- two new statistics histograms, `ingest_external_file_prepare_micros` and `ingest_external_file_run_micros`, show how long ingestion takes and how long it blocks writes. The statistics guide also documents the database properties that show if compactions fall behind.
+- block based tables accept `format_version` 8 and `optimize_key_common_prefix`, which stores the shared key prefix of a block once
+
+### Bug Fixes
+
+- a database opened with an env from `new_env/1` crashed the VM once the env term was garbage collected, for example when the process that opened it exited. The database now keeps its env alive. In-memory envs created by the `in_memory` and `{env, memenv}` options were never freed, they are now freed when the database closes.
+- using a write batch after `release_batch/1` crashed the VM, it now raises `badarg`. Concurrent calls on the same batch are serialized.
+- one malformed merge operand made flush fail and then every write, so the database stopped accepting writes. Now only reads of that key fail. This applies to the Erlang, bitset and counter merge operators.
+- the bitset merge operator wrote one byte past the bitmap for the first position after its end, and changed the stored value in place, so snapshots and concurrent readers saw bits they should not. Positions must now be plain decimal numbers inside the bitmap.
+- `int_add` in the Erlang merge operator and the counter merge operator wrapped around on overflow, they now fail the merge
+- closing a database, a column family or another handle while other processes still used it could crash the VM
+- an iterator using `auto_refresh_iterator_with_snapshot` read a freed snapshot after `release_snapshot/1`. Iterators now keep their snapshot. Reads given a released snapshot raise `badarg`, before they silently read the latest data.
+- an SST file reader iterator dropped without `sst_file_reader_iterator_close/1` kept its reader forever, and closing it could free the reader while the iterator still used it
+- `posting_list_contains/2` trusted the sizes inside the binary, a malformed one could ask for gigabytes of memory
+- repeating `iterate_upper_bound` or `iterate_lower_bound` in iterator options leaked memory
+- the build no longer downloads anything from the network: the vendored CRoaring build fetched a CMake helper from GitHub at configure time, so offline builds failed
+
+### Changes
+
+- posting list functions run on a dirty scheduler when the posting list is large (over 64 KB, or over 4096 keys for a parsed one), so they no longer hold a normal scheduler for milliseconds. Small lists still run inline.
+- a compaction filter handler that does not answer in time is not asked again for the rest of that compaction, the remaining keys are kept. Before, every key waited the full timeout, so a stuck handler could stall compaction for hours. The handler is asked again at the next compaction.
+- the `batch_size` option of the compaction filter is now documented as having no effect: keys are always sent one per message
+
+### Deprecations
+
+- the `external_sst_file_global_seqno_offset` entry returned by `sst_file_reader_get_table_properties/1` is always 0: RocksDB 11.13 no longer records it
+
 ## erlang-rocksdb 3.1.2, released on 2026/07/25
 
 ### Bug Fixes

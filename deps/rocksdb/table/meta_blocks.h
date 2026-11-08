@@ -41,6 +41,9 @@ class MetaIndexBuilder {
  public:
   MetaIndexBuilder(const MetaIndexBuilder&) = delete;
   MetaIndexBuilder& operator=(const MetaIndexBuilder&) = delete;
+  MetaIndexBuilder(MetaIndexBuilder&&) = delete;
+  MetaIndexBuilder& operator=(MetaIndexBuilder&&) = delete;
+  ~MetaIndexBuilder() = default;
 
   MetaIndexBuilder();
   void Add(const std::string& key, const BlockHandle& handle);
@@ -59,6 +62,9 @@ class PropertyBlockBuilder {
  public:
   PropertyBlockBuilder(const PropertyBlockBuilder&) = delete;
   PropertyBlockBuilder& operator=(const PropertyBlockBuilder&) = delete;
+  PropertyBlockBuilder(PropertyBlockBuilder&&) = delete;
+  PropertyBlockBuilder& operator=(PropertyBlockBuilder&&) = delete;
+  ~PropertyBlockBuilder() = default;
 
   PropertyBlockBuilder();
 
@@ -110,9 +116,18 @@ bool NotifyCollectTableCollectorsOnFinish(
     UserCollectedProperties& user_collected_properties,
     UserCollectedProperties& readable_properties);
 
+// The optional offset is relative to the start of the properties block.
 Status ParsePropertiesBlock(
-    const ImmutableOptions& ioptions, uint64_t offset, Block& block,
-    std::unique_ptr<TableProperties>& new_table_properties);
+    const ImmutableOptions& ioptions, Block& block,
+    std::unique_ptr<TableProperties>& new_table_properties,
+    uint32_t* global_seqno_value_offset);
+
+// Sets global_seqno to the sequence number that should replace per-entry
+// sequence numbers while reading this file. When largest_seqno is
+// kDisableGlobalSequenceNumber, leaves the stored sequence numbers unchanged.
+Status GetGlobalSequenceNumber(const TableProperties& table_properties,
+                               SequenceNumber largest_seqno,
+                               SequenceNumber* global_seqno);
 
 // Read table properties from a file using known BlockHandle.
 // @returns a status to indicate if the operation succeeded. On success,

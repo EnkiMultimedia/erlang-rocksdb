@@ -7,12 +7,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <atomic>
+#include <memory>
+#include <string>
 #include <tuple>
+#include <utility>
 
 #include "compaction/compaction_picker_universal.h"
 #include "db/blob/blob_index.h"
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
+#include "db/periodic_compaction_phaser.h"
+#include "db/table_cache.h"
 #include "env/mock_env.h"
 #include "file/filename.h"
 #include "port/port.h"
@@ -23,10 +29,14 @@
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/iostats_context.h"
 #include "rocksdb/sst_file_writer.h"
+#include "table/block_based/block_based_table_factory.h"
+#include "table/table_builder.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/sync_point.h"
 #include "test_util/testutil.h"
 #include "util/concurrent_task_limiter_impl.h"
+#include "util/fastrange.h"
+#include "util/hash.h"
 #include "util/random.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
@@ -119,6 +129,17 @@ class DBCompactionTest : public DBTestBase {
   DBCompactionTest()
       : DBTestBase("db_compaction_test", /*env_do_fsync=*/false) {}
 
+  void TearDown() override {
+    // Reset Env::Default() thread pool state that tests may have modified.
+    // Under sharded execution multiple tests share a process, so leaked
+    // thread-pool sizes (especially BOTTOM) cause later tests to see
+    // unexpected compaction scheduling (e.g. ForwardToBottomPriPool).
+    Env::Default()->SetBackgroundThreads(0, Env::Priority::BOTTOM);
+    Env::Default()->SetBackgroundThreads(1, Env::Priority::LOW);
+    Env::Default()->SetBackgroundThreads(1, Env::Priority::HIGH);
+    DBTestBase::TearDown();
+  }
+
  protected:
   /*
    * Verifies compaction stats of cfd are valid.
@@ -156,6 +177,264 @@ class DBCompactionTest : public DBTestBase {
 #endif /* NDEBUG */
   }
 };
+
+struct FileCuttingTableFactoryState {
+  std::atomic<int> cut_requests{0};
+  int max_cut_requests = 1;
+  bool allow_empty_builder_cut = false;
+};
+
+class FileCuttingTableBuilder : public TableBuilder {
+ public:
+  FileCuttingTableBuilder(std::unique_ptr<TableBuilder> base_builder,
+                          std::string cut_before_user_key,
+                          std::shared_ptr<FileCuttingTableFactoryState> state)
+      : base_builder_(std::move(base_builder)),
+        cut_before_user_key_(std::move(cut_before_user_key)),
+        state_(std::move(state)) {}
+
+  void Add(const Slice& key, const Slice& value) override {
+    base_builder_->Add(key, value);
+  }
+
+  TableBuilderAddResult TryAdd(const Slice& key, const Slice& value,
+                               TableBuilderAddContext* context) override {
+    const Slice user_key = ExtractUserKey(key);
+    const bool cut_request_limit_not_reached =
+        state_->cut_requests.load() < state_->max_cut_requests;
+    const bool should_cut =
+        cut_request_limit_not_reached &&
+        (state_->allow_empty_builder_cut || !base_builder_->IsEmpty()) &&
+        user_key.compare(Slice(cut_before_user_key_)) == 0;
+    if (should_cut) {
+      state_->cut_requests++;
+      context->new_table_reason = TableBuilderNewTableReason::kBuilderPolicy;
+      return TableBuilderAddResult::kRequiresNewTable;
+    }
+    return base_builder_->TryAdd(key, value, context);
+  }
+
+  Status status() const override { return base_builder_->status(); }
+
+  IOStatus io_status() const override { return base_builder_->io_status(); }
+
+  Status Finish() override { return base_builder_->Finish(); }
+
+  void Abandon() override { base_builder_->Abandon(); }
+
+  uint64_t NumEntries() const override { return base_builder_->NumEntries(); }
+
+  bool IsEmpty() const override { return base_builder_->IsEmpty(); }
+
+  uint64_t PreCompressionSize() const override {
+    return base_builder_->PreCompressionSize();
+  }
+
+  uint64_t FileSize() const override { return base_builder_->FileSize(); }
+
+  uint64_t EstimatedFileSize() const override {
+    return base_builder_->EstimatedFileSize();
+  }
+
+  uint64_t EstimatedTailSize() const override {
+    return base_builder_->EstimatedTailSize();
+  }
+
+  uint64_t GetTailSize() const override { return base_builder_->GetTailSize(); }
+
+  bool NeedCompact() const override { return base_builder_->NeedCompact(); }
+
+  TableProperties GetTableProperties() const override {
+    return base_builder_->GetTableProperties();
+  }
+
+  std::string GetFileChecksum() const override {
+    return base_builder_->GetFileChecksum();
+  }
+
+  const char* GetFileChecksumFuncName() const override {
+    return base_builder_->GetFileChecksumFuncName();
+  }
+
+  void SetSeqnoTimeTableProperties(const SeqnoToTimeMapping& relevant_mapping,
+                                   uint64_t oldest_ancestor_time) override {
+    base_builder_->SetSeqnoTimeTableProperties(relevant_mapping,
+                                               oldest_ancestor_time);
+  }
+
+  uint64_t GetWorkerCPUMicros() const override {
+    return base_builder_->GetWorkerCPUMicros();
+  }
+
+ private:
+  std::unique_ptr<TableBuilder> base_builder_;
+  std::string cut_before_user_key_;
+  std::shared_ptr<FileCuttingTableFactoryState> state_;
+};
+
+class FileCuttingTableFactory : public TableFactory {
+ public:
+  FileCuttingTableFactory(std::string cut_before_user_key,
+                          std::shared_ptr<FileCuttingTableFactoryState> state)
+      : cut_before_user_key_(std::move(cut_before_user_key)),
+        state_(std::move(state)) {}
+
+  const char* Name() const override { return "FileCuttingTableFactory"; }
+
+  using TableFactory::NewTableReader;
+
+  Status NewTableReader(
+      const ReadOptions& read_options,
+      const TableReaderOptions& table_reader_options,
+      std::unique_ptr<RandomAccessFileReader>&& file, uint64_t file_size,
+      std::unique_ptr<TableReader>* table_reader,
+      bool prefetch_index_and_filter_in_cache) const override {
+    return base_factory_.NewTableReader(
+        read_options, table_reader_options, std::move(file), file_size,
+        table_reader, prefetch_index_and_filter_in_cache);
+  }
+
+  TableBuilder* NewTableBuilder(
+      const TableBuilderOptions& table_builder_options,
+      WritableFileWriter* file) const override {
+    return new FileCuttingTableBuilder(
+        std::unique_ptr<TableBuilder>(
+            base_factory_.NewTableBuilder(table_builder_options, file)),
+        cut_before_user_key_, state_);
+  }
+
+  std::unique_ptr<TableFactory> Clone() const override {
+    return std::make_unique<FileCuttingTableFactory>(cut_before_user_key_,
+                                                     state_);
+  }
+
+  bool IsDeleteRangeSupported() const override {
+    return base_factory_.IsDeleteRangeSupported();
+  }
+
+  std::string GetPrintableOptions() const override {
+    return base_factory_.GetPrintableOptions();
+  }
+
+ private:
+  std::string cut_before_user_key_;
+  std::shared_ptr<FileCuttingTableFactoryState> state_;
+  BlockBasedTableFactory base_factory_;
+};
+
+TEST_F(DBCompactionTest, TableBuilderCanRequestNewTableDuringCompaction) {
+  auto factory_state = std::make_shared<FileCuttingTableFactoryState>();
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.level0_file_num_compaction_trigger = 10;
+  options.target_file_size_base = 1 << 30;
+  options.table_factory =
+      std::make_shared<FileCuttingTableFactory>(Key(5), factory_state);
+  Reopen(options);
+
+  for (int key : {0, 2, 4, 6, 8}) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+  for (int key : {1, 3, 5, 7, 9}) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_EQ(2, NumTableFilesAtLevel(0));
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  ASSERT_EQ(1, factory_state->cut_requests.load());
+  ASSERT_EQ(0, NumTableFilesAtLevel(0));
+  ASSERT_EQ(2, NumTableFilesAtLevel(1));
+  for (int key = 0; key < 10; ++key) {
+    ASSERT_EQ("value" + std::to_string(key), Get(Key(key)));
+  }
+}
+
+TEST_F(DBCompactionTest, TableBuilderCutRequestForLevelZeroFailsCompaction) {
+  auto factory_state = std::make_shared<FileCuttingTableFactoryState>();
+
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleUniversal;
+  options.disable_auto_compactions = true;
+  options.num_levels = 1;
+  options.table_factory =
+      std::make_shared<FileCuttingTableFactory>(Key(5), factory_state);
+  Reopen(options);
+
+  for (int key : {0, 2, 4, 6, 8}) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+  for (int key : {1, 3, 5, 7, 9}) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+
+  Status status = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(std::string::npos, status.ToString().find("level 0 output"))
+      << status.ToString();
+  ASSERT_EQ(1, factory_state->cut_requests.load());
+}
+
+TEST_F(DBCompactionTest, TableBuilderCutOnEmptyBuilderFailsCompaction) {
+  auto factory_state = std::make_shared<FileCuttingTableFactoryState>();
+  factory_state->allow_empty_builder_cut = true;
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.allow_data_in_errors = false;
+  options.level0_file_num_compaction_trigger = 10;
+  options.target_file_size_base = 1 << 30;
+  options.table_factory =
+      std::make_shared<FileCuttingTableFactory>(Key(0), factory_state);
+  Reopen(options);
+
+  for (int key : {0, 2, 4, 6, 8}) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+  for (int key : {1, 3, 5, 7, 9}) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+
+  Status status = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(std::string::npos, status.ToString().find("key: hidden"))
+      << status.ToString();
+  ASSERT_EQ(1, factory_state->cut_requests.load());
+}
+
+TEST_F(DBCompactionTest, TableBuilderRepeatedCutRequestFailsCompaction) {
+  auto factory_state = std::make_shared<FileCuttingTableFactoryState>();
+  factory_state->max_cut_requests = 2;
+  factory_state->allow_empty_builder_cut = true;
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.level0_file_num_compaction_trigger = 10;
+  options.target_file_size_base = 1 << 30;
+  options.table_factory =
+      std::make_shared<FileCuttingTableFactory>(Key(5), factory_state);
+  Reopen(options);
+
+  for (int key : {0, 2, 4, 6, 8}) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+  for (int key : {1, 3, 5, 7, 9}) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+
+  Status status = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_EQ(2, factory_state->cut_requests.load());
+}
 
 class DBCompactionTestWithParam
     : public DBTestBase,
@@ -800,6 +1079,23 @@ TEST_F(DBCompactionTest, CompactRangeBottomPri) {
   int low_pri_count = 0;
   int bottom_pri_count = 0;
   bool bottom_running_seen = false;
+  std::atomic<bool> bottom_property_seen = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():Start", [&](void*) {
+        uint64_t total = 0;
+        uint64_t bottom = 0;
+        ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningCompactions,
+                                        &total));
+        ASSERT_TRUE(db_->GetIntProperty(
+            DB::Properties::kNumRunningBottomCompactions, &bottom));
+        ASSERT_GE(total, bottom);
+        ASSERT_GE(total, 1);
+        ASSERT_LE(total, 2);
+        ASSERT_LE(bottom, 1);
+        if (bottom > 0) {
+          bottom_property_seen = true;
+        }
+      });
   SyncPoint::GetInstance()->SetCallBack(
       "BackgroundCallCompaction:1", [&](void*) {
         if (dbfull()->TEST_NumRunningBottomCompactions() > 0) {
@@ -825,6 +1121,7 @@ TEST_F(DBCompactionTest, CompactRangeBottomPri) {
   ASSERT_EQ(1, low_pri_count);
   ASSERT_EQ(1, bottom_pri_count);
   ASSERT_TRUE(bottom_running_seen);
+  ASSERT_TRUE(bottom_property_seen);
   ASSERT_EQ("0,0,2", FilesPerLevel(0));
 
   // Recompact bottom most level uses bottom pool
@@ -1301,6 +1598,118 @@ TEST_F(DBCompactionTest, CompactionSstPartitionerNonTrivial) {
   ASSERT_EQ(2, files.size());
   ASSERT_EQ("A", Get("aaaa1"));
   ASSERT_EQ("B", Get("bbbb1"));
+}
+
+TEST_F(DBCompactionTest, CompactionSstPartitionerPrefixFastPath) {
+  // Exercises the ShouldPartitionByPrefix() fast path in CompactionOutputs:
+  // multiple keys sharing a fixed prefix must stay together in one output file
+  // (no spurious cuts), with boundaries landing exactly at prefix changes.
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleLevel;
+  options.level0_file_num_compaction_trigger = 3;
+  options.sst_partitioner_factory = NewSstPartitionerFixedPrefixFactory(4);
+  DestroyAndReopen(options);
+
+  // Three prefixes with multiple keys each, spread across two flushed files so
+  // that a non-trivial compaction merges them.
+  ASSERT_OK(Put("aaaa1", "v"));
+  ASSERT_OK(Put("aaaa3", "v"));
+  ASSERT_OK(Put("bbbb1", "v"));
+  ASSERT_OK(Put("cccc2", "v"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+
+  ASSERT_OK(Put("aaaa2", "v"));
+  ASSERT_OK(Put("bbbb2", "v"));
+  ASSERT_OK(Put("cccc1", "v"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+
+  ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  // Exactly one output file per distinct 4-byte prefix.
+  std::vector<LiveFileMetaData> files;
+  dbfull()->GetLiveFilesMetaData(&files);
+  ASSERT_EQ(3, files.size());
+  // Each file holds a whole prefix group (multiple keys => the fast path
+  // correctly did NOT cut within a shared prefix).
+  for (const auto& f : files) {
+    ASSERT_EQ(f.smallestkey.substr(0, 4), f.largestkey.substr(0, 4));
+  }
+  for (const std::string k :
+       {"aaaa1", "aaaa2", "aaaa3", "bbbb1", "bbbb2", "cccc1", "cccc2"}) {
+    ASSERT_EQ("v", Get(k));
+  }
+}
+
+TEST_F(DBCompactionTest, CompactionSstPartitionerPrefixShortKeyFallback) {
+  // Keys shorter than the fixed prefix length cannot be represented as a
+  // prefix, so ShouldPartitionByPrefix() returns no value and CompactionOutputs
+  // falls back to per-key ShouldPartition(). This also exercises short->long
+  // and long->short mode transitions across output file boundaries.
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleLevel;
+  options.level0_file_num_compaction_trigger = 3;
+  options.sst_partitioner_factory = NewSstPartitionerFixedPrefixFactory(4);
+  DestroyAndReopen(options);
+
+  // "a" and "bb" are shorter than len 4 (fallback, each in its own file);
+  // "cccc1"/"cccc2" share prefix "cccc" (fast path, one file); "dd" is short
+  // again (fallback, own file).
+  ASSERT_OK(Put("a", "v"));
+  ASSERT_OK(Put("bb", "v"));
+  ASSERT_OK(Put("cccc1", "v"));
+  ASSERT_OK(Put("dd", "v"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+
+  // Second file overlaps to force a non-trivial (rewriting) compaction.
+  ASSERT_OK(Put("cccc2", "v"));
+  ASSERT_OK(Put("a", "v2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+
+  ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  // "a" | "bb" | {"cccc1","cccc2"} | "dd" => 4 files.
+  std::vector<LiveFileMetaData> files;
+  dbfull()->GetLiveFilesMetaData(&files);
+  ASSERT_EQ(4, files.size());
+  ASSERT_EQ("v2", Get("a"));
+  for (const std::string k : {"bb", "cccc1", "cccc2", "dd"}) {
+    ASSERT_EQ("v", Get(k));
+  }
+}
+
+TEST_F(DBCompactionTest, CompactionSstPartitionerZeroLenNoSplit) {
+  // A zero-length fixed prefix yields an empty (but present) prefix from
+  // ShouldPartitionByPrefix(), which means "no further partitions": every key
+  // "starts with" the empty prefix, so the fast path never cuts.
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleLevel;
+  options.level0_file_num_compaction_trigger = 3;
+  options.sst_partitioner_factory = NewSstPartitionerFixedPrefixFactory(0);
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("aaaa1", "v1"));
+  ASSERT_OK(Put("bbbb1", "v1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+
+  // Overlapping key forces a non-trivial compaction (not a trivial move).
+  ASSERT_OK(Put("aaaa1", "v2"));
+  ASSERT_OK(Put("cccc1", "v2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+
+  ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  std::vector<LiveFileMetaData> files;
+  dbfull()->GetLiveFilesMetaData(&files);
+  ASSERT_EQ(1, files.size());
+  ASSERT_EQ("v2", Get("aaaa1"));
+  ASSERT_EQ("v1", Get("bbbb1"));
+  ASSERT_EQ("v2", Get("cccc1"));
 }
 
 TEST_F(DBCompactionTest, ZeroSeqIdCompaction) {
@@ -2312,9 +2721,12 @@ TEST_P(DBDeleteFileRangeTest, DeleteFilesInRanges) {
 
   // Delete files in range [0, 299] (inclusive)
   {
-    auto begin_str1 = Key(0), end_str1 = Key(100);
-    auto begin_str2 = Key(100), end_str2 = Key(200);
-    auto begin_str3 = Key(200), end_str3 = Key(299);
+    auto begin_str1 = Key(0);
+    auto end_str1 = Key(100);
+    auto begin_str2 = Key(100);
+    auto end_str2 = Key(200);
+    auto begin_str3 = Key(200);
+    auto end_str3 = Key(299);
     std::vector<RangeOpt> ranges;
     ranges.emplace_back(begin_str1, end_str1);
     ranges.emplace_back(begin_str2, end_str2);
@@ -2336,12 +2748,18 @@ TEST_P(DBDeleteFileRangeTest, DeleteFilesInRanges) {
 
   // Delete files in range [600, 999) (exclusive)
   {
-    auto begin_str1 = Key(600), end_str1 = Key(800);
-    auto begin_str2 = Key(700), end_str2 = Key(900);
-    auto begin_str3 = Key(800), end_str3 = Key(999);
-    Slice begin1(begin_str1), end1(end_str1);
-    Slice begin2(begin_str2), end2(end_str2);
-    Slice begin3(begin_str3), end3(end_str3);
+    auto begin_str1 = Key(600);
+    auto end_str1 = Key(800);
+    auto begin_str2 = Key(700);
+    auto end_str2 = Key(900);
+    auto begin_str3 = Key(800);
+    auto end_str3 = Key(999);
+    Slice begin1(begin_str1);
+    Slice end1(end_str1);
+    Slice begin2(begin_str2);
+    Slice end2(end_str2);
+    Slice begin3(begin_str3);
+    Slice end3(end_str3);
     std::vector<RangePtr> ranges;
     ranges.emplace_back(&begin1, &end1);
     ranges.emplace_back(&begin2, &end2);
@@ -2428,8 +2846,10 @@ TEST_P(DBDeleteFileRangeTest, DeleteFileRangeFileEndpointsOverlapBug) {
 
   // Verify `DeleteFilesInRange` can't drop only file 0 which would cause
   // "1 -> vals[0]" to reappear.
-  std::string begin_str = Key(0), end_str = Key(1);
-  Slice begin = begin_str, end = end_str;
+  std::string begin_str = Key(0);
+  std::string end_str = Key(1);
+  Slice begin = begin_str;
+  Slice end = end_str;
   ASSERT_OK(
       DeleteFilesInRange(db_.get(), db_->DefaultColumnFamily(), &begin, &end));
   ASSERT_EQ(vals[1], GetValue(Key(1)));
@@ -2737,7 +3157,8 @@ TEST_P(DBCompactionTestWithParam, LevelCompactionCFPathUse) {
 
   std::vector<Options> option_vector;
   option_vector.emplace_back(options);
-  ColumnFamilyOptions cf_opt1(options), cf_opt2(options);
+  ColumnFamilyOptions cf_opt1(options);
+  ColumnFamilyOptions cf_opt2(options);
   // Configure CF1 specific paths.
   cf_opt1.cf_paths.emplace_back(dbname_ + "cf1", 500 * 1024);
   cf_opt1.cf_paths.emplace_back(dbname_ + "cf1_2", 4 * 1024 * 1024);
@@ -3513,7 +3934,10 @@ TEST_P(DBCompactionTestWithParam, CompressLevelCompaction) {
   // move to level 3 will not be allowed
   options.compression_per_level = {kNoCompression, kNoCompression,
                                    kZlibCompression};
-  int matches = 0, didnt_match = 0, trivial_move = 0, non_trivial = 0;
+  int matches = 0;
+  int didnt_match = 0;
+  int trivial_move = 0;
+  int non_trivial = 0;
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "Compaction::InputCompressionMatchesOutput:Matches",
@@ -4589,7 +5013,8 @@ TEST_F(DBCompactionTest, CompactBottomLevelFilesWithDeletions) {
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   ASSERT_EQ(kNumLevelFiles, NumTableFilesAtLevel(1));
 
-  std::vector<LiveFileMetaData> pre_release_metadata, post_release_metadata;
+  std::vector<LiveFileMetaData> pre_release_metadata;
+  std::vector<LiveFileMetaData> post_release_metadata;
   db_->GetLiveFilesMetaData(&pre_release_metadata);
   // just need to bump seqnum so ReleaseSnapshot knows the newest key in the SST
   // files does not need to be preserved in case of a future snapshot.
@@ -4736,7 +5161,8 @@ TEST_F(DBCompactionTest, NoCompactBottomLevelFilesWithDeletions) {
   ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr));
   ASSERT_EQ(kNumLevelFiles, NumTableFilesAtLevel(1));
 
-  std::vector<LiveFileMetaData> pre_release_metadata, post_release_metadata;
+  std::vector<LiveFileMetaData> pre_release_metadata;
+  std::vector<LiveFileMetaData> post_release_metadata;
   db_->GetLiveFilesMetaData(&pre_release_metadata);
   // just need to bump seqnum so ReleaseSnapshot knows the newest key in the SST
   // files does not need to be preserved in case of a future snapshot.
@@ -5204,10 +5630,10 @@ TEST_F(DBCompactionTest, LevelTtlCascadingCompactions) {
             *max_open_files = 2;
           });
       // In the case where all files are opened and doing DB restart
-      // forcing the oldest ancester time in manifest file to be 0 to
+      // forcing the oldest ancestor time in manifest file to be 0 to
       // simulate the case of reading from an old version.
       ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-          "VersionEdit::EncodeTo:VarintOldestAncesterTime", [&](void* arg) {
+          "VersionEdit::EncodeTo:VarintOldestAncestorTime", [&](void* arg) {
             if (if_restart && if_open_all_files) {
               std::string* encoded_field = static_cast<std::string*>(arg);
               *encoded_field = "";
@@ -5244,7 +5670,7 @@ TEST_F(DBCompactionTest, LevelTtlCascadingCompactions) {
       std::vector<std::vector<FileMetaData>> level_to_files;
       dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(),
                                       &level_to_files);
-      uint64_t oldest_time = level_to_files[0][0].oldest_ancester_time;
+      uint64_t oldest_time = level_to_files[0][0].oldest_ancestor_time;
       // Add 1 hour and do another flush.
       env_->MockSleepForSeconds(1 * 60 * 60);
       for (int i = 101; i <= 200; ++i) {
@@ -5312,7 +5738,7 @@ TEST_F(DBCompactionTest, LevelTtlCascadingCompactions) {
 
       dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(),
                                       &level_to_files);
-      ASSERT_EQ(oldest_time, level_to_files[6][0].oldest_ancester_time);
+      ASSERT_EQ(oldest_time, level_to_files[6][0].oldest_ancestor_time);
 
       env_->MockSleepForSeconds(25 * 60 * 60);
       ASSERT_OK(Put(Key(2), "1"));
@@ -5340,6 +5766,7 @@ TEST_F(DBCompactionTest, LevelPeriodicCompaction) {
     for (bool if_open_all_files : {false, true}) {
       Options options = CurrentOptions();
       options.periodic_compaction_seconds = 48 * 60 * 60;  // 2 days
+      options.periodic_compaction_phase_recovery_percent = 0;
       if (if_open_all_files) {
         options.max_open_files = -1;  // needed for ttl compaction
       } else {
@@ -5435,6 +5862,169 @@ TEST_F(DBCompactionTest, LevelPeriodicCompaction) {
   }
 }
 
+TEST_F(DBCompactionTest, PeriodicCompactionPhaseTriggerTime) {
+  // Unit-tests PeriodicCompactionPhaser::TriggerTime, the core of
+  // preferred-phase periodic compaction (see
+  // DBOptions::periodic_compaction_phase_recovery_percent).
+  using Params = PeriodicCompactionPhaseParams;
+  const uint64_t kN = 1000;  // periodic_compaction_seconds
+
+  // The trigger-time helper treats seed_hash as an opaque value; use a fixed
+  // constant and derive the resulting preferred-phase target the same way
+  // production does (FastRange64 of the seed over the interval).
+  const uint64_t kSeed = 0x9e3779b97f4a7c15ULL;
+  const uint64_t target = FastRange64(kSeed, kN);
+  ASSERT_LT(target, kN);
+
+  // recovery_percent == 0 => classic behavior: trigger at file_mod + N.
+  {
+    Params p;
+    p.seed_hash = kSeed;
+    p.recovery_percent = 0;
+    for (uint64_t fm : {uint64_t{1}, uint64_t{7}, uint64_t{12345}}) {
+      ASSERT_EQ(PeriodicCompactionPhaser::TriggerTime(fm, kN, p), fm + kN);
+    }
+  }
+
+  // Steady state (anchor in the distant past): trigger is pulled earlier by
+  // recovery_percent% of the phase offset, and never later than the deadline.
+  {
+    Params p;
+    p.seed_hash = kSeed;
+    p.recovery_percent = 50;
+    p.anchor_time = 0;
+    const uint64_t fm = 500;
+    const uint64_t natural = fm + kN;
+    const uint64_t offset = (fm % kN + kN - target) % kN;
+    const uint64_t expected = natural - offset * 50 / 100;
+    ASSERT_EQ(PeriodicCompactionPhaser::TriggerTime(fm, kN, p), expected);
+    ASSERT_LE(expected, natural);
+  }
+
+  // Geometric convergence: repeatedly re-stamp the file at its trigger time and
+  // confirm the phase error is non-increasing and converges to (near) zero.
+  for (int recovery_percent : {50, 100}) {
+    Params p;
+    p.seed_hash = kSeed;
+    p.recovery_percent = recovery_percent;
+    p.anchor_time = 0;
+    uint64_t fm = 123;
+    uint64_t prev_error = kN;
+    for (int cycle = 0; cycle < 64; ++cycle) {
+      const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(fm, kN, p);
+      ASSERT_LE(trig, fm + kN);  // never later than the deadline
+      const uint64_t error = (trig % kN + kN - target) % kN;
+      ASSERT_LE(error, prev_error);
+      prev_error = error;
+      fm = trig;
+    }
+    // rp=100 pulls the whole gap so it reaches the phase exactly; smaller rates
+    // decay geometrically and leave a tiny integer-rounding residue.
+    if (recovery_percent == 100) {
+      ASSERT_EQ(prev_error, uint64_t{0});
+    } else {
+      ASSERT_LE(prev_error, uint64_t{1});
+    }
+  }
+
+  // Already past the hard deadline when phasing took effect (e.g. the DB was
+  // down, or periodic_compaction_seconds was turned down): instead of firing
+  // the whole cohort immediately, spread it over the first quarter-period after
+  // the anchor on an absolute (epoch-aligned) grid of period N/4.
+  {
+    Params p;
+    p.seed_hash = kSeed;
+    p.recovery_percent = 50;
+    p.anchor_time = 200;
+    const uint64_t n = 100;
+    const uint64_t grid = n / 4;  // 25
+    const uint64_t phase = FastRange64(kSeed, grid);
+    // natural deadline (10 + 100 = 110) is before the anchor (200).
+    const uint64_t expected = 200 + (phase + grid - 200 % grid) % grid;
+    const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(10, n, p);
+    ASSERT_EQ(trig, expected);
+    ASSERT_GE(trig, uint64_t{200});  // never before the anchor
+    ASSERT_LT(trig, 200 + grid);     // within N/4 of the anchor
+  }
+
+  // Past due against the recovery target but not yet at the deadline => spread
+  // across [anchor, deadline] using the phase; never later than the deadline.
+  {
+    const uint64_t n = 100;
+    const uint64_t small_target = FastRange64(kSeed, n);
+    const uint64_t fm = small_target + 50 + 3 * n;  // phase offset == 50
+    const uint64_t natural = fm + n;
+    const uint64_t anchor =
+        natural - 25;  // recovery target (natural-50) < anchor
+    Params p;
+    p.seed_hash = kSeed;
+    p.recovery_percent = 100;
+    p.anchor_time = anchor;
+    ASSERT_EQ((fm % n + n - small_target) % n, uint64_t{50});
+    const uint64_t expected = anchor + FastRange64(kSeed, natural - anchor);
+    const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(fm, n, p);
+    ASSERT_EQ(trig, expected);
+    ASSERT_GE(trig, anchor);
+    ASSERT_LT(trig, natural);
+  }
+}
+
+TEST_F(DBCompactionTest, PeriodicCompactionPhaseCfSpread) {
+  // Unit-tests PeriodicCompactionPhaser::CfPhaseSeedHash: a DB's column
+  // families are spread quasi-uniformly around the DB base phase via the
+  // golden-ratio recurrence, for any base and any number of CFs.
+  using Phaser = PeriodicCompactionPhaser;
+
+  // cf_id 0 leaves the base phase unchanged; distinct cf_ids -> distinct
+  // phases.
+  for (uint64_t base : {uint64_t{0}, uint64_t{0x9e3779b97f4a7c15ULL},
+                        uint64_t{12345678901234567ULL}, ~uint64_t{0}}) {
+    ASSERT_EQ(Phaser::CfPhaseSeedHash(base, 0), base);
+    std::vector<uint64_t> hs;
+    for (uint32_t id = 0; id < 64; ++id) {
+      hs.push_back(Phaser::CfPhaseSeedHash(base, id));
+    }
+    std::sort(hs.begin(), hs.end());
+    for (size_t i = 1; i < hs.size(); ++i) {
+      ASSERT_NE(hs[i], hs[i - 1]) << "duplicate CF phase seed at base=" << base;
+    }
+  }
+
+  // Low-discrepancy: for N CFs the phases over an interval are well spread --
+  // no gap larger than ~2x the average (a hash would allow chance clustering).
+  for (uint64_t base : {uint64_t{0}, uint64_t{0xdeadbeefcafef00dULL}}) {
+    for (uint32_t N : {uint32_t{3}, uint32_t{8}, uint32_t{16}, uint32_t{40}}) {
+      const uint64_t n = 100000;
+      std::vector<uint64_t> phases;
+      for (uint32_t id = 0; id < N; ++id) {
+        phases.push_back(FastRange64(Phaser::CfPhaseSeedHash(base, id), n));
+      }
+      std::sort(phases.begin(), phases.end());
+      uint64_t max_gap = n - phases.back() + phases.front();  // wrap-around gap
+      for (size_t i = 1; i < phases.size(); ++i) {
+        max_gap = std::max(max_gap, phases[i] - phases[i - 1]);
+      }
+      ASSERT_LE(max_gap, 2 * (n / N))
+          << "base=" << base << " N=" << N << " max_gap=" << max_gap;
+    }
+  }
+}
+
+TEST_F(DBCompactionTest, PeriodicCompactionPhaseOptions) {
+  // Verifies periodic_compaction_phase_recovery_percent is plumbed and
+  // dynamically settable.
+  Options options = CurrentOptions();
+  options.periodic_compaction_phase_recovery_percent = 25;
+  DestroyAndReopen(options);
+  ASSERT_EQ(dbfull()->GetDBOptions().periodic_compaction_phase_recovery_percent,
+            25);
+
+  ASSERT_OK(dbfull()->SetDBOptions(
+      {{"periodic_compaction_phase_recovery_percent", "0"}}));
+  ASSERT_EQ(dbfull()->GetDBOptions().periodic_compaction_phase_recovery_percent,
+            0);
+}
+
 TEST_F(DBCompactionTest, LevelPeriodicCompactionOffpeak) {
   // This test simply checks if offpeak adjustment works in Leveled
   // Compactions. For testing offpeak periodic compactions in various
@@ -5452,6 +6042,7 @@ TEST_F(DBCompactionTest, LevelPeriodicCompactionOffpeak) {
     Options options = CurrentOptions();
     options.ttl = 0;
     options.periodic_compaction_seconds = 5 * kSecondsPerDay;  // 5 days
+    options.periodic_compaction_phase_recovery_percent = 0;
     // In the case where all files are opened and doing DB restart
     // forcing the file creation time in manifest file to be 0 to
     // simulate the case of reading from an old version.
@@ -5570,7 +6161,7 @@ TEST_F(DBCompactionTest, LevelPeriodicCompactionWithOldDB) {
           props->file_creation_time = 0;
         }
         if (set_creation_time_to_zero) {
-          props->creation_time = 0;
+          props->oldest_ancestor_time = 0;
         }
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
@@ -5599,6 +6190,7 @@ TEST_F(DBCompactionTest, LevelPeriodicCompactionWithOldDB) {
   // Forward the clock by 2 days.
   env_->MockSleepForSeconds(2 * 24 * 60 * 60);
   options.periodic_compaction_seconds = 1 * 24 * 60 * 60;  // 1 day
+  options.periodic_compaction_phase_recovery_percent = 0;
 
   Reopen(options);
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
@@ -5617,6 +6209,7 @@ TEST_F(DBCompactionTest, LevelPeriodicAndTtlCompaction) {
   Options options = CurrentOptions();
   options.ttl = 10 * 60 * 60;                          // 10 hours
   options.periodic_compaction_seconds = 48 * 60 * 60;  // 2 days
+  options.periodic_compaction_phase_recovery_percent = 0;
   options.max_open_files = -1;  // needed for both periodic and ttl compactions
   env_->SetMockSleep();
   options.env = env_;
@@ -5699,6 +6292,7 @@ TEST_F(DBCompactionTest, LevelTtlBooster) {
   Options options = CurrentOptions();
   options.ttl = 10 * 60 * 60;                           // 10 hours
   options.periodic_compaction_seconds = 480 * 60 * 60;  // very long
+  options.periodic_compaction_phase_recovery_percent = 0;
   options.level0_file_num_compaction_trigger = 2;
   options.max_bytes_for_level_base = 5 * uint64_t{kNumKeysPerFile * kValueSize};
   options.max_open_files = -1;  // needed for both periodic and ttl compactions
@@ -6118,7 +6712,8 @@ TEST_F(DBCompactionTest, CompactRangeFlushOverlappingMemtable) {
       CompactRangeOptions compact_range_opts;
       ASSERT_OK(db_->CompactRange(compact_range_opts, begin_ptr, end_ptr));
 
-      uint64_t get_prop_tmp, num_memtable_entries = 0;
+      uint64_t get_prop_tmp;
+      uint64_t num_memtable_entries = 0;
       ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumEntriesImmMemTables,
                                       &get_prop_tmp));
       num_memtable_entries += get_prop_tmp;
@@ -6143,6 +6738,7 @@ TEST_F(DBCompactionTest, CompactRangeFlushOverlappingMemtable) {
 TEST_F(DBCompactionTest, CompactionStatsTest) {
   Options options = CurrentOptions();
   options.level0_file_num_compaction_trigger = 2;
+  options.max_background_compactions = 1;
   CompactionStatsCollector* collector = new CompactionStatsCollector();
   options.listeners.emplace_back(collector);
   DestroyAndReopen(options);
@@ -6150,9 +6746,13 @@ TEST_F(DBCompactionTest, CompactionStatsTest) {
   // Verify that the internal statistics for num_running_compactions and
   // num_running_compaction_sorted_runs start and end at valid states
   uint64_t num_running_compactions = 0;
+  uint64_t num_running_bottom_compactions = 0;
   ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningCompactions,
                                   &num_running_compactions));
-  ASSERT_EQ(num_running_compactions, 0);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningBottomCompactions,
+                                  &num_running_bottom_compactions));
+  ASSERT_EQ(0, num_running_compactions);
+  ASSERT_EQ(0, num_running_bottom_compactions);
   uint64_t num_running_compaction_sorted_runs = 0;
   ASSERT_TRUE(
       db_->GetIntProperty(DB::Properties::kNumRunningCompactionSortedRuns,
@@ -6161,6 +6761,18 @@ TEST_F(DBCompactionTest, CompactionStatsTest) {
   // Check that the stat actually gets changed some time between the start and
   // end of compaction
   std::atomic<bool> sorted_runs_count_incremented = false;
+  std::atomic<bool> running_compaction_seen = false;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():Start", [&](void*) {
+        ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningCompactions,
+                                        &num_running_compactions));
+        ASSERT_TRUE(
+            db_->GetIntProperty(DB::Properties::kNumRunningBottomCompactions,
+                                &num_running_bottom_compactions));
+        ASSERT_EQ(1, num_running_compactions);
+        ASSERT_EQ(0, num_running_bottom_compactions);
+        running_compaction_seen = true;
+      });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "CompactionMergingIterator::UpdateInternalStats",
       [&](void*) { sorted_runs_count_incremented = true; });
@@ -6184,11 +6796,15 @@ TEST_F(DBCompactionTest, CompactionStatsTest) {
   // to process
   ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningCompactions,
                                   &num_running_compactions));
-  ASSERT_EQ(num_running_compactions, 0);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningBottomCompactions,
+                                  &num_running_bottom_compactions));
+  ASSERT_EQ(0, num_running_compactions);
+  ASSERT_EQ(0, num_running_bottom_compactions);
   ASSERT_TRUE(
       db_->GetIntProperty(DB::Properties::kNumRunningCompactionSortedRuns,
                           &num_running_compaction_sorted_runs));
   ASSERT_EQ(num_running_compaction_sorted_runs, 0);
+  ASSERT_TRUE(running_compaction_seen);
   ASSERT_TRUE(sorted_runs_count_incremented);
 
   SyncPoint::GetInstance()->DisableProcessing();
@@ -6639,6 +7255,572 @@ TEST_P(DBCompactionDirectIOTest, DirectIO) {
 
 INSTANTIATE_TEST_CASE_P(DBCompactionDirectIOTest, DBCompactionDirectIOTest,
                         testing::Bool());
+
+// With use_direct_io_for_compaction_reads OFF, compaction reads must stay
+// buffered: neither the compaction-input FileOptions nor a kernel O_DIRECT
+// open should fire. Runs on every platform (the sync points just don't fire
+// where O_DIRECT isn't reachable). Pairs with
+// UseDirectIoForCompactionReadsEndToEnd for the on case.
+TEST_F(DBCompactionTest, UseDirectIoForCompactionReadsOffStaysBuffered) {
+  Options options = CurrentOptions();
+  Destroy(options);
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.use_direct_reads = false;
+  options.use_direct_io_for_compaction_reads = false;
+  options.use_direct_io_for_flush_and_compaction = false;
+
+  std::atomic<bool> observed_direct_compaction_read{false};
+  std::atomic<int> observed_callbacks{0};
+  std::atomic<int> observed_odirect_opens{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::CreateInputIterator:InputFileOptions", [&](void* arg) {
+        const auto* fo = static_cast<const FileOptions*>(arg);
+        observed_callbacks.fetch_add(1, std::memory_order_relaxed);
+        if (fo->use_direct_reads) {
+          observed_direct_compaction_read.store(true,
+                                                std::memory_order_relaxed);
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "NewRandomAccessFile:O_DIRECT", [&](void* /*arg*/) {
+        observed_odirect_opens.fetch_add(1, std::memory_order_relaxed);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(TryReopen(options));
+
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_OK(Put(Key(i), value));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_OK(Put(Key(i), value));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_GT(observed_callbacks.load(), 0);
+  ASSERT_FALSE(observed_direct_compaction_read.load());
+  ASSERT_EQ(0, observed_odirect_opens.load());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  Destroy(options);
+}
+
+TEST_F(DBCompactionTest,
+       UseDirectIoForCompactionReadsUsesBoundedEphemeralReaders) {
+  auto fs = std::make_shared<MockFileSystem>(Env::Default()->GetSystemClock(),
+                                             /*supports_direct_io=*/true);
+  std::unique_ptr<Env> mock_env = NewCompositeEnv(fs);
+
+  Options options = CurrentOptions();
+  options.env = mock_env.get();
+  Destroy(options);
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.use_direct_reads = false;
+  options.use_direct_io_for_compaction_reads = true;
+  options.use_direct_io_for_flush_and_compaction = false;
+  options.max_subcompactions = 3;
+  options.statistics = CreateDBStatistics();
+
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = NewLRUCache(64 << 20);
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.pin_l0_filter_and_index_blocks_in_cache = true;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  std::atomic<int> fresh_reader_opens{0};
+  std::atomic<int> malformed_fresh_reader_options{0};
+  std::atomic<int> avoid_shared_metadata_cache_opens{0};
+  std::atomic<int> shared_metadata_cache_uses{0};
+  std::atomic<size_t> input_iterator_file_bound{0};
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::FindTable:FreshTableReader", [&](void* arg) {
+        const auto* open_options = static_cast<TableCacheOpenOptions*>(arg);
+        fresh_reader_opens.fetch_add(1, std::memory_order_relaxed);
+        if (!open_options->open_ephemeral_table_reader ||
+            !open_options->avoid_shared_metadata_cache ||
+            !open_options->skip_filters) {
+          malformed_fresh_reader_options.fetch_add(1,
+                                                   std::memory_order_relaxed);
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTable::PrefetchIndexAndFilterBlocks:SharedMetadataCache",
+      [&](void* arg) {
+        const auto* context = static_cast<std::pair<bool, bool>*>(arg);
+        const bool avoid_shared_metadata_cache = context->first;
+        const bool use_cache = context->second;
+        if (avoid_shared_metadata_cache) {
+          avoid_shared_metadata_cache_opens.fetch_add(
+              1, std::memory_order_relaxed);
+          if (use_cache) {
+            shared_metadata_cache_uses.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::MakeInputIterator:NewCompactionMergingIterator",
+      [&](void* arg) {
+        input_iterator_file_bound.fetch_add(*static_cast<size_t*>(arg),
+                                            std::memory_order_relaxed);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(TryReopen(options));
+
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_OK(Put(Key(i), value));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_OK(Put(Key(i), value));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_GT(fresh_reader_opens.load(), 0);
+  EXPECT_EQ(0, malformed_fresh_reader_options.load());
+  ASSERT_GT(avoid_shared_metadata_cache_opens.load(), 0);
+  EXPECT_EQ(0, shared_metadata_cache_uses.load());
+  ASSERT_GT(input_iterator_file_bound.load(), 0);
+  EXPECT_LE(static_cast<size_t>(fresh_reader_opens.load()),
+            input_iterator_file_bound.load());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  Destroy(options);
+}
+
+// End-to-end check that use_direct_io_for_compaction_reads opens compaction
+// inputs with O_DIRECT while use_direct_reads stays off (user reads buffered).
+// The NewRandomAccessFile:O_DIRECT sync point in env/fs_posix.cc fires once
+// per fresh open with the O_DIRECT flag, so this proves the kernel path, not
+// just the FileOptions. Only runs on platforms that take the O_DIRECT path.
+#if !defined(OS_MACOSX) && !defined(OS_OPENBSD) && !defined(OS_SOLARIS) && \
+    !defined(OS_WIN)
+TEST_F(DBCompactionTest, UseDirectIoForCompactionReadsEndToEnd) {
+  if (!IsDirectIOSupported()) {
+    ROCKSDB_GTEST_BYPASS("Direct IO not supported");
+    return;
+  }
+
+  Options options = CurrentOptions();
+  Destroy(options);
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  // User reads stay buffered, compaction reads should switch to O_DIRECT.
+  options.use_direct_reads = false;
+  options.use_direct_io_for_compaction_reads = true;
+  // Isolate the read-side change; leave the compaction write path buffered.
+  options.use_direct_io_for_flush_and_compaction = false;
+
+  // Sync-point callbacks fire on compaction threads while the test thread
+  // reads these counters, so use atomics to avoid a data race.
+  std::atomic<int> observed_run_starts{0};
+  std::atomic<int> observed_odirect_opens{0};
+  std::atomic<bool> observed_direct_compaction_read{false};
+  std::atomic<int> observed_callbacks{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({});
+  // Plumbing-level probe: the compaction-input FileOptions should carry
+  // use_direct_reads = true when the new flag is enabled.
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::CreateInputIterator:InputFileOptions", [&](void* arg) {
+        const auto* fo = static_cast<const FileOptions*>(arg);
+        observed_callbacks.fetch_add(1, std::memory_order_relaxed);
+        if (fo != nullptr && fo->use_direct_reads) {
+          observed_direct_compaction_read.store(true,
+                                                std::memory_order_relaxed);
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():Start", [&](void* /*arg*/) {
+        observed_run_starts.fetch_add(1, std::memory_order_relaxed);
+      });
+  // Kernel-level probe: this fires only when open() is issued with O_DIRECT,
+  // proving we change the actual cache mode, not just the FileOptions struct.
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "NewRandomAccessFile:O_DIRECT", [&](void* /*arg*/) {
+        observed_odirect_opens.fetch_add(1, std::memory_order_relaxed);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Status s = TryReopen(options);
+  if (s.IsNotSupported() || s.IsInvalidArgument()) {
+    ROCKSDB_GTEST_BYPASS(
+        "Direct IO reads not supported in this test environment");
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+    return;
+  }
+  ASSERT_OK(s);
+
+  // Produce two L0 files with OVERLAPPING key ranges so that CompactRange has
+  // actual merge work to do (otherwise RocksDB performs a trivial file move
+  // and never constructs a CompactionJob).
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_OK(Put(Key(i), value));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_OK(Put(Key(i), value));
+  }
+  ASSERT_OK(Flush());
+
+  // User reads should still go through the buffered path. Confirm that the
+  // option does not silently flip use_direct_reads for user reads.
+  for (int i = 0; i < 8; ++i) {
+    std::string actual;
+    ASSERT_OK(db_->Get(ReadOptions(), Key(i), &actual));
+    ASSERT_EQ(value, actual);
+  }
+
+  ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  // Wait for compaction to complete and CompactionJob to be constructed.
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  // Confirm the compaction actually ran; otherwise the missing sync-point hits
+  // would be a test-setup problem, not an option regression.
+  ASSERT_GT(observed_run_starts.load(), 0)
+      << "CompactionJob::Run():Start never fired; CompactRange did not "
+         "schedule a compaction.";
+  ASSERT_GT(observed_callbacks.load(), 0);
+  ASSERT_TRUE(observed_direct_compaction_read.load());
+  // At least one compaction-input open went through O_DIRECT. Without the
+  // TableCache bypass this would be zero, since compaction would reuse the
+  // buffered handles cached for user reads.
+  EXPECT_GT(observed_odirect_opens.load(), 0)
+      << "no compaction-input opens went through O_DIRECT; "
+         "observed_odirect_opens="
+      << observed_odirect_opens.load();
+
+  // Quick sanity sweep after compaction to confirm data is intact.
+  for (int i = 0; i < 64; ++i) {
+    std::string actual;
+    ASSERT_OK(db_->Get(ReadOptions(), Key(i), &actual));
+    ASSERT_EQ(value, actual);
+  }
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  Destroy(options);
+}
+
+// Exercise the LevelIterator bypass path (L1+ compactions) with range
+// tombstones, where the ephemeral TableReader's lifetime is coupled to the
+// range_tombstone_iter the file iterator returns. The end-to-end test above
+// only makes two L0 files, which take the direct NewIterator path and never
+// hit LevelIterator. Here we build L1/L2 with tombstones and compact L1->L2 so
+// LevelIterator::NewFileIterator drives the bypass; a wrong reader/iterator
+// lifetime would crash or trip sanitizers as LevelIterator switches files.
+// Correctness is checked by computing the expected state of every key and
+// asserting Get() matches: wave-2 puts beat wave-1, and each key's most-recent
+// covering tombstone shadows older puts.
+TEST_F(DBCompactionTest,
+       UseDirectIoForCompactionReadsLevelIteratorWithTombstones) {
+  if (!IsDirectIOSupported()) {
+    ROCKSDB_GTEST_BYPASS("Direct IO not supported");
+    return;
+  }
+
+  Options options = CurrentOptions();
+  Destroy(options);
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.use_direct_reads = false;
+  options.use_direct_io_for_compaction_reads = true;
+  options.use_direct_io_for_flush_and_compaction = false;
+  // Small files / small level base so we can pack data into L1 and L2 with
+  // a few flushes and CompactRange calls instead of needing millions of keys.
+  options.write_buffer_size = 64 * 1024;
+  options.target_file_size_base = 64 * 1024;
+  options.max_bytes_for_level_base = 256 * 1024;
+  options.level0_file_num_compaction_trigger = 100;  // never auto-trigger
+
+  std::atomic<int> observed_odirect_opens{0};
+  std::atomic<int> observed_run_starts{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "NewRandomAccessFile:O_DIRECT", [&](void* /*arg*/) {
+        observed_odirect_opens.fetch_add(1, std::memory_order_relaxed);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():Start", [&](void* /*arg*/) {
+        observed_run_starts.fetch_add(1, std::memory_order_relaxed);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Status s = TryReopen(options);
+  if (s.IsNotSupported() || s.IsInvalidArgument()) {
+    ROCKSDB_GTEST_BYPASS(
+        "Direct IO reads not supported in this test environment");
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+    return;
+  }
+  ASSERT_OK(s);
+
+  // Use distinguishable values per wave so we can verify which wave's put
+  // won the merge for each key, not just "some put won".
+  const std::string wave1_value(1024, '1');
+  const std::string wave2_value(1024, '2');
+
+  auto write_batch = [&](int begin, int end, const std::string& value,
+                         bool with_range_tombstone) {
+    for (int i = begin; i < end; ++i) {
+      ASSERT_OK(Put(Key(i), value));
+    }
+    if (with_range_tombstone) {
+      // Drop a slice in the middle of the just-written range. The
+      // DeleteRange follows the puts in this batch, so its sequence number
+      // is higher and it shadows the puts on [del_lo, del_hi) within this
+      // SST.
+      ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                                 Key(begin + (end - begin) / 4),
+                                 Key(begin + 3 * (end - begin) / 4)));
+    }
+    ASSERT_OK(Flush());
+  };
+
+  // Wave 1: four flushed SSTs covering [0, 800), each with a tombstone
+  // covering the middle half of its own range. Then compact down so the
+  // next phase exercises LevelIterator over L1+ files.
+  constexpr int kWave1Begin = 0;
+  constexpr int kWave1End = 800;
+  constexpr int kWave1BatchSize = 200;
+  for (int batch_begin = kWave1Begin; batch_begin < kWave1End;
+       batch_begin += kWave1BatchSize) {
+    write_batch(batch_begin, batch_begin + kWave1BatchSize, wave1_value,
+                /*with_range_tombstone=*/true);
+  }
+  ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  // Wave 2: two more flushed SSTs at L0 that overlap wave 1, each with their
+  // own range tombstone. The puts in wave 2 have higher seqno than wave 1,
+  // so they win when not tombstoned.
+  struct Wave2Range {
+    int begin;
+    int end;
+  };
+  const Wave2Range wave2_ranges[] = {{50, 250}, {350, 550}};
+  for (const auto& r : wave2_ranges) {
+    write_batch(r.begin, r.end, wave2_value, /*with_range_tombstone=*/true);
+  }
+
+  const int run_starts_before = observed_run_starts.load();
+  const int odirect_before = observed_odirect_opens.load();
+
+  // Compact everything together, forcing a LevelIterator over the lower-level
+  // files on the bypass path. Wrong ephemeral reader / tombstone-iter
+  // lifetimes should trip sanitizers here.
+  ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_GT(observed_run_starts.load(), run_starts_before)
+      << "expected at least one compaction to run during the L1+ phase";
+  EXPECT_GT(observed_odirect_opens.load(), odirect_before)
+      << "no compaction-input opens went through O_DIRECT during L1+ "
+         "compaction; LevelIterator bypass path may be broken";
+
+  // Compute the precise expected state per key from the test parameters.
+  // For each k in the wave-1 range:
+  //   - If k is inside a wave-2 batch: wave-2 wins. NotFound iff k is in
+  //     that batch's tombstone range; otherwise present with wave2_value.
+  //   - Else: wave 1 wins. NotFound iff k is in its batch's tombstone
+  //     range; otherwise present with wave1_value.
+  enum class Expectation { kAbsent, kWave1Value, kWave2Value };
+  auto classify = [&](int k) -> Expectation {
+    // Wave 2 first (it shadows wave 1 wherever it covers).
+    for (const auto& r : wave2_ranges) {
+      if (k >= r.begin && k < r.end) {
+        const int width = r.end - r.begin;
+        const int del_lo = r.begin + width / 4;
+        const int del_hi = r.begin + 3 * width / 4;
+        if (k >= del_lo && k < del_hi) {
+          return Expectation::kAbsent;
+        }
+        return Expectation::kWave2Value;
+      }
+    }
+    // Fall back to wave 1.
+    const int batch = (k - kWave1Begin) / kWave1BatchSize;
+    const int batch_begin = kWave1Begin + batch * kWave1BatchSize;
+    const int del_lo = batch_begin + kWave1BatchSize / 4;
+    const int del_hi = batch_begin + 3 * kWave1BatchSize / 4;
+    if (k >= del_lo && k < del_hi) {
+      return Expectation::kAbsent;
+    }
+    return Expectation::kWave1Value;
+  };
+
+  int present_w1 = 0;
+  int present_w2 = 0;
+  int absent = 0;
+  std::string actual;
+  for (int k = kWave1Begin; k < kWave1End; ++k) {
+    const Status get_s = db_->Get(ReadOptions(), Key(k), &actual);
+    const Expectation exp = classify(k);
+    switch (exp) {
+      case Expectation::kAbsent:
+        EXPECT_TRUE(get_s.IsNotFound())
+            << "key " << k << " expected NotFound (covered by tombstone); "
+            << "got status=" << get_s.ToString()
+            << " value_len=" << (get_s.ok() ? actual.size() : 0);
+        ++absent;
+        break;
+      case Expectation::kWave1Value:
+        ASSERT_OK(get_s) << "key " << k << " expected wave-1 value";
+        EXPECT_EQ(wave1_value, actual)
+            << "key " << k << " expected wave-1 value but got a different one";
+        ++present_w1;
+        break;
+      case Expectation::kWave2Value:
+        ASSERT_OK(get_s) << "key " << k << " expected wave-2 value";
+        EXPECT_EQ(wave2_value, actual)
+            << "key " << k << " expected wave-2 value but got a different one";
+        ++present_w2;
+        break;
+    }
+  }
+  // All three buckets should be non-empty, so the test really exercises both
+  // tombstone paths and the wave-2-wins path. A zero here means the setup
+  // drifted and the setup (not these checks) should be fixed.
+  EXPECT_GT(present_w1, 0);
+  EXPECT_GT(present_w2, 0);
+  EXPECT_GT(absent, 0);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  Destroy(options);
+}
+
+// With the option enabled, run reader threads against the live DB while manual
+// compactions run in the background. Each compaction-input file is open through
+// an ephemeral O_DIRECT handle while the shared TableCache still serves user
+// reads through a buffered handle, so the same SST is open in two cache modes
+// at once. This stresses that coexistence under TSAN/ASAN/UBSAN; it asserts
+// reads stay consistent and final values match the last writes, not anything
+// about timing.
+TEST_F(DBCompactionTest, UseDirectIoForCompactionReadsConcurrentReadStress) {
+  if (!IsDirectIOSupported()) {
+    ROCKSDB_GTEST_BYPASS("Direct IO not supported");
+    return;
+  }
+
+  Options options = CurrentOptions();
+  Destroy(options);
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.use_direct_reads = false;
+  options.use_direct_io_for_compaction_reads = true;
+  options.use_direct_io_for_flush_and_compaction = false;
+  options.write_buffer_size = 64 * 1024;
+  options.target_file_size_base = 64 * 1024;
+  options.max_bytes_for_level_base = 256 * 1024;
+  options.level0_file_num_compaction_trigger = 100;  // never auto-trigger
+
+  Status s = TryReopen(options);
+  if (s.IsNotSupported() || s.IsInvalidArgument()) {
+    ROCKSDB_GTEST_BYPASS(
+        "Direct IO reads not supported in this test environment");
+    return;
+  }
+  ASSERT_OK(s);
+
+  constexpr int kNumKeys = 512;
+  constexpr int kValueSize = 256;
+  const std::string base_value(kValueSize, 'b');
+
+  // Initial population, flushed into a few L0 SSTs.
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), base_value));
+    if (i > 0 && i % 128 == 0) {
+      ASSERT_OK(Flush());
+    }
+  }
+  ASSERT_OK(Flush());
+
+  std::atomic<bool> stop{false};
+  std::atomic<int64_t> reads_observed{0};
+  std::atomic<int64_t> read_errors{0};
+
+  // Reader threads loop until stop is set, recording any status that isn't OK
+  // or NotFound. The point is to surface Corruption/IOError/use-after-free, so
+  // the main thread can fail the test.
+  constexpr int kNumReaders = 4;
+  std::vector<port::Thread> readers;
+  readers.reserve(kNumReaders);
+  for (int t = 0; t < kNumReaders; ++t) {
+    readers.emplace_back([&, t]() {
+      std::string value;
+      while (!stop.load(std::memory_order_acquire)) {
+        const int k =
+            (t * 7919 +
+             static_cast<int>(reads_observed.load(std::memory_order_relaxed))) %
+            kNumKeys;
+        Status read_s = db_->Get(ReadOptions(), Key(k), &value);
+        if (!read_s.ok() && !read_s.IsNotFound()) {
+          read_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+        reads_observed.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  // Drive a few rounds of writes and compactions on the main thread while
+  // the readers hammer Get(). Each round overwrites every key with a
+  // round-tagged value and then compacts.
+  constexpr int kRounds = 4;
+  std::string last_value = base_value;
+  for (int round = 0; round < kRounds; ++round) {
+    const std::string round_value(kValueSize,
+                                  static_cast<char>('A' + (round % 26)));
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(Put(Key(i), round_value));
+      if (i > 0 && i % 64 == 0) {
+        ASSERT_OK(Flush());
+      }
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    last_value = round_value;
+  }
+
+  stop.store(true, std::memory_order_release);
+  for (auto& reader : readers) {
+    reader.join();
+  }
+
+  // Every key must now hold the final round's value. Catches wholesale
+  // corruption the sampling readers might miss, and confirms compaction
+  // finished under the bypass path.
+  std::string value;
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(db_->Get(ReadOptions(), Key(i), &value));
+    EXPECT_EQ(last_value, value);
+  }
+  EXPECT_GT(reads_observed.load(), 0)
+      << "reader threads never observed a single read; test was a no-op";
+  EXPECT_EQ(0, read_errors.load())
+      << "concurrent reads against compaction with bypass-path saw "
+      << read_errors.load() << " non-OK/non-NotFound status returns";
+
+  Destroy(options);
+}
+#endif  // !defined(OS_MACOSX) && !defined(OS_OPENBSD) && ...
 
 class CompactionPriTest : public DBTestBase,
                           public testing::WithParamInterface<uint32_t> {
@@ -7300,7 +8482,8 @@ TEST_F(DBCompactionTest, ManualCompactionBottomLevelOptimized) {
 }
 
 TEST_F(DBCompactionTest, ManualCompactionMax) {
-  uint64_t l1_avg_size = 0, l2_avg_size = 0;
+  uint64_t l1_avg_size = 0;
+  uint64_t l2_avg_size = 0;
   auto generate_sst_func = [&]() {
     Random rnd(301);
     for (auto i = 0; i < 100; i++) {
@@ -8488,7 +9671,8 @@ TEST_P(DBCompactionTestL0FilesMisorderCorruptionWithParam,
   // `start` and `end` is carefully chosen so that compact range:
   // (1) doesn't overlap with memtable therefore the memtable won't be flushed
   // (2) should target at compacting s0 with s1 and s2
-  Slice start("k3"), end("k5");
+  Slice start("k3");
+  Slice end("k5");
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
   // After compaction, we have LSM tree:
   //
@@ -10003,8 +11187,12 @@ TEST_F(DBCompactionTest, FIFOMultiTierTemperatureAging) {
   env_->SetMockSleep();
 
   // Track all temperature file creations
-  int total_hot = 0, total_warm = 0, total_cool = 0, total_cold = 0,
-      total_ice = 0, total_unknown = 0;
+  int total_hot = 0;
+  int total_warm = 0;
+  int total_cool = 0;
+  int total_cold = 0;
+  int total_ice = 0;
+  int total_unknown = 0;
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "NewWritableFile::FileOptions.temperature", [&](void* arg) {
         Temperature temperature = *(static_cast<Temperature*>(arg));
@@ -10840,7 +12028,8 @@ TEST_F(DBCompactionTest, DrainUnnecessaryLevelsAfterMultiplierChanged) {
   // necessary, unnecessary levels should to be drained.
   const int kBaseLevelBytes = 256 << 10;  // 256KB
   const int kFileBytes = 64 << 10;        // 64KB
-  const int kInitMultiplier = 2, kChangedMultiplier = 10;
+  const int kInitMultiplier = 2;
+  const int kChangedMultiplier = 10;
   const int kNumFiles = 32;
   const int kNumLevels = 5;
   const int kValueBytes = 1 << 10;  // 1KB
@@ -11516,7 +12705,7 @@ TEST_F(DBCompactionTest, RecordNewestKeyTimeForTtlCompaction) {
     ASSERT_EQ(newest_key_time, file_metadatas[idx]
                                    ->fd.pinned_reader.Get()
                                    ->GetTableProperties()
-                                   ->creation_time);
+                                   ->oldest_ancestor_time);
   }
   // The delta between the first and last newest_key_times is 15s
   uint64_t last_newest_key_time = prev_newest_key_time;
@@ -11535,14 +12724,14 @@ TEST_F(DBCompactionTest, RecordNewestKeyTimeForTtlCompaction) {
                 ->GetTableProperties()
                 ->newest_key_time,
             first_newest_key_time);
-  // Contrast newest_key_time with creation_time, which records the oldest
-  // ancestor time (15s older than newest_key_time)
+  // Contrast newest_key_time with oldest_ancestor_time (15s older than
+  // newest_key_time)
   ASSERT_EQ(file_metadatas[0]
                 ->fd.pinned_reader.Get()
                 ->GetTableProperties()
-                ->creation_time,
+                ->oldest_ancestor_time,
             last_newest_key_time);
-  ASSERT_EQ(file_metadatas[0]->oldest_ancester_time, last_newest_key_time);
+  ASSERT_EQ(file_metadatas[0]->oldest_ancestor_time, last_newest_key_time);
 
   // Make sure TTL of 5s causes compaction
   env_->MockSleepForSeconds(6);
@@ -11661,6 +12850,7 @@ TEST_F(DBCompactionTest, PeriodicTask) {
   options.statistics = CreateDBStatistics();
   int kPeriodicCompactionSeconds = 7 * 24 * 60 * 60;  // 1 week
   options.periodic_compaction_seconds = kPeriodicCompactionSeconds;
+  options.periodic_compaction_phase_recovery_percent = 0;
   options.num_levels = 50;
   auto listener = std::make_shared<PeriodicCompactionListener>();
   options.listeners.push_back(listener);
@@ -11680,6 +12870,76 @@ TEST_F(DBCompactionTest, PeriodicTask) {
 
   ASSERT_EQ(listener->num_periodic_compactions, 1);
   Close();
+}
+
+TEST_F(DBCompactionTest, ReadTriggeredCompaction) {
+  Options options = CurrentOptions();
+  options.num_levels = 3;
+  options.level0_file_num_compaction_trigger = 10;
+  options.read_triggered_compaction_threshold = 0.001;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  // Write data at L2 first so L1 is not the bottommost level
+  Random rnd(301);
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put(Key(i), rnd.RandomString(1024)));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_EQ("0,0,1", FilesPerLevel());
+
+  // Write more data and move to L1 (the hot level)
+  for (int i = 5; i < 10; ++i) {
+    ASSERT_OK(Put(Key(i), rnd.RandomString(1024)));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,1,1", FilesPerLevel());
+
+  ColumnFamilyMetaData cf_meta;
+  dbfull()->GetColumnFamilyMetaData(dbfull()->DefaultColumnFamily(), &cf_meta);
+  ASSERT_EQ(cf_meta.levels[1].files.size(), 1);
+  uint64_t file_size = cf_meta.levels[1].files[0].size;
+  // Set reads high enough to exceed threshold (0.001 * file_size)
+  uint64_t reads_needed =
+      static_cast<uint64_t>(0.002 * static_cast<double>(file_size));
+
+  {
+    auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                    dbfull()->DefaultColumnFamily())
+                    ->cfd();
+    auto* vstorage = cfd->current()->storage_info();
+    for (auto* f : vstorage->LevelFiles(1)) {
+      f->stats.num_collapsible_entry_reads_sampled.store(reads_needed);
+    }
+  }
+
+  std::atomic<int> read_triggered_compactions{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        Compaction* compaction = static_cast<Compaction*>(arg);
+        if (compaction->compaction_reason() ==
+            CompactionReason::kReadTriggered) {
+          read_triggered_compactions.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  // Enable auto compactions to trigger
+  ASSERT_OK(dbfull()->SetOptions({{"disable_auto_compactions", "false"}}));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_GE(read_triggered_compactions, 1);
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+
+  // Verify the L1 file was compacted down (L1 should be empty now)
+  ASSERT_EQ(0, NumTableFilesAtLevel(1));
+
+  // Verify data integrity: all keys are still readable
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_NE(Get(Key(i)), "NOT_FOUND");
+  }
 }
 
 // Regression test for a bug in SetupOtherFilesWithRoundRobinExpansion where
@@ -11752,7 +13012,7 @@ TEST_F(DBCompactionTest, RoundRobinCleanCutWithSharedBoundary) {
 // 2. A post-verification step fails (injected here via sync point), setting
 //    compact_->status to error while each subcompaction's status stays OK.
 // 3. SubcompactionState::Cleanup checks individual status (OK) and skips
-//    ReleaseObsolete — the cache entries leak.
+//    ReleaseObsolete -- the cache entries leak.
 // 4. FaultInjectionTestFS injects metadata read errors, causing GetChildren
 //    to fail in FindObsoleteFiles.
 // 5. Close()'s FindObsoleteFiles also fails to find the orphan for the same
@@ -11783,7 +13043,7 @@ TEST_F(DBCompactionTest, LeakedTableCacheEntryOnCompactionFailure) {
   // fail while individual subcompaction statuses stay OK (so Cleanup skips
   // ReleaseObsolete). The filesystem deactivation makes GetChildren fail
   // in FindObsoleteFiles, preventing the backstop from evicting the leaked
-  // cache entries — matching the crash test's metadata read fault injection.
+  // cache entries -- matching the crash test's metadata read fault injection.
   std::atomic<bool> inject_error{true};
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "CompactionJob::Run():AfterVerifyOutputFiles", [&](void* arg) {
@@ -11795,7 +13055,7 @@ TEST_F(DBCompactionTest, LeakedTableCacheEntryOnCompactionFailure) {
   // Enable metadata read fault injection on the bg compaction thread after
   // the compaction job finishes but before FindObsoleteFiles runs. This
   // makes GetChildren fail (metadata read), matching crash test's
-  // --open_metadata_read_fault_one_in=8. Only metadata reads fail —
+  // --open_metadata_read_fault_one_in=8. Only metadata reads fail --
   // logging and other IO operations continue normally.
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "BackgroundCallCompaction:1", [&](void*) {
@@ -11808,7 +13068,7 @@ TEST_F(DBCompactionTest, LeakedTableCacheEntryOnCompactionFailure) {
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
-  // Trigger compaction — fails after VerifyOutputFiles.
+  // Trigger compaction -- fails after VerifyOutputFiles.
   Status s = dbfull()->TEST_CompactRange(0, nullptr, nullptr);
   ASSERT_NOK(s);
 
@@ -11827,6 +13087,226 @@ TEST_F(DBCompactionTest, LeakedTableCacheEntryOnCompactionFailure) {
   s = db_->Close();
   ASSERT_OK(s);
   // Release DB before fault_env goes out of scope to avoid use-after-free.
+  db_ = nullptr;
+}
+
+// Regression test for table cache leak when InstallCompactionResults fails.
+// Similar to LeakedTableCacheEntryOnCompactionFailure but the failure occurs
+// during Install() (MANIFEST write) rather than during Run().
+// 1. Compaction Run() succeeds: all subcompactions OK, VerifyOutputFiles
+//    inserts output files into the table cache, compact_->status = OK.
+// 2. Install() calls InstallCompactionResults() -> LogAndApply(), which
+//    fails (injected MANIFEST write error).
+// 3. Install()'s local status captures the error, but compact_->status
+//    was never updated (THE BUG). CleanupCompaction passes compact_->status
+//    (OK) to Cleanup(), which skips ReleaseObsolete.
+// 4. FaultInjection prevents FindObsoleteFiles backstop from working.
+// 5. Close()'s TEST_VerifyNoObsoleteFilesCached finds the leaked entry.
+TEST_F(DBCompactionTest, LeakedTableCacheEntryOnInstallFailure) {
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> fault_env(NewCompositeEnv(fault_fs));
+
+  Options options = CurrentOptions();
+  options.env = fault_env.get();
+  options.paranoid_file_checks = true;
+  options.level0_file_num_compaction_trigger = 2;
+  options.disable_auto_compactions = true;
+  options.num_levels = 3;
+  DestroyAndReopen(options);
+
+  // Write overlapping data to force a real (non-trivial) compaction.
+  ASSERT_OK(Put("a", std::string(1024, 'x')));
+  ASSERT_OK(Put("z", std::string(1024, 'x')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("a", std::string(1024, 'y')));
+  ASSERT_OK(Put("z", std::string(1024, 'y')));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(NumTableFilesAtLevel(0), 2);
+
+  // After VerifyOutputFiles succeeds (cache entries created) and Run()
+  // completes successfully, inject an error into InstallCompactionResults()
+  // so that Install() fails while compact_->status remains OK.
+  // Also enable metadata read faults to prevent the FindObsoleteFiles
+  // backstop from evicting the leaked cache entries.
+  std::atomic<bool> inject_error{true};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::InstallCompactionResults:BeforeLogAndApply",
+      [&](void* arg) {
+        if (inject_error.exchange(false)) {
+          *static_cast<Status*>(arg) = Status::IOError("injected");
+        }
+      });
+
+  // After the compaction job finishes (including Install), enable metadata
+  // read faults so FindObsoleteFiles backstop cannot scan the directory.
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "BackgroundCallCompaction:1", [&](void*) {
+        fault_fs->SetThreadLocalErrorContext(
+            FaultInjectionIOType::kMetadataRead, /*seed=*/0, /*one_in=*/1,
+            /*retryable=*/false, /*has_data_loss=*/false);
+        fault_fs->EnableThreadLocalErrorInjection(
+            FaultInjectionIOType::kMetadataRead);
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  // Trigger compaction -- Run() succeeds but Install() fails.
+  Status s = dbfull()->TEST_CompactRange(0, nullptr, nullptr);
+  ASSERT_NOK(s);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Enable metadata read fault injection on the main thread too, so
+  // Close()'s FindObsoleteFiles also fails to find the orphan file.
+  fault_fs->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kMetadataRead, /*seed=*/0, /*one_in=*/1,
+      /*retryable=*/false, /*has_data_loss=*/false);
+  fault_fs->EnableThreadLocalErrorInjection(
+      FaultInjectionIOType::kMetadataRead);
+
+  // TEST_VerifyNoObsoleteFilesCached asserted within Close on ASAN builds
+  s = db_->Close();
+  ASSERT_OK(s);
+  // Release DB before fault_env goes out of scope to avoid use-after-free.
+  db_ = nullptr;
+}
+
+// Regression test for ReleaseObsolete failing to erase table cache entries
+// when concurrent readers hold references.
+// 1. Flush creates an L0 SST file with an entry in the table cache.
+// 2. A concurrent reader acquires a cache reference on the file (simulated
+//    with a direct cache Lookup).
+// 3. ReleaseObsolete is called (simulating what PurgeObsoleteFiles does when
+//    the file becomes obsolete). With the old code, this calls
+//    ReleaseAndEraseIfLastRef which fails because of the concurrent ref.
+// 4. The concurrent reader releases its reference.
+// 5. Without the fix, the entry remains in the cache (leak). With the fix,
+//    ReleaseObsolete's Erase() marked the entry Invisible, so it was cleaned
+//    up when the concurrent ref was released.
+TEST_F(DBCompactionTest, ObsoleteFileTableCacheEntryWithConcurrentRef) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  // Create an L0 file.
+  ASSERT_OK(Put("a", std::string(1024, 'x')));
+  ASSERT_OK(Put("z", std::string(1024, 'x')));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+
+  // Get the file number of the L0 file.
+  std::vector<LiveFileMetaData> files;
+  dbfull()->GetLiveFilesMetaData(&files);
+  ASSERT_EQ(files.size(), 1);
+  uint64_t target_file_number = files[0].file_number;
+
+  // Ensure the file is in the table cache by reading from it.
+  ASSERT_EQ(Get("a"), std::string(1024, 'x'));
+
+  Cache* table_cache = dbfull()->TEST_table_cache();
+
+  // Simulate a concurrent reader acquiring a cache reference.
+  Cache::Handle* concurrent_handle =
+      TableCache::Lookup(table_cache, target_file_number);
+  ASSERT_NE(concurrent_handle, nullptr);
+
+  // Call ReleaseObsolete directly -- this is what PurgeObsoleteFiles calls
+  // when a file becomes obsolete. Pass nullptr for the handle to make
+  // ReleaseObsolete do its own Lookup internally.
+  TableCache::ReleaseObsolete(table_cache, target_file_number,
+                              /*handle=*/nullptr,
+                              /*uncache_aggressiveness=*/0);
+
+  // The concurrent reader releases its reference.
+  table_cache->Release(concurrent_handle);
+
+  // With the fix, the entry should be gone: ReleaseObsolete called Erase()
+  // which marked it Invisible, so it was freed when the concurrent ref was
+  // released. Without the fix, the entry leaks here.
+  Cache::Handle* leaked = TableCache::Lookup(table_cache, target_file_number);
+  ASSERT_EQ(leaked, nullptr);
+}
+
+// Regression test for the atomic flush path leaking table cache entries when
+// InstallMemtableAtomicFlushResults (MANIFEST write) fails.
+// 1. atomic_flush is enabled with two column families.
+// 2. Both CFs have data, a flush is triggered.
+// 3. FlushJob::Run() succeeds for both (files are added to table cache by
+//    BuildTable), but write_manifest=false so no install happens in Run().
+// 4. The combined MANIFEST write (InstallMemtableAtomicFlushResults) fails
+//    due to injected I/O error.
+// 5. Without the fix, the files remain in the table cache but are not in
+//    any Version, causing TEST_VerifyNoObsoleteFilesCached to fire during
+//    Close() (especially when metadata_read_fault_one_in disables the
+//    FindObsoleteFiles backstop).
+TEST_F(DBCompactionTest, LeakedTableCacheEntryOnAtomicFlushInstallFailure) {
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> fault_env(NewCompositeEnv(fault_fs));
+
+  Options options = CurrentOptions();
+  options.env = fault_env.get();
+  options.atomic_flush = true;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  // Enough buffer so auto-flush doesn't trigger prematurely.
+  options.write_buffer_size = 64 << 20;
+  DestroyAndReopen(options);
+
+  // Create a second column family.
+  CreateAndReopenWithCF({"pikachu"}, options);
+  ASSERT_EQ(2, handles_.size());
+
+  // Write data to both CFs.
+  ASSERT_OK(Put(0, "key0", std::string(1024, 'a')));
+  ASSERT_OK(Put(1, "key1", std::string(1024, 'b')));
+
+  // Inject a write error during the combined MANIFEST write that happens
+  // inside InstallMemtableAtomicFlushResults (via LogAndApply).
+  std::atomic<bool> inject_error{true};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WriteManifest", [&](void*) {
+        if (inject_error.exchange(false)) {
+          fault_fs->SetThreadLocalErrorContext(
+              FaultInjectionIOType::kWrite, /*seed=*/0, /*one_in=*/1,
+              /*retryable=*/false, /*has_data_loss=*/false);
+          fault_fs->EnableThreadLocalErrorInjection(
+              FaultInjectionIOType::kWrite);
+        }
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  // Trigger atomic flush - Run() succeeds but MANIFEST write fails.
+  FlushOptions flush_opts;
+  flush_opts.wait = true;
+  Status s = db_->Flush(flush_opts, handles_);
+  ASSERT_NOK(s);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Disable the write fault so Close() can proceed.
+  fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+
+  // Enable metadata read fault injection on the main thread so that
+  // Close()'s FindObsoleteFiles full-scan backstop cannot find the orphan
+  // files (simulating metadata_read_fault_one_in from the stress test).
+  fault_fs->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kMetadataRead, /*seed=*/0, /*one_in=*/1,
+      /*retryable=*/false, /*has_data_loss=*/false);
+  fault_fs->EnableThreadLocalErrorInjection(
+      FaultInjectionIOType::kMetadataRead);
+
+  // Destroy column family handles before closing.
+  for (auto h : handles_) {
+    ASSERT_OK(db_->DestroyColumnFamilyHandle(h));
+  }
+  handles_.clear();
+
+  // Close the DB. Without the fix, TEST_VerifyNoObsoleteFilesCached fires.
+  s = db_->Close();
+  ASSERT_OK(s);
   db_ = nullptr;
 }
 
@@ -11956,6 +13436,56 @@ TEST_F(DBCompactionTest, VerifyAllOutputFlagsWithoutParanoidFileChecks) {
     }
     ASSERT_EQ(Get(Key(i)), expected);
   }
+}
+
+// Requires ~8GB+ RAM because the compaction filter internally creates a ~4GB
+// value via std::string::assign().
+TEST_F(DBCompactionTest, CompactionFilterLargeValueRejected) {
+  if (!test::HasBigMem()) {
+    ROCKSDB_GTEST_BYPASS("insufficient memory for reliable continuous testing");
+    return;
+  }
+
+  // A compaction filter that inflates every value to a configurable size
+  class InflatingFilter : public CompactionFilter {
+   public:
+    std::atomic<size_t> target_size{0};
+    Decision FilterV2(int /*level*/, const Slice& /*key*/,
+                      ValueType /*value_type*/, const Slice& /*existing_value*/,
+                      std::string* new_value,
+                      std::string* /*skip_until*/) const override {
+      new_value->assign(target_size.load(), 'X');
+      return Decision::kChangeValue;
+    }
+    const char* Name() const override { return "InflatingFilter"; }
+  };
+
+  InflatingFilter inflating_filter;
+  Options options = CurrentOptions();
+  options.compaction_filter = &inflating_filter;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  // Control: value at exactly 4GB - 1 should be accepted
+  inflating_filter.target_size = size_t{std::numeric_limits<uint32_t>::max()};
+  ASSERT_OK(Put("key", "small_value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key", "small_value2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  // Now test rejection: value at 4GB should be rejected
+  inflating_filter.target_size =
+      size_t{std::numeric_limits<uint32_t>::max()} + 1;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "small_value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key", "small_value2"));
+  ASSERT_OK(Flush());
+
+  Status s = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_TRUE(s.ToString().find("4GB") != std::string::npos) << s.ToString();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

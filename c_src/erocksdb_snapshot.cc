@@ -63,7 +63,7 @@ ReleaseSnapshot(
 {
     const ERL_NIF_TERM& handle_ref = argv[0];
     ReferencePtr<SnapshotObject> snapshot_ptr;
-    snapshot_ptr.assign(SnapshotObject::RetrieveSnapshotObject(env, handle_ref));
+    snapshot_ptr.try_assign(SnapshotObject::RetrieveSnapshotObject(env, handle_ref));
 
     if(NULL==snapshot_ptr.get())
     {
@@ -84,7 +84,7 @@ GetSnapshotSequenceNumber(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[
 {
     const ERL_NIF_TERM& handle_ref = argv[0];
     ReferencePtr<SnapshotObject> snapshot_ptr;
-    snapshot_ptr.assign(SnapshotObject::RetrieveSnapshotObject(env, handle_ref));
+    snapshot_ptr.try_assign(SnapshotObject::RetrieveSnapshotObject(env, handle_ref));
 
     if(NULL==snapshot_ptr.get())
         return enif_make_badarg(env);

@@ -131,6 +131,43 @@ static const SequenceNumber kMaxSequenceNumber = ((0x1ull << 56) - 1);
 static const SequenceNumber kDisableGlobalSequenceNumber =
     std::numeric_limits<uint64_t>::max();
 
+// Single source of truth for whether a bottommost entry's sequence number can
+// be zeroed out (the "seqno squashing" compaction optimization), for the two
+// conditions that gate it independently of snapshot visibility: the seqno->time
+// "preserve" window and the user-defined-timestamp (UDT) history cutoff.
+//
+// Callers still apply their own snapshot-visibility gate (which differs: the
+// compaction iterator is transaction/snapshot-checker aware, the version marker
+// only compares against the oldest snapshot). This shared predicate exists so
+// the entry-level decision in CompactionIterator::PrepareOutput and the
+// file-level decision in
+// VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction cannot drift
+// apart -- a mismatch causes a bottommost file to be marked for a compaction
+// that can make no progress, i.e. an infinite compaction loop.
+//
+// - `seq`: the entry's sequence number (or a file's largest sequence number).
+// - `preserve_seqno_after`: max seqno that may be zeroed given the preserve
+//   window; a seqno above it is too recent to zero.
+// - `ts_sz`: user-defined timestamp size (0 means UDT disabled).
+// - `full_history_ts_low_set`: whether full_history_ts_low has ever been set.
+// - `ts_below_full_history_ts_low`: whether the entry's (or file's max) user
+//   timestamp is strictly below full_history_ts_low. Only consulted when UDT is
+//   enabled; callers pass false when the timestamp is unknown so an
+//   indeterminate file is treated as not-zeroable (conservative, no loop).
+inline bool BottommostSeqnoCanBeZeroed(SequenceNumber seq,
+                                       SequenceNumber preserve_seqno_after,
+                                       size_t ts_sz,
+                                       bool full_history_ts_low_set,
+                                       bool ts_below_full_history_ts_low) {
+  if (seq > preserve_seqno_after) {
+    return false;
+  }
+  if (ts_sz == 0) {
+    return true;
+  }
+  return full_history_ts_low_set && ts_below_full_history_ts_low;
+}
+
 constexpr uint64_t kNumInternalBytes = 8;
 
 // Defined in dbformat.cc
@@ -397,7 +434,6 @@ class InternalKeyComparator
   //    overhead, set `named` to false. In that case, `Name()` will return a
   //    generic name that is non-specific to the underlying comparator.
   explicit InternalKeyComparator(const Comparator* c) : user_comparator_(c) {}
-  virtual ~InternalKeyComparator() {}
 
   int Compare(const Slice& a, const Slice& b) const override;
 
@@ -584,6 +620,8 @@ class IterKey {
   // No copying allowed
   IterKey(const IterKey&) = delete;
   void operator=(const IterKey&) = delete;
+  IterKey(IterKey&&) = delete;
+  void operator=(IterKey&&) = delete;
 
   ~IterKey() {
     ResetBuffer();
@@ -645,6 +683,19 @@ class IterKey {
     }
 
     memcpy(buf_ + shared_len, non_shared_data, non_shared_len);
+    key_ = buf_;
+    key_size_ = total_size;
+  }
+
+  // Sets the key to `prefix` immediately followed by `suffix`, always copying
+  // into buf_. Used by the data-block common-prefix feature to reconstruct a
+  // restart-point key from the block's stored common user-key prefix plus the
+  // key's stored (prefix-stripped) bytes. is_user_key_ is left unchanged.
+  void SetKeyPrependingPrefix(const Slice& prefix, const Slice& suffix) {
+    const size_t total_size = prefix.size() + suffix.size();
+    EnlargeBufferIfNeeded(total_size);
+    memcpy(buf_, prefix.data(), prefix.size());
+    memcpy(buf_ + prefix.size(), suffix.data(), suffix.size());
     key_ = buf_;
     key_size_ = total_size;
   }
@@ -829,6 +880,85 @@ class IterKey {
   }
 
   bool IsUserKey() const { return is_user_key_; }
+
+  void Swap(IterKey& other) {
+    // Record pointer relationships before any mutation.
+    bool this_key_in_buf = (key_ == buf_);
+    bool this_key_in_sec = (key_ == secondary_buf_);
+    bool other_key_in_buf = (other.key_ == other.buf_);
+    bool other_key_in_sec = (other.key_ == other.secondary_buf_);
+    const char* orig_this_key = key_;
+    const char* orig_other_key = other.key_;
+
+    // --- Swap primary buffer ---
+    bool this_buf_inline = (buf_ == space_);
+    bool other_buf_inline = (other.buf_ == other.space_);
+    if (this_buf_inline && other_buf_inline) {
+      char temp[kInlineBufferSize];
+      size_t max_sz =
+          std::min(std::max(key_size_, other.key_size_), kInlineBufferSize);
+      memcpy(temp, space_, max_sz);
+      memcpy(space_, other.space_, max_sz);
+      memcpy(other.space_, temp, max_sz);
+    } else if (this_buf_inline) {
+      memcpy(other.space_, space_, key_size_);
+      buf_ = other.buf_;
+      other.buf_ = other.space_;
+    } else if (other_buf_inline) {
+      memcpy(space_, other.space_, other.key_size_);
+      other.buf_ = buf_;
+      buf_ = space_;
+    } else {
+      std::swap(buf_, other.buf_);
+    }
+
+    // --- Swap secondary buffer ---
+    bool this_sec_inline = (secondary_buf_ == space_for_secondary_buf_);
+    bool other_sec_inline =
+        (other.secondary_buf_ == other.space_for_secondary_buf_);
+    if (this_sec_inline && other_sec_inline) {
+      char temp[kInlineBufferSize];
+      memcpy(temp, space_for_secondary_buf_, kInlineBufferSize);
+      memcpy(space_for_secondary_buf_, other.space_for_secondary_buf_,
+             kInlineBufferSize);
+      memcpy(other.space_for_secondary_buf_, temp, kInlineBufferSize);
+    } else if (this_sec_inline) {
+      memcpy(other.space_for_secondary_buf_, space_for_secondary_buf_,
+             secondary_buf_size_);
+      secondary_buf_ = other.secondary_buf_;
+      other.secondary_buf_ = other.space_for_secondary_buf_;
+    } else if (other_sec_inline) {
+      memcpy(space_for_secondary_buf_, other.space_for_secondary_buf_,
+             other.secondary_buf_size_);
+      other.secondary_buf_ = secondary_buf_;
+      secondary_buf_ = space_for_secondary_buf_;
+    } else {
+      std::swap(secondary_buf_, other.secondary_buf_);
+    }
+
+    // --- Redirect key_ pointers ---
+    if (other_key_in_buf) {
+      key_ = buf_;
+    } else if (other_key_in_sec) {
+      key_ = secondary_buf_;
+    } else {
+      key_ = orig_other_key;
+    }
+
+    if (this_key_in_buf) {
+      other.key_ = other.buf_;
+    } else if (this_key_in_sec) {
+      other.key_ = other.secondary_buf_;
+    } else {
+      other.key_ = orig_this_key;
+    }
+
+    std::swap(key_size_, other.key_size_);
+    std::swap(buf_size_, other.buf_size_);
+    std::swap(secondary_buf_size_, other.secondary_buf_size_);
+    std::swap(is_user_key_, other.is_user_key_);
+    std::swap(key_slices_, other.key_slices_);
+  }
 
  private:
   char* buf_;
@@ -1145,7 +1275,8 @@ inline int InternalKeyComparator::Compare(const Slice& a,
                                           SequenceNumber b_global_seqno) const {
   int r = user_comparator_.Compare(ExtractUserKey(a), ExtractUserKey(b));
   if (r == 0) {
-    uint64_t a_footer, b_footer;
+    uint64_t a_footer;
+    uint64_t b_footer;
     if (a_global_seqno == kDisableGlobalSequenceNumber) {
       a_footer = ExtractInternalKeyFooter(a);
     } else {

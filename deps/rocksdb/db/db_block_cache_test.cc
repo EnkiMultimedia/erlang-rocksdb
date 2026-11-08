@@ -542,7 +542,7 @@ TEST_F(DBBlockCacheTest, WarmCacheWithDataBlocksDuringCompaction) {
   EXPECT_TRUE(tracking_cache->HasPriority(Cache::Priority::BOTTOM));
   EXPECT_FALSE(tracking_cache->HasPriority(Cache::Priority::LOW));
 
-  // Compaction output is in cache — reads should have zero misses.
+  // Compaction output is in cache -- reads should have zero misses.
   auto data_miss_before =
       options.statistics->getTickerCount(BLOCK_CACHE_DATA_MISS);
   ASSERT_EQ(value + "2", Get("key"));
@@ -1482,10 +1482,13 @@ TEST_P(DBBlockCacheTypeTest, AddRedundantStats) {
   // Access just data, forcing redundant load+insert
   ReadOptions read_options;
   std::unique_ptr<Iterator> iter{db_->NewIterator(read_options)};
+  ASSERT_OK(iter->Refresh());
+
   cache->SetNthLookupNotFound(1);
   iter->SeekToFirst();
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(iter->key(), "bar");
+  ASSERT_EQ(iter->value(), "value");
 
   EXPECT_EQ(2, TestGetTickerCount(options, BLOCK_CACHE_INDEX_ADD));
   EXPECT_EQ(2, TestGetTickerCount(options, BLOCK_CACHE_FILTER_ADD));
@@ -1918,7 +1921,10 @@ TEST_F(CacheKeyTest, DBImplSessionIdStructure) {
   // counter."
   std::string session_id1 = DBImpl::GenerateDbSessionId(/*env*/ nullptr);
   std::string session_id2 = DBImpl::GenerateDbSessionId(/*env*/ nullptr);
-  uint64_t upper1, upper2, lower1, lower2;
+  uint64_t upper1;
+  uint64_t upper2;
+  uint64_t lower1;
+  uint64_t lower2;
   ASSERT_OK(DecodeSessionId(session_id1, &upper1, &lower1));
   ASSERT_OK(DecodeSessionId(session_id2, &upper2, &lower2));
   // Because generated in same process
@@ -1978,7 +1984,8 @@ struct CacheKeyDecoder {
   }
 
   void Decode(const CacheKey& key) {
-    uint64_t file_num_etc64, offset_etc64;
+    uint64_t file_num_etc64;
+    uint64_t offset_etc64;
     DeconstructNonemptyCacheKey(key, &file_num_etc64, &offset_etc64);
 
     // First decode session counter

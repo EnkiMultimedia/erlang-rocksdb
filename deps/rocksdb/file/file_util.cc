@@ -78,13 +78,14 @@ IOStatus CopyFile(FileSystem* fs, const std::string& source,
           std::to_string(dest_writer->GetFileSize()));
     }
 
-    io_s = dest_writer->Append(writeIOOptions.value_or(opts), slice);
+    io_s = dest_writer->Append(slice, writeIOOptions.value_or(opts));
     if (!io_s.ok()) {
       return io_s;
     }
     size -= slice.size();
   }
-  return dest_writer->Sync(writeIOOptions.value_or(opts), use_fsync);
+  return use_fsync ? dest_writer->Fsync(writeIOOptions.value_or(opts))
+                   : dest_writer->Sync(writeIOOptions.value_or(opts));
 }
 
 IOStatus CopyFile(FileSystem* fs, const std::string& source,
@@ -132,11 +133,11 @@ IOStatus CreateFile(FileSystem* fs, const std::string& destination,
   // TODO: pass in Histograms if the destination file is sst or blob
   dest_writer.reset(
       new WritableFileWriter(std::move(destfile), destination, soptions));
-  io_s = dest_writer->Append(opts, Slice(contents));
+  io_s = dest_writer->Append(Slice(contents), opts);
   if (!io_s.ok()) {
     return io_s;
   }
-  return dest_writer->Sync(opts, use_fsync);
+  return use_fsync ? dest_writer->Fsync(opts) : dest_writer->Sync(opts);
 }
 
 Status DeleteDBFile(const ImmutableDBOptions* db_options,
@@ -161,6 +162,21 @@ Status DeleteUnaccountedDBFile(const ImmutableDBOptions* db_options,
   if (sfm && !force_fg) {
     return sfm->ScheduleUnaccountedFileDeletion(fname, dir_to_sync, force_bg,
                                                 bucket);
+  } else {
+    return db_options->env->DeleteFile(fname);
+  }
+}
+
+Status DeleteExistingTrashDBFile(const ImmutableDBOptions* db_options,
+                                 const std::string& fname,
+                                 const std::string& dir_to_sync,
+                                 const bool force_bg, const bool force_fg,
+                                 std::optional<int32_t> bucket) {
+  SstFileManagerImpl* sfm = static_cast_with_check<SstFileManagerImpl>(
+      db_options->sst_file_manager.get());
+  if (sfm && !force_fg) {
+    return sfm->ScheduleExistingTrashFileDeletion(fname, dir_to_sync, force_bg,
+                                                  bucket);
   } else {
     return db_options->env->DeleteFile(fname);
   }
@@ -221,7 +237,7 @@ IOStatus GenerateOneFileChecksum(
     std::unique_ptr<FSRandomAccessFile> r_file;
     FileOptions fopts = file_options;
     if (fopts.file_checksum.empty()) {
-      // No expected checksum is known — this is a from-scratch computation.
+      // No expected checksum is known -- this is a from-scratch computation.
       fopts.file_checksum_func_name = kNoFileChecksumFuncName;
     }
     io_s = fs->NewRandomAccessFile(file_path, fopts, &r_file, nullptr);
@@ -261,8 +277,7 @@ IOStatus GenerateOneFileChecksum(
   while (size > 0) {
     size_t bytes_to_read =
         static_cast<size_t>(std::min(uint64_t{readahead_size}, size));
-    io_s = reader->Read(opts, offset, bytes_to_read, &slice, buf.get(), nullptr,
-                        &dbg);
+    io_s = reader->Read(offset, bytes_to_read, opts, &slice, buf.get(), &dbg);
     if (!io_s.ok()) {
       return IOStatus::Corruption("file read failed with error: " +
                                   io_s.ToString());

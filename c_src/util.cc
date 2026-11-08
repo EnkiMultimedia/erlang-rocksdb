@@ -99,7 +99,7 @@ binary_to_slice(ErlNifEnv* env, ERL_NIF_TERM val, rocksdb::Slice* slice)
 int
 enif_get_db(ErlNifEnv* env, ERL_NIF_TERM dbval, erocksdb::ReferencePtr<erocksdb::DbObject>* db_ptr)
 {
-    db_ptr->assign(erocksdb::DbObject::RetrieveDbObject(env, dbval));
+    db_ptr->try_assign(erocksdb::DbObject::RetrieveDbObject(env, dbval));
 
     if(NULL==db_ptr->get())
         return 0;
@@ -113,7 +113,7 @@ enif_get_db(ErlNifEnv* env, ERL_NIF_TERM dbval, erocksdb::ReferencePtr<erocksdb:
 int
 enif_get_cf(ErlNifEnv* env, ERL_NIF_TERM cfval, erocksdb::ReferencePtr<erocksdb::ColumnFamilyObject>* cf_ptr)
 {
-    cf_ptr->assign(erocksdb::ColumnFamilyObject::RetrieveColumnFamilyObject(env, cfval));
+    cf_ptr->try_assign(erocksdb::ColumnFamilyObject::RetrieveColumnFamilyObject(env, cfval));
 
     if(NULL==cf_ptr->get())
         return 0;
@@ -127,7 +127,7 @@ enif_get_backup_engine(
     ErlNifEnv* env, ERL_NIF_TERM val,
     erocksdb::ReferencePtr<erocksdb::BackupEngineObject>* backup_engine_ptr)
 {
-    backup_engine_ptr->assign(erocksdb::BackupEngineObject::RetrieveBackupEngineObject(env, val));
+    backup_engine_ptr->try_assign(erocksdb::BackupEngineObject::RetrieveBackupEngineObject(env, val));
 
     if(NULL==backup_engine_ptr->get())
         return 0;
@@ -140,7 +140,7 @@ enif_get_transaction(
     ErlNifEnv* env, ERL_NIF_TERM val,
     erocksdb::ReferencePtr<erocksdb::TransactionObject>* tx_ptr)
 {
-    tx_ptr->assign(erocksdb::TransactionObject::RetrieveTransactionObject(env, val));
+    tx_ptr->try_assign(erocksdb::TransactionObject::RetrieveTransactionObject(env, val));
 
     if(NULL==tx_ptr->get())
         return 0;

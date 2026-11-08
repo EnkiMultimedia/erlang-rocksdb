@@ -15,6 +15,9 @@
 #include <memory>
 #include <optional>
 
+#include "db/blob/blob_fetcher.h"
+#include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_index.h"
 #include "db/dbformat.h"
 #include "db/kv_checksum.h"
 #include "db/merge_context.h"
@@ -40,11 +43,72 @@
 #include "table/internal_iterator.h"
 #include "table/iterator_wrapper.h"
 #include "table/merging_iterator.h"
+#include "util/atomic.h"
 #include "util/autovector.h"
 #include "util/coding.h"
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+Status PushWideColumnEntityDefaultOperand(const Slice& user_key,
+                                          const Slice& entity,
+                                          MergeContext* merge_context,
+                                          bool operand_pinned,
+                                          const BlobFetcher* blob_fetcher) {
+  assert(merge_context != nullptr);
+
+  Slice value_of_default;
+  bool is_blob_reference = false;
+  Status status = WideColumnSerialization::GetValueOfDefaultColumn(
+      entity, value_of_default, is_blob_reference);
+  if (!status.ok()) {
+    return status;
+  }
+  if (!is_blob_reference) {
+    merge_context->PushOperand(value_of_default, operand_pinned);
+    return status;
+  }
+
+  PinnableSlice resolved_default;
+  status = WideColumnSerialization::ResolveDefaultColumnBlobReference(
+      value_of_default, user_key, blob_fetcher, resolved_default);
+  if (status.ok()) {
+    // Resolved value is backed by this stack-local PinnableSlice, so copy it
+    // into MergeContext instead of pinning its storage.
+    merge_context->PushOperand(Slice(resolved_default), false);
+  }
+  return status;
+}
+
+Status MergeWithWideColumnEntityBaseValue(
+    const Slice& user_key, const Slice& entity,
+    const MergeOperator* merge_operator, MergeContext* merge_context,
+    Logger* logger, Statistics* statistics, SystemClock* clock,
+    std::string* value, PinnableWideColumns* columns,
+    const BlobFetcher* blob_fetcher) {
+  assert(merge_context != nullptr);
+
+  std::string resolved_entity;
+  Slice effective_entity;
+  Status status = WideColumnSerialization::ResolveEntityForMerge(
+      entity, user_key, blob_fetcher, nullptr /* prefetch_buffers */,
+      resolved_entity, effective_entity);
+  if (!status.ok()) {
+    return status;
+  }
+
+  // `op_failure_scope` (an output parameter) is not provided (set to nullptr)
+  // since a failure must be propagated regardless of its value.
+  return MergeHelper::TimedFullMerge(
+      merge_operator, user_key, MergeHelper::kWideBaseValue, effective_entity,
+      merge_context->GetOperands(), logger, statistics, clock,
+      /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr, value,
+      columns);
+}
+
+}  // namespace
 
 ImmutableMemTableOptions::ImmutableMemTableOptions(
     const ImmutableOptions& ioptions,
@@ -71,20 +135,66 @@ ImmutableMemTableOptions::ImmutableMemTableOptions(
           mutable_cf_options.memtable_protection_bytes_per_key),
       allow_data_in_errors(ioptions.allow_data_in_errors),
       paranoid_memory_checks(mutable_cf_options.paranoid_memory_checks),
-      memtable_veirfy_per_key_checksum_on_seek(
-          mutable_cf_options.memtable_veirfy_per_key_checksum_on_seek),
+      memtable_verify_per_key_checksum_on_seek(
+          mutable_cf_options.memtable_verify_per_key_checksum_on_seek),
       memtable_batch_lookup_optimization(
           ioptions.memtable_batch_lookup_optimization) {}
+
+void ReadOnlyMemTable::ProtectSealedBlobFiles(
+    const std::shared_ptr<BlobFilePartitionManager>& blob_partition_manager,
+    const std::vector<uint64_t>& file_numbers) {
+  if (file_numbers.empty()) {
+    return;
+  }
+
+  assert(blob_partition_manager != nullptr);
+  if (protected_blob_file_manager_ == nullptr) {
+    protected_blob_file_manager_ = blob_partition_manager;
+  } else {
+    assert(protected_blob_file_manager_.get() == blob_partition_manager.get());
+  }
+
+  std::vector<uint64_t> newly_protected_file_numbers;
+  newly_protected_file_numbers.reserve(file_numbers.size());
+  for (uint64_t file_number : file_numbers) {
+    auto it = std::find(protected_blob_file_numbers_.begin(),
+                        protected_blob_file_numbers_.end(), file_number);
+    if (it != protected_blob_file_numbers_.end()) {
+      continue;
+    }
+    protected_blob_file_numbers_.push_back(file_number);
+    newly_protected_file_numbers.push_back(file_number);
+  }
+
+  if (!newly_protected_file_numbers.empty()) {
+    protected_blob_file_manager_->ProtectSealedBlobFileNumbers(
+        newly_protected_file_numbers);
+  }
+}
+
+void ReadOnlyMemTable::ReleaseProtectedSealedBlobFiles() {
+  if (protected_blob_file_manager_ == nullptr) {
+    assert(protected_blob_file_numbers_.empty());
+    return;
+  }
+
+  std::shared_ptr<BlobFilePartitionManager> blob_partition_manager =
+      std::move(protected_blob_file_manager_);
+  blob_partition_manager->UnprotectSealedBlobFileNumbers(
+      protected_blob_file_numbers_);
+  protected_blob_file_numbers_.clear();
+}
 
 MemTable::MemTable(const InternalKeyComparator& cmp,
                    const ImmutableOptions& ioptions,
                    const MutableCFOptions& mutable_cf_options,
                    WriteBufferManager* write_buffer_manager,
-                   SequenceNumber latest_seq, uint32_t column_family_id)
+                   SequenceNumber latest_seq, uint32_t column_family_id,
+                   FlushInitiator* flush_initiator)
     : comparator_(cmp),
       moptions_(ioptions, mutable_cf_options),
       kArenaBlockSize(Arena::OptimizeBlockSize(moptions_.arena_block_size)),
-      mem_tracker_(write_buffer_manager),
+      mem_tracker_(write_buffer_manager, flush_initiator),
       arena_(moptions_.arena_block_size,
              (write_buffer_manager != nullptr &&
               (write_buffer_manager->enabled() ||
@@ -95,6 +205,7 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
       table_(ioptions.memtable_factory->CreateMemTableRep(
           comparator_, &arena_, mutable_cf_options.prefix_extractor.get(),
           ioptions.logger, column_family_id)),
+      // range del table must support concurrent inserts
       range_del_table_(SkipListFactory().CreateMemTableRep(
           comparator_, &arena_, nullptr /* transform */, ioptions.logger,
           column_family_id)),
@@ -122,7 +233,7 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
           mutable_cf_options.memtable_max_range_deletions),
       key_validation_callback_(
           (moptions_.protection_bytes_per_key != 0 &&
-           moptions_.memtable_veirfy_per_key_checksum_on_seek)
+           moptions_.memtable_verify_per_key_checksum_on_seek)
               ? std::bind(&MemTable::ValidateKey, this, std::placeholders::_1,
                           std::placeholders::_2)
               : std::function<Status(const char*, bool)>(nullptr)) {
@@ -144,26 +255,14 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
   auto new_cache = std::make_shared<FragmentedRangeTombstoneListCache>();
   size_t size = cached_range_tombstone_.Size();
   for (size_t i = 0; i < size; ++i) {
-#if defined(__cpp_lib_atomic_shared_ptr)
-    std::atomic<std::shared_ptr<FragmentedRangeTombstoneListCache>>*
-        local_cache_ref_ptr = cached_range_tombstone_.AccessAtCore(i);
-    auto new_local_cache_ref = std::make_shared<
-        const std::shared_ptr<FragmentedRangeTombstoneListCache>>(new_cache);
-    std::shared_ptr<FragmentedRangeTombstoneListCache> aliased_ptr(
-        new_local_cache_ref, new_cache.get());
-    local_cache_ref_ptr->store(std::move(aliased_ptr),
-                               std::memory_order_relaxed);
-#else
     std::shared_ptr<FragmentedRangeTombstoneListCache>* local_cache_ref_ptr =
         cached_range_tombstone_.AccessAtCore(i);
     auto new_local_cache_ref = std::make_shared<
         const std::shared_ptr<FragmentedRangeTombstoneListCache>>(new_cache);
-    std::atomic_store_explicit(
-        local_cache_ref_ptr,
-        std::shared_ptr<FragmentedRangeTombstoneListCache>(new_local_cache_ref,
-                                                           new_cache.get()),
-        std::memory_order_relaxed);
-#endif
+    std::shared_ptr<FragmentedRangeTombstoneListCache> aliased_ptr(
+        new_local_cache_ref, new_cache.get());
+    AtomicSharedPtrStore(local_cache_ref_ptr, std::move(aliased_ptr),
+                         std::memory_order_relaxed);
   }
   const Comparator* ucmp = cmp.user_comparator();
   assert(ucmp);
@@ -266,6 +365,15 @@ bool MemTable::ShouldFlushNow() {
   // as: "arena block size * 0.25 / write buffer size". User who specify a small
   // write buffer size and/or big arena block size may suffer.
   return arena_.AllocatedAndUnused() < kArenaBlockSize / 4;
+}
+
+FlushReason MemTable::GetFlushReason() const {
+  if (memtable_max_range_deletions_ > 0 &&
+      num_range_deletes_.LoadRelaxed() >=
+          static_cast<uint64_t>(memtable_max_range_deletions_)) {
+    return FlushReason::kMemtableMaxRangeDeletions;
+  }
+  return FlushReason::kWriteBufferFull;
 }
 
 void MemTable::UpdateFlushState() {
@@ -406,7 +514,7 @@ class MemTableIterator : public InternalIterator {
         paranoid_memory_checks_(mem.moptions_.paranoid_memory_checks),
         validate_on_seek_(
             mem.moptions_.paranoid_memory_checks ||
-            mem.moptions_.memtable_veirfy_per_key_checksum_on_seek),
+            mem.moptions_.memtable_verify_per_key_checksum_on_seek),
         allow_data_in_error_(mem.moptions_.allow_data_in_errors),
         key_validation_callback_(mem.key_validation_callback_) {
     if (kind == kRangeDelEntries) {
@@ -431,6 +539,8 @@ class MemTableIterator : public InternalIterator {
   // No copying allowed
   MemTableIterator(const MemTableIterator&) = delete;
   void operator=(const MemTableIterator&) = delete;
+  MemTableIterator(MemTableIterator&&) = delete;
+  void operator=(MemTableIterator&&) = delete;
 
   ~MemTableIterator() override {
 #ifndef NDEBUG
@@ -664,6 +774,8 @@ class TimestampStrippingIterator : public InternalIterator {
   // No copying allowed
   TimestampStrippingIterator(const TimestampStrippingIterator&) = delete;
   void operator=(const TimestampStrippingIterator&) = delete;
+  TimestampStrippingIterator(TimestampStrippingIterator&&) = delete;
+  void operator=(TimestampStrippingIterator&&) = delete;
 
   ~TimestampStrippingIterator() override {
     if (arena_mode_) {
@@ -821,13 +933,8 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
 
   // takes current cache
   std::shared_ptr<FragmentedRangeTombstoneListCache> cache =
-#if defined(__cpp_lib_atomic_shared_ptr)
-      cached_range_tombstone_.Access()->load(std::memory_order_relaxed)
-#else
-      std::atomic_load_explicit(cached_range_tombstone_.Access(),
-                                std::memory_order_relaxed)
-#endif
-      ;
+      AtomicSharedPtrLoad(cached_range_tombstone_.Access(),
+                          std::memory_order_relaxed);
   // construct fragmented tombstone list if necessary
   if (!cache->initialized.load(std::memory_order_acquire)) {
     cache->reader_mutex.lock();
@@ -860,6 +967,81 @@ void MemTable::ConstructFragmentedRangeTombstones() {
         std::make_unique<FragmentedRangeTombstoneList>(
             std::unique_ptr<InternalIterator>(unfragmented_iter),
             comparator_.comparator);
+  }
+}
+
+bool MemTable::AddLogicallyRedundantRangeTombstone(
+    SequenceNumber seq, const Slice& start_key, const Slice& end_key,
+    uint64_t version_number, port::RWMutex& ingest_sst_lock) {
+  // Fast path: skip if already immutable.
+  if (is_immutable_.LoadRelaxed()) {
+    return false;
+  }
+
+#ifndef NDEBUG
+  std::pair<Slice, Slice> range{start_key, end_key};
+  TEST_SYNC_POINT_CALLBACK(
+      "MemTable::AddLogicallyRedundantRangeTombstone:AddRange", &range);
+#endif  // !NDEBUG
+
+  // Prevents racing with MarkImmutable()
+  ReadLock rl(&immutable_mutex_);
+  if (is_immutable_.LoadRelaxed()) {
+    return false;
+  }
+
+  // Range tombstone reads have an assumption that all levels below it have a
+  // LOWER seqno than it, so it is safe to skip reading files. Normally, this is
+  // true, but range tombstone conversion creates an exception.
+  //
+  // The inserted range tombstone uses iterator seqno. There are guards to
+  // ensure that we only insert it if it is within current memtable's bounds,
+  // BUT an external file ingestion can break that still, as the newly ingested
+  // L0 file will be assigned a higher seqno than an earlier iterator.
+  //
+  // So the solution here is to use a RW lock + ingest seqno to gate range
+  // tombstone conversions. An added side effect is also we can no longer insert
+  // to memtables while a file ingestion is in progress, which is an expectation
+  // of file ingestion. Note we expect this insertion to be rare, and we do not
+  // want to limit concurrent external file ingestions so the conversion path
+  // uses a write lock while the ingestion path uses a read lock.
+  TryWriteLock ingest_wl(&ingest_sst_lock);
+  if (!ingest_wl.OwnsLock()) {
+    return false;
+  }
+  // After ingestion releases its WriteLock, an iterator with an older
+  // snapshot could still try to convert a tombstone whose seq sits
+  // below the just-ingested file's seq. The barrier persists past the end
+  // of the ingestion that bumped it and refuses such inserts.
+  if (seq < ingest_seqno_barrier_.LoadRelaxed()) {
+    return false;
+  }
+  // The iterator's Version predates an ingestion, so the deleted run it saw
+  // can surround ingested keys that it cannot see.
+  if (version_number < ingest_version_barrier_.LoadRelaxed()) {
+    return false;
+  }
+
+  MemTablePostProcessInfo post_process_info;
+  Status s = Add(seq, kTypeRangeDeletion, start_key, end_key,
+                 nullptr /* kv_prot_info */, true /* allow_concurrent */,
+                 &post_process_info);
+  if (s.ok()) {
+    BatchPostProcess(post_process_info);
+    return true;
+  }
+  return false;
+}
+
+void MemTable::BumpIngestSeqnoBarrier(SequenceNumber y) {
+  if (ingest_seqno_barrier_.LoadRelaxed() < y) {
+    ingest_seqno_barrier_.StoreRelaxed(y);
+  }
+}
+
+void MemTable::BumpIngestVersionBarrier(uint64_t version_number) {
+  if (ingest_version_barrier_.LoadRelaxed() < version_number) {
+    ingest_version_barrier_.StoreRelaxed(version_number);
   }
 }
 
@@ -968,6 +1150,11 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   char* buf = nullptr;
   std::unique_ptr<MemTableRep>& table =
       type == kTypeRangeDeletion ? range_del_table_ : table_;
+  // Range deletion table always uses SkipList, which supports concurrent
+  // inserts. Inserts must be made concurrent because
+  // AddLogicallyRedundantRangeTombstone can also insert range tombstones.
+  assert(type != kTypeRangeDeletion || allow_concurrent);
+
   KeyHandle handle = table->Allocate(encoded_len, &buf);
 
   char* p = EncodeVarint32(buf, internal_key_size);
@@ -994,6 +1181,7 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   }
 
   Slice key_without_ts = StripTimestampFromUserKey(key, ts_sz_);
+  bool activate_flush_initiator = false;
 
   if (!allow_concurrent) {
     // Extract prefix for insert with hint. Hints are for point key table
@@ -1012,16 +1200,17 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
       }
     }
 
-    // this is a bit ugly, but is the way to avoid locked instructions
-    // when incrementing an atomic
-    num_entries_.StoreRelaxed(num_entries_.LoadRelaxed() + 1);
-    data_size_.StoreRelaxed(data_size_.LoadRelaxed() + encoded_len);
+    // Use atomic FetchAdd because even though this write path is serialized
+    // (non-concurrent), these counters may be concurrently modified by
+    // BatchPostProcess() (e.g., from AddLogicallyRedundantRangeTombstone
+    // called on a read path).
+    activate_flush_initiator = num_entries_.FetchAddRelaxed(1) == 0;
+    data_size_.FetchAddRelaxed(encoded_len);
     if (type == kTypeDeletion || type == kTypeSingleDeletion ||
         type == kTypeDeletionWithTimestamp) {
-      num_deletes_.StoreRelaxed(num_deletes_.LoadRelaxed() + 1);
+      num_deletes_.FetchAddRelaxed(1);
     } else if (type == kTypeRangeDeletion) {
-      uint64_t val = num_range_deletes_.LoadRelaxed() + 1;
-      num_range_deletes_.StoreRelaxed(val);
+      num_range_deletes_.FetchAddRelaxed(1);
     }
 
     if (bloom_filter_ && prefix_extractor_ &&
@@ -1032,21 +1221,7 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
       bloom_filter_->Add(key_without_ts);
     }
 
-    // The first sequence number inserted into the memtable
-    assert(first_seqno_ == 0 || s >= first_seqno_);
-    if (first_seqno_ == 0) {
-      first_seqno_.store(s, std::memory_order_relaxed);
-
-      if (earliest_seqno_ == kMaxSequenceNumber) {
-        earliest_seqno_.store(GetFirstSequenceNumber(),
-                              std::memory_order_relaxed);
-      }
-      assert(first_seqno_.load() >= earliest_seqno_.load());
-    }
     assert(post_process_info == nullptr);
-    // TODO(yuzhangyu): support updating newest UDT for when `allow_concurrent`
-    // is true.
-    MaybeUpdateNewestUDT(key_slice);
     UpdateFlushState();
   } else {
     bool res = (hint == nullptr)
@@ -1059,7 +1234,8 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
     assert(post_process_info != nullptr);
     post_process_info->num_entries++;
     post_process_info->data_size += encoded_len;
-    if (type == kTypeDeletion) {
+    if (type == kTypeDeletion || type == kTypeSingleDeletion ||
+        type == kTypeDeletionWithTimestamp) {
       post_process_info->num_deletes++;
     }
 
@@ -1071,19 +1247,24 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
     if (bloom_filter_ && moptions_.memtable_whole_key_filtering) {
       bloom_filter_->AddConcurrently(key_without_ts);
     }
-
-    // atomically update first_seqno_ and earliest_seqno_.
-    uint64_t cur_seq_num = first_seqno_.load(std::memory_order_relaxed);
-    while ((cur_seq_num == 0 || s < cur_seq_num) &&
-           !first_seqno_.compare_exchange_weak(cur_seq_num, s)) {
-    }
-    uint64_t cur_earliest_seqno =
-        earliest_seqno_.load(std::memory_order_relaxed);
-    while (
-        (cur_earliest_seqno == kMaxSequenceNumber || s < cur_earliest_seqno) &&
-        !earliest_seqno_.compare_exchange_weak(cur_earliest_seqno, s)) {
-    }
   }
+
+  // In the non-concurrent path, sequence numbers are non-decreasing.
+  assert(allow_concurrent || first_seqno_ == 0 || s >= first_seqno_);
+
+  // Atomically update first_seqno_ and earliest_seqno_.
+  uint64_t cur_seq_num = first_seqno_.load(std::memory_order_relaxed);
+  while ((cur_seq_num == 0 || s < cur_seq_num) &&
+         !first_seqno_.compare_exchange_weak(cur_seq_num, s)) {
+  }
+  uint64_t cur_earliest_seqno = earliest_seqno_.load(std::memory_order_relaxed);
+  while ((cur_earliest_seqno == kMaxSequenceNumber || s < cur_earliest_seqno) &&
+         !earliest_seqno_.compare_exchange_weak(cur_earliest_seqno, s)) {
+  }
+  if (activate_flush_initiator) {
+    mem_tracker_.ActivateFlushInitiator();
+  }
+  MaybeUpdateNewestUDT(key_slice);
   if (type == kTypeRangeDeletion) {
     auto new_cache = std::make_shared<FragmentedRangeTombstoneListCache>();
     size_t size = cached_range_tombstone_.Size();
@@ -1092,31 +1273,19 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
       range_del_mutex_.lock();
     }
     for (size_t i = 0; i < size; ++i) {
-#if defined(__cpp_lib_atomic_shared_ptr)
-      std::atomic<std::shared_ptr<FragmentedRangeTombstoneListCache>>*
-          local_cache_ref_ptr = cached_range_tombstone_.AccessAtCore(i);
-      auto new_local_cache_ref = std::make_shared<
-          const std::shared_ptr<FragmentedRangeTombstoneListCache>>(new_cache);
-      std::shared_ptr<FragmentedRangeTombstoneListCache> aliased_ptr(
-          new_local_cache_ref, new_cache.get());
-      local_cache_ref_ptr->store(std::move(aliased_ptr),
-                                 std::memory_order_relaxed);
-#else
       std::shared_ptr<FragmentedRangeTombstoneListCache>* local_cache_ref_ptr =
           cached_range_tombstone_.AccessAtCore(i);
       auto new_local_cache_ref = std::make_shared<
           const std::shared_ptr<FragmentedRangeTombstoneListCache>>(new_cache);
+      std::shared_ptr<FragmentedRangeTombstoneListCache> aliased_ptr(
+          new_local_cache_ref, new_cache.get());
       // It is okay for some reader to load old cache during invalidation as
       // the new sequence number is not published yet.
       // Each core will have a shared_ptr to a shared_ptr to the cached
-      // fragmented range tombstones, so that ref count is maintianed locally
+      // fragmented range tombstones, so that ref count is maintained locally
       // per-core using the per-core shared_ptr.
-      std::atomic_store_explicit(
-          local_cache_ref_ptr,
-          std::shared_ptr<FragmentedRangeTombstoneListCache>(
-              new_local_cache_ref, new_cache.get()),
-          std::memory_order_relaxed);
-#endif
+      AtomicSharedPtrStore(local_cache_ref_ptr, std::move(aliased_ptr),
+                           std::memory_order_relaxed);
     }
 
     if (allow_concurrent) {
@@ -1125,7 +1294,6 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
     is_range_del_table_empty_.StoreRelaxed(false);
   }
   UpdateOldestKeyTime();
-
   TEST_SYNC_POINT_CALLBACK("MemTable::Add:BeforeReturn:Encoded", &encoded);
   return Status::OK();
 }
@@ -1152,11 +1320,14 @@ struct Saver {
   bool inplace_update_support;
   bool do_merge;
   SystemClock* clock;
+  const BlobFetcher* blob_fetcher;
 
   ReadCallback* callback_;
   bool* is_blob_index;
   bool allow_data_in_errors;
   uint32_t protection_bytes_per_key;
+  // MultiGet's per-key result. Single-key Get stores its result on callback_.
+  bool* newer_version_present;
   bool CheckCallback(SequenceNumber _seq) {
     if (callback_) {
       return callback_->IsVisible(_seq);
@@ -1216,6 +1387,12 @@ static bool SaveValue(void* arg, const char* entry) {
     ValueType type;
     SequenceNumber seq;
     UnPackSequenceAndType(tag, &seq, &type);
+    if (UNLIKELY(
+            s->callback_ != nullptr &&
+            s->callback_->NeedToTrackNewerVersions(s->newer_version_present))) {
+      s->callback_->MaybeRecordNewerVersion(seq, type,
+                                            s->newer_version_present);
+    }
     // If the value is not in the snapshot, skip it
     if (!s->CheckCallback(seq)) {
       return true;  // to continue to the next seq
@@ -1316,48 +1493,61 @@ static bool SaveValue(void* arg, const char* entry) {
         Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
 
         *(s->status) = Status::OK();
+        bool default_blob_index_returned = false;
 
         if (!s->do_merge) {
           // Preserve the value with the goal of returning it as part of
           // raw merge operands to the user
 
-          Slice value_of_default;
-          *(s->status) = WideColumnSerialization::GetValueOfDefaultColumn(
-              v, value_of_default);
-
-          if (s->status->ok()) {
-            merge_context->PushOperand(
-                value_of_default,
-                s->inplace_update_support == false /* operand_pinned */);
-          }
+          *(s->status) = PushWideColumnEntityDefaultOperand(
+              s->key->user_key(), v, merge_context,
+              s->inplace_update_support == false /* operand_pinned */,
+              s->blob_fetcher);
         } else if (*(s->merge_in_progress)) {
           assert(s->do_merge);
 
           if (s->value || s->columns) {
-            // `op_failure_scope` (an output parameter) is not provided (set
-            // to nullptr) since a failure must be propagated regardless of
-            // its value.
-            *(s->status) = MergeHelper::TimedFullMerge(
-                merge_operator, s->key->user_key(), MergeHelper::kWideBaseValue,
-                v, merge_context->GetOperands(), s->logger, s->statistics,
-                s->clock, /* update_num_ops_stats */ true,
-                /* op_failure_scope */ nullptr, s->value, s->columns);
+            *(s->status) = MergeWithWideColumnEntityBaseValue(
+                s->key->user_key(), v, merge_operator, merge_context, s->logger,
+                s->statistics, s->clock, s->value, s->columns, s->blob_fetcher);
           }
         } else if (s->value) {
           Slice value_of_default;
+          bool is_blob_reference = false;
           *(s->status) = WideColumnSerialization::GetValueOfDefaultColumn(
-              v, value_of_default);
+              v, value_of_default, is_blob_reference);
           if (s->status->ok()) {
-            s->value->assign(value_of_default.data(), value_of_default.size());
+            if (!is_blob_reference) {
+              s->value->assign(value_of_default.data(),
+                               value_of_default.size());
+            } else if (s->is_blob_index != nullptr) {
+              // Caller requested the raw blob index (StackableDB BlobDB); hand
+              // back the serialized BlobIndex bytes without resolving.
+              s->value->assign(value_of_default.data(),
+                               value_of_default.size());
+              default_blob_index_returned = true;
+            } else {
+              // Base RocksDB read of a blob-backed default column without
+              // is_blob_index requested: not supported here.
+              *(s->status) = Status::NotSupported(
+                  "Encountered blob-backed default column without "
+                  "is_blob_index");
+            }
           }
         } else if (s->columns) {
+          // NOTE/TODO: copying all of the wide columns that are inlined in the
+          // memtable. (Blob-indirect columns avoid the copy in
+          // MaybeResolveMemtableBlobValue()). We could consider avoiding the
+          // copy, perhaps conditional on size, by pinning the SuperVersion with
+          // the result, but there's no precedent for that, even without wide
+          // columns (plain memtable values are copied too).
           *(s->status) = s->columns->SetWideColumnValue(v);
         }
 
         *(s->found_final_value) = true;
 
         if (s->is_blob_index != nullptr) {
-          *(s->is_blob_index) = false;
+          *(s->is_blob_index) = default_blob_index_returned;
         }
 
         return false;
@@ -1408,7 +1598,8 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
                    SequenceNumber* max_covering_tombstone_seq,
                    SequenceNumber* seq, const ReadOptions& read_opts,
                    bool immutable_memtable, ReadCallback* callback,
-                   bool* is_blob_index, bool do_merge) {
+                   bool* is_blob_index, bool do_merge,
+                   const BlobFetcher* blob_fetcher) {
   // The sequence number is updated synchronously in version_set.h
   if (IsEmpty()) {
     // Avoiding recording stats for speed.
@@ -1417,9 +1608,32 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
 
   PERF_TIMER_GUARD(get_from_memtable_time);
 
+  // Metadata reads widen the lookup seq to detect newer range tombstones. The
+  // regular masking iterator must stay at the user's snapshot seq so such
+  // tombstones only set metadata and do not hide snapshot-visible values.
+  const SequenceNumber lookup_seq = GetInternalKeySeqno(key.internal_key());
+  const MetadataReadBounds* metadata_read_bounds =
+      callback != nullptr ? callback->GetMetadataReadBounds() : nullptr;
+  const SequenceNumber range_del_read_seq =
+      metadata_read_bounds != nullptr ? metadata_read_bounds->read_snapshot_seq
+                                      : lookup_seq;
+  assert(range_del_read_seq <= lookup_seq);
+  if (callback != nullptr && callback->NeedToTrackNewerVersions() &&
+      !is_range_del_table_empty_.LoadRelaxed()) {
+    std::unique_ptr<FragmentedRangeTombstoneIterator> latest_range_del_iter(
+        NewRangeTombstoneIteratorInternal(read_opts, lookup_seq,
+                                          immutable_memtable));
+    const SequenceNumber covering_seq =
+        latest_range_del_iter != nullptr
+            ? latest_range_del_iter->MaxCoveringTombstoneSeqnum(key.user_key(),
+                                                                callback)
+            : 0;
+    if (covering_seq != 0) {
+      callback->MaybeRecordNewerVersion(covering_seq, kTypeRangeDeletion);
+    }
+  }
   std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
-      NewRangeTombstoneIterator(read_opts,
-                                GetInternalKeySeqno(key.internal_key()),
+      NewRangeTombstoneIterator(read_opts, range_del_read_seq,
                                 immutable_memtable));
   if (range_del_iter != nullptr) {
     SequenceNumber covering_seq =
@@ -1466,7 +1680,7 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
     }
     GetFromTable(key, *max_covering_tombstone_seq, do_merge, callback,
                  is_blob_index, value, columns, timestamp, s, merge_context,
-                 seq, &found_final_value, &merge_in_progress);
+                 seq, &found_final_value, &merge_in_progress, blob_fetcher);
   }
 
   // No change to value, since we have not yet found a Put/Delete
@@ -1482,14 +1696,13 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
   return found_final_value;
 }
 
-void MemTable::GetFromTable(const LookupKey& key,
-                            SequenceNumber max_covering_tombstone_seq,
-                            bool do_merge, ReadCallback* callback,
-                            bool* is_blob_index, std::string* value,
-                            PinnableWideColumns* columns,
-                            std::string* timestamp, Status* s,
-                            MergeContext* merge_context, SequenceNumber* seq,
-                            bool* found_final_value, bool* merge_in_progress) {
+void MemTable::GetFromTable(
+    const LookupKey& key, SequenceNumber max_covering_tombstone_seq,
+    bool do_merge, ReadCallback* callback, bool* is_blob_index,
+    std::string* value, PinnableWideColumns* columns, std::string* timestamp,
+    Status* s, MergeContext* merge_context, SequenceNumber* seq,
+    bool* found_final_value, bool* merge_in_progress,
+    const BlobFetcher* blob_fetcher, bool* newer_version_present) {
   Saver saver;
   saver.status = s;
   saver.found_final_value = found_final_value;
@@ -1507,14 +1720,16 @@ void MemTable::GetFromTable(const LookupKey& key,
   saver.inplace_update_support = moptions_.inplace_update_support;
   saver.statistics = moptions_.statistics;
   saver.clock = clock_;
+  saver.blob_fetcher = blob_fetcher;
   saver.callback_ = callback;
   saver.is_blob_index = is_blob_index;
   saver.do_merge = do_merge;
   saver.allow_data_in_errors = moptions_.allow_data_in_errors;
   saver.protection_bytes_per_key = moptions_.protection_bytes_per_key;
+  saver.newer_version_present = newer_version_present;
 
   if (!moptions_.paranoid_memory_checks &&
-      !moptions_.memtable_veirfy_per_key_checksum_on_seek) {
+      !moptions_.memtable_verify_per_key_checksum_on_seek) {
     table_->Get(key, &saver, SaveValue);
   } else {
     Status check_s = table_->GetAndValidate(
@@ -1536,7 +1751,8 @@ Status MemTable::ValidateKey(const char* key, bool allow_data_in_errors) {
 }
 
 void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
-                        ReadCallback* callback, bool immutable_memtable) {
+                        ReadCallback* callback, bool immutable_memtable,
+                        const BlobFetcher* blob_fetcher) {
   // The sequence number is updated synchronously in version_set.h
   if (IsEmpty()) {
     // Avoiding recording stats for speed.
@@ -1544,13 +1760,25 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
   }
   PERF_TIMER_GUARD(get_from_memtable_time);
 
-  // For now, memtable Bloom filter is effectively disabled if there are any
-  // range tombstones. This is the simplest way to ensure range tombstones are
-  // handled. TODO: allow Bloom checks where max_covering_tombstone_seq==0
-  bool no_range_del = read_options.ignore_range_deletions ||
-                      is_range_del_table_empty_.LoadRelaxed();
   MultiGetRange temp_range(*range, range->begin(), range->end());
-  if (bloom_filter_ && no_range_del) {
+  const bool has_range_del = !is_range_del_table_empty_.LoadRelaxed();
+  const bool apply_range_del =
+      has_range_del && !read_options.ignore_range_deletions;
+  bool track_range_del_metadata = false;
+  if (has_range_del && callback != nullptr &&
+      callback->GetMetadataReadBounds() != nullptr) {
+    for (auto iter = temp_range.begin(); iter != temp_range.end(); ++iter) {
+      if (callback->NeedToTrackNewerVersions(&iter->newer_version_present)) {
+        track_range_del_metadata = true;
+        break;
+      }
+    }
+  }
+
+  // For now, memtable Bloom filter is effectively disabled if there are range
+  // tombstones that must affect either read results or metadata.
+  // TODO: allow Bloom checks where max_covering_tombstone_seq==0.
+  if (bloom_filter_ && !apply_range_del && !track_range_del_metadata) {
     bool whole_key =
         !prefix_extractor_ || moptions_.memtable_whole_key_filtering;
     std::array<Slice, MultiGetContext::MAX_BATCH_SIZE> bloom_keys;
@@ -1581,7 +1809,26 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
   // Use batch lookup optimization when enabled
   bool use_batch_optimization = moptions_.memtable_batch_lookup_optimization;
   bool validate = moptions_.paranoid_memory_checks ||
-                  moptions_.memtable_veirfy_per_key_checksum_on_seek;
+                  moptions_.memtable_verify_per_key_checksum_on_seek;
+
+  // For metadata-tracking reads, allocate one "latest" range tombstone
+  // iterator per memtable batch (highest seq across the keys that requested
+  // metadata that has not already observed newer data) instead of one per key.
+  std::unique_ptr<FragmentedRangeTombstoneIterator> latest_range_del_iter;
+  if (track_range_del_metadata) {
+    SequenceNumber latest_range_del_read_seq = 0;
+    for (auto iter = temp_range.begin(); iter != temp_range.end(); ++iter) {
+      if (callback->NeedToTrackNewerVersions(&iter->newer_version_present)) {
+        latest_range_del_read_seq =
+            std::max(latest_range_del_read_seq,
+                     GetInternalKeySeqno(iter->lkey->internal_key()));
+      }
+    }
+    if (latest_range_del_read_seq > 0) {
+      latest_range_del_iter.reset(NewRangeTombstoneIteratorInternal(
+          read_options, latest_range_del_read_seq, immutable_memtable));
+    }
+  }
 
   if (use_batch_optimization) {
     // Phase 1: Handle range tombstones and set up Savers for batched lookup
@@ -1593,18 +1840,39 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
     size_t num_keys = 0;
 
     for (auto iter = temp_range.begin(); iter != temp_range.end(); ++iter) {
-      if (!no_range_del) {
-        std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
-            NewRangeTombstoneIteratorInternal(
-                read_options, GetInternalKeySeqno(iter->lkey->internal_key()),
-                immutable_memtable));
-        SequenceNumber covering_seq =
-            range_del_iter->MaxCoveringTombstoneSeqnum(iter->lkey->user_key());
-        if (covering_seq > iter->max_covering_tombstone_seq) {
-          iter->max_covering_tombstone_seq = covering_seq;
-          if (iter->timestamp) {
-            iter->timestamp->assign(range_del_iter->timestamp().data(),
-                                    range_del_iter->timestamp().size());
+      if (apply_range_del || latest_range_del_iter != nullptr) {
+        if (latest_range_del_iter != nullptr &&
+            callback->NeedToTrackNewerVersions(&iter->newer_version_present)) {
+          const SequenceNumber covering_seq =
+              latest_range_del_iter->MaxCoveringTombstoneSeqnum(
+                  iter->lkey->user_key(), callback);
+          if (covering_seq != 0) {
+            callback->MaybeRecordNewerVersion(covering_seq, kTypeRangeDeletion,
+                                              &iter->newer_version_present);
+          }
+        }
+        if (apply_range_del) {
+          const SequenceNumber lookup_seq =
+              GetInternalKeySeqno(iter->lkey->internal_key());
+          const MetadataReadBounds* metadata_read_bounds =
+              callback != nullptr ? callback->GetMetadataReadBounds() : nullptr;
+          const SequenceNumber range_del_read_seq =
+              metadata_read_bounds != nullptr
+                  ? metadata_read_bounds->read_snapshot_seq
+                  : lookup_seq;
+          assert(range_del_read_seq <= lookup_seq);
+          std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+              NewRangeTombstoneIteratorInternal(
+                  read_options, range_del_read_seq, immutable_memtable));
+          SequenceNumber covering_seq =
+              range_del_iter->MaxCoveringTombstoneSeqnum(
+                  iter->lkey->user_key());
+          if (covering_seq > iter->max_covering_tombstone_seq) {
+            iter->max_covering_tombstone_seq = covering_seq;
+            if (iter->timestamp) {
+              iter->timestamp->assign(range_del_iter->timestamp().data(),
+                                      range_del_iter->timestamp().size());
+            }
           }
         }
       }
@@ -1628,11 +1896,16 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
       saver.inplace_update_support = moptions_.inplace_update_support;
       saver.statistics = moptions_.statistics;
       saver.clock = clock_;
+      saver.blob_fetcher = blob_fetcher;
       saver.callback_ = callback;
       saver.is_blob_index = &iter->is_blob_index;
       saver.do_merge = true;
       saver.allow_data_in_errors = moptions_.allow_data_in_errors;
       saver.protection_bytes_per_key = moptions_.protection_bytes_per_key;
+      saver.newer_version_present =
+          callback != nullptr && callback->GetMetadataReadBounds() != nullptr
+              ? &iter->newer_version_present
+              : nullptr;
 
       memtable_keys[num_keys] = iter->lkey->memtable_key().data();
       callback_args[num_keys] = &savers[num_keys];
@@ -1679,7 +1952,7 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
           range->AddValueSize(iter->value->size());
         } else {
           assert(iter->columns);
-          range->AddValueSize(iter->columns->serialized_size());
+          range->AddValueSize(iter->columns->payload_size());
         }
 
         range->MarkKeyDone(iter);
@@ -1699,18 +1972,39 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
     for (auto iter = temp_range.begin(); iter != temp_range.end(); ++iter) {
       bool found_final_value{false};
       bool merge_in_progress = iter->s->IsMergeInProgress();
-      if (!no_range_del) {
-        std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
-            NewRangeTombstoneIteratorInternal(
-                read_options, GetInternalKeySeqno(iter->lkey->internal_key()),
-                immutable_memtable));
-        SequenceNumber covering_seq =
-            range_del_iter->MaxCoveringTombstoneSeqnum(iter->lkey->user_key());
-        if (covering_seq > iter->max_covering_tombstone_seq) {
-          iter->max_covering_tombstone_seq = covering_seq;
-          if (iter->timestamp) {
-            iter->timestamp->assign(range_del_iter->timestamp().data(),
-                                    range_del_iter->timestamp().size());
+      if (apply_range_del || latest_range_del_iter != nullptr) {
+        if (latest_range_del_iter != nullptr &&
+            callback->NeedToTrackNewerVersions(&iter->newer_version_present)) {
+          const SequenceNumber covering_seq =
+              latest_range_del_iter->MaxCoveringTombstoneSeqnum(
+                  iter->lkey->user_key(), callback);
+          if (covering_seq != 0) {
+            callback->MaybeRecordNewerVersion(covering_seq, kTypeRangeDeletion,
+                                              &iter->newer_version_present);
+          }
+        }
+        if (apply_range_del) {
+          const SequenceNumber lookup_seq =
+              GetInternalKeySeqno(iter->lkey->internal_key());
+          const MetadataReadBounds* metadata_read_bounds =
+              callback != nullptr ? callback->GetMetadataReadBounds() : nullptr;
+          const SequenceNumber range_del_read_seq =
+              metadata_read_bounds != nullptr
+                  ? metadata_read_bounds->read_snapshot_seq
+                  : lookup_seq;
+          assert(range_del_read_seq <= lookup_seq);
+          std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+              NewRangeTombstoneIteratorInternal(
+                  read_options, range_del_read_seq, immutable_memtable));
+          SequenceNumber covering_seq =
+              range_del_iter->MaxCoveringTombstoneSeqnum(
+                  iter->lkey->user_key());
+          if (covering_seq > iter->max_covering_tombstone_seq) {
+            iter->max_covering_tombstone_seq = covering_seq;
+            if (iter->timestamp) {
+              iter->timestamp->assign(range_del_iter->timestamp().data(),
+                                      range_del_iter->timestamp().size());
+            }
           }
         }
       }
@@ -1719,7 +2013,10 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
           *(iter->lkey), iter->max_covering_tombstone_seq, true, callback,
           &iter->is_blob_index, iter->value ? iter->value->GetSelf() : nullptr,
           iter->columns, iter->timestamp, iter->s, &(iter->merge_context),
-          &dummy_seq, &found_final_value, &merge_in_progress);
+          &dummy_seq, &found_final_value, &merge_in_progress, blob_fetcher,
+          callback != nullptr && callback->GetMetadataReadBounds() != nullptr
+              ? &iter->newer_version_present
+              : nullptr);
 
       if (!found_final_value && merge_in_progress) {
         if (iter->s->ok()) {
@@ -1737,7 +2034,7 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
           range->AddValueSize(iter->value->size());
         } else {
           assert(iter->columns);
-          range->AddValueSize(iter->columns->serialized_size());
+          range->AddValueSize(iter->columns->payload_size());
         }
 
         range->MarkKeyDone(iter);
@@ -2006,14 +2303,22 @@ void MemTable::MaybeUpdateNewestUDT(const Slice& user_key) {
   }
   const Comparator* ucmp = GetInternalKeyComparator().user_comparator();
   Slice udt = ExtractTimestampFromUserKey(user_key, ts_sz_);
-  if (newest_udt_.empty() || ucmp->CompareTimestamp(udt, newest_udt_) > 0) {
-    newest_udt_ = udt;
+  const char* cur = newest_udt_data_.Load();
+  while (cur == nullptr ||
+         ucmp->CompareTimestamp(udt, Slice(cur, ts_sz_)) > 0) {
+    if (newest_udt_data_.CasWeak(cur, udt.data())) {
+      break;
+    }
   }
 }
 
-const Slice& MemTable::GetNewestUDT() const {
+Slice MemTable::GetNewestUDT() const {
   assert(ts_sz_ > 0);
-  return newest_udt_;
+  const char* data = newest_udt_data_.Load();
+  if (data == nullptr) {
+    return Slice();
+  }
+  return Slice(data, ts_sz_);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

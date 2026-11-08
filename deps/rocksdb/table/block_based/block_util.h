@@ -1,4 +1,4 @@
-//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
+//  Copyright (c) Meta Platforms, Inc. and affiliates.
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "db/dbformat.h"
+#include "port/likely.h"
 #include "port/port.h"
 #include "rocksdb/slice.h"
 #include "util/coding.h"
@@ -33,7 +34,9 @@ struct DecodeEntry {
     // We need 2 bytes for shared and non_shared size. We also need one more
     // byte either for value size or the actual value in case of value delta
     // encoding.
-    assert(limit - p >= 3);
+    if (UNLIKELY(limit - p < 3)) {
+      return nullptr;
+    }
     *shared = reinterpret_cast<const unsigned char*>(p)[0];
     *non_shared = reinterpret_cast<const unsigned char*>(p)[1];
     *value_length = reinterpret_cast<const unsigned char*>(p)[2];

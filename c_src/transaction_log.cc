@@ -40,7 +40,7 @@ TransactionLogIterator(
 {
 
     ErlNifSInt64 since;
-    std::unique_ptr<rocksdb::TransactionLogIterator> iter;
+    std::unique_ptr<rocksdb::WalIterator> iter;
     ReferencePtr<DbObject> db_ptr;
 
     if(!enif_get_db(env, argv[0], &db_ptr))
@@ -96,14 +96,14 @@ TransactionLogNextUpdate(
     const ERL_NIF_TERM& itr_handle_ref   = argv[0];
 
     ReferencePtr<TLogItrObject> itr_ptr;
-    itr_ptr.assign(TLogItrObject::RetrieveTLogItrObject(env, itr_handle_ref));
+    itr_ptr.try_assign(TLogItrObject::RetrieveTLogItrObject(env, itr_handle_ref));
 
     if(NULL==itr_ptr.get())
     {
         return enif_make_badarg(env);
     }
 
-    rocksdb::TransactionLogIterator* itr = itr_ptr->m_Iter;
+    rocksdb::WalIterator* itr = itr_ptr->m_Iter;
 
     if(!itr->Valid())
         return enif_make_tuple2(env, ATOM_ERROR, ATOM_INVALID_ITERATOR);
@@ -142,14 +142,14 @@ TransactionLogNextBinaryUpdate(
     const ERL_NIF_TERM& itr_handle_ref = argv[0];
 
     ReferencePtr<TLogItrObject> itr_ptr;
-    itr_ptr.assign(TLogItrObject::RetrieveTLogItrObject(env, itr_handle_ref));
+    itr_ptr.try_assign(TLogItrObject::RetrieveTLogItrObject(env, itr_handle_ref));
 
     if(NULL==itr_ptr.get())
     {
         return enif_make_badarg(env);
     }
 
-    rocksdb::TransactionLogIterator* itr = itr_ptr->m_Iter;
+    rocksdb::WalIterator* itr = itr_ptr->m_Iter;
 
     if(!itr->Valid())
         return enif_make_tuple2(env, ATOM_ERROR, ATOM_INVALID_ITERATOR);

@@ -28,6 +28,8 @@
 #include "rocksdb/db.h"
 #include "rocksdb/write_batch.h"
 
+#include <mutex>
+
 #include "atoms.h"
 #include "refobjects.h"
 #include "util.h"
@@ -38,7 +40,8 @@
 
 struct Batch
 {
-    rocksdb::WriteBatch* wb;
+    std::mutex mutex;           // serializes all use of wb and env
+    rocksdb::WriteBatch* wb;    // NULL once released
     ErlNifEnv* env;
 };
 
@@ -61,6 +64,25 @@ batch_resource_cleanup(ErlNifEnv * /*env*/, void *arg)
 {
     Batch* batch = reinterpret_cast<Batch*>(arg);
     cleanup_batch(batch);
+    batch->~Batch();
+}
+
+// Get a batch that was not released and lock it for the rest of the call.
+static bool
+lock_batch(ErlNifEnv* env, ERL_NIF_TERM term, Batch** batch_ptr,
+           std::unique_lock<std::mutex>& lock)
+{
+    Batch* batch = nullptr;
+    if(!enif_get_resource(env, term, m_Batch_RESOURCE, (void **) &batch))
+        return false;
+    lock = std::unique_lock<std::mutex>(batch->mutex);
+    if(batch->wb == nullptr)
+    {
+        lock.unlock();
+        return false;
+    }
+    *batch_ptr = batch;
+    return true;
 }
 
 void
@@ -88,12 +110,12 @@ NewBatch(
         return error_tuple(env, ATOM_ERROR, "out of memory");
     }
 
+    new(batch) Batch();
     batch->wb = new(wb) rocksdb::WriteBatch();
     batch->env = enif_alloc_env();
     if (batch->env == nullptr)
     {
-        batch->wb->~WriteBatch();
-        enif_free(wb);
+        cleanup_obj_ptr(batch->wb);
         enif_release_resource(batch);
         return error_tuple(env, ATOM_ERROR, "out of memory");
     }
@@ -112,6 +134,8 @@ ReleaseBatch(
     if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
         return enif_make_badarg(env);
 
+    // releasing twice is fine
+    std::lock_guard<std::mutex> lock(batch_ptr->mutex);
     cleanup_batch(batch_ptr);
     batch_ptr = NULL;
     return ATOM_OK;
@@ -128,7 +152,8 @@ WriteBatch(
     ReferencePtr<DbObject> db_ptr;
     if(!enif_get_db(env, argv[0], &db_ptr))
         return enif_make_badarg(env);
-    if(!enif_get_resource(env, argv[1], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[1], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     wb = batch_ptr->wb;
     rocksdb::WriteOptions* opts = new rocksdb::WriteOptions;
@@ -157,7 +182,8 @@ PutBatch(
     ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
     ErlNifBinary key, value;
 
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     wb = batch_ptr->wb;
     if (argc > 3)
@@ -205,7 +231,8 @@ MergeBatch(
     ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
     ErlNifBinary key, value;
 
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     wb = batch_ptr->wb;
     if (argc > 3)
@@ -251,7 +278,8 @@ DeleteBatch(
     Batch* batch_ptr = nullptr;
     ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
     ErlNifBinary key;
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     wb = batch_ptr->wb;
     if (argc > 2)
@@ -290,7 +318,8 @@ SingleDeleteBatch(
     Batch* batch_ptr = nullptr;
     ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
     ErlNifBinary key;
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     wb = batch_ptr->wb;
     if (argc > 2)
@@ -327,7 +356,8 @@ DeleteRangeBatch(
     rocksdb::Slice begin;
     rocksdb::Slice end;
 
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     wb = batch_ptr->wb;
 
@@ -373,7 +403,8 @@ ClearBatch(
         const ERL_NIF_TERM argv[])
 {
     Batch* batch_ptr = nullptr;
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     batch_ptr->wb->Clear();
     enif_clear_env(batch_ptr->env);
@@ -388,7 +419,8 @@ BatchSetSavePoint(
         const ERL_NIF_TERM argv[])
 {
     Batch* batch_ptr = nullptr;
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     batch_ptr->wb->SetSavePoint();
     return ATOM_OK;
@@ -401,7 +433,8 @@ BatchRollbackToSavePoint(
         const ERL_NIF_TERM argv[])
 {
     Batch* batch_ptr = nullptr;
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     rocksdb::Status status = batch_ptr->wb->RollbackToSavePoint();
     if(!status.ok())
@@ -416,7 +449,8 @@ BatchCount(
         const ERL_NIF_TERM argv[])
 {
     Batch* batch_ptr = nullptr;
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     int count = (int) batch_ptr->wb->Count();
     return enif_make_int(env, count);
@@ -429,7 +463,8 @@ BatchDataSize(
         const ERL_NIF_TERM argv[])
 {
     Batch* batch_ptr = nullptr;
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     int count = batch_ptr->wb->GetDataSize();
     return enif_make_int(env, count);
@@ -442,7 +477,8 @@ BatchToList(
         const ERL_NIF_TERM argv[])
 {
     Batch* batch_ptr = nullptr;
-    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+    std::unique_lock<std::mutex> batch_lock;
+    if(!lock_batch(env, argv[0], &batch_ptr, batch_lock))
         return enif_make_badarg(env);
     TransactionLogHandler handler = TransactionLogHandler(env);
     batch_ptr->wb->Iterate(&handler);

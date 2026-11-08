@@ -17,6 +17,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class InternalTblPropColl;
+class CompressionManager;
 
 // -- Table Properties
 // Other than basic table properties, each table may also have the user
@@ -35,6 +36,10 @@ class InternalTblPropColl;
 using UserCollectedProperties = std::map<std::string, std::string>;
 
 // table properties' human-readable names in the property block.
+//
+// DEPRECATED: intended for internal use only and will be removed from the
+// public API in a future release. Use the corresponding TableProperties
+// fields instead.
 struct TablePropertiesNames {
   static const std::string kDbId;
   static const std::string kDbSessionId;
@@ -46,10 +51,14 @@ struct TablePropertiesNames {
   static const std::string kTopLevelIndexSize;
   static const std::string kIndexKeyIsUserKey;
   static const std::string kIndexValueIsDeltaEncoded;
+  static const std::string kUDIIsPrimaryIndex;
   static const std::string kFilterSize;
   static const std::string kRawKeySize;
   static const std::string kRawValueSize;
   static const std::string kNumDataBlocks;
+  static const std::string kNumDataBlocksCompressionRejected;
+  static const std::string kNumDataBlocksCompressionBypassed;
+  static const std::string kNumUniformBlocks;
   static const std::string kNumEntries;
   static const std::string kNumFilterEntries;
   static const std::string kDeletedKeys;
@@ -66,7 +75,12 @@ struct TablePropertiesNames {
   static const std::string kPropertyCollectors;
   static const std::string kCompression;
   static const std::string kCompressionOptions;
-  static const std::string kCreationTime;
+  // NOTE: set to "rocksdb.creation.time" because of unfortunate initial
+  // mis-naming of the property. See kFileCreationTime and file_creation_time.
+  static const std::string kOldestAncestorTime;
+  // DEPRECATED: old name for kOldestAncestorTime. Will be removed in a future
+  // release.
+  static const std::string& kCreationTime;
   static const std::string kOldestKeyTime;
   static const std::string kNewestKeyTime;
   static const std::string kFileCreationTime;
@@ -80,6 +94,8 @@ struct TablePropertiesNames {
   static const std::string kDataBlockRestartInterval;
   static const std::string kIndexBlockRestartInterval;
   static const std::string kSeparateKeyValueInDataBlock;
+  static const std::string kUncompressedDataSize;
+  static const std::string kLsmInfoAtCreation;
 };
 
 // `TablePropertiesCollector` provides the mechanism for users to collect
@@ -97,7 +113,7 @@ struct TablePropertiesNames {
 // including data loss, unreported corruption, deadlocks, and more.
 class TablePropertiesCollector {
  public:
-  virtual ~TablePropertiesCollector() {}
+  virtual ~TablePropertiesCollector() = default;
 
   // DEPRECATE User defined collector should implement AddUserKey(), though
   //           this old function still works for backward compatible reason.
@@ -166,7 +182,7 @@ class TablePropertiesCollector {
 class TablePropertiesCollectorFactory : public Customizable {
  public:
   struct Context {
-    uint32_t column_family_id;
+    uint32_t column_family_id = kUnknownColumnFamily;
     // The level at creating the SST file (i.e, table), of which the
     // properties are being collected.
     int level_at_creation = kUnknownLevelAtCreation;
@@ -175,7 +191,7 @@ class TablePropertiesCollectorFactory : public Customizable {
     // cutoff sequence number will be considered by a compaction job as eligible
     // to be placed on the last level. When this is the maximum sequence number,
     // it indicates tiering is disabled.
-    SequenceNumber last_level_inclusive_max_seqno_threshold;
+    SequenceNumber last_level_inclusive_max_seqno_threshold = 0;
     static const uint32_t kUnknownColumnFamily;
     static const int kUnknownLevelAtCreation = -1;
     static const int kUnknownNumLevels = -1;
@@ -191,7 +207,7 @@ class TablePropertiesCollectorFactory : public Customizable {
               _last_level_inclusive_max_seqno_threshold) {}
   };
 
-  ~TablePropertiesCollectorFactory() override {}
+  ~TablePropertiesCollectorFactory() override = default;
   static const char* Type() { return "TablePropertiesCollectorFactory"; }
   static Status CreateFromString(
       const ConfigOptions& options, const std::string& value,
@@ -213,6 +229,48 @@ class TablePropertiesCollectorFactory : public Customizable {
   // configuration info that will // be logged to the info log when the
   // DB is opened
   virtual std::string ToString() const { return Name(); }
+};
+
+// Decoded form of TableProperties::lsm_info_at_creation. Encapsulates the
+// packed uint64 encoding and its three overall states, so TableProperties
+// itself can stay a bare data struct. Round-trips losslessly through
+// Encode() / DecodeFrom().
+struct LsmInfoAtCreation {
+  // Sentinel for an unknown level (same value as
+  // TablePropertiesCollectorFactory::Context::kUnknownLevelAtCreation).
+  static constexpr int kUnknownLevel = -1;
+
+  // Overall applicability of the LSM-at-creation info:
+  //  - kUnknown: nothing recorded (e.g. a file written by an older RocksDB).
+  //  - kApplicable: created at a known LSM position (flush / compaction /
+  //    recovery); level_at_creation and is_bottommost are meaningful.
+  //  - kNotApplicable: the file has no LSM position (e.g. SstFileWriter /
+  //    external files, or other misc uses).
+  enum class Applicability : uint8_t { kUnknown, kApplicable, kNotApplicable };
+  Applicability applicability = Applicability::kUnknown;
+
+  // Meaningful only when applicability == kApplicable. kUnknownLevel (-1) when
+  // the level itself is unknown (e.g. files created by the DB repairer).
+  int level_at_creation = kUnknownLevel;
+
+  // Meaningful only when applicability == kApplicable.
+  bool is_bottommost = false;
+
+  static LsmInfoAtCreation Applicable(int level_at_creation,
+                                      bool is_bottommost);
+  static LsmInfoAtCreation NotApplicable();
+
+  // Serialize to / deserialize from the packed
+  // TableProperties::lsm_info_at_creation representation. DecodeFrom ignores
+  // unrecognized (reserved) bits so the encoding can be extended in the future.
+  uint64_t Encode() const;
+  static LsmInfoAtCreation DecodeFrom(uint64_t encoded);
+
+  bool operator==(const LsmInfoAtCreation& other) const {
+    return applicability == other.applicability &&
+           level_at_creation == other.level_at_creation &&
+           is_bottommost == other.is_bottommost;
+  }
 };
 
 // TableProperties contains a bunch of read-only properties of its associated
@@ -237,6 +295,9 @@ struct TableProperties {
   uint64_t index_key_is_user_key = 0;
   // Whether delta encoding is used to encode the index values.
   uint64_t index_value_is_delta_encoded = 0;
+  // Whether the UDI is the primary index for reads. The standard index is
+  // still fully populated alongside the UDI.
+  uint64_t udi_is_primary_index = 0;
   // the size of filter block.
   uint64_t filter_size = 0;
   // total raw (uncompressed, undelineated) key size
@@ -245,6 +306,15 @@ struct TableProperties {
   uint64_t raw_value_size = 0;
   // the number of blocks in this table
   uint64_t num_data_blocks = 0;
+  // Number of data blocks stored uncompressed because compression was
+  // attempted but the compressed output exceeded the ratio limit set by
+  // CompressionOptions::max_compressed_bytes_per_kb.
+  uint64_t num_data_blocks_compression_rejected = 0;
+  // Number of data blocks stored uncompressed because compression was
+  // never attempted (e.g., kNoCompression, no compressor available).
+  uint64_t num_data_blocks_compression_bypassed = 0;
+  // the number of uniform blocks in this table
+  uint64_t num_uniform_blocks = 0;
   // the number of entries in this table
   uint64_t num_entries = 0;
   // the number of unique entries (keys or prefixes) added to filters
@@ -264,7 +334,7 @@ struct TableProperties {
   uint64_t column_family_id = ROCKSDB_NAMESPACE::
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily;
 
-  // Oldest ancester time. 0 means unknown.
+  // Oldest ancestor time. 0 means unknown.
   //
   // For flush output file, oldest ancestor time is the oldest key time in the
   // file.  If the oldest key time is not available, flush time is used.
@@ -274,10 +344,12 @@ struct TableProperties {
   // the compaction output from other SST files, which could in turn be outputs
   // for compact older SST files. If that's not available, creation time of this
   // compaction output file is used.
-  //
-  // TODO(sagar0): Should be changed to oldest_ancester_time ... but don't know
-  // the full implications of backward compatibility. Hence retaining for now.
-  uint64_t creation_time = 0;
+  union {
+    uint64_t oldest_ancestor_time = 0;
+    // DEPRECATED: old name for oldest_ancestor_time. Will be removed in a
+    // future release.
+    uint64_t creation_time;
+  };
 
   // Timestamp of the earliest key. 0 means unknown.
   uint64_t oldest_key_time = 0;
@@ -293,11 +365,6 @@ struct TableProperties {
   // compression algorithm (see `ColumnFamilyOptions::sample_for_compression`).
   // 0 means unknown.
   uint64_t fast_compression_estimated_data_size = 0;
-  // Offset of the value of the property "external sst file global seqno" in the
-  // file if the property exists.
-  // 0 means not exists.
-  uint64_t external_sst_file_global_seqno_offset = 0;
-
   // Offset where the "tail" part of SST file starts
   // "Tail" refers to all blocks after data blocks till the end of the SST file
   uint64_t tail_start_offset = 0;
@@ -334,6 +401,16 @@ struct TableProperties {
   // debugging/validation purposes. Consider removing this if we ever decide to
   // mix separation strategies for a sst.
   uint64_t separate_key_value_in_data_block = 0;
+
+  // Packed, informational LSM metadata about how/where this file was created
+  // (level and bottommost), for debugging and analysis (e.g. tiering,
+  // write-amp). Decode/encode with LsmInfoAtCreation, e.g.
+  // LsmInfoAtCreation::DecodeFrom(lsm_info_at_creation). A value of 0 means
+  // "unknown" (nothing recorded, e.g. older files); it is only written to the
+  // properties block when not "unknown". Distinguishes "unknown" from "not
+  // applicable" (files with no LSM position, e.g. SstFileWriter). See
+  // LsmInfoAtCreation.
+  uint64_t lsm_info_at_creation = 0;
 
   // DB identity
   // db_id is an identifier generated the first time the DB is created
@@ -428,6 +505,28 @@ struct TableProperties {
                 const TableProperties* other_table_properties,
                 std::string* mismatch) const;
 };
+
+// Parse TableProperties::compression_name into human-readable format.
+// Thread-safe, but not purely local: the single-argument overload may consult
+// globally registered CompressionManagers via ObjectLibrary using the stored
+// compatibility name, and the two-argument overload consults the supplied
+// CompressionManager first before falling back to that lookup.
+// For format_version >= 7: "<compatibility_name>;<hex_codes>;" -> "ZSTD",
+// "LZ4", etc. For older versions (no semicolon): returns as-is (e.g., "ZSTD",
+// "Snappy", "kZSTD" are preserved with their original names). This means the
+// single-argument overload can now return manager-specific names for custom
+// compression types when a compatible CompressionManager is registered
+// globally; otherwise, reserved/custom values fall back to generic names such
+// as "Reserved7F" or "Custom8A". Returns "NoCompression" for an empty input,
+// an empty hex field such as "BuiltinV2;;", or when all parsed entries are
+// filtered out as NoCompression/DisableOption. Returns "Unknown" for malformed
+// format_version >= 7 metadata, including a missing second semicolon,
+// odd-length hex payload, or invalid hex characters. If multiple compression
+// types are present, returns a comma-separated list in input order.
+std::string ParseCompressionNameForDisplay(const std::string& compression_name);
+std::string ParseCompressionNameForDisplay(
+    const std::string& compression_name,
+    std::shared_ptr<CompressionManager> compression_manager);
 
 // Extra properties
 // Below is a list of non-basic properties that are collected by database

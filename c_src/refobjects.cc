@@ -103,7 +103,11 @@ ErlRefObject::InitiateCloseRequest(
 
     // special handling since destructor may have been called
     if (NULL!=Object && 0==Object->m_CloseRequested)
+    {
+        // same lock as TryRefInc, see there
+        std::lock_guard<std::mutex> lk(*Object->m_CloseMutex);
         ret_flag=erocksdb::compare_and_swap(Object->m_CloseRequested, 0u, 1u);
+    }
 
     // vtable is still good, this thread is initiating close
     //   ask object to clean-up
@@ -115,6 +119,17 @@ ErlRefObject::InitiateCloseRequest(
     return(ret_flag);
 
 }   // ErlRefObject::InitiateCloseRequest
+
+
+bool
+ErlRefObject::TryRefInc()
+{
+    std::lock_guard<std::mutex> lk(*m_CloseMutex);
+    if (0!=m_CloseRequested)
+        return false;
+    RefInc();
+    return true;
+}   // ErlRefObject::TryRefInc
 
 
 void
@@ -285,6 +300,7 @@ DbObject::Shutdown()
     SnapshotObject * snapshot_ptr;
     TLogItrObject *tlog_ptr;
     TransactionObject *tx_ptr;
+    IngestionObject *ingestion_ptr;
 
     do
     {
@@ -404,6 +420,27 @@ DbObject::Shutdown()
 
     } while (again);
 
+    // roll back ingestions prepared but never committed
+    do {
+        again = false;
+        ingestion_ptr = NULL;
+
+        {
+            std::lock_guard<std::mutex> lock(m_IngestionMutex);
+
+            if (!m_IngestionList.empty()) {
+                again = true;
+                ingestion_ptr = m_IngestionList.front();
+                m_IngestionList.pop_front();
+            }   // if
+        }
+
+        // outside lock so IngestionObject can attempt RemoveIngestionReference
+        if (again)
+            IngestionObject::InitiateCloseRequest(ingestion_ptr);
+
+    } while (again);
+
 
 
 #endif
@@ -477,6 +514,20 @@ DbObject::RemoveSnapshotReference(
 
     return;
 }   // DbObject::RemoveSnapshotReference
+
+void
+DbObject::AddIngestionReference(IngestionObject *IngestionPtr) {
+    std::lock_guard<std::mutex> lock(m_IngestionMutex);
+    m_IngestionList.push_back(IngestionPtr);
+}   // DbObject::AddIngestionReference
+
+
+void
+DbObject::RemoveIngestionReference(IngestionObject *IngestionPtr) {
+    std::lock_guard<std::mutex> lock(m_IngestionMutex);
+    m_IngestionList.remove(IngestionPtr);
+}   // DbObject::RemoveIngestionReference
+
 
 void
 DbObject::AddTLogReference(TLogItrObject *TLogItrPtr) {
@@ -905,6 +956,12 @@ ItrObject::~ItrObject() {
     delete m_Iterator;
     //m_Iterator = nullptr;
 
+    // the snapshot is released only once the iterator is gone
+    SnapshotObject * snapshot = m_SnapshotPtr.get();
+    m_SnapshotPtr.assign(NULL);
+    if (snapshot != nullptr)
+        enif_release_resource(snapshot);
+
     // release any resources (column family, transaction) pinned for this
     // iterator's lifetime. Done after deleting the iterator, which still
     // references them.
@@ -915,6 +972,15 @@ ItrObject::~ItrObject() {
     return;
 
 }   // ItrObject::~ItrObject
+
+
+void
+ItrObject::KeepSnapshot(SnapshotObject * Snapshot) {
+    if (Snapshot == nullptr || m_SnapshotPtr.get() != nullptr)
+        return;
+    enif_keep_resource(Snapshot);
+    m_SnapshotPtr.assign(Snapshot);
+}   // ItrObject::KeepSnapshot
 
 
 void
@@ -952,7 +1018,7 @@ TLogItrObject::CreateTLogItrObjectType(
 TLogItrObject *
 TLogItrObject::CreateTLogItrObject(
         DbObject *DbPtr,
-        rocksdb::TransactionLogIterator * Itr) {
+        rocksdb::WalIterator * Itr) {
     TLogItrObject *ret_ptr;
     void *alloc_ptr;
 
@@ -1015,7 +1081,7 @@ TLogItrObject::TLogItrObjectResourceCleanup(
 
 TLogItrObject::TLogItrObject(
         DbObject *DbPtr,
-        rocksdb::TransactionLogIterator * Itr)
+        rocksdb::WalIterator * Itr)
         : m_Iter(Itr), m_DbPtr(DbPtr) {
 
     if (NULL != DbPtr)
@@ -1047,6 +1113,114 @@ TLogItrObject::Shutdown() {
     return;
 }   // TLogItrObject::CloseRequest
 
+
+
+/**
+ * IngestionObject Functions
+ */
+
+ErlNifResourceType *IngestionObject::m_Ingestion_RESOURCE(NULL);
+
+
+void
+IngestionObject::CreateIngestionObjectType(
+        ErlNifEnv *Env) {
+    ErlNifResourceFlags flags = (ErlNifResourceFlags)(ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER);
+
+    m_Ingestion_RESOURCE = enif_open_resource_type(Env, NULL, "erocksdb_IngestionObject",
+                                                   &IngestionObject::IngestionObjectResourceCleanup,
+                                                   flags, NULL);
+}   // IngestionObject::CreateIngestionObjectType
+
+
+IngestionObject *
+IngestionObject::CreateIngestionObject(
+        DbObject *DbPtr,
+        std::unique_ptr<rocksdb::FileIngestionHandle> Handle) {
+    void *alloc_ptr;
+
+    // the alloc call initializes the reference count to "one"
+    alloc_ptr = enif_alloc_resource(m_Ingestion_RESOURCE, sizeof(IngestionObject));
+
+    IngestionObject *ret_ptr = new(alloc_ptr) IngestionObject(DbPtr, std::move(Handle));
+
+    // manual reference increase to keep active until "close" called
+    ret_ptr->RefInc();
+
+    return ret_ptr;
+}   // IngestionObject::CreateIngestionObject
+
+
+IngestionObject *
+IngestionObject::RetrieveIngestionObject(
+        ErlNifEnv *Env,
+        const ERL_NIF_TERM &Term) {
+    IngestionObject *ret_ptr = NULL;
+
+    if (enif_get_resource(Env, Term, m_Ingestion_RESOURCE, (void **) &ret_ptr)) {
+        // committed, aborted or its database is closed
+        if (ret_ptr->m_CloseRequested)
+            ret_ptr = NULL;
+    }
+
+    return ret_ptr;
+}   // IngestionObject::RetrieveIngestionObject
+
+
+void
+IngestionObject::IngestionObjectResourceCleanup(
+        ErlNifEnv * /*env*/,
+        void *arg) {
+    IngestionObject *ingestion_ptr = (IngestionObject *)arg;
+
+    InitiateCloseRequest(ingestion_ptr);
+
+    // can be called after the destructor ran, see ErlRefObject
+    AwaitCloseAndDestructor(ingestion_ptr);
+}   // IngestionObject::IngestionObjectResourceCleanup
+
+
+IngestionObject::IngestionObject(
+        DbObject *DbPtr,
+        std::unique_ptr<rocksdb::FileIngestionHandle> Handle)
+        : m_DbPtr(DbPtr), m_Handle(std::move(Handle)) {
+
+    if (NULL != DbPtr)
+        DbPtr->AddIngestionReference(this);
+
+}   // IngestionObject::IngestionObject
+
+
+IngestionObject::~IngestionObject() {
+
+    if (NULL != m_DbPtr.get())
+        m_DbPtr->RemoveIngestionReference(this);
+
+    // Destroying a handle that was not committed rolls the ingestion back.
+    // This must happen while m_DbPtr still keeps the database open.
+    m_Handle.reset();
+
+}   // IngestionObject::~IngestionObject
+
+
+void
+IngestionObject::Shutdown() {
+    RefDec();
+}   // IngestionObject::Shutdown
+
+
+std::unique_ptr<rocksdb::FileIngestionHandle>
+IngestionObject::TakeHandle() {
+    std::lock_guard<std::mutex> lock(m_HandleMutex);
+    return std::move(m_Handle);
+}   // IngestionObject::TakeHandle
+
+
+void
+IngestionObject::RestoreHandle(std::unique_ptr<rocksdb::FileIngestionHandle> Handle) {
+    std::lock_guard<std::mutex> lock(m_HandleMutex);
+    m_Handle = std::move(Handle);
+}   // IngestionObject::RestoreHandle
 
 
 /**

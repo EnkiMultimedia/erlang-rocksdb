@@ -23,6 +23,7 @@
 #define INCL_EROCKSB_DB_H
 
 #include "erl_nif.h"
+#include "refobjects.h"
 
 // Forward declaration
 namespace rocksdb {
@@ -37,6 +38,11 @@ namespace rocksdb {
 ERL_NIF_TERM parse_db_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::DBOptions& opts);
 ERL_NIF_TERM parse_cf_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ColumnFamilyOptions& opts);
 ERL_NIF_TERM parse_read_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::ReadOptions& opts);
+
+// Apply the {snapshot, S} read option and keep S alive in *pin for as long
+// as opts is used. Returns false if S is not a live snapshot.
+bool pin_read_snapshot(ErlNifEnv* env, ERL_NIF_TERM options, rocksdb::ReadOptions& opts,
+                       erocksdb::ReferencePtr<erocksdb::SnapshotObject>* pin);
 ERL_NIF_TERM parse_write_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::WriteOptions& opts);
 ERL_NIF_TERM parse_txn_db_option(ErlNifEnv* env, ERL_NIF_TERM item, rocksdb::TransactionDBOptions& opts);
 

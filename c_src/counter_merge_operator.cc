@@ -15,6 +15,7 @@
 // under the License.
 
 #include <iostream>
+#include <limits>
 #include <string>
 #include <memory>
 #include <list>
@@ -31,6 +32,29 @@
 namespace erocksdb {
 
     CounterMergeOperator::CounterMergeOperator() {}
+
+    bool CounterMergeOperator::FullMergeV2(
+            const MergeOperationInput& merge_in,
+            MergeOperationOutput* merge_out) const {
+        // A bad operand fails the reads of this key only. With the default
+        // scope a flush or compaction meeting it would make the DB read-only.
+        merge_out->op_failure_scope = OpFailureScope::kMustMerge;
+
+        // fold the operands with Merge, as AssociativeMergeOperator does
+        std::string acc;
+        rocksdb::Slice acc_slice;
+        const rocksdb::Slice* existing = merge_in.existing_value;
+        for (const rocksdb::Slice& operand : merge_in.operand_list) {
+            std::string out;
+            if (!Merge(merge_in.key, existing, operand, &out, merge_in.logger))
+                return false;
+            acc = std::move(out);
+            acc_slice = rocksdb::Slice(acc);
+            existing = &acc_slice;
+        }
+        merge_out->new_value = std::move(acc);
+        return true;
+    }
 
     bool CounterMergeOperator::Merge(
             const rocksdb::Slice& /*key*/,
@@ -54,7 +78,11 @@ namespace erocksdb {
         } catch(...) {
             return false;
         }
-        auto new_counter = counter + oper;
+        // the counter is an int: fail instead of overflowing
+        const long long new_counter = static_cast<long long>(counter) + oper;
+        if (new_counter > std::numeric_limits<int>::max()
+                || new_counter < std::numeric_limits<int>::min())
+            return false;
         *new_value = std::to_string(new_counter);
         return true;
     }

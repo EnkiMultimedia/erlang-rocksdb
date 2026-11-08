@@ -22,7 +22,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
-#include "rocksdb/transaction_log.h"
+#include "rocksdb/wal_iterator.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -147,6 +147,16 @@ std::string CompactionProgressFileName(const std::string& dbname,
 // Format:  COMPACTION_PROGRESS-[timestamp].dbtmp
 std::string TempCompactionProgressFileName(const std::string& dbname,
                                            uint64_t timestamp);
+
+// Return the DB session temporary directory.
+std::string SessionTmpDir(const std::string& dbname);
+
+// Return the path for the client-selected staging directory name. When the
+// session temporary directory is not used, an already DB-rooted path is
+// returned unchanged for compatibility with legacy clients.
+std::string RemoteCompactionJobDir(const std::string& dbname,
+                                   bool use_output_root_dir,
+                                   const std::string& job_dir_name);
 
 // Return the name to use for a metadatabase. The result will be prefixed with
 // "dbname".

@@ -177,7 +177,7 @@ TestWritableFile::TestWritableFile(const std::string& fname,
 
 TestWritableFile::~TestWritableFile() {
   if (writable_file_opened_) {
-    Close().PermitUncheckedError();
+    TestWritableFile::Close().PermitUncheckedError();
   }
 }
 
@@ -229,7 +229,7 @@ TestRandomRWFile::TestRandomRWFile(const std::string& /*fname*/,
 
 TestRandomRWFile::~TestRandomRWFile() {
   if (file_opened_) {
-    Close().PermitUncheckedError();
+    TestRandomRWFile::Close().PermitUncheckedError();
   }
 }
 
@@ -316,7 +316,8 @@ Status FaultInjectionTestEnv::ReopenWritableFile(
   }
 
   bool exists;
-  Status s, exists_s = target()->FileExists(fname);
+  Status s;
+  Status exists_s = target()->FileExists(fname);
   if (exists_s.IsNotFound()) {
     exists = false;
   } else if (exists_s.ok()) {
@@ -359,6 +360,15 @@ Status FaultInjectionTestEnv::ReopenWritableFile(
     }
   }
   return s;
+}
+
+Status FaultInjectionTestEnv::SyncFile(const std::string& fname,
+                                       const EnvOptions& options,
+                                       bool use_fsync) {
+  // Call Env's default implementation instead of EnvWrapper forwarding so
+  // SyncFile exercises this wrapper's ReopenWritableFile hook and the wrapped
+  // file's Sync, Fsync, and Close hooks.
+  return Env::SyncFile(fname, options, use_fsync);
 }
 
 Status FaultInjectionTestEnv::NewRandomRWFile(

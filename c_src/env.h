@@ -19,6 +19,7 @@
 #define INCL_ENV_H
 
 #include <memory>
+#include <utility>
 
 #include "erl_nif.h"
 
@@ -62,6 +63,42 @@ namespace erocksdb {
       std::shared_ptr<rocksdb::EncryptionProvider> provider_;
       std::shared_ptr<rocksdb::BlockCipher> cipher_;
   };
+
+  /**
+   * Holds a reference on a ManagedEnv resource for as long as something uses
+   * its rocksdb::Env (a database, an SST writer or reader). Without it the env
+   * is freed when its Erlang term is garbage collected, while still in use.
+   */
+  class EnvRef {
+    public:
+      EnvRef() : env_(nullptr) {}
+      ~EnvRef() { Reset(); }
+
+      EnvRef(const EnvRef &) = delete;
+      EnvRef & operator=(const EnvRef &) = delete;
+
+      // Take a new reference on env.
+      void Keep(ManagedEnv * env);
+
+      // Take over the reference the caller holds on a new resource.
+      void Adopt(ManagedEnv * env);
+
+      void Swap(EnvRef & other) { std::swap(env_, other.env_); }
+
+      void Reset();
+
+      ManagedEnv * get() const { return env_; }
+
+    private:
+      ManagedEnv * env_;
+  };
+
+  // Apply the env options of an options list to opts: {env, Env},
+  // {env, memenv} and {in_memory, true}; the last one wins. ref keeps the env
+  // alive and must outlive every use of opts.env. A memory env is created
+  // here and owned by ref.
+  void ResolveEnvOption(ErlNifEnv * env, ERL_NIF_TERM options,
+                        rocksdb::DBOptions & opts, EnvRef * ref);
 
 }
 

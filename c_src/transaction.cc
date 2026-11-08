@@ -138,6 +138,12 @@ namespace erocksdb {
 
         rocksdb::ReadOptions *opts =  new rocksdb::ReadOptions();
         fold(env, argv[i+1], parse_read_option, *opts);
+        ReferencePtr<SnapshotObject> snapshot_pin;
+        if (!pin_read_snapshot(env, argv[i+1], *opts, &snapshot_pin))
+        {
+            delete opts;
+            return enif_make_badarg(env);
+        }
 
         rocksdb::Status status;
         rocksdb::PinnableSlice pvalue;
@@ -193,6 +199,11 @@ namespace erocksdb {
 
         rocksdb::ReadOptions opts;
         fold(env, argv[i+1], parse_read_option, opts);
+        ReferencePtr<SnapshotObject> snapshot_pin;
+        if (!pin_read_snapshot(env, argv[i+1], opts, &snapshot_pin))
+        {
+            return enif_make_badarg(env);
+        }
 
         rocksdb::Status status;
         rocksdb::PinnableSlice pvalue;
@@ -284,6 +295,11 @@ namespace erocksdb {
         // Parse read options
         rocksdb::ReadOptions opts;
         fold(env, argv[opts_idx], parse_read_option, opts);
+        ReferencePtr<SnapshotObject> snapshot_pin;
+        if (!pin_read_snapshot(env, argv[opts_idx], opts, &snapshot_pin))
+        {
+            return enif_make_badarg(env);
+        }
 
         // Call MultiGet on transaction
         std::vector<rocksdb::ColumnFamilyHandle*> cfs(num_keys, cfh);
@@ -377,6 +393,11 @@ namespace erocksdb {
         // Parse read options
         rocksdb::ReadOptions opts;
         fold(env, argv[opts_idx], parse_read_option, opts);
+        ReferencePtr<SnapshotObject> snapshot_pin;
+        if (!pin_read_snapshot(env, argv[opts_idx], opts, &snapshot_pin))
+        {
+            return enif_make_badarg(env);
+        }
 
         // Call MultiGetForUpdate on transaction - tracks keys for conflict detection
         std::vector<rocksdb::ColumnFamilyHandle*> cfs(num_keys, cfh);
@@ -497,6 +518,8 @@ namespace erocksdb {
 
         itr_ptr = ItrObject::CreateItrObject(tx_ptr->m_DbPtr.get(), itr_env, iterator);
 
+        itr_ptr->KeepSnapshot(bounds.snapshot.get());
+
         // pin the transaction (its write batch backs the iterator's delta) and
         // the column family so neither can be garbage collected and freed while
         // this iterator is still using them
@@ -568,7 +591,7 @@ namespace erocksdb {
     {
       const ERL_NIF_TERM& handle_ref = argv[0];
       ReferencePtr<erocksdb::TransactionObject> tx_ptr;
-      tx_ptr.assign(TransactionObject::RetrieveTransactionObject(env, handle_ref));
+      tx_ptr.try_assign(TransactionObject::RetrieveTransactionObject(env, handle_ref));
 
       if(NULL==tx_ptr.get())
         return ATOM_OK;

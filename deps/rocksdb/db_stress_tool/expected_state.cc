@@ -4,6 +4,8 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #ifdef GFLAGS
 
 #include "db/wide/wide_column_serialization.h"
@@ -211,6 +213,8 @@ Status AnonExpectedState::Open(bool /* create */) {
       new std::atomic<uint32_t>[GetValuesLen() /
                                 sizeof(std::atomic<uint32_t>)]);
   values_ = &values_allocation_[0];
+  persisted_seqno_allocation_.reset(new std::atomic<SequenceNumber>(0));
+  persisted_seqno_ = persisted_seqno_allocation_.get();
   Reset();
   return Status::OK();
 }
@@ -344,6 +348,42 @@ Status FileExpectedStateManager::Open() {
   return s;
 }
 
+namespace {
+
+class FatalExpectedStateTraceWriter : public TraceWriter {
+ public:
+  FatalExpectedStateTraceWriter(std::string trace_file_path,
+                                std::unique_ptr<TraceWriter>&& target)
+      : trace_file_path_(std::move(trace_file_path)),
+        target_(std::move(target)) {
+    assert(target_ != nullptr);
+  }
+
+  Status Write(const Slice& data) override {
+    Status s = target_->Write(data);
+    if (!s.ok()) {
+      // Expected-state tracing is part of crash-recovery verification, not
+      // best-effort observability. Stop immediately before history diverges.
+      fprintf(stderr, "Fatal expected-state trace write failure for %s: %s\n",
+              trace_file_path_.c_str(), s.ToString().c_str());
+      fflush(stderr);
+      fflush(stdout);
+      std::_Exit(1);
+    }
+    return s;
+  }
+
+  Status Close() override { return target_->Close(); }
+
+  uint64_t GetFileSize() override { return target_->GetFileSize(); }
+
+ private:
+  const std::string trace_file_path_;
+  std::unique_ptr<TraceWriter> target_;
+};
+
+}  // anonymous namespace
+
 Status FileExpectedStateManager::SaveAtAndAfter(DB* db) {
   SequenceNumber seqno = db->GetLatestSequenceNumber();
 
@@ -386,6 +426,10 @@ Status FileExpectedStateManager::SaveAtAndAfter(DB* db) {
     soptions.writable_file_max_buffer_size = 0;
     s = NewFileTraceWriter(Env::Default(), soptions, trace_file_path,
                            &trace_writer);
+    if (s.ok()) {
+      trace_writer.reset(new FatalExpectedStateTraceWriter(
+          trace_file_path, std::move(trace_writer)));
+    }
   }
   if (s.ok()) {
     TraceOptions trace_opts;
@@ -393,6 +437,10 @@ Status FileExpectedStateManager::SaveAtAndAfter(DB* db) {
     trace_opts.filter |= kTraceFilterMultiGet;
     trace_opts.filter |= kTraceFilterIteratorSeek;
     trace_opts.filter |= kTraceFilterIteratorSeekForPrev;
+    // Expected-state restore replays by recovered DB sequence count rather than
+    // by trace-side commit acknowledgement. This trace therefore needs to be an
+    // ordered superset of writes that could survive recovery: missing trace
+    // entries are fatal, while extra suffix entries are tolerated.
     trace_opts.preserve_write_order = true;
     s = db->StartTrace(trace_opts, std::move(trace_writer));
   }
@@ -419,8 +467,8 @@ bool FileExpectedStateManager::HasHistory() {
 
 namespace {
 
-// An `ExpectedStateTraceRecordHandler` applies a configurable number of
-// write operation trace records to the configured expected state. It is used in
+// An `ExpectedStateTraceRecordHandler` applies a configurable number of traced
+// write operations to the configured expected state. It is used in
 // `FileExpectedStateManager::Restore()` to sync the expected state with the
 // DB's post-recovery state.
 class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
@@ -431,10 +479,12 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
         state_(state),
         buffered_writes_(nullptr) {}
 
-  ~ExpectedStateTraceRecordHandler() { assert(IsDone()); }
-
   // True if we have already reached the limit on write operations to apply.
-  bool IsDone() { return num_write_ops_ == max_write_ops_; }
+  bool IsDone() const { return num_write_ops_ >= max_write_ops_; }
+
+  uint64_t NumWriteOps() const { return num_write_ops_; }
+
+  bool Continue() override { return !IsDone(); }
 
   Status Handle(const WriteQueryTraceRecord& record,
                 std::unique_ptr<TraceRecordResult>* /* result */) override {
@@ -471,20 +521,21 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
                const Slice& value) override {
     Slice key =
         StripTimestampFromUserKey(key_with_ts, FLAGS_user_timestamp_size);
-    uint64_t key_id;
-    if (!GetIntVal(key.ToString(), &key_id)) {
-      return Status::Corruption("unable to parse key", key.ToString());
+    uint64_t key_id = 0;
+    Status status = ParseTracedKey(key, "unable to parse key", &key_id);
+    if (!status.ok()) {
+      return status;
     }
-    uint32_t value_base = GetValueBase(value);
+    const int64_t expected_key_id = static_cast<int64_t>(key_id);
+    const uint32_t value_base = GetValueBase(value);
 
-    bool should_buffer_write = !(buffered_writes_ == nullptr);
-    if (should_buffer_write) {
+    if (buffered_writes_ != nullptr) {
       return WriteBatchInternal::Put(buffered_writes_.get(), column_family_id,
                                      key, value);
     }
 
-    state_->SyncPut(column_family_id, static_cast<int64_t>(key_id), value_base);
-    ++num_write_ops_;
+    state_->SyncPut(column_family_id, expected_key_id, value_base);
+    NoteWriteOpApplied();
     return Status::OK();
   }
 
@@ -492,21 +543,22 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
                     const Slice& value, uint64_t write_unix_time) override {
     Slice key =
         StripTimestampFromUserKey(key_with_ts, FLAGS_user_timestamp_size);
-    uint64_t key_id;
-    if (!GetIntVal(key.ToString(), &key_id)) {
-      return Status::Corruption("unable to parse key", key.ToString());
+    uint64_t key_id = 0;
+    Status status = ParseTracedKey(key, "unable to parse key", &key_id);
+    if (!status.ok()) {
+      return status;
     }
-    uint32_t value_base = GetValueBase(value);
+    const int64_t expected_key_id = static_cast<int64_t>(key_id);
+    const uint32_t value_base = GetValueBase(value);
 
-    bool should_buffer_write = !(buffered_writes_ == nullptr);
-    if (should_buffer_write) {
+    if (buffered_writes_ != nullptr) {
       return WriteBatchInternal::TimedPut(buffered_writes_.get(),
                                           column_family_id, key, value,
                                           write_unix_time);
     }
 
-    state_->SyncPut(column_family_id, static_cast<int64_t>(key_id), value_base);
-    ++num_write_ops_;
+    state_->SyncPut(column_family_id, expected_key_id, value_base);
+    NoteWriteOpApplied();
     return Status::OK();
   }
 
@@ -516,13 +568,16 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
         StripTimestampFromUserKey(key_with_ts, FLAGS_user_timestamp_size);
 
     uint64_t key_id = 0;
-    if (!GetIntVal(key.ToString(), &key_id)) {
-      return Status::Corruption("Unable to parse key", key.ToString());
+    Status status = ParseTracedKey(key, "Unable to parse key", &key_id);
+    if (!status.ok()) {
+      return status;
     }
+    const int64_t expected_key_id = static_cast<int64_t>(key_id);
 
     Slice entity_copy = entity;
     WideColumns columns;
-    if (!WideColumnSerialization::Deserialize(entity_copy, columns).ok()) {
+    if (!WideColumnSerialization::DeserializeSimple(entity_copy, columns)
+             .ok()) {
       return Status::Corruption("Unable to deserialize entity",
                                 entity.ToString(/* hex */ true));
     }
@@ -539,11 +594,8 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
 
     const uint32_t value_base =
         GetValueBase(WideColumnsHelper::GetDefaultColumn(columns));
-
-    state_->SyncPut(column_family_id, static_cast<int64_t>(key_id), value_base);
-
-    ++num_write_ops_;
-
+    state_->SyncPut(column_family_id, expected_key_id, value_base);
+    NoteWriteOpApplied();
     return Status::OK();
   }
 
@@ -551,19 +603,20 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
                   const Slice& key_with_ts) override {
     Slice key =
         StripTimestampFromUserKey(key_with_ts, FLAGS_user_timestamp_size);
-    uint64_t key_id;
-    if (!GetIntVal(key.ToString(), &key_id)) {
-      return Status::Corruption("unable to parse key", key.ToString());
+    uint64_t key_id = 0;
+    Status status = ParseTracedKey(key, "unable to parse key", &key_id);
+    if (!status.ok()) {
+      return status;
     }
+    const int64_t expected_key_id = static_cast<int64_t>(key_id);
 
-    bool should_buffer_write = !(buffered_writes_ == nullptr);
-    if (should_buffer_write) {
+    if (buffered_writes_ != nullptr) {
       return WriteBatchInternal::Delete(buffered_writes_.get(),
                                         column_family_id, key);
     }
 
-    state_->SyncDelete(column_family_id, static_cast<int64_t>(key_id));
-    ++num_write_ops_;
+    state_->SyncDelete(column_family_id, expected_key_id);
+    NoteWriteOpApplied();
     return Status::OK();
   }
 
@@ -591,17 +644,18 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
         StripTimestampFromUserKey(begin_key_with_ts, FLAGS_user_timestamp_size);
     Slice end_key =
         StripTimestampFromUserKey(end_key_with_ts, FLAGS_user_timestamp_size);
-    uint64_t begin_key_id, end_key_id;
-    if (!GetIntVal(begin_key.ToString(), &begin_key_id)) {
-      return Status::Corruption("unable to parse begin key",
-                                begin_key.ToString());
+    uint64_t begin_key_id = 0;
+    uint64_t end_key_id = 0;
+    Status status =
+        ParseTracedKey(begin_key, "unable to parse begin key", &begin_key_id);
+    if (status.ok()) {
+      status = ParseTracedKey(end_key, "unable to parse end key", &end_key_id);
     }
-    if (!GetIntVal(end_key.ToString(), &end_key_id)) {
-      return Status::Corruption("unable to parse end key", end_key.ToString());
+    if (!status.ok()) {
+      return status;
     }
 
-    bool should_buffer_write = !(buffered_writes_ == nullptr);
-    if (should_buffer_write) {
+    if (buffered_writes_ != nullptr) {
       return WriteBatchInternal::DeleteRange(
           buffered_writes_.get(), column_family_id, begin_key, end_key);
     }
@@ -609,7 +663,7 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
     state_->SyncDeleteRange(column_family_id,
                             static_cast<int64_t>(begin_key_id),
                             static_cast<int64_t>(end_key_id));
-    ++num_write_ops_;
+    NoteWriteOpApplied();
     return Status::OK();
   }
 
@@ -625,6 +679,33 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
     }
 
     return PutCF(column_family_id, key, value);
+  }
+
+  Status PutBlobIndexCF(uint32_t column_family_id, const Slice& key_with_ts,
+                        const Slice& value) override {
+    Slice key =
+        StripTimestampFromUserKey(key_with_ts, FLAGS_user_timestamp_size);
+    uint64_t key_id = 0;
+    Status status = ParseTracedKey(key, "unable to parse key", &key_id);
+    if (!status.ok()) {
+      return status;
+    }
+    const int64_t expected_key_id = static_cast<int64_t>(key_id);
+
+    if (buffered_writes_ != nullptr) {
+      return WriteBatchInternal::PutBlobIndex(buffered_writes_.get(),
+                                              column_family_id, key, value);
+    }
+
+    // Blob direct-write traces record the transformed BlobIndex write rather
+    // than the original value bytes. For expected-state replay we only need
+    // the logical effect of "another put to this key", and db_stress values
+    // advance deterministically by one value_base per committed write.
+    const uint32_t value_base =
+        state_->Get(column_family_id, expected_key_id).NextValueBase();
+    state_->SyncPut(column_family_id, expected_key_id, value_base);
+    NoteWriteOpApplied();
+    return Status::OK();
   }
 
   Status MarkBeginPrepare(bool = false) override {
@@ -669,6 +750,20 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
   }
 
  private:
+  Status ParseTracedKey(const Slice& key, const char* error_msg,
+                        uint64_t* key_id) {
+    const std::string raw_key = key.ToString();
+    if (!GetIntVal(raw_key, key_id)) {
+      return Status::Corruption(error_msg, raw_key);
+    }
+    return Status::OK();
+  }
+
+  void NoteWriteOpApplied() {
+    ++num_write_ops_;
+    assert(num_write_ops_ <= max_write_ops_);
+  }
+
   uint64_t num_write_ops_ = 0;
   uint64_t max_write_ops_;
   ExpectedState* state_;
@@ -685,6 +780,7 @@ Status FileExpectedStateManager::Restore(DB* db) {
   if (seqno < saved_seqno_) {
     return Status::Corruption("DB is older than any restorable expected state");
   }
+  const uint64_t replay_write_ops = seqno - saved_seqno_;
 
   std::string state_filename =
       std::to_string(saved_seqno_) + kStateFilenameSuffix;
@@ -700,8 +796,13 @@ Status FileExpectedStateManager::Restore(DB* db) {
   std::string trace_file_path = GetPathForFilename(trace_filename);
 
   std::unique_ptr<TraceReader> trace_reader;
-  Status s = NewFileTraceReader(Env::Default(), EnvOptions(), trace_file_path,
-                                &trace_reader);
+  Status s = Status::OK();
+  // If the DB recovered exactly to `saved_seqno_`, skip opening/replaying the
+  // trace and reuse the normal state promotion and cleanup flow below.
+  if (replay_write_ops > 0) {
+    s = NewFileTraceReader(Env::Default(), EnvOptions(), trace_file_path,
+                           &trace_reader);
+  }
 
   std::string persisted_seqno_file_path = GetPathForFilename(
       kPersistedSeqnoBasename + kPersistedSeqnoFilenameSuffix);
@@ -725,9 +826,9 @@ Status FileExpectedStateManager::Restore(DB* db) {
                                         num_column_families_));
       s = state->Open(false /* create */);
     }
-    if (s.ok()) {
-      handler.reset(new ExpectedStateTraceRecordHandler(seqno - saved_seqno_,
-                                                        state.get()));
+    if (s.ok() && replay_write_ops > 0) {
+      handler.reset(
+          new ExpectedStateTraceRecordHandler(replay_write_ops, state.get()));
       // TODO(ajkr): An API limitation requires we provide `handles` although
       // they will be unused since we only use the replayer for reading records.
       // Just give a default CFH for now to satisfy the requirement.
@@ -735,14 +836,16 @@ Status FileExpectedStateManager::Restore(DB* db) {
                                  std::move(trace_reader), &replayer);
     }
 
-    if (s.ok()) {
+    if (s.ok() && replay_write_ops > 0) {
       s = replayer->Prepare();
     }
-    for (; s.ok();) {
+    for (; s.ok() && replay_write_ops > 0;) {
       std::unique_ptr<TraceRecord> record;
       s = replayer->Next(&record);
       if (!s.ok()) {
-        if (s.IsCorruption() && handler->IsDone()) {
+        const bool handler_done = handler != nullptr && handler->IsDone();
+        const bool tolerated_tail_corruption = s.IsCorruption() && handler_done;
+        if (tolerated_tail_corruption) {
           // There could be a corruption reading the tail record of the trace
           // due to `db_stress` crashing while writing it. It shouldn't matter
           // as long as we already found all the write ops we need to catch up
@@ -758,6 +861,12 @@ Status FileExpectedStateManager::Restore(DB* db) {
       }
       std::unique_ptr<TraceRecordResult> res;
       s = record->Accept(handler.get(), &res);
+    }
+    if (s.ok() && replay_write_ops > 0 && !handler->IsDone()) {
+      s = Status::Corruption(
+          "Trace ended before replaying all expected write ops",
+          std::to_string(handler->NumWriteOps()) + " < " +
+              std::to_string(replay_write_ops));
     }
   }
 

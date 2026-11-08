@@ -36,6 +36,7 @@
 
 #include "memory/allocator.h"
 #include "port/port.h"
+#include "rocksdb/slice.h"
 #include "util/atomic.h"
 #include "util/random.h"
 
@@ -55,6 +56,9 @@ class SkipList {
   // No copying allowed
   SkipList(const SkipList&) = delete;
   void operator=(const SkipList&) = delete;
+  SkipList(SkipList&&) = delete;
+  void operator=(SkipList&&) = delete;
+  ~SkipList() = default;
 
   // Insert key into the list.
   // REQUIRES: nothing that compares equal to key is currently in the list.

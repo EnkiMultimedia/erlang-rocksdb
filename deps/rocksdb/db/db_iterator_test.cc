@@ -10,18 +10,61 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <memory>
+#include <utility>
+#include <vector>
 
 #include "db/arena_wrapped_db_iter.h"
 #include "db/db_iter.h"
 #include "db/db_test_util.h"
+#include "env/composite_env_wrapper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
+#include "rocksdb/file_system.h"
 #include "rocksdb/io_dispatcher.h"
 #include "rocksdb/iostats_context.h"
 #include "rocksdb/perf_context.h"
 #include "table/block_based/flush_block_policy_impl.h"
+#include "test_util/testutil.h"
 #include "util/random.h"
 #include "utilities/merge_operators/string_append/stringappend2.h"
+
+#ifdef OS_LINUX
+namespace {
+struct QueryAbortState {
+  int check_count = 0;
+  int abort_after_check_count = -1;
+};
+
+QueryAbortState& GetQueryAbortState() {
+  static thread_local QueryAbortState state;
+  return state;
+}
+
+class ScopedQueryAbort {
+ public:
+  explicit ScopedQueryAbort(int abort_after_check_count) {
+    QueryAbortState& state = GetQueryAbortState();
+    state.check_count = 0;
+    state.abort_after_check_count = abort_after_check_count;
+  }
+
+  ~ScopedQueryAbort() { GetQueryAbortState().abort_after_check_count = -1; }
+
+  int check_count() const { return GetQueryAbortState().check_count; }
+};
+}  // namespace
+
+extern "C" bool RocksDbThreadYieldAndCheckAbort() {
+  QueryAbortState& state = GetQueryAbortState();
+  if (state.abort_after_check_count < 0) {
+    return false;
+  }
+  ++state.check_count;
+  return state.abort_after_check_count > 0 &&
+         state.check_count >= state.abort_after_check_count;
+}
+#endif  // OS_LINUX
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -38,6 +81,100 @@ class DBIteratorBaseTest : public DBTestBase {
   DBIteratorBaseTest()
       : DBTestBase("db_iterator_test", /*env_do_fsync=*/true) {}
 };
+
+#ifdef OS_LINUX
+TEST_F(DBIteratorBaseTest, PrevChecksQueryAbort) {
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put("c", "vc"));
+
+  for (int abort_after_check_count = 1; abort_after_check_count <= 2;
+       ++abort_after_check_count) {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->Seek("c");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+
+    ScopedQueryAbort abort(abort_after_check_count);
+    iter->Prev();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsAborted());
+  }
+}
+
+TEST_F(DBIteratorBaseTest, ForwardMergeChecksQueryAbort) {
+  Options options = CurrentOptions();
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("b", "base"));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(db_->Merge(WriteOptions(), "b", "operand"));
+  }
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/0);
+    iter->Seek("b");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(iter->key(), "b");
+    ASSERT_EQ(iter->value(), "base,operand,operand,operand,operand");
+    ASSERT_EQ(abort.check_count(), 4);
+  }
+
+  iter.reset(db_->NewIterator(ReadOptions()));
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/3);
+    iter->Seek("b");
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsAborted());
+    ASSERT_EQ(abort.check_count(), 3);
+  }
+}
+
+TEST_F(DBIteratorBaseTest, PrevReseekMergeChecksQueryAbort) {
+  Options options = CurrentOptions();
+  options.max_sequential_skip_in_iterations = 2;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "base"));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(db_->Merge(WriteOptions(), "b", "operand"));
+  }
+  ASSERT_OK(Put("c", "vc"));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->Seek("c");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/0);
+    iter->Prev();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(iter->key(), "b");
+    // One check reaches "b", two trigger the reseek, four scan merge
+    // operands, and three finish positioning before "b".
+    ASSERT_EQ(abort.check_count(), 10);
+  }
+
+  iter.reset(db_->NewIterator(ReadOptions()));
+  iter->Seek("c");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/4);
+    iter->Prev();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsAborted());
+    ASSERT_EQ(abort.check_count(), 4);
+  }
+}
+#endif  // OS_LINUX
 
 TEST_F(DBIteratorBaseTest, APICallsWithPerfContext) {
   // Set up the DB
@@ -82,6 +219,392 @@ TEST_F(DBIteratorBaseTest, APICallsWithPerfContext) {
   ASSERT_EQ(1, get_perf_context()->iter_prev_count);
 
   delete iter;
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanPrunesNonIntersectingFiles) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("z", "vz"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(2, NumTableFilesAtLevel(0));
+
+  int table_iterators_created = 0;
+  int files_added = 0;
+  int block_based_iterators = 0;
+  int level_iterators = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::NewIterator::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_iterators_created; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:AddedFile",
+      [&](void* /*arg*/) { ++files_added; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:IteratorType", [&](void* arg) {
+        auto* iterator_type = static_cast<std::pair<bool, bool>*>(arg);
+        if (iterator_type->first) {
+          ++block_based_iterators;
+        }
+        if (iterator_type->second) {
+          ++level_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("b"));
+  Slice upper_bound("b");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(0, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  iter->Prepare(scan_opts);
+  ASSERT_EQ(1, table_iterators_created);
+  ASSERT_EQ(1, files_added);
+  ASSERT_EQ(1, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  std::vector<std::string> keys;
+  for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"a"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanPrunesNonIntersectingLevels) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("z", "vz"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_OK(Put("m", "vm"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  int table_iterators_created = 0;
+  int files_added = 0;
+  int block_based_iterators = 0;
+  int level_iterators = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::NewIterator::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_iterators_created; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:AddedFile",
+      [&](void* /*arg*/) { ++files_added; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:IteratorType", [&](void* arg) {
+        auto* iterator_type = static_cast<std::pair<bool, bool>*>(arg);
+        if (iterator_type->first) {
+          ++block_based_iterators;
+        }
+        if (iterator_type->second) {
+          ++level_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("n"));
+  Slice upper_bound("n");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(0, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  iter->Prepare(scan_opts);
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(2, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(1, level_iterators);
+  std::vector<std::string> keys;
+  for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"a", "m"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanAllowsSingleUnboundedRange) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("b"));
+  ReadOptions read_options;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  iter->Prepare(scan_opts);
+  std::vector<std::string> keys;
+  for (iter->Seek("b"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"b", "c"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanRejectsRepeatedPrepare) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("b"));
+  Slice upper_bound("b");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  iter->Prepare(scan_opts);
+  ASSERT_OK(iter->status());
+  iter->Prepare(scan_opts);
+  ASSERT_NOK(iter->status());
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanDedupsMultipleRangesInSameFile) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("m", "vm"));
+  ASSERT_OK(Put("z", "vz"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  int table_iterators_created = 0;
+  int files_added = 0;
+  int block_based_iterators = 0;
+  int level_iterators = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::NewIterator::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_iterators_created; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:AddedFile",
+      [&](void* /*arg*/) { ++files_added; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:IteratorType", [&](void* arg) {
+        auto* iterator_type = static_cast<std::pair<bool, bool>*>(arg);
+        if (iterator_type->first) {
+          ++block_based_iterators;
+        }
+        if (iterator_type->second) {
+          ++level_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("b"));
+  scan_opts.insert(Slice("m"), Slice("n"));
+  Slice upper_bound("b");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(0, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  iter->Prepare(scan_opts);
+  ASSERT_EQ(1, table_iterators_created);
+  ASSERT_EQ(1, files_added);
+  ASSERT_EQ(1, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+
+  std::vector<std::string> keys;
+  for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(keys, std::vector<std::string>({"a"}));
+
+  upper_bound = "n";
+  for (iter->Seek("m"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"a", "m"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanPrunesOverlappingL0Files) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("m", "vm"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(2, NumTableFilesAtLevel(0));
+
+  int table_iterators_created = 0;
+  int files_added = 0;
+  int block_based_iterators = 0;
+  int level_iterators = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::NewIterator::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_iterators_created; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:AddedFile",
+      [&](void* /*arg*/) { ++files_added; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:IteratorType", [&](void* arg) {
+        auto* iterator_type = static_cast<std::pair<bool, bool>*>(arg);
+        if (iterator_type->first) {
+          ++block_based_iterators;
+        }
+        if (iterator_type->second) {
+          ++level_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("n"));
+  Slice upper_bound("n");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(0, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  iter->Prepare(scan_opts);
+  ASSERT_EQ(2, table_iterators_created);
+  ASSERT_EQ(2, files_added);
+  ASSERT_EQ(2, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  std::vector<std::string> keys;
+  for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"a", "m"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanPrunesNonIntersectingMemTables) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  ASSERT_OK(db_->PauseBackgroundWork());
+  ASSERT_OK(Put("z_imm", "vz"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(Put("z_mem", "vz"));
+
+  int table_iterators_created = 0;
+  int files_added = 0;
+  int block_based_iterators = 0;
+  int level_iterators = 0;
+  int merging_iterators = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::NewIterator::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_iterators_created; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:AddedFile",
+      [&](void* /*arg*/) { ++files_added; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:IteratorType", [&](void* arg) {
+        auto* iterator_type = static_cast<std::pair<bool, bool>*>(arg);
+        if (iterator_type->first) {
+          ++block_based_iterators;
+        }
+        if (iterator_type->second) {
+          ++level_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "MergeIteratorBuilder::Finish:UseMergingIterator", [&](void* arg) {
+        if (*static_cast<bool*>(arg)) {
+          ++merging_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("b"));
+  Slice upper_bound("b");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(0, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  ASSERT_EQ(0, merging_iterators);
+  iter->Prepare(scan_opts);
+  ASSERT_EQ(1, table_iterators_created);
+  ASSERT_EQ(1, files_added);
+  ASSERT_EQ(1, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  ASSERT_EQ(0, merging_iterators);
+  std::vector<std::string> keys;
+  for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"a"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(db_->ContinueBackgroundWork());
 }
 
 // Test param:
@@ -180,7 +703,8 @@ TEST_P(DBIteratorTest, PersistedTierOnIterator) {
 
 TEST_P(DBIteratorTest, NonBlockingIteration) {
   do {
-    ReadOptions non_blocking_opts, regular_opts;
+    ReadOptions non_blocking_opts;
+    ReadOptions regular_opts;
     anon::OptionsOverride options_override;
     options_override.full_block_cache = true;
     Options options = CurrentOptions(options_override);
@@ -942,6 +1466,68 @@ TEST_P(DBIteratorTest, IteratorDeleteAfterCfDelete) {
   delete iter;
 }
 
+TEST_P(DBIteratorTest, IteratorSeekAfterCfDelete) {
+  CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
+
+  ASSERT_OK(Put(1, "foo", "delete-cf-then-seek-iter"));
+  ASSERT_OK(Put(1, "hello", "value2"));
+
+  ColumnFamilyHandle* cf = handles_[1];
+  ReadOptions ro;
+
+  auto* iter = db_->NewIterator(ro, cf);
+
+  // Delete the CF handle before the lazy iterator tree is materialized.
+  EXPECT_OK(db_->DestroyColumnFamilyHandle(cf));
+  handles_.erase(std::begin(handles_) + 1);
+
+  iter->Seek("foo");
+  ASSERT_EQ(IterStatus(iter), "foo->delete-cf-then-seek-iter");
+  iter->SeekForPrev("hello");
+  ASSERT_EQ(IterStatus(iter), "hello->value2");
+  iter->SeekToFirst();
+  ASSERT_EQ(IterStatus(iter), "foo->delete-cf-then-seek-iter");
+  iter->Next();
+  ASSERT_EQ(IterStatus(iter), "hello->value2");
+  delete iter;
+}
+
+TEST_P(DBIteratorTest, IteratorAutoRefreshAfterCfDeleteBeforeLazyInit) {
+  CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
+
+  ASSERT_OK(Put(1, "foo", "delete-cf-then-auto-refresh"));
+  ASSERT_OK(Flush(1));
+
+  ColumnFamilyHandle* cf = handles_[1];
+  const Snapshot* snapshot = db_->GetSnapshot();
+
+  ReadOptions ro;
+  ro.snapshot = snapshot;
+  ro.auto_refresh_iterator_with_snapshot = true;
+
+  auto* iter = db_->NewIterator(ro, cf);
+
+  ASSERT_OK(Put(1, "zzz", "after-snapshot"));
+  ASSERT_OK(Flush(1));
+
+  // Delete the CF handle before the lazy iterator tree is materialized. The
+  // following operations force auto-refresh to acquire a newer SuperVersion.
+  EXPECT_OK(db_->DestroyColumnFamilyHandle(cf));
+  handles_.erase(std::begin(handles_) + 1);
+
+  iter->Seek("foo");
+  ASSERT_EQ(IterStatus(iter), "foo->delete-cf-then-auto-refresh");
+  ASSERT_OK(iter->status());
+  iter->SeekForPrev("foo");
+  ASSERT_EQ(IterStatus(iter), "foo->delete-cf-then-auto-refresh");
+  ASSERT_OK(iter->status());
+  iter->Next();
+  ASSERT_OK(iter->status());
+
+  delete iter;
+  db_->ReleaseSnapshot(snapshot);
+}
+
 TEST_P(DBIteratorTest, IteratorDeleteAfterCfDrop) {
   CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
 
@@ -960,6 +1546,30 @@ TEST_P(DBIteratorTest, IteratorDeleteAfterCfDrop) {
   handles_.erase(std::begin(handles_) + 1);
 
   // delete Iterator after CF handle is dropped
+  delete iter;
+}
+
+TEST_P(DBIteratorTest, IteratorSeekAfterCfDrop) {
+  CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
+
+  ASSERT_OK(Put(1, "foo", "drop-cf-then-seek-iter"));
+
+  ReadOptions ro;
+  ColumnFamilyHandle* cf = handles_[1];
+
+  auto* iter = db_->NewIterator(ro, cf);
+
+  // Drop and delete the CF before the lazy iterator tree is materialized.
+  EXPECT_OK(db_->DropColumnFamily(cf));
+  EXPECT_OK(db_->DestroyColumnFamilyHandle(cf));
+  handles_.erase(std::begin(handles_) + 1);
+
+  iter->Seek("foo");
+  ASSERT_EQ(IterStatus(iter), "foo->drop-cf-then-seek-iter");
+  iter->SeekForPrev("foo");
+  ASSERT_EQ(IterStatus(iter), "foo->drop-cf-then-seek-iter");
+  iter->SeekToFirst();
+  ASSERT_EQ(IterStatus(iter), "foo->drop-cf-then-seek-iter");
   delete iter;
 }
 
@@ -2274,6 +2884,10 @@ TEST_P(DBIteratorTest, ReadAhead) {
   options.env = env_;
   options.disable_auto_compactions = true;
   options.write_buffer_size = 4 << 20;
+  // Pin compression so the readahead byte thresholds below don't depend on the
+  // default compression type. kNoCompression keeps the SST files large enough
+  // to exercise readahead and is always available.
+  options.compression = kNoCompression;
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
   BlockBasedTableOptions table_options;
   table_options.block_size = 1024;
@@ -2690,6 +3304,8 @@ TEST_P(DBIteratorTest, CreationFailure) {
 
   Iterator* iter = NewIterator(ReadOptions());
   ASSERT_FALSE(iter->Valid());
+  iter->SeekToFirst();
+  ASSERT_FALSE(iter->Valid());
   ASSERT_TRUE(iter->status().IsCorruption());
   delete iter;
 }
@@ -2746,16 +3362,18 @@ TEST_P(DBIteratorTest, TableFilter) {
   {
     std::set<uint64_t> unseen{1, 2, 3};
     ReadOptions opts;
-    opts.table_filter = [&](const TableProperties& props) {
-      auto it = unseen.find(props.num_entries);
-      if (it == unseen.end()) {
-        ADD_FAILURE() << "saw table properties with an unexpected "
-                      << props.num_entries << " entries";
-      } else {
-        unseen.erase(it);
-      }
-      return true;
-    };
+    std::function<bool(const TableProperties&)> filter =
+        [&](const TableProperties& props) {
+          auto it = unseen.find(props.num_entries);
+          if (it == unseen.end()) {
+            ADD_FAILURE() << "saw table properties with an unexpected "
+                          << props.num_entries << " entries";
+          } else {
+            unseen.erase(it);
+          }
+          return true;
+        };
+    opts.table_filter = &filter;
     auto iter = NewIterator(opts);
     iter->SeekToFirst();
     ASSERT_EQ(IterStatus(iter), "a->1");
@@ -2780,9 +3398,9 @@ TEST_P(DBIteratorTest, TableFilter) {
   // during iteration.
   {
     ReadOptions opts;
-    opts.table_filter = [](const TableProperties& props) {
-      return props.num_entries != 2;
-    };
+    std::function<bool(const TableProperties&)> filter =
+        [](const TableProperties& props) { return props.num_entries != 2; };
+    opts.table_filter = &filter;
     auto iter = NewIterator(opts);
     iter->SeekToFirst();
     ASSERT_EQ(IterStatus(iter), "a->1");
@@ -3342,6 +3960,71 @@ INSTANTIATE_TEST_CASE_P(DBIteratorTestInstance, DBIteratorTest,
 // Tests how DBIter work with ReadCallback
 class DBIteratorWithReadCallbackTest : public DBIteratorTest {};
 
+#ifdef OS_LINUX
+TEST_F(DBIteratorWithReadCallbackTest,
+       PrevReseekVisibilityScanChecksQueryAbort) {
+  class TestReadCallback : public ReadCallback {
+   public:
+    explicit TestReadCallback(SequenceNumber max_visible_seq)
+        : ReadCallback(max_visible_seq) {}
+
+    bool IsVisibleFullCheck(SequenceNumber seq) override {
+      return seq <= max_visible_seq_;
+    }
+  };
+
+  Options options = CurrentOptions();
+  options.max_sequential_skip_in_iterations = 2;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("b", "visible"));
+  }
+  ASSERT_OK(Put("c", "vc"));
+  TestReadCallback callback(db_->GetLatestSequenceNumber());
+  ASSERT_OK(Put("b", "hidden"));
+
+  auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
+      db_->DefaultColumnFamily());
+  auto* cfd = cfh->cfd();
+  DBImpl* db_impl = dbfull();
+  SuperVersion* super_version = cfd->GetReferencedSuperVersion(db_impl);
+  std::unique_ptr<Iterator> iter(
+      db_impl->NewIteratorImpl(ReadOptions(), cfh, super_version,
+                               db_->GetLatestSequenceNumber(), &callback));
+  iter->Seek("c");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/0);
+    iter->Prev();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(iter->key(), "b");
+    // One check reaches "b", two trigger the reseek, one skips the invisible
+    // value, and two finish positioning before "b".
+    ASSERT_EQ(abort.check_count(), 6);
+  }
+
+  super_version = cfd->GetReferencedSuperVersion(db_impl);
+  iter.reset(db_impl->NewIteratorImpl(ReadOptions(), cfh, super_version,
+                                      db_->GetLatestSequenceNumber(),
+                                      &callback));
+  iter->Seek("c");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/4);
+    iter->Prev();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsAborted());
+    ASSERT_EQ(abort.check_count(), 4);
+  }
+}
+#endif  // OS_LINUX
+
 TEST_F(DBIteratorWithReadCallbackTest, ReadCallback) {
   class TestReadCallback : public ReadCallback {
    public:
@@ -3587,7 +4270,9 @@ TEST_F(DBIteratorTest, ErrorWhenReadFile) {
   db_->GetLiveFilesMetaData(&files);
   // Get file names for F1, F2 and F3.
   // These are file names, not full paths.
-  std::string f1, f2, f3;
+  std::string f1;
+  std::string f2;
+  std::string f3;
   for (auto& file_meta : files) {
     if (file_meta.level == 6) {
       f3 = file_meta.name;
@@ -3819,6 +4504,109 @@ TEST_F(DBIteratorTest, IteratorsConsistentViewExplicitSnapshot) {
         static_cast_with_check<ColumnFamilyHandleImpl>(handles_[i])->cfd();
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVObsolete);
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
+  }
+}
+
+TEST_F(DBIteratorTest, NewIteratorsWithPerColumnFamilyReadOptions) {
+  Options options = GetDefaultOptions();
+  options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+  table_options.whole_key_filtering = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  CreateAndReopenWithCF({"cf_1"}, options);
+
+  ASSERT_OK(Put(0, "b1", "default_value"));
+  ASSERT_OK(Put(1, "b1", "cf_1_value"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Flush(1));
+
+  ReadOptions prefix_read_options;
+  prefix_read_options.total_order_seek = false;
+  ReadOptions total_order_read_options;
+  total_order_read_options.total_order_seek = true;
+  std::vector<ReadOptions> read_options = {prefix_read_options,
+                                           total_order_read_options};
+  std::vector<Iterator*> iterators;
+  ASSERT_OK(db_->NewIterators(read_options, handles_, &iterators));
+  ASSERT_EQ(2U, iterators.size());
+
+  iterators[0]->Seek("a9");
+  ASSERT_FALSE(iterators[0]->Valid());
+  ASSERT_OK(iterators[0]->status());
+  iterators[1]->Seek("a9");
+  ASSERT_TRUE(iterators[1]->Valid());
+  ASSERT_EQ("b1", iterators[1]->key());
+  ASSERT_OK(iterators[1]->status());
+
+  for (auto* iterator : iterators) {
+    delete iterator;
+  }
+}
+
+TEST_F(DBIteratorTest, NewIteratorsPerColumnFamilyOptionsValidation) {
+  Options options = GetDefaultOptions();
+  CreateAndReopenWithCF({"cf_1"}, options);
+
+  std::vector<Iterator*> iterators;
+  ASSERT_TRUE(
+      db_->NewIterators(std::vector<ReadOptions>(1), handles_, &iterators)
+          .IsInvalidArgument());
+
+  std::vector<ReadOptions> read_options(2);
+  read_options[1].tailing = true;
+  ASSERT_TRUE(db_->NewIterators(read_options, handles_, &iterators)
+                  .IsInvalidArgument());
+
+  read_options[1].tailing = false;
+  const Snapshot* first_snapshot = db_->GetSnapshot();
+  ASSERT_OK(Put(0, "key", "value"));
+  const Snapshot* second_snapshot = db_->GetSnapshot();
+  read_options[0].snapshot = second_snapshot;
+  read_options[1].snapshot = second_snapshot;
+  ASSERT_OK(db_->NewIterators(read_options, handles_, &iterators));
+  for (auto* iterator : iterators) {
+    delete iterator;
+  }
+
+  read_options[0].snapshot = first_snapshot;
+  read_options[1].snapshot = second_snapshot;
+  ASSERT_TRUE(db_->NewIterators(read_options, handles_, &iterators)
+                  .IsInvalidArgument());
+  db_->ReleaseSnapshot(first_snapshot);
+  db_->ReleaseSnapshot(second_snapshot);
+}
+
+TEST_F(DBIteratorTest,
+       ReadOnlyNewIteratorsAllowsTableFilterWithRangeConversion) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(ReadOnlyReopen(options));
+
+  std::function<bool(const TableProperties&)> table_filter =
+      [](const TableProperties&) { return true; };
+  ReadOptions read_options;
+  read_options.table_filter = &table_filter;
+  const std::vector<ReadOptions> per_cf_read_options = {read_options};
+  const std::vector<ColumnFamilyHandle*> column_families = {
+      db_->DefaultColumnFamily()};
+  for (bool use_per_cf_read_options : {false, true}) {
+    std::vector<Iterator*> iterators;
+    const Status s =
+        use_per_cf_read_options
+            ? db_->NewIterators(per_cf_read_options, column_families,
+                                &iterators)
+            : db_->NewIterators(read_options, column_families, &iterators);
+    ASSERT_OK(s);
+    ASSERT_EQ(1U, iterators.size());
+    iterators[0]->SeekToFirst();
+    ASSERT_OK(iterators[0]->status());
+    ASSERT_TRUE(iterators[0]->Valid());
+    ASSERT_EQ("key", iterators[0]->key());
+    delete iterators[0];
   }
 }
 
@@ -4138,6 +4926,69 @@ TEST_P(DBIteratorTest, AverageMemtableOpsScanFlushTriggerByOverwrites) {
   ASSERT_EQ(1, NumTableFilesAtLevel(0));
 }
 
+TEST_P(DBIteratorTest, PrefixSameAsStartSeekToNonInDomainKey) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(3));
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("abc1", "v1"));
+  ASSERT_OK(Put("abc2", "v2"));
+  ASSERT_OK(Put("abc3", "v3"));
+
+  // Seek to "ab" (2 bytes) -- out-of-domain for FixedPrefixTransform(3).
+  // ShouldSetPrefix returns false for out-of-domain targets, so no prefix
+  // constraint is set. The seek should find "abc1" and iteration should
+  // proceed without prefix_same_as_start enforcement.
+  ReadOptions ro;
+  ro.prefix_same_as_start = true;
+  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+  iter->Seek("ab");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key().ToString(), "abc1");
+  ASSERT_EQ(iter->value().ToString(), "v1");
+
+  // Since prefix_ was not set (out-of-domain seek target), Next should
+  // continue without prefix boundary checking.
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key().ToString(), "abc2");
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key().ToString(), "abc3");
+}
+
+TEST_P(DBIteratorTest, PrefixSameAsStartIteratePastOutOfDomainKey) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  // FixedPrefixTransform(3): keys shorter than 3 bytes are out-of-domain.
+  options.prefix_extractor.reset(NewFixedPrefixTransform(3));
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("abc1", "v1"));
+  ASSERT_OK(Put("abc2", "v2"));
+  ASSERT_OK(Put("zz", "short"));  // out-of-domain: only 2 bytes
+
+  ReadOptions ro;
+  ro.prefix_same_as_start = true;
+  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+  iter->Seek("abc1");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key().ToString(), "abc1");
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key().ToString(), "abc2");
+
+  // Next encounters "zz" (out-of-domain for FixedPrefixTransform(3)).
+  // PrefixCheck returns false for out-of-domain keys, so the iterator
+  // invalidates cleanly instead of calling Transform() on the short key.
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+}
+
 class DBMultiScanIteratorTest : public DBTestBase,
                                 public ::testing::WithParamInterface<bool> {
  public:
@@ -4326,6 +5177,71 @@ TEST_P(DBMultiScanIteratorTest, RangeAcrossFiles) {
     std::cerr << "Iterator returned logic error " << ex.what();
     abort();
   }
+  iter.reset();
+}
+
+TEST_P(DBMultiScanIteratorTest, SortedRangesSkipIODispatcherSort) {
+  auto options = CurrentOptions();
+  options.target_file_size_base = 100 << 10;
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 50;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  auto key = [](int i) {
+    std::stringstream ss;
+    ss << "k" << std::setw(5) << std::setfill('0') << i;
+    return ss.str();
+  };
+
+  auto rnd = Random::GetTLSInstance();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put(key(i), rnd->RandomString(2 << 10)));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_->CompactRange({}, nullptr, nullptr));
+  ASSERT_EQ(2, NumTableFilesAtLevel(49));
+
+  int sort_count = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "IODispatcherImpl::SubmitJob:SortBlockHandles",
+      [&](void* /*arg*/) { ++sort_count; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  auto tracking_dispatcher = std::make_shared<TrackingIODispatcher>();
+  std::vector<std::string> key_ranges({key(10), key(90)});
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.io_dispatcher = tracking_dispatcher;
+  scan_options.use_async_io = false;
+  scan_options.insert(key_ranges[0], key_ranges[1]);
+
+  ReadOptions ro;
+  ro.fill_cache = GetParam();
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+  std::unique_ptr<MultiScan> iter =
+      dbfull()->NewMultiScan(ro, cfh, scan_options);
+
+  try {
+    int i = 10;
+    for (auto range : *iter) {
+      for (auto it : range) {
+        ASSERT_EQ(it.first.ToString(), key(i));
+        ++i;
+      }
+    }
+    ASSERT_EQ(i, 90);
+  } catch (MultiScanException& ex) {
+    ASSERT_NOK(ex.status());
+    std::cerr << "Iterator returned status " << ex.what();
+    abort();
+  } catch (std::logic_error& ex) {
+    std::cerr << "Iterator returned logic error " << ex.what();
+    abort();
+  }
+
+  ASSERT_GT(tracking_dispatcher->GetReadSets().size(), 0);
+  EXPECT_EQ(sort_count, 0);
   iter.reset();
 }
 
@@ -4804,6 +5720,275 @@ TEST_P(DBMultiScanIteratorTest, AsyncPrefetchAcrossMultipleFiles) {
   }
 
   iter.reset();
+}
+
+TEST_P(DBMultiScanIteratorTest, ReversePrefetchAcrossMultipleRanges) {
+  auto options = CurrentOptions();
+  options.target_file_size_base = 1 << 15;  // 32KiB
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 50;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  Random rnd(303);
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_OK(Put(Key(i), rnd.RandomString(1 << 10)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange({}, nullptr, nullptr));
+  ASSERT_GT(NumTableFilesAtLevel(49), 3);
+
+  ReadOptions ro;
+  ro.fill_cache = GetParam();
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+  auto tracking_dispatcher = std::make_shared<TrackingIODispatcher>();
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.use_async_io = false;
+  scan_options.reverse = true;
+  scan_options.io_dispatcher = tracking_dispatcher;
+  std::vector<std::string> key_ranges(
+      {Key(100), Key(200), Key(500), Key(600), Key(800), Key(900)});
+  scan_options.insert(key_ranges[0], key_ranges[1]);
+  scan_options.insert(key_ranges[2], key_ranges[3]);
+  scan_options.insert(key_ranges[4], key_ranges[5]);
+
+  std::unique_ptr<MultiScan> iter =
+      dbfull()->NewMultiScan(ro, cfh, scan_options);
+  ASSERT_NE(iter, nullptr);
+
+  std::vector<std::string> actual_keys;
+  try {
+    for (auto range : *iter) {
+      for (auto it : range) {
+        actual_keys.push_back(it.first.ToString());
+      }
+    }
+  } catch (MultiScanException& ex) {
+    FAIL() << "Iterator returned status " << ex.what();
+  } catch (std::logic_error& ex) {
+    FAIL() << "Iterator returned logic error " << ex.what();
+  }
+
+  std::vector<std::string> expected_keys;
+  for (int i = 199; i >= 100; --i) {
+    expected_keys.push_back(Key(i));
+  }
+  for (int i = 599; i >= 500; --i) {
+    expected_keys.push_back(Key(i));
+  }
+  for (int i = 899; i >= 800; --i) {
+    expected_keys.push_back(Key(i));
+  }
+  ASSERT_EQ(actual_keys, expected_keys);
+  ASSERT_GT(tracking_dispatcher->GetReadSets().size(), 0);
+}
+
+TEST_P(DBMultiScanIteratorTest, ReverseUnreleasedPrefetchBlocksCountAsWasted) {
+  auto options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.disable_auto_compactions = true;
+  options.statistics = CreateDBStatistics();
+
+  BlockBasedTableOptions table_options;
+  table_options.flush_block_policy_factory =
+      std::make_shared<FlushBlockEveryKeyPolicyFactory>();
+  table_options.block_cache = NewLRUCache(10 * 1024 * 1024);
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  constexpr int kNumKeys = 40;
+  const std::string value(100, 'v');
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), value));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange({}, nullptr, nullptr));
+
+  ReadOptions ro;
+  ro.fill_cache = GetParam();
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+  auto tracking_dispatcher = std::make_shared<TrackingIODispatcher>();
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.use_async_io = false;
+  scan_options.reverse = true;
+  scan_options.io_dispatcher = tracking_dispatcher;
+  const std::string start_key = Key(0);
+  const std::string limit_key = Key(kNumKeys);
+  scan_options.insert(start_key, limit_key);
+
+  {
+    std::unique_ptr<MultiScan> iter =
+        dbfull()->NewMultiScan(ro, cfh, scan_options);
+    ASSERT_NE(iter, nullptr);
+
+    try {
+      auto range_it = iter->begin();
+      ASSERT_NE(range_it, iter->end());
+      auto range = *range_it;
+      auto row_it = range.begin();
+      ASSERT_NE(row_it, range.end());
+      ASSERT_EQ((*row_it).first.ToString(), Key(kNumKeys - 1));
+    } catch (MultiScanException& ex) {
+      FAIL() << "Iterator returned status " << ex.what();
+    } catch (std::logic_error& ex) {
+      FAIL() << "Iterator returned logic error " << ex.what();
+    }
+
+    ASSERT_GT(tracking_dispatcher->GetReadSets().size(), 0);
+  }
+
+  ASSERT_GT(
+      options.statistics->getTickerCount(MULTISCAN_PREFETCH_BLOCKS_WASTED), 0);
+}
+
+TEST_P(DBMultiScanIteratorTest, ReverseRequiresLimits) {
+  auto options = CurrentOptions();
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Flush());
+
+  ReadOptions ro;
+  ro.fill_cache = GetParam();
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.reverse = true;
+  scan_options.insert("a");
+  scan_options.insert("b", "c");
+
+  std::unique_ptr<MultiScan> iter =
+      dbfull()->NewMultiScan(ro, cfh, scan_options);
+  ASSERT_NE(iter, nullptr);
+  try {
+    (void)iter->begin();
+    FAIL() << "Expected reverse MultiScan without an upper bound to fail";
+  } catch (MultiScanException& ex) {
+    ASSERT_NOK(ex.status());
+    ASSERT_TRUE(ex.status().IsInvalidArgument());
+  }
+}
+
+// Wrapper filesystem that does not support async IO.
+// Used to verify that MultiScan gracefully falls back to sync IO.
+class NoAsyncIOFS : public FileSystemWrapper {
+ public:
+  explicit NoAsyncIOFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  static const char* kClassName() { return "NoAsyncIOFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  void SupportedOps(int64_t& supported_ops) override {
+    target()->SupportedOps(supported_ops);
+    supported_ops &= ~(1 << FSSupportedOps::kAsyncIO);
+  }
+
+  IOStatus Poll(std::vector<void*>& /*io_handles*/,
+                size_t /*min_completions*/) override {
+    ADD_FAILURE() << "Poll should not be called when kAsyncIO is unsupported";
+    return IOStatus::NotSupported();
+  }
+
+  IOStatus AbortIO(std::vector<void*>& /*io_handles*/) override {
+    ADD_FAILURE()
+        << "AbortIO should not be called when kAsyncIO is unsupported";
+    return IOStatus::NotSupported();
+  }
+
+  IOStatus NewRandomAccessFile(const std::string& fname,
+                               const FileOptions& opts,
+                               std::unique_ptr<FSRandomAccessFile>* result,
+                               IODebugContext* dbg) override {
+    IOStatus s = target()->NewRandomAccessFile(fname, opts, result, dbg);
+    if (s.ok()) {
+      *result = std::make_unique<NoAsyncIOFile>(std::move(*result));
+    }
+    return s;
+  }
+
+ private:
+  class NoAsyncIOFile : public FSRandomAccessFileOwnerWrapper {
+   public:
+    using FSRandomAccessFileOwnerWrapper::FSRandomAccessFileOwnerWrapper;
+    IOStatus ReadAsync(FSReadRequest& /*req*/, const IOOptions& /*opts*/,
+                       std::function<void(FSReadRequest&, void*)> /*cb*/,
+                       void* /*cb_arg*/, void** /*io_handle*/,
+                       IOHandleDeleter* /*del_fn*/,
+                       IODebugContext* /*dbg*/) override {
+      ADD_FAILURE()
+          << "ReadAsync should not be called when kAsyncIO is unsupported";
+      return IOStatus::NotSupported();
+    }
+  };
+};
+
+TEST_P(DBMultiScanIteratorTest, AsyncIOFallbackWithoutFSSupport) {
+  // Verify that MultiScan works correctly when use_async_io = true but the
+  // filesystem does NOT support kAsyncIO. The constructor should silently
+  // disable async IO, and no async operations should be attempted.
+  auto options = CurrentOptions();
+  options.target_file_size_base = 1 << 15;  // 32KiB
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 50;
+  options.compression = kNoCompression;
+
+  auto no_async_fs = std::make_shared<NoAsyncIOFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> wrapped_env(new CompositeEnvWrapper(env_, no_async_fs));
+  options.env = wrapped_env.get();
+
+  DestroyAndReopen(options);
+
+  Random rnd(305);
+
+  // Create data across multiple files
+  for (int i = 0; i < 1000; ++i) {
+    std::stringstream ss;
+    ss << "k" << std::setw(5) << std::setfill('0') << i;
+    ASSERT_OK(Put(ss.str(), rnd.RandomString(1 << 10)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange({}, nullptr, nullptr));
+
+  // Set up multiple non-overlapping ranges
+  std::vector<std::string> key_ranges(
+      {"k00000", "k00100", "k00500", "k00600", "k00800", "k00900"});
+  ReadOptions ro;
+  ro.fill_cache = GetParam();
+
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.use_async_io = true;  // Deliberately request async IO
+  scan_options.insert(key_ranges[0], key_ranges[1]);
+  scan_options.insert(key_ranges[2], key_ranges[3]);
+  scan_options.insert(key_ranges[4], key_ranges[5]);
+
+  // The MultiScan constructor should disable async IO since the FS
+  // doesn't support it. If it doesn't, the NoAsyncIOFS wrapper will
+  // cause ADD_FAILURE() when ReadAsync/Poll/AbortIO are called.
+  std::unique_ptr<MultiScan> iter =
+      dbfull()->NewMultiScan(ro, cfh, scan_options);
+  ASSERT_NE(iter, nullptr);
+
+  // Iterate all ranges and verify keys are returned correctly
+  try {
+    for (auto range : *iter) {
+      for (auto it : range) {
+        it.first.ToString();
+      }
+    }
+  } catch (MultiScanException& ex) {
+    FAIL() << "Iterator returned status " << ex.what();
+  } catch (std::logic_error& ex) {
+    FAIL() << "Iterator returned logic error " << ex.what();
+  }
+
+  iter.reset();
+  Close();
 }
 
 TEST_P(DBMultiScanIteratorTest, AsyncPrefetchMultipleLevels) {
@@ -5384,14 +6569,2252 @@ TEST_P(DBMultiScanIteratorTest, WastedBlocksTracking) {
   uint64_t wasted =
       options.statistics->getTickerCount(MULTISCAN_PREFETCH_BLOCKS_WASTED);
 
-  // We expect some wasted blocks due to the gap between ranges
-  // The exact number depends on prefetch behavior, but should be > 0
-  // if blocks between k020-k050 were prefetched
-  std::cout << "Wasted blocks: " << wasted << std::endl;
-
-  // Note: The test verifies the tracking mechanism works.
-  // The actual count depends on prefetch heuristics which may vary.
+  ASSERT_GT(wasted, 0);
 }
+
+TEST_P(DBMultiScanIteratorTest, PrefetchStatsRecorded) {
+  // Regression test: the MultiScan prefetch stats must still be published after
+  // the prefetch path moved into the IODispatcher. A cold scan populates the
+  // prefetch counters; a warm re-scan registers cache hits.
+  auto options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.disable_auto_compactions = true;
+  options.statistics = CreateDBStatistics();
+
+  BlockBasedTableOptions table_options;
+  table_options.flush_block_policy_factory =
+      std::make_shared<FlushBlockEveryKeyPolicyFactory>();
+  table_options.block_cache = NewLRUCache(10 * 1024 * 1024);  // 10MB cache
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  const int kNumKeys = 50;
+  std::string value(100, 'v');
+  for (int i = 0; i < kNumKeys; ++i) {
+    std::stringstream ss;
+    ss << "k" << std::setw(3) << std::setfill('0') << i;
+    ASSERT_OK(Put(ss.str(), value));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange({}, nullptr, nullptr));
+
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+
+  auto run_scan = [&]() {
+    MultiScanArgs scan_options(BytewiseComparator());
+    scan_options.use_async_io = false;  // deterministic sync path
+    scan_options.insert("k000", "k049");
+    ReadOptions ro;
+    ro.fill_cache = true;
+    std::unique_ptr<MultiScan> iter =
+        dbfull()->NewMultiScan(ro, cfh, scan_options);
+    ASSERT_NE(iter, nullptr);
+    if (iter == nullptr) {
+      return;
+    }
+    int count = 0;
+    try {
+      for (auto range : *iter) {
+        for (auto it : range) {
+          it.first.ToString();
+          count++;
+        }
+      }
+    } catch (MultiScanException& ex) {
+      FAIL() << "Scan failed: " << ex.what();
+    }
+    ASSERT_GT(count, 0);
+  };
+
+  // Cold scan: force blocks to be read from disk so the prefetch path runs.
+  table_options.block_cache->EraseUnRefEntries();
+  SetPerfLevel(kEnableCount);
+  PerfContext* perf = get_perf_context();
+  ASSERT_NE(perf, nullptr);
+  if (perf == nullptr) {
+    return;
+  }
+  perf->Reset();
+  run_scan();  // MultiScanIndexIterator destroyed here -> stats recorded
+
+  ASSERT_GT(TestGetTickerCount(options, MULTISCAN_PREPARE_CALLS), 0);
+  ASSERT_GT(TestGetTickerCount(options, MULTISCAN_BLOCKS_PREFETCHED), 0);
+  ASSERT_GT(TestGetTickerCount(options, MULTISCAN_PREFETCH_BYTES), 0);
+  ASSERT_GT(TestGetTickerCount(options, MULTISCAN_IO_REQUESTS), 0);
+  HistogramData blocks_per_prepare;
+  options.statistics->histogramData(MULTISCAN_BLOCKS_PER_PREPARE,
+                                    &blocks_per_prepare);
+  ASSERT_GT(blocks_per_prepare.count, 0);
+
+  // PerfContext mirrors the same metrics scoped to this operation/thread.
+  ASSERT_GT(perf->multiscan_prepare_count, 0);
+  ASSERT_GT(perf->multiscan_blocks_prefetched, 0);
+  ASSERT_GT(perf->multiscan_prefetch_bytes, 0);
+  ASSERT_GT(perf->multiscan_io_requests, 0);
+  SetPerfLevel(kDisable);
+
+  // Warm scan: the just-cached blocks now count as cache hits.
+  uint64_t cache_hits_before =
+      TestGetTickerCount(options, MULTISCAN_BLOCKS_FROM_CACHE);
+  run_scan();
+  ASSERT_GT(TestGetTickerCount(options, MULTISCAN_BLOCKS_FROM_CACHE),
+            cache_hits_before);
+}
+
+class ReadPathRangeTombstoneTest : public DBIteratorBaseTest,
+                                   public ::testing::WithParamInterface<bool> {
+ protected:
+  bool Forward() const { return GetParam(); }
+
+  void SetUp() override {
+    attempted_insert_ranges_.clear();
+    SyncPoint::GetInstance()->SetCallBack(
+        "MemTable::AddLogicallyRedundantRangeTombstone:AddRange",
+        [this](void* arg) {
+          auto* range = static_cast<std::pair<Slice, Slice>*>(arg);
+          attempted_insert_ranges_.emplace_back(range->first.ToString(),
+                                                range->second.ToString());
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+
+  void TearDown() override {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
+  void SetupTestData(char first_key, char last_key,
+                     const std::vector<std::string>& flushed_point_dels,
+                     const std::vector<std::string>& memtable_point_dels,
+                     const Slice* ts = nullptr) {
+    for (char c = first_key; c <= last_key; c++) {
+      if (ts) {
+        ASSERT_OK(db_->Put(WriteOptions(), std::string(1, c), *ts,
+                           std::string("v") + c));
+      } else {
+        ASSERT_OK(Put(std::string(1, c), std::string("v") + c));
+      }
+    }
+    ASSERT_OK(Flush());
+    for (const auto& key : flushed_point_dels) {
+      if (ts) {
+        ASSERT_OK(db_->Delete(WriteOptions(), key, *ts));
+      } else {
+        ASSERT_OK(Delete(key));
+      }
+    }
+    if (!flushed_point_dels.empty()) {
+      ASSERT_OK(Flush());
+    }
+    for (const auto& key : memtable_point_dels) {
+      if (ts) {
+        ASSERT_OK(db_->Delete(WriteOptions(), key, *ts));
+      } else {
+        ASSERT_OK(Delete(key));
+      }
+    }
+  }
+
+  void AssertRange(size_t idx, const std::string& start,
+                   const std::string& end) {
+    ASSERT_LT(idx, attempted_insert_ranges_.size());
+    ASSERT_EQ(attempted_insert_ranges_[idx].first, start);
+    ASSERT_EQ(attempted_insert_ranges_[idx].second, end);
+  }
+
+  Slice MaxTimestamp(std::string* storage) const {
+    storage->assign(sizeof(uint64_t), static_cast<char>(0xff));
+    return Slice(*storage);
+  }
+
+  void VerifyIteration(const std::vector<std::string>& expected_keys,
+                       const ReadOptions& ro = ReadOptions()) {
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+    if (Forward()) {
+      iter->SeekToFirst();
+      for (const auto& key : expected_keys) {
+        ASSERT_TRUE(iter->Valid());
+        ASSERT_EQ(key, iter->key().ToString());
+        iter->Next();
+      }
+    } else {
+      iter->SeekToLast();
+      for (auto it = expected_keys.rbegin(); it != expected_keys.rend(); ++it) {
+        ASSERT_TRUE(iter->Valid());
+        ASSERT_EQ(*it, iter->key().ToString());
+        iter->Prev();
+      }
+    }
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+
+  void AssertTableFilterRangeConversionRejected(
+      const ReadOptions& ro, ColumnFamilyHandle* cfh = nullptr) {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(
+        ro, cfh != nullptr ? cfh : db_->DefaultColumnFamily()));
+    ASSERT_TRUE(iter->status().IsInvalidArgument());
+    ASSERT_TRUE(iter->status().ToString().find(
+                    "table_filter is not supported") != std::string::npos)
+        << iter->status().ToString();
+  }
+
+  std::vector<std::pair<std::string, std::string>> attempted_insert_ranges_;
+};
+
+INSTANTIATE_TEST_CASE_P(ReadPathRangeTombstoneTest, ReadPathRangeTombstoneTest,
+                        ::testing::Bool());
+
+TEST_P(ReadPathRangeTombstoneTest, BasicInsertion) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+
+  bool forward = Forward();
+  for (bool flush_before_read : {false, true}) {
+    SCOPED_TRACE(flush_before_read ? "flush before read"
+                                   : "no flush before read");
+    options.statistics = CreateDBStatistics();
+    DestroyAndReopen(options);
+
+    SetupTestData(/*first_key=*/'a', /*last_key=*/'n',
+                  /*flushed_point_dels=*/{"b", "c", "d", "e", "f"},
+                  /*memtable_point_dels=*/{"i", "j", "k", "l", "m"});
+
+    if (flush_before_read) {
+      ASSERT_OK(Flush());
+      // After dropping the IsEmpty() fast-path in conversion, the now-empty
+      // active memtable is a valid conversion target; the per-CF
+      // ingest_sst_lock (held shared by ingestion) is the mechanism that
+      // gates conversion vs ingestion, not memtable emptiness.
+      attempted_insert_ranges_.clear();
+      VerifyIteration({"a", "g", "h", "n"});
+      ASSERT_EQ(attempted_insert_ranges_.size(), 2);
+      if (forward) {
+        AssertRange(0, "b", "g");
+        AssertRange(1, "i", "n");
+      } else {
+        AssertRange(0, "i", "n");
+        AssertRange(1, "b", "g");
+      }
+      break;
+    }
+
+    attempted_insert_ranges_.clear();
+
+    VerifyIteration({"a", "g", "h", "n"});
+
+    ASSERT_EQ(attempted_insert_ranges_.size(), 2);
+    if (forward) {
+      AssertRange(0, "b", "g");
+      AssertRange(1, "i", "n");
+    } else {
+      AssertRange(0, "i", "n");
+      AssertRange(1, "b", "g");
+    }
+    ASSERT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        2);
+
+    attempted_insert_ranges_.clear();
+    VerifyIteration({"a", "g", "h", "n"});
+    ASSERT_EQ(attempted_insert_ranges_.size(), 0);
+    ASSERT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        2);
+
+    ASSERT_OK(Put("b", "b_new"));
+    ASSERT_EQ(Get("b"), "b_new");
+  }
+}
+
+TEST_P(ReadPathRangeTombstoneTest, NonContiguous) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  SetupTestData(/*first_key=*/'a', /*last_key=*/'h',
+                /*flushed_point_dels=*/{"b", "c"},
+                /*memtable_point_dels=*/{"e", "f"});
+
+  VerifyIteration({"a", "d", "g", "h"});
+
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+}
+
+TEST_P(ReadPathRangeTombstoneTest, MemtableSwitch) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  SetupTestData(/*first_key=*/'a', /*last_key=*/'h',
+                /*flushed_point_dels=*/{},
+                /*memtable_point_dels=*/{"b", "c", "d", "e", "f"});
+
+  attempted_insert_ranges_.clear();
+  SyncPoint::GetInstance()->SetCallBack(
+      "MemTable::AddLogicallyRedundantRangeTombstone:AddRange",
+      [this](void* arg) {
+        auto* range = static_cast<std::pair<Slice, Slice>*>(arg);
+        attempted_insert_ranges_.emplace_back(range->first.ToString(),
+                                              range->second.ToString());
+        auto* cfh =
+            static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily());
+        cfh->cfd()->mem()->MarkImmutable();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  VerifyIteration({"a", "g", "h"});
+
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  AssertRange(0, "b", "g");
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_DISCARDED),
+      1);
+
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+  ASSERT_EQ(Get("g"), "vg");
+}
+
+TEST_P(ReadPathRangeTombstoneTest, ExhaustedIteratorWithBounds) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  // Keys a-j with tombstones at both ends: a-d deleted, g-j deleted.
+  // Live keys: e, f.
+  SetupTestData(/*first_key=*/'a', /*last_key=*/'j',
+                /*flushed_point_dels=*/{"a", "b", "c", "d"},
+                /*memtable_point_dels=*/{"g", "h", "i", "j"});
+
+  ReadOptions ro;
+  Slice lower("a");
+  Slice upper("z");
+  ro.iterate_lower_bound = &lower;
+  ro.iterate_upper_bound = &upper;
+
+  VerifyIteration({"e", "f"}, ro);
+
+  // Both directions encounter two tombstone runs (a-d and g-j).
+  ASSERT_EQ(attempted_insert_ranges_.size(), 2);
+  if (Forward()) {
+    // Forward: sees a-d tombstones first -> live e terminates -> [a, e).
+    // Then g-j -> exhaustion past j, saved_key_="j" fallback -> [g, j),
+    // covering g,h,i. j remains a point tombstone.
+    AssertRange(0, "a", "e");
+    AssertRange(1, "g", "j");
+  } else {
+    // Reverse: sees j-g tombstones first, then f,e live, then d-a -> exhausts.
+    AssertRange(0, "g", "z");
+    AssertRange(1, "a", "e");
+  }
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      2);
+  ASSERT_EQ(Get("e"), "ve");
+  ASSERT_EQ(Get("f"), "vf");
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+  ASSERT_EQ(Get("g"), "NOT_FOUND");
+  ASSERT_EQ(Get("j"), "NOT_FOUND");
+
+  // Second read: range tombstones already in memtable, no new insertion.
+  attempted_insert_ranges_.clear();
+  VerifyIteration({"e", "f"}, ro);
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      2);
+}
+
+TEST_P(ReadPathRangeTombstoneTest, ExhaustedIteratorNoBounds) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  // Same data as ExhaustedIteratorWithBounds but no bounds set.
+  SetupTestData(/*first_key=*/'a', /*last_key=*/'j',
+                /*flushed_point_dels=*/{"a", "b", "c", "d"},
+                /*memtable_point_dels=*/{"g", "h", "i", "j"});
+
+  VerifyIteration({"e", "f"});
+
+  if (Forward()) {
+    // Forward: a-d run terminates at live e -> [a, e). g-j run exhausts
+    // past j -> saved_key_ fallback -> [g, j), covering g,h,i with j as a
+    // point tombstone.
+    ASSERT_EQ(attempted_insert_ranges_.size(), 2);
+    AssertRange(0, "a", "e");
+    AssertRange(1, "g", "j");
+    ASSERT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        2);
+  } else {
+    // Reverse fallback path remains prefix-gated.
+    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+    AssertRange(0, "a", "e");
+    ASSERT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        1);
+  }
+}
+
+TEST_P(ReadPathRangeTombstoneTest, DirectionChange) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  bool forward_first = Forward();
+  SetupTestData(/*first_key=*/'a', /*last_key=*/'p',
+                /*flushed_point_dels=*/{"c", "d", "e"},
+                /*memtable_point_dels=*/{"f", "g", "j", "k", "l", "m", "n"});
+
+  attempted_insert_ranges_.clear();
+
+  {
+    ReadOptions ro;
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+    if (forward_first) {
+      iter->SeekToFirst();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("a", iter->key().ToString());
+      iter->Next();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("b", iter->key().ToString());
+      iter->Next();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("h", iter->key().ToString());
+      iter->Next();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("i", iter->key().ToString());
+      iter->Next();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("o", iter->key().ToString());
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("i", iter->key().ToString());
+    } else {
+      iter->SeekToLast();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("p", iter->key().ToString());
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("o", iter->key().ToString());
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("i", iter->key().ToString());
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("h", iter->key().ToString());
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("b", iter->key().ToString());
+      iter->Next();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("h", iter->key().ToString());
+    }
+    ASSERT_OK(iter->status());
+  }
+
+  ASSERT_EQ(attempted_insert_ranges_.size(), 2);
+  if (forward_first) {
+    AssertRange(0, "c", "h");
+    AssertRange(1, "j", "o");
+  } else {
+    AssertRange(0, "j", "o");
+    AssertRange(1, "c", "h");
+  }
+
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      2);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_DISCARDED),
+      1);
+}
+
+TEST_P(ReadPathRangeTombstoneTest, MixedDeleteAndSingleDelete) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  SetupTestData(/*first_key=*/'a', /*last_key=*/'h',
+                /*flushed_point_dels=*/{},
+                /*memtable_point_dels=*/{"b", "d", "f"});
+
+  ASSERT_OK(SingleDelete("c"));
+  ASSERT_OK(SingleDelete("e"));
+
+  attempted_insert_ranges_.clear();
+
+  VerifyIteration({"a", "g", "h"});
+
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  AssertRange(0, "b", "g");
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      1);
+
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+  ASSERT_EQ(Get("c"), "NOT_FOUND");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+  ASSERT_EQ(Get("e"), "NOT_FOUND");
+  ASSERT_EQ(Get("f"), "NOT_FOUND");
+  ASSERT_EQ(Get("g"), "vg");
+}
+
+TEST_P(ReadPathRangeTombstoneTest, SingleDeleteOnlyRun) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  SetupTestData(/*first_key=*/'a', /*last_key=*/'h',
+                /*flushed_point_dels=*/{}, /*memtable_point_dels=*/{});
+
+  ASSERT_OK(SingleDelete("b"));
+  ASSERT_OK(SingleDelete("c"));
+  ASSERT_OK(SingleDelete("d"));
+  ASSERT_OK(SingleDelete("e"));
+  ASSERT_OK(SingleDelete("f"));
+
+  attempted_insert_ranges_.clear();
+
+  VerifyIteration({"a", "g", "h"});
+
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  AssertRange(0, "b", "g");
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      1);
+}
+
+TEST_P(ReadPathRangeTombstoneTest, PrefixFilterDefaultReadOptions) {
+  // total_order_seek=false (default) with prefix extractor. Even when the
+  // visible scan contains a valid in-prefix tombstone run [ba, bc), read-path
+  // range conversion is disabled in this legacy prefix mode, so no
+  // converted memtable tombstone is inserted.
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+  table_options.whole_key_filtering = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  // One live key is enough to terminate the same-prefix run [ba, bc).
+  ASSERT_OK(Put("bc", "live_b"));
+  ASSERT_OK(Flush());
+
+  // Two point tombstones make [ba, bc) a valid same-prefix conversion
+  // candidate, but default legacy prefix reads must still not materialize it.
+  ASSERT_OK(Delete("ba"));
+  ASSERT_OK(Delete("bb"));
+
+  attempted_insert_ranges_.clear();
+  auto it = std::unique_ptr<Iterator>(db_->NewIterator(ReadOptions()));
+  if (Forward()) {
+    it->Seek("b");
+    while (it->Valid()) {
+      it->Next();
+    }
+  } else {
+    it->Seek("bc");
+    ASSERT_TRUE(it->Valid());
+    while (it->Valid()) {
+      it->Prev();
+    }
+  }
+  ASSERT_OK(it->status());
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0u);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0u);
+}
+
+TEST_P(ReadPathRangeTombstoneTest, PrefixFilterTotalOrderSeek) {
+  // total_order_seek=true disables prefix filtering -- all files visible.
+  // The delete run spans from prefix 'b' into prefix 'c', terminated by
+  // live key "cb" from L0. The tombstone [ba, cb) crosses prefix boundaries,
+  // which is safe because total_order_seek makes all files visible.
+  for (bool use_udt : {false, true}) {
+    SCOPED_TRACE(use_udt ? "with UDT" : "without UDT");
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.statistics = CreateDBStatistics();
+    options.disable_auto_compactions = true;
+    options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+    if (use_udt) {
+      options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    }
+    BlockBasedTableOptions table_options;
+    table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    table_options.whole_key_filtering = false;
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+
+    std::string ts;
+    Slice ts_slice;
+    std::string read_ts;
+    Slice read_ts_slice;
+    if (use_udt) {
+      PutFixed64(&ts, 1);
+      ts_slice = Slice(ts);
+      read_ts_slice = MaxTimestamp(&read_ts);
+    }
+
+    auto put = [&](const std::string& k, const std::string& v) {
+      return use_udt ? db_->Put(WriteOptions(), k, ts_slice, v) : Put(k, v);
+    };
+    auto del = [&](const std::string& k) {
+      return use_udt ? db_->Delete(WriteOptions(), k, ts_slice) : Delete(k);
+    };
+
+    // L0: live key "cb" (prefix 'c').
+    ASSERT_OK(put("cb", "live_value"));
+    ASSERT_OK(Flush());
+
+    // Memtable: contiguous deletes spanning prefixes 'b' and 'c'.
+    // No live key between "bb" and "cb" -- the run crosses prefix boundaries.
+    ASSERT_OK(put("aa", "below"));
+    ASSERT_OK(del("ba"));
+    ASSERT_OK(del("bb"));
+    ASSERT_OK(del("ca"));
+    ASSERT_OK(put("fa", "above"));
+
+    attempted_insert_ranges_.clear();
+    ReadOptions ro;
+    ro.total_order_seek = true;
+    if (use_udt) {
+      ro.timestamp = &read_ts_slice;
+    }
+    auto it = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+    if (Forward()) {
+      it->Seek("b");
+      while (it->Valid()) {
+        it->Next();
+      }
+    } else {
+      it->Seek("fa");
+      ASSERT_TRUE(it->Valid());
+      while (it->Valid()) {
+        it->Prev();
+      }
+    }
+    ASSERT_OK(it->status());
+    // Tombstone crosses from prefix 'b' into 'c', terminated by live "cb".
+    ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
+    if (use_udt) {
+      AssertRange(0, std::string("ba") + ts, std::string("cb") + ts);
+    } else {
+      AssertRange(0, "ba", "cb");
+    }
+  }
+}
+
+TEST_P(ReadPathRangeTombstoneTest, PrefixFilterPrefixSameAsStart) {
+  // prefix_same_as_start=true: prefix filtering active, DBIter bounds the
+  // scan to the seek prefix. An out-of-prefix tombstone ends the visible run,
+  // but the converted range still stays within prefix by flushing to the
+  // last tracked in-prefix tombstone.
+  // total_order_seek should not matter as we are guaranteed a total order view
+  // within the prefix bounds.
+  for (bool use_udt : {false, true}) {
+    for (bool total_order : {false, true}) {
+      SCOPED_TRACE(std::string(use_udt ? "UDT" : "no-UDT") + ", " +
+                   (total_order ? "total_order" : "prefix_seek"));
+      Options options = CurrentOptions();
+      options.min_tombstones_for_range_conversion = 2;
+      options.statistics = CreateDBStatistics();
+      options.disable_auto_compactions = true;
+      options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+      if (use_udt) {
+        options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+      }
+      BlockBasedTableOptions table_options;
+      table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+      table_options.whole_key_filtering = false;
+      options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+      DestroyAndReopen(options);
+
+      std::string ts;
+      Slice ts_slice;
+      std::string read_ts;
+      Slice read_ts_slice;
+      if (use_udt) {
+        PutFixed64(&ts, 1);
+        ts_slice = Slice(ts);
+        read_ts_slice = MaxTimestamp(&read_ts);
+      }
+
+      auto put = [&](const std::string& k, const std::string& v) {
+        return use_udt ? db_->Put(WriteOptions(), k, ts_slice, v) : Put(k, v);
+      };
+      auto del = [&](const std::string& k) {
+        return use_udt ? db_->Delete(WriteOptions(), k, ts_slice) : Delete(k);
+      };
+
+      ASSERT_OK(put("cb", "live_value"));
+      ASSERT_OK(Flush());
+
+      ASSERT_OK(put("aa", "below"));
+      ASSERT_OK(del("ba"));
+      ASSERT_OK(del("bb"));
+      ASSERT_OK(del("ca"));
+      ASSERT_OK(put("fa", "above"));
+
+      attempted_insert_ranges_.clear();
+      ReadOptions ro;
+      ro.prefix_same_as_start = true;
+      ro.total_order_seek = total_order;
+      if (use_udt) {
+        ro.timestamp = &read_ts_slice;
+      }
+      auto it = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+      if (Forward()) {
+        it->Seek("ba");
+        while (it->Valid()) {
+          it->Next();
+        }
+      } else {
+        it->SeekForPrev("bb");
+        ASSERT_FALSE(it->Valid());
+      }
+      ASSERT_OK(it->status());
+      ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
+      ASSERT_EQ(options.statistics->getTickerCount(
+                    READ_PATH_RANGE_TOMBSTONES_INSERTED),
+                1u);
+      if (use_udt) {
+        const std::string end_ts =
+            Forward() ? ts : std::string(sizeof(uint64_t), '\0');
+        AssertRange(0, std::string("ba") + ts, std::string("bb") + end_ts);
+      } else {
+        AssertRange(0, "ba", "bb");
+      }
+      if (use_udt) {
+        std::string val;
+        ASSERT_OK(db_->Get(ro, db_->DefaultColumnFamily(), "cb", &val));
+        ASSERT_EQ(val, "live_value");
+      } else {
+        ASSERT_EQ(Get("cb"), "live_value");
+      }
+    }
+  }
+}
+
+TEST_P(ReadPathRangeTombstoneTest,
+       PrefixFilterUpperBoundDoesNotCoverSkippedLiveKey) {
+  if (!Forward()) {
+    return;
+  }
+
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 3;
+  options.statistics = CreateDBStatistics();
+  options.disable_auto_compactions = true;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+  table_options.whole_key_filtering = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  // Keep a live in-prefix key above the user upper bound in an SST so the
+  // bounded prefix scan cannot return it, then leave a later same-prefix
+  // memtable key available as the internal stop key. If cleanup uses that
+  // late memtable key as the synthetic range end, it will cover "be".
+  ASSERT_OK(Put("be", "live_b"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Delete("ba"));
+  ASSERT_OK(Delete("bb"));
+  ASSERT_OK(Delete("bc"));
+  ASSERT_OK(Put("bz", "live_z"));
+
+  attempted_insert_ranges_.clear();
+  ReadOptions ro;
+  ro.prefix_same_as_start = true;
+  std::string upper_str = "bd";
+  Slice upper(upper_str);
+  ro.iterate_upper_bound = &upper;
+  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+
+  std::vector<std::string> keys;
+  for (iter->Seek("ba"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(keys.empty());
+
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
+
+  ASSERT_EQ(Get("be"), "live_b");
+}
+
+TEST_P(ReadPathRangeTombstoneTest, PrefixFilterOutOfDomainSeek) {
+  // With an out-of-domain seek target, prefix_same_as_start cannot establish
+  // a seek-prefix bound. The iterator therefore behaves like an unrestricted
+  // scan while still avoiding Transform() on the short seek target, so the
+  // valid run [bbbb, bbdd) should be converted even though it spans multiple
+  // distinct prefixes.
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  options.disable_auto_compactions = true;
+  // FixedPrefixTransform(4): keys shorter than 4 bytes are out-of-domain.
+  options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+  table_options.whole_key_filtering = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  // All keys are in-domain (>= 4 bytes).
+  ASSERT_OK(Put("aaaa", "v1"));
+  ASSERT_OK(Delete("bbbb"));
+  ASSERT_OK(Delete("bbcc"));
+  ASSERT_OK(Delete("bbcd"));
+  ASSERT_OK(Put("bbdd", "v2"));
+  ASSERT_OK(Put("cccc", "v3"));
+
+  attempted_insert_ranges_.clear();
+  ReadOptions ro;
+  ro.prefix_same_as_start = true;
+  auto it = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+  if (Forward()) {
+    // Seek with a 1-byte key -- out-of-domain for FixedPrefixTransform(4).
+    // prefix_same_as_start cannot set a prefix bound for this target.
+    it->Seek("b");
+    while (it->Valid()) {
+      it->Next();
+    }
+  } else {
+    it->Seek("c");
+    ASSERT_TRUE(it->Valid());
+    while (it->Valid()) {
+      it->Prev();
+    }
+  }
+  ASSERT_OK(it->status());
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
+  AssertRange(0, "bbbb", "bbdd");
+}
+
+TEST_P(ReadPathRangeTombstoneTest, TableFilterNotAllowed) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  // Base data lives in one SST.
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Put("d", "vd"));
+  ASSERT_OK(Flush());
+
+  // Two point tombstones in a second SST are enough to trigger range
+  // conversion during a subsequent unfiltered scan.
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Flush());
+
+  // Keep the active memtable non-empty so the read path has somewhere to store
+  // the converted memtable range tombstone.
+  ASSERT_OK(Put("zz", "tail_mem"));
+
+  attempted_insert_ranges_.clear();
+  {
+    // First iterator sees the full SST set, so converting [a, c) into a
+    // memtable range tombstone is safe.
+    ReadOptions ro;
+    auto it = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+    it->SeekToFirst();
+    while (it->Valid()) {
+      it->Next();
+    }
+    ASSERT_OK(it->status());
+  }
+
+  ASSERT_GE(attempted_insert_ranges_.size(), 1u);
+  AssertRange(0, "a", "c");
+
+  {
+    ReadOptions filtered_ro;
+    std::function<bool(const TableProperties&)> filter =
+        [](const TableProperties& props) { return props.num_entries != 2; };
+    filtered_ro.table_filter = &filter;
+    // Hiding the two-delete SST would otherwise leave this iterator with a
+    // partial SST view plus the previously converted memtable tombstone,
+    // allowing hidden SST state to affect the filtered read result.
+    AssertTableFilterRangeConversionRejected(filtered_ro);
+  }
+
+  // Rejecting the filtered iterator preserves the correct full-DB view.
+  VerifyIteration({"c", "d", "zz"});
+}
+
+TEST_P(ReadPathRangeTombstoneTest, SnapshotPredatesMemtable) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  SetupTestData(/*first_key=*/'a', /*last_key=*/'h',
+                /*flushed_point_dels=*/{"b", "c", "d", "e", "f"},
+                /*memtable_point_dels=*/{});
+
+  const Snapshot* snap = db_->GetSnapshot();
+
+  ASSERT_OK(Put("x", "vx"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("y", "vy"));
+
+  attempted_insert_ranges_.clear();
+
+  ReadOptions ro;
+  ro.snapshot = snap;
+  VerifyIteration({"a", "g", "h"}, ro);
+
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+  ASSERT_GT(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_DISCARDED),
+      0);
+
+  db_->ReleaseSnapshot(snap);
+}
+
+TEST_P(ReadPathRangeTombstoneTest, NoInsertionOnBlockCacheTierIncomplete) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+
+  BlockBasedTableOptions table_options;
+  table_options.flush_block_policy_factory =
+      std::make_shared<FlushBlockEveryKeyPolicyFactory>();
+  table_options.block_cache = NewLRUCache(1 << 20);
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.pin_l0_filter_and_index_blocks_in_cache = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  for (char c = 'a'; c <= 'h'; c++) {
+    ASSERT_OK(Put(std::string(1, c), std::string("v") + c));
+  }
+  ASSERT_OK(Flush());
+
+  if (Forward()) {
+    // Warm cache for a-g, leave h uncached.
+    for (char c = 'a'; c <= 'g'; c++) {
+      ASSERT_EQ(Get(std::string(1, c)), std::string("v") + c);
+    }
+    // Delete d-g (4 contiguous tombstones).
+    for (char c = 'd'; c <= 'g'; c++) {
+      ASSERT_OK(Delete(std::string(1, c)));
+    }
+  } else {
+    // Warm cache for b-h, leave a uncached.
+    for (char c = 'b'; c <= 'h'; c++) {
+      ASSERT_EQ(Get(std::string(1, c)), std::string("v") + c);
+    }
+    // Delete b-e (4 contiguous tombstones).
+    for (char c = 'b'; c <= 'e'; c++) {
+      ASSERT_OK(Delete(std::string(1, c)));
+    }
+  }
+
+  {
+    ReadOptions ro;
+    ro.read_tier = kBlockCacheTier;
+    Slice upper("z");
+    ro.iterate_upper_bound = &upper;
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+    if (Forward()) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      }
+    } else {
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+      }
+    }
+    ASSERT_TRUE(iter->status().IsIncomplete());
+  }
+
+  // No range tombstone should have been inserted despite meeting threshold:
+  // conversion is disabled for kBlockCacheTier, and the iterator terminated
+  // with Incomplete (cache miss).
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+
+  // All keys must still be readable via normal Get.
+  if (Forward()) {
+    ASSERT_EQ(Get("h"), "vh");
+  } else {
+    ASSERT_EQ(Get("a"), "va");
+  }
+}
+
+TEST_P(ReadPathRangeTombstoneTest, NoInsertionFromMemtableTierIterator) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  // "c" is live and only exists in an SST file, which a kMemtableTier
+  // iterator does not read.
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Delete("d"));
+  ASSERT_OK(Put("e", "ve"));
+
+  {
+    ReadOptions ro;
+    ro.read_tier = kMemtableTier;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    std::vector<std::string> seen;
+    if (Forward()) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        seen.push_back(iter->key().ToString());
+      }
+    } else {
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        seen.insert(seen.begin(), iter->key().ToString());
+      }
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(seen, std::vector<std::string>({"a", "e"}));
+  }
+
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(Get("c"), "vc");
+}
+
+TEST_P(ReadPathRangeTombstoneTest, PartialTierReadsAfterConversion) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  BlockBasedTableOptions table_options;
+  table_options.flush_block_policy_factory =
+      std::make_shared<FlushBlockEveryKeyPolicyFactory>();
+  std::shared_ptr<Cache> block_cache = NewLRUCache(1 << 20);
+  table_options.block_cache = block_cache;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  // Conversion starts disabled so the reads recorded before it do not insert.
+  DestroyAndReopen(options);
+
+  for (char c = 'a'; c <= 'h'; c++) {
+    ASSERT_OK(Put(std::string(1, c), std::string("v") + c));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Delete("c"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("a", "va2"));
+  ASSERT_OK(Delete("d"));
+  ASSERT_OK(Put("e", "ve2"));
+  ASSERT_OK(Delete("e"));
+
+  auto scan = [&](ReadTier tier) {
+    ReadOptions ro;
+    ro.read_tier = tier;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    std::vector<std::string> out;
+    if (Forward()) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        out.push_back(iter->key().ToString() + "=" + iter->value().ToString());
+      }
+    } else {
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        out.insert(out.begin(),
+                   iter->key().ToString() + "=" + iter->value().ToString());
+      }
+    }
+    out.push_back(iter->status().ToString());
+    return out;
+  };
+  // kMemtableTier only affects iterators, so point reads compare
+  // kBlockCacheTier with kReadAllTier.
+  auto gets = [&](ReadTier tier) {
+    ReadOptions ro;
+    ro.read_tier = tier;
+    std::vector<std::string> out;
+    for (char c = 'a'; c <= 'h'; c++) {
+      std::string value;
+      Status s = db_->Get(ro, std::string(1, c), &value);
+      out.push_back(std::string(1, c) + ":" + (s.ok() ? value : s.ToString()));
+    }
+    return out;
+  };
+
+  const auto cold_cache_scan_before = scan(kBlockCacheTier);
+  const auto cold_cache_gets_before = gets(kBlockCacheTier);
+  const std::string incomplete =
+      Status::Incomplete("no blocking io").ToString();
+  ASSERT_EQ(cold_cache_scan_before.back(), incomplete);
+  ASSERT_EQ(cold_cache_gets_before[1], "b:" + incomplete);
+  ASSERT_EQ(cold_cache_gets_before[2], "c:" + incomplete);
+
+  // A full scan with conversion disabled reads every block into the cache.
+  const std::vector<std::string> full_view = {"a=va2", "f=vf", "g=vg", "h=vh",
+                                              "OK"};
+  ASSERT_EQ(scan(kReadAllTier), full_view);
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0);
+
+  const auto mem_scan_before = scan(kMemtableTier);
+  ASSERT_EQ(mem_scan_before, std::vector<std::string>({"a=va2", "OK"}));
+  const auto warm_cache_scan_before = scan(kBlockCacheTier);
+  ASSERT_EQ(warm_cache_scan_before, full_view);
+  const auto warm_cache_gets_before = gets(kBlockCacheTier);
+  const auto full_gets = gets(kReadAllTier);
+  ASSERT_EQ(warm_cache_gets_before, full_gets);
+
+  ASSERT_OK(db_->SetOptions({{"min_tombstones_for_range_conversion", "2"}}));
+  // A complete kBlockCacheTier scan does not convert. Only kReadAllTier does.
+  ASSERT_EQ(scan(kBlockCacheTier), warm_cache_scan_before);
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0);
+  ASSERT_EQ(scan(kReadAllTier), full_view);
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  AssertRange(0, "b", "f");
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      1);
+
+  ASSERT_EQ(scan(kMemtableTier), mem_scan_before);
+  ASSERT_EQ(scan(kBlockCacheTier), warm_cache_scan_before);
+  ASSERT_EQ(gets(kBlockCacheTier), warm_cache_gets_before);
+
+  // With a cold cache, Gets of the covered keys "b" and "c" now stop at the
+  // memtable range tombstone and return the full-tier NotFound instead of
+  // Incomplete. No read returns a different value.
+  block_cache->EraseUnRefEntries();
+  ASSERT_EQ(scan(kBlockCacheTier), cold_cache_scan_before);
+  auto expected_cold_cache_gets = cold_cache_gets_before;
+  expected_cold_cache_gets[1] = full_gets[1];
+  expected_cold_cache_gets[2] = full_gets[2];
+  ASSERT_EQ(gets(kBlockCacheTier), expected_cold_cache_gets);
+}
+
+TEST_P(ReadPathRangeTombstoneTest, SkipInsertionWhenCoveredByExistingRange) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  for (char c = 'a'; c <= 'h'; c++) {
+    ASSERT_OK(Put(std::string(1, c), std::string("v") + c));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(
+      db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "c", "h"));
+
+  for (char c = 'd'; c <= 'g'; c++) {
+    ASSERT_OK(Delete(std::string(1, c)));
+  }
+
+  attempted_insert_ranges_.clear();
+  ReadOptions ro;
+  Slice upper("z");
+  ro.iterate_upper_bound = &upper;
+  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+  if (Forward()) {
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    }
+  } else {
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+    }
+  }
+  ASSERT_OK(iter->status());
+
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+  ASSERT_GT(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_DISCARDED),
+      0);
+}
+
+// Verifies that range tombstone insertion works correctly with user-defined
+// timestamps (UDT) when the read timestamp has full visibility. With UDT, keys
+// include an 8-byte timestamp suffix, so the comparator, Put/Delete APIs, and
+// ReadOptions all require timestamps. This test keeps the optimization enabled
+// by reading at the max timestamp.
+TEST_P(ReadPathRangeTombstoneTest, UDTBasicScan) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  DestroyAndReopen(options);
+
+  std::string ts;
+  PutFixed64(&ts, 1);
+  Slice ts_slice(ts);
+  std::string read_ts;
+  Slice read_ts_slice = MaxTimestamp(&read_ts);
+  SetupTestData('a', 'h', /*flushed_point_dels=*/{},
+                /*memtable_point_dels=*/{"b", "c", "d", "e", "f"}, &ts_slice);
+
+  ReadOptions ro;
+  ro.timestamp = &read_ts_slice;
+  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+  std::vector<std::string> keys;
+  if (Forward()) {
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+  } else {
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+      keys.push_back(iter->key().ToString());
+    }
+    std::reverse(keys.begin(), keys.end());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(keys, (std::vector<std::string>{"a", "g", "h"}));
+
+  // Range covers [b+ts, g+ts).
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  AssertRange(0, std::string("b") + ts, std::string("g") + ts);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      1);
+}
+
+// Regression test: an older UDT read timestamp can hide newer live versions
+// inside a delete run. Range conversion must stay disabled in that case, or
+// the converted range tombstone will incorrectly hide those newer versions
+// for later max-timestamp reads.
+TEST_P(ReadPathRangeTombstoneTest, UDTOlderTimestampDisablesInsertion) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  DestroyAndReopen(options);
+
+  std::string ts1;
+  std::string ts2;
+  std::string ts3;
+  PutFixed64(&ts1, 1);
+  PutFixed64(&ts2, 2);
+  PutFixed64(&ts3, 3);
+  Slice ts1_slice(ts1);
+  Slice ts2_slice(ts2);
+  Slice ts3_slice(ts3);
+  std::string max_ts;
+  Slice max_ts_slice = MaxTimestamp(&max_ts);
+
+  ASSERT_OK(db_->Put(WriteOptions(), "a", ts1_slice, "va1"));
+  ASSERT_OK(db_->Put(WriteOptions(), "c", ts1_slice, "vc1"));
+  ASSERT_OK(db_->Put(WriteOptions(), "d", ts1_slice, "vd1"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_->Delete(WriteOptions(), "a", ts2_slice));
+  ASSERT_OK(db_->Delete(WriteOptions(), "c", ts2_slice));
+
+  ASSERT_OK(db_->Put(WriteOptions(), "a", ts3_slice, "va3"));
+  ASSERT_OK(db_->Put(WriteOptions(), "b", ts3_slice, "vb3"));
+  ASSERT_OK(db_->Put(WriteOptions(), "c", ts3_slice, "vc3"));
+
+  attempted_insert_ranges_.clear();
+  ReadOptions old_ro;
+  old_ro.timestamp = &ts2_slice;
+  VerifyIteration({"d"}, old_ro);
+
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0u);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+
+  ReadOptions latest_ro;
+  latest_ro.timestamp = &max_ts_slice;
+  VerifyIteration({"a", "b", "c", "d"}, latest_ro);
+}
+
+// When UDT is enabled and iteration exhausts with tombstones at the boundary,
+// range tombstone insertion should still work if the read sees all timestamps.
+// For forward exhaustion, the iterate_upper_bound is padded with the min
+// timestamp to form a valid end key. For reverse exhaustion, the end key comes
+// from the next live key which already has the timestamp suffix.
+TEST_P(ReadPathRangeTombstoneTest, ExhaustedWithUDT) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 4;
+  options.statistics = CreateDBStatistics();
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  DestroyAndReopen(options);
+
+  std::string ts;
+  PutFixed64(&ts, 1);
+  Slice ts_slice(ts);
+  std::string read_ts;
+  Slice read_ts_slice = MaxTimestamp(&read_ts);
+  std::string min_ts(sizeof(uint64_t), '\0');
+
+  // Forward: tombstones at end (e-h), needs upper bound for end key.
+  // Reverse: tombstones at start (a-d), end key from live key "e".
+  if (Forward()) {
+    SetupTestData('a', 'h', /*flushed_point_dels=*/{},
+                  /*memtable_point_dels=*/{"e", "f", "g", "h"}, &ts_slice);
+  } else {
+    SetupTestData('a', 'h', /*flushed_point_dels=*/{},
+                  /*memtable_point_dels=*/{"a", "b", "c", "d"}, &ts_slice);
+  }
+
+  ReadOptions ro;
+  ro.timestamp = &read_ts_slice;
+  std::string upper_str = "z";
+  Slice upper(upper_str);
+  if (Forward()) {
+    ro.iterate_upper_bound = &upper;
+  }
+  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+  std::vector<std::string> keys;
+  if (Forward()) {
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+  } else {
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+      keys.push_back(iter->key().ToString());
+    }
+    std::reverse(keys.begin(), keys.end());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(keys.size(), 4);
+
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  if (Forward()) {
+    // Forward exhaustion past h: saved_key_="h"+ts fallback -> [e+ts, h+ts).
+    AssertRange(0, std::string("e") + ts, std::string("h") + ts);
+  } else {
+    // Reverse exhaustion: range is [a+ts, e+ts).
+    AssertRange(0, std::string("a") + ts, std::string("e") + ts);
+  }
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      1);
+}
+
+TEST_P(ReadPathRangeTombstoneTest, SeekForPrevTombstone) {
+  // SeekForPrev lands directly on tombstones. No upper bound. Forward
+  // exhaustion past h falls back to saved_key_="h" -> [e, h), covering
+  // e,f,g with h as a point tombstone.
+  // Reverse: SeekForPrev("h") -> Delete(h,g,f,e) -> live "d" -> range [e, h).
+  for (bool use_udt : {false, true}) {
+    SCOPED_TRACE(use_udt ? "with UDT" : "without UDT");
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 4;
+    options.statistics = CreateDBStatistics();
+    if (use_udt) {
+      options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    }
+    DestroyAndReopen(options);
+
+    std::string ts;
+    Slice ts_slice;
+    std::string read_ts;
+    Slice read_ts_slice;
+    Slice* ts_ptr = nullptr;
+    if (use_udt) {
+      PutFixed64(&ts, 1);
+      ts_slice = Slice(ts);
+      read_ts_slice = MaxTimestamp(&read_ts);
+      ts_ptr = &ts_slice;
+    }
+    SetupTestData('a', 'h', /*flushed_point_dels=*/{},
+                  /*memtable_point_dels=*/{"e", "f", "g", "h"}, ts_ptr);
+    attempted_insert_ranges_.clear();
+
+    ReadOptions ro;
+    if (use_udt) {
+      ro.timestamp = &read_ts_slice;
+    }
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+
+    std::vector<std::string> keys;
+    if (Forward()) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        keys.push_back(iter->key().ToString());
+      }
+    } else {
+      // SeekForPrev("h") lands on Delete(h), traverses g,f,e -> finds "d".
+      for (iter->SeekForPrev("h"); iter->Valid(); iter->Prev()) {
+        keys.push_back(iter->key().ToString());
+      }
+      std::reverse(keys.begin(), keys.end());
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(keys, (std::vector<std::string>{"a", "b", "c", "d"}));
+
+    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+    if (Forward()) {
+      // Forward exhausts past h -> saved_key_="h" fallback -> [e, h),
+      // covering e,f,g with h as a point tombstone.
+      if (use_udt) {
+        AssertRange(0, std::string("e") + ts, std::string("h") + ts);
+      } else {
+        AssertRange(0, "e", "h");
+      }
+    } else {
+      if (use_udt) {
+        std::string min_ts(sizeof(uint64_t), '\0');
+        AssertRange(0, std::string("e") + ts, std::string("h") + min_ts);
+      } else {
+        AssertRange(0, "e", "h");
+      }
+    }
+    ASSERT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        1);
+  }
+}
+
+TEST_P(ReadPathRangeTombstoneTest, UpperBoundTombstone) {
+  // iterate_upper_bound lands past the data. Both directions see tombstones
+  // e-h. Forward exhausts naturally past h (no key in DB >= upper) so the
+  // forward path falls back to saved_key_ ("h") as the exclusive end_key,
+  // covering n-1 of n deletes -- [e, h). The remaining tombstone for h
+  // stays as a point delete. Reverse captures the live key "d" before the
+  // run and uses it via range_tomb_end_key_ -- [e, i) when SeekToLast
+  // delegates to SeekForPrev("i").
+  for (bool use_udt : {false, true}) {
+    SCOPED_TRACE(use_udt ? "with UDT" : "without UDT");
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 4;
+    options.statistics = CreateDBStatistics();
+    if (use_udt) {
+      options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    }
+    DestroyAndReopen(options);
+
+    std::string ts;
+    Slice ts_slice;
+    std::string read_ts;
+    Slice read_ts_slice;
+    Slice* ts_ptr = nullptr;
+    if (use_udt) {
+      PutFixed64(&ts, 1);
+      ts_slice = Slice(ts);
+      read_ts_slice = MaxTimestamp(&read_ts);
+      ts_ptr = &ts_slice;
+    }
+    SetupTestData('a', 'h', /*flushed_point_dels=*/{},
+                  /*memtable_point_dels=*/{"e", "f", "g", "h"}, ts_ptr);
+    attempted_insert_ranges_.clear();
+
+    ReadOptions ro;
+    if (use_udt) {
+      ro.timestamp = &read_ts_slice;
+    }
+    std::string upper_str = "i";
+    Slice upper(upper_str);
+    ro.iterate_upper_bound = &upper;
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+
+    std::vector<std::string> keys;
+    if (Forward()) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        keys.push_back(iter->key().ToString());
+      }
+    } else {
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        keys.push_back(iter->key().ToString());
+      }
+      std::reverse(keys.begin(), keys.end());
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(keys, (std::vector<std::string>{"a", "b", "c", "d"}));
+
+    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+    if (use_udt) {
+      if (Forward()) {
+        // Forward end key: saved_key_ ("h") with the tombstone's own ts.
+        AssertRange(0, std::string("e") + ts, std::string("h") + ts);
+      } else {
+        // Reverse end key: upper bound padded with max_ts (via
+        // SetSavedKeyToSeekForPrevTarget).
+        std::string end_ts(sizeof(uint64_t), '\xff');
+        AssertRange(0, std::string("e") + ts, std::string("i") + end_ts);
+      }
+    } else {
+      AssertRange(0, "e", Forward() ? "h" : "i");
+    }
+    ASSERT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        1);
+  }
+}
+
+TEST_P(ReadPathRangeTombstoneTest, LowerBoundTruncatesReverse) {
+  // Keys a-j, delete a-h. Lower bound "e" truncates reverse iteration
+  // mid-tombstone-run. Forward: tombstones e-h ended by live key i -> [e, i).
+  // Reverse: tombstones h,g,f,e then lower_bound hit -> flush [e, i).
+  for (bool use_udt : {false, true}) {
+    SCOPED_TRACE(use_udt ? "with UDT" : "without UDT");
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 4;
+    options.statistics = CreateDBStatistics();
+    if (use_udt) {
+      options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    }
+    DestroyAndReopen(options);
+
+    std::string ts;
+    Slice ts_slice;
+    std::string read_ts;
+    Slice read_ts_slice;
+    Slice* ts_ptr = nullptr;
+    if (use_udt) {
+      PutFixed64(&ts, 1);
+      ts_slice = Slice(ts);
+      read_ts_slice = MaxTimestamp(&read_ts);
+      ts_ptr = &ts_slice;
+    }
+    SetupTestData(
+        'a', 'j', /*flushed_point_dels=*/{},
+        /*memtable_point_dels=*/{"a", "b", "c", "d", "e", "f", "g", "h"},
+        ts_ptr);
+    attempted_insert_ranges_.clear();
+
+    ReadOptions ro;
+    if (use_udt) {
+      ro.timestamp = &read_ts_slice;
+    }
+    std::string lower_str = "e";
+    Slice lower(lower_str);
+    ro.iterate_lower_bound = &lower;
+    std::string upper_str = "z";
+    Slice upper(upper_str);
+    ro.iterate_upper_bound = &upper;
+
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
+    std::vector<std::string> keys;
+    if (Forward()) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        keys.push_back(iter->key().ToString());
+      }
+    } else {
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        keys.push_back(iter->key().ToString());
+      }
+      std::reverse(keys.begin(), keys.end());
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(keys, (std::vector<std::string>{"i", "j"}));
+
+    // Both directions produce one range covering tombstones e-h.
+    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+    if (use_udt) {
+      AssertRange(0, std::string("e") + ts, std::string("i") + ts);
+    } else {
+      AssertRange(0, "e", "i");
+    }
+    ASSERT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        1);
+  }
+}
+
+// Regression test: a delete run discovered through the reseek path must be
+// materialized at the reader's sequence so older snapshots keep seeing the
+// pre-delete values.
+TEST_P(ReadPathRangeTombstoneTest,
+       ReseekDiscoveredDeleteRunPreservesOlderSnapshots) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  // Low skip threshold forces FindValueForCurrentKeyUsingSeek for keys with
+  // many versions.
+  options.max_sequential_skip_in_iterations = 2;
+  DestroyAndReopen(options);
+
+  // Put keys a-d, flush so they get low sequence numbers.
+  //   seq 1: Put(a)  seq 2: Put(b)  seq 3: Put(c)  seq 4: Put(d)
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Put("d", "vd"));
+  ASSERT_OK(Flush());
+
+  // Give both b and c extra versions so FindValueForCurrentKey triggers the
+  // reseek path for each.
+  //   seq 5-7: Put(b) x3     seq 8-10: Put(c) x3
+  ASSERT_OK(Put("b", "b_v2"));
+  ASSERT_OK(Put("b", "b_v3"));
+  ASSERT_OK(Put("b", "b_v4"));
+  ASSERT_OK(Put("c", "c_v2"));
+  ASSERT_OK(Put("c", "c_v3"));
+  ASSERT_OK(Put("c", "c_v4"));
+
+  // Snapshot BEFORE the deletes. At this snapshot b and c are live.
+  const Snapshot* snap = db_->GetSnapshot();
+
+  // Delete b and c (2 tombstones = threshold).
+  //   seq 11: Del(b)   seq 12: Del(c)
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Delete("c"));
+
+  // Iterate at the latest sequence. Both b and c hit the reseek path and
+  // convert a range tombstone [b, d) for later readers at the same seq.
+  attempted_insert_ranges_.clear();
+  VerifyIteration({"a", "d"});
+
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  AssertRange(0, "b", "d");
+
+  // Read with the earlier snapshot. The point deletes (seq 11-12) are not
+  // visible, so b and c must remain live after the latest iterator ran.
+  ReadOptions ro;
+  ro.snapshot = snap;
+  VerifyIteration({"a", "b", "c", "d"}, ro);
+
+  db_->ReleaseSnapshot(snap);
+}
+
+// Regression test: keys written entirely after the snapshot do not break a
+// tombstone run discovered by reverse iteration.
+TEST_P(ReadPathRangeTombstoneTest, InvisibleKeysDontBreakTombstoneRun) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  // Base keys: a, b, d, f.
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put("d", "vd"));
+  ASSERT_OK(Put("f", "vf"));
+  ASSERT_OK(Flush());
+
+  // Delete b, d -- visible tombstones.
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Delete("d"));
+
+  // Snapshot S.  At S: a(live), b(del), d(del), f(live).
+  const Snapshot* snap = db_->GetSnapshot();
+
+  // Write c, e AFTER the snapshot -- invisible at S.
+  // At S the iterator sees: a(live), b(del), c(invis), d(del),
+  //   e(invis), f(live).
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Put("e", "ve"));
+
+  ReadOptions ro;
+  ro.snapshot = snap;
+  attempted_insert_ranges_.clear();
+  VerifyIteration({"a", "f"}, ro);
+
+  // Invisible keys c and e should not break the tombstone run.
+  // 2 tombstones (b, d) >= threshold -> range [b, f).
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  AssertRange(0, "b", "f");
+
+  db_->ReleaseSnapshot(snap);
+}
+
+// Regression test: a converted tombstone can land in the current memtable at
+// an older snapshot sequence than a live point already ingested into an older
+// L0 file. Latest point lookups must continue searching that older file when
+// its sequence range can still contain a newer point version.
+TEST_P(ReadPathRangeTombstoneTest, NewerPointInOlderFileStillVisible) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.disable_auto_compactions = true;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Put("d", "vd"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Delete("c"));
+  ASSERT_OK(Flush());
+
+  // Keep the active memtable older than the snapshot so the read path is
+  // allowed to convert a tombstone into it later.
+  ASSERT_OK(Put("z", "vz_anchor"));
+  const Snapshot* snap = db_->GetSnapshot();
+
+  const std::string ingest_file = dbname_ + "_live_c.sst";
+  {
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(ingest_file));
+    ASSERT_OK(writer.Put("c", "vc_live"));
+    ASSERT_OK(writer.Finish());
+  }
+
+  IngestExternalFileOptions ifo;
+  ifo.allow_blocking_flush = false;
+  ASSERT_OK(db_->IngestExternalFile({ingest_file}, ifo));
+  ASSERT_EQ(Get("c"), "vc_live");
+
+  attempted_insert_ranges_.clear();
+  ReadOptions snap_ro;
+  snap_ro.snapshot = snap;
+  VerifyIteration({"d", "z"}, snap_ro);
+
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  AssertRange(0, "b", "d");
+
+  const Snapshot* latest = db_->GetSnapshot();
+  ASSERT_EQ(Get("c", latest), "vc_live");
+  ASSERT_EQ(MultiGet({"c"}, latest), (std::vector<std::string>{"vc_live"}));
+
+  db_->ReleaseSnapshot(latest);
+  db_->ReleaseSnapshot(snap);
+}
+
+// Regression test: SeekToLast() after Seek() must clear stale saved_key_ to
+// avoid corrupting range tombstone tracking bounds.
+TEST_P(ReadPathRangeTombstoneTest, SeekToLastStaleSavedKey) {
+  if (Forward()) {
+    return;
+  }
+
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  for (char c = 'a'; c <= 'z'; c++) {
+    ASSERT_OK(Put(std::string(1, c), std::string("v") + c));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Delete("x"));
+  ASSERT_OK(Delete("y"));
+
+  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ReadOptions()));
+
+  // Seek populates saved_key_ with "a".
+  iter->Seek("a");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("a", iter->key().ToString());
+
+  // SeekToLast must not carry the stale saved_key_ into range tombstone bounds.
+  iter->SeekToLast();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ("z", iter->key().ToString());
+
+  // Reverse iteration skips deleted x and y.
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ("w", iter->key().ToString());
+}
+
+TEST_P(ReadPathRangeTombstoneTest, SeekToLastTombstones) {
+  if (Forward()) {
+    ROCKSDB_GTEST_BYPASS(
+        "SeekToLast tombstone materialization is reverse-only.");
+  }
+
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  for (char c = 'a'; c <= 'z'; c++) {
+    ASSERT_OK(Put(std::string(1, c), std::string("v") + c));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Delete("x"));
+  ASSERT_OK(Delete("y"));
+  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ReadOptions()));
+  attempted_insert_ranges_.clear();
+
+  iter->Seek("a");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("a", iter->key().ToString());
+
+  iter->SeekToLast();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ("z", iter->key().ToString());
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0u);
+
+  // Reverse iteration skips deleted x and y.
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ("w", iter->key().ToString());
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
+  AssertRange(0, "x", "z");
+}
+
+// Regression test for a crash-test pattern where the interior between two
+// point tombstones is hidden by a later DeleteRange. A latest iterator may
+// still convert a redundant range tombstone, but an older snapshot must
+// continue to see the pre-DeleteRange live key after iteration.
+TEST_P(ReadPathRangeTombstoneTest,
+       RangeDeletedInteriorPreservesOlderSnapshots) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  for (char c = 'a'; c <= 'n'; ++c) {
+    ASSERT_OK(Put(std::string(1, c), std::string("v") + c));
+  }
+  ASSERT_OK(Flush());
+
+  // Point tombstones at the boundaries of the future range-deleted interior.
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Delete("m"));
+
+  const Snapshot* snap = db_->GetSnapshot();
+  ReadOptions snap_ro;
+  snap_ro.snapshot = snap;
+  std::string snap_value;
+  ASSERT_OK(db_->Get(snap_ro, "c", &snap_value));
+  ASSERT_EQ(snap_value, "vc");
+
+  // Latest readers now see c-l deleted by range tombstone, but the older
+  // snapshot above must still see them live.
+  ASSERT_OK(
+      db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "c", "m"));
+
+  attempted_insert_ranges_.clear();
+  VerifyIteration({"a", "n"});
+
+  // Materialize the redundant tombstone at the latest read sequence only.
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  AssertRange(0, "b", "n");
+
+  snap_value.clear();
+  ASSERT_OK(db_->Get(snap_ro, "c", &snap_value));
+  ASSERT_EQ(snap_value, "vc");
+
+  db_->ReleaseSnapshot(snap);
+}
+
+// An ingested file that gets no new sequence number is invisible to an
+// iterator created before the ingestion. That iterator must not convert the
+// deleted keys around the file into a range tombstone that covers it.
+TEST_P(ReadPathRangeTombstoneTest, IngestedFileSurvivesOlderIterator) {
+  enum class IngestMode { kSeqnoZero, kIngestBehind, kDbGenerated };
+  for (IngestMode mode : {IngestMode::kSeqnoZero, IngestMode::kIngestBehind,
+                          IngestMode::kDbGenerated}) {
+    SCOPED_TRACE("ingest mode " + std::to_string(static_cast<int>(mode)));
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    options.cf_allow_ingest_behind = mode == IngestMode::kIngestBehind;
+    DestroyAndReopen(options);
+
+    std::string file = dbname_ + "/ingest_c.sst";
+    SequenceNumber expected_file_seqno = 0;
+    if (mode == IngestMode::kDbGenerated) {
+      const std::string src_path = dbname_ + "_src";
+      ASSERT_OK(DestroyDB(src_path, options));
+      std::unique_ptr<DB> src;
+      ASSERT_OK(DB::Open(options, src_path, &src));
+      ASSERT_OK(src->Put(WriteOptions(), "c", "vc"));
+      ASSERT_OK(src->Flush(FlushOptions()));
+      std::vector<LiveFileMetaData> src_files;
+      src->GetLiveFilesMetaData(&src_files);
+      ASSERT_EQ(src_files.size(), 1);
+      expected_file_seqno = src_files[0].largest_seqno;
+      ASSERT_GT(expected_file_seqno, 0);
+      file = src_files[0].directory + "/" + src_files[0].relative_filename;
+      ASSERT_OK(src->Close());
+    } else {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put("c", "vc"));
+      ASSERT_OK(writer.Finish());
+    }
+
+    for (const char* key : {"a", "b", "d", "e", "f", "g"}) {
+      ASSERT_OK(Put(key, std::string("v") + key));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("b"));
+    ASSERT_OK(Delete("d"));
+    // The iterator sequence number must be above the DB-generated file's.
+    ASSERT_OK(Delete("f"));
+    ASSERT_GT(db_->GetLatestSequenceNumber(), expected_file_seqno);
+
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+
+    // "c" falls between the deleted keys and overlaps no key in the DB.
+    IngestExternalFileOptions ifo;
+    ifo.ingest_behind = mode == IngestMode::kIngestBehind;
+    ifo.allow_db_generated_files = mode == IngestMode::kDbGenerated;
+    ASSERT_OK(db_->IngestExternalFile({file}, ifo));
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    bool found = false;
+    for (const auto& f : files) {
+      if (f.smallestkey == "c") {
+        found = true;
+        ASSERT_EQ(f.level, options.num_levels - 1);
+        ASSERT_EQ(f.largest_seqno, expected_file_seqno);
+      }
+    }
+    ASSERT_TRUE(found);
+    ASSERT_EQ(Get("c"), "vc");
+
+    // The iterator predates the ingestion, so it sees b and d as one run of
+    // deleted keys.
+    attempted_insert_ranges_.clear();
+    if (Forward()) {
+      iter->SeekToFirst();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "a");
+      iter->Next();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "e");
+    } else {
+      iter->SeekToLast();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "g");
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "e");
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "a");
+    }
+    ASSERT_OK(iter->status());
+    iter.reset();
+    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+    AssertRange(0, "b", "e");
+
+    EXPECT_EQ(Get("c"), "vc");
+    VerifyIteration({"a", "c", "e", "g"});
+    ASSERT_OK(Flush());
+    Reopen(options);
+    EXPECT_EQ(Get("c"), "vc");
+  }
+}
+
+// NewIterator() references the SuperVersion before it reads the sequence
+// number. An ingestion plus a write in between gives the iterator a sequence
+// number above the ingested files' while its SuperVersion lacks them. It must
+// not convert the deleted keys around those files into a range tombstone.
+TEST_P(ReadPathRangeTombstoneTest,
+       IngestedFileSurvivesIteratorWithOlderSuperVersion) {
+  for (bool new_seqno : {false, true}) {
+    SCOPED_TRACE(new_seqno ? "ingested with a new seqno"
+                           : "ingested with seqno zero");
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+
+    for (const char* key : {"a", "b", "d", "e"}) {
+      ASSERT_OK(Put(key, std::string("v") + key));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("b"));
+    ASSERT_OK(Delete("d"));
+    // The memtable stays empty, so the ingestion does not switch it.
+    ASSERT_OK(Flush());
+
+    // "c" alone overlaps no key, so it gets seqno zero. Adding "b" overlaps
+    // the deleted "b" in L0, so the file gets a new seqno.
+    const std::string file = dbname_ + "/ingest.sst";
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    if (new_seqno) {
+      ASSERT_OK(writer.Put("b", "vb2"));
+    }
+    ASSERT_OK(writer.Put("c", "vc"));
+    ASSERT_OK(writer.Finish());
+
+    SyncPoint::GetInstance()->LoadDependency(
+        {{"DBImpl::NewIterator:1",
+          "ReadPathRangeTombstoneTest::OlderSuperVersion:Ingest"},
+         {"ReadPathRangeTombstoneTest::OlderSuperVersion:Written",
+          "DBImpl::NewIterator:2"}});
+    std::unique_ptr<Iterator> iter;
+    port::Thread reader([&]() { iter.reset(db_->NewIterator(ReadOptions())); });
+    TEST_SYNC_POINT("ReadPathRangeTombstoneTest::OlderSuperVersion:Ingest");
+    ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+    ASSERT_OK(Put("z", "vz"));
+    TEST_SYNC_POINT("ReadPathRangeTombstoneTest::OlderSuperVersion:Written");
+    reader.join();
+    SyncPoint::GetInstance()->ClearTrace();
+    SyncPoint::GetInstance()->LoadDependency({});
+
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    bool found = false;
+    for (const auto& f : files) {
+      if (f.largestkey == "c") {
+        found = true;
+        ASSERT_EQ(f.largest_seqno > 0, new_seqno);
+      }
+    }
+    ASSERT_TRUE(found);
+
+    // The iterator reads past the write of "z" but not the ingested file.
+    attempted_insert_ranges_.clear();
+    std::vector<std::string> seen;
+    if (Forward()) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        seen.push_back(iter->key().ToString());
+      }
+    } else {
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        seen.insert(seen.begin(), iter->key().ToString());
+      }
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(seen, std::vector<std::string>({"a", "e", "z"}));
+    iter.reset();
+    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+    AssertRange(0, "b", "e");
+
+    EXPECT_EQ(Get("c"), "vc");
+    EXPECT_EQ(Get("b"), new_seqno ? "vb2" : "NOT_FOUND");
+    ASSERT_OK(Flush());
+    Reopen(options);
+    EXPECT_EQ(Get("c"), "vc");
+  }
+}
+
+// One IngestExternalFiles() call installs files in two column families. Each
+// column family's older iterator must refuse its conversion.
+TEST_P(ReadPathRangeTombstoneTest, AtomicIngestionSurvivesOlderIterators) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"pikachu"}, options);
+  std::vector<std::string> files;
+  for (int cf = 0; cf < 2; cf++) {
+    files.push_back(dbname_ + "/ingest_c" + std::to_string(cf) + ".sst");
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(files.back()));
+    ASSERT_OK(writer.Put("c", "vc"));
+    ASSERT_OK(writer.Finish());
+    for (const char* key : {"a", "b", "d", "e"}) {
+      ASSERT_OK(Put(cf, key, std::string("v") + key));
+    }
+    ASSERT_OK(Flush(cf));
+    ASSERT_OK(Delete(cf, "b"));
+    ASSERT_OK(Delete(cf, "d"));
+  }
+  std::unique_ptr<Iterator> it0(db_->NewIterator(ReadOptions(), handles_[0]));
+  std::unique_ptr<Iterator> it1(db_->NewIterator(ReadOptions(), handles_[1]));
+  std::vector<IngestExternalFileArg> args(2);
+  for (int cf = 0; cf < 2; cf++) {
+    args[cf].column_family = handles_[cf];
+    args[cf].external_files = {files[cf]};
+  }
+  ASSERT_OK(db_->IngestExternalFiles(args));
+
+  attempted_insert_ranges_.clear();
+  for (auto* it : {it0.get(), it1.get()}) {
+    if (Forward()) {
+      for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      }
+    } else {
+      for (it->SeekToLast(); it->Valid(); it->Prev()) {
+      }
+    }
+    ASSERT_OK(it->status());
+  }
+  it0.reset();
+  it1.reset();
+  EXPECT_EQ(attempted_insert_ranges_.size(), 2);
+  EXPECT_EQ(Get(0, "c"), "vc");
+  EXPECT_EQ(Get(1, "c"), "vc");
+}
+
+// An iterator created after an ingestion sees the ingested files, so the
+// barrier must still let it convert.
+TEST_P(ReadPathRangeTombstoneTest, IteratorCreatedAfterIngestionConverts) {
+  for (bool seqno_zero : {true, false}) {
+    SCOPED_TRACE(seqno_zero ? "ingested with seqno zero"
+                            : "ingested with a new seqno");
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    options.statistics = CreateDBStatistics();
+    DestroyAndReopen(options);
+
+    // "x" alone overlaps no key, so it gets seqno zero. Adding "e" overlaps
+    // the flushed "e", so the file gets a new seqno.
+    const std::string file = dbname_ + "/ingest_x.sst";
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    if (!seqno_zero) {
+      ASSERT_OK(writer.Put("e", "ve2"));
+    }
+    ASSERT_OK(writer.Put("x", "vx"));
+    ASSERT_OK(writer.Finish());
+    for (const char* key : {"a", "b", "c", "d", "e"}) {
+      ASSERT_OK(Put(key, std::string("v") + key));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("b"));
+    ASSERT_OK(Delete("c"));
+    ASSERT_OK(Delete("d"));
+    IngestExternalFileOptions ifo;
+    ifo.allow_blocking_flush = false;
+    ASSERT_OK(db_->IngestExternalFile({file}, ifo));
+
+    {
+      std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+      for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      }
+      ASSERT_OK(it->status());
+    }
+    EXPECT_EQ(TestGetTickerCount(options, READ_PATH_RANGE_TOMBSTONES_INSERTED),
+              1);
+    VerifyIteration({"a", "e", "x"});
+    EXPECT_EQ(Get("e"), seqno_zero ? "ve" : "ve2");
+  }
+}
+
+// A conversion that runs before an ingestion leaves a range tombstone in the
+// memtable over the gap where the file lands. The ingestion must either fail
+// or make the file visible, whatever the ingestion options.
+TEST_P(ReadPathRangeTombstoneTest, IngestionAfterConversionIsNeverHidden) {
+  enum class IngestMode {
+    kNoGlobalSeqnoNoFlush,
+    kNoGlobalSeqno,
+    kGlobalSeqno,
+    kDbGenerated
+  };
+  for (IngestMode mode :
+       {IngestMode::kNoGlobalSeqnoNoFlush, IngestMode::kNoGlobalSeqno,
+        IngestMode::kGlobalSeqno, IngestMode::kDbGenerated}) {
+    SCOPED_TRACE("ingest mode " + std::to_string(static_cast<int>(mode)));
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    options.statistics = CreateDBStatistics();
+    DestroyAndReopen(options);
+
+    std::string file = dbname_ + "/ingest_c.sst";
+    if (mode == IngestMode::kDbGenerated) {
+      const std::string src_path = dbname_ + "_src";
+      ASSERT_OK(DestroyDB(src_path, options));
+      std::unique_ptr<DB> src;
+      ASSERT_OK(DB::Open(options, src_path, &src));
+      ASSERT_OK(src->Put(WriteOptions(), "c", "vc"));
+      ASSERT_OK(src->Flush(FlushOptions()));
+      std::vector<LiveFileMetaData> src_files;
+      src->GetLiveFilesMetaData(&src_files);
+      ASSERT_EQ(src_files.size(), 1);
+      file = src_files[0].directory + "/" + src_files[0].relative_filename;
+      ASSERT_OK(src->Close());
+    } else {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put("c", "vc"));
+      ASSERT_OK(writer.Finish());
+    }
+
+    for (const char* key : {"a", "b", "d", "e"}) {
+      ASSERT_OK(Put(key, std::string("v") + key));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("b"));
+    ASSERT_OK(Delete("d"));
+    attempted_insert_ranges_.clear();
+    VerifyIteration({"a", "e"});
+    ASSERT_EQ(TestGetTickerCount(options, READ_PATH_RANGE_TOMBSTONES_INSERTED),
+              1);
+    AssertRange(0, "b", "e");
+
+    IngestExternalFileOptions ifo;
+    ifo.allow_global_seqno = mode == IngestMode::kGlobalSeqno;
+    ifo.allow_blocking_flush = mode != IngestMode::kNoGlobalSeqnoNoFlush;
+    ifo.allow_db_generated_files = mode == IngestMode::kDbGenerated;
+    Status s = db_->IngestExternalFile({file}, ifo);
+    if (mode == IngestMode::kGlobalSeqno) {
+      ASSERT_OK(s);
+    } else {
+      ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    }
+
+    const std::string expected_c = s.ok() ? "vc" : "NOT_FOUND";
+    EXPECT_EQ(Get("c"), expected_c);
+    VerifyIteration(s.ok() ? std::vector<std::string>{"a", "c", "e"}
+                           : std::vector<std::string>{"a", "e"});
+    ASSERT_OK(Flush());
+    Reopen(options);
+    EXPECT_EQ(Get("c"), expected_c);
+  }
+}
+
+// SeekForPrev uses the reverse path: PrevInternal -> FindValueForCurrentKey.
+// When a key has more versions than max_sequential_skip_in_iterations,
+// FindValueForCurrentKey delegates to FindValueForCurrentKeyUsingSeek which
+// re-seeks forward to the newest visible version. That function must preserve
+// key pinning by passing the correct `copy` parameter to
+// saved_key_.SetUserKey().
+TEST_P(DBIteratorTest, SeekForPrevKeyPinnedWithManyVersions) {
+  Options options = CurrentOptions();
+  options.max_sequential_skip_in_iterations = 8;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  // 20 versions > max_sequential_skip (8), forcing the reseek path.
+  // No flush: keeps all versions alive in the memtable.
+  for (int i = 0; i < 20; i++) {
+    ASSERT_OK(Put("key1", "value" + std::to_string(i)));
+  }
+
+  ReadOptions ro;
+  ro.pin_data = true;
+
+  std::unique_ptr<Iterator> iter(NewIterator(ro));
+  std::string prop_value;
+
+  // Seek (forward) correctly reports key as pinned.
+  iter->Seek("key1");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->GetProperty("rocksdb.iterator.is-key-pinned", &prop_value));
+  ASSERT_EQ("1", prop_value);
+
+  uint64_t reseeks_before =
+      options.statistics->getTickerCount(NUMBER_OF_RESEEKS_IN_ITERATION);
+
+  iter->SeekForPrev("key1");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("key1", iter->key().ToString());
+
+  // Confirm FindValueForCurrentKeyUsingSeek was actually taken.
+  uint64_t reseeks_after =
+      options.statistics->getTickerCount(NUMBER_OF_RESEEKS_IN_ITERATION);
+  ASSERT_GT(reseeks_after, reseeks_before);
+
+  ASSERT_OK(iter->GetProperty("rocksdb.iterator.is-key-pinned", &prop_value));
+  ASSERT_EQ("1", prop_value);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

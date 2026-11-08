@@ -17,7 +17,10 @@
 #include "file/file_util.h"
 #include "file/random_access_file_reader.h"
 #include "logging/logging.h"
+#include "monitoring/statistics_impl.h"
+#include "options/options_helper.h"
 #include "table/merging_iterator.h"
+#include "table/prepared_file_info.h"
 #include "table/sst_file_writer_collectors.h"
 #include "table/table_builder.h"
 #include "table/unique_id_impl.h"
@@ -26,22 +29,148 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+bool ExternalSstFileIngestionJob::SupportsAtomicReplaceRangeTombstone() const {
+  return cfd_->is_delete_range_supported() &&
+         cfd_->ioptions().compaction_style == kCompactionStyleUniversal &&
+         ingestion_options_.allow_global_seqno &&
+         !ingestion_options_.allow_db_generated_files &&
+         !ingestion_options_.snapshot_consistency &&
+         ucmp_->timestamp_size() == 0;
+}
+
+bool ExternalSstFileIngestionJob::CanUseAtomicReplaceRangeTombstone(
+    const std::optional<RangeOpt>& atomic_replace_range) const {
+  return atomic_replace_range.has_value() &&
+         atomic_replace_range->start.has_value() &&
+         atomic_replace_range->limit.has_value() &&
+         SupportsAtomicReplaceRangeTombstone() &&
+         !ingestion_options_.fail_if_not_bottommost_level;
+}
+
+bool ExternalSstFileIngestionJob::HasPartialOverlap(
+    const VersionStorageInfo* vstorage) const {
+  assert(vstorage != nullptr);
+  assert(atomic_replace_range_.has_value());
+  assert(!atomic_replace_range_->unset());
+  for (int level = 0; level < cfd_->NumberLevels(); ++level) {
+    for (const auto* file : vstorage->LevelFiles(level)) {
+      if (file_range_checker_.Overlaps(*atomic_replace_range_, file->smallest,
+                                       file->largest) &&
+          !file_range_checker_.Contains(*atomic_replace_range_, file->smallest,
+                                        file->largest)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+size_t ExternalSstFileIngestionJob::NumFilesToPrepare(
+    size_t num_external_files,
+    const std::optional<RangeOpt>& atomic_replace_range) const {
+  return num_external_files +
+         static_cast<size_t>(
+             CanUseAtomicReplaceRangeTombstone(atomic_replace_range));
+}
+
+Status ExternalSstFileIngestionJob::PrepareAtomicReplaceRangeTombstone(
+    const Slice& start, const Slice& limit, uint64_t file_number,
+    SuperVersion* super_version) {
+  assert(cfd_->is_delete_range_supported());
+  assert(cfd_->ioptions().compaction_style == kCompactionStyleUniversal);
+  assert(ingestion_options_.allow_global_seqno);
+  assert(!ingestion_options_.allow_db_generated_files);
+  assert(!ingestion_options_.fail_if_not_bottommost_level);
+  assert(!ingestion_options_.snapshot_consistency);
+  assert(ucmp_->timestamp_size() == 0);
+
+  const uint32_t path_id = 0;
+  const std::string file_path =
+      TableFileName(cfd_->ioptions().cf_paths, file_number, path_id);
+  ExternalSstFileInfo external_file_info;
+  Status status;
+  {
+    Options options(
+        BuildDBOptions(db_options_, mutable_db_options_),
+        BuildColumnFamilyOptions(cfd_->initial_cf_options(),
+                                 super_version->mutable_cf_options));
+    SstFileWriter writer(env_options_, options, ucmp_);
+    status = writer.Open(
+        file_path, super_version->mutable_cf_options.default_write_temperature);
+    if (status.ok()) {
+      status = writer.DeleteRange(start, limit);
+    }
+    if (status.ok()) {
+      status = writer.Finish(&external_file_info);
+    }
+  }
+  if (!status.ok()) {
+    fs_->DeleteFile(file_path, IOOptions(), nullptr).PermitUncheckedError();
+    return status;
+  }
+
+  IngestedFileInfo tombstone;
+  tombstone.file_temperature =
+      super_version->mutable_cf_options.default_write_temperature;
+  tombstone.prefetch_lmax_index_and_filter_blocks =
+      ingestion_options_.prefetch_lmax_index_and_filter_blocks;
+  status = GetIngestedFileInfo(file_path, file_number,
+                               external_file_info.prepared_file_info.get(),
+                               &tombstone, super_version);
+  if (!status.ok()) {
+    fs_->DeleteFile(file_path, IOOptions(), nullptr).PermitUncheckedError();
+    return status;
+  }
+
+  tombstone.internal_file_path = file_path;
+  tombstone.copy_file = true;
+  tombstone.generated_for_ingestion = true;
+  tombstone.file_checksum = external_file_info.file_checksum;
+  tombstone.file_checksum_func_name =
+      external_file_info.file_checksum_func_name;
+  atomic_replace_range_tombstone_.emplace(std::move(tombstone));
+  return Status::OK();
+}
+
+void ExternalSstFileIngestionJob::ActivateAtomicReplaceRangeTombstone() {
+  assert(atomic_replace_range_tombstone_.has_value());
+  // Prepare rejects an empty external file list and verifies every input file
+  // is contained in the replacement range. The covering tombstone must
+  // therefore overlap at least one input file.
+  assert(!files_to_ingest_.empty());
+  file_batches_to_ingest_.clear();
+  files_to_ingest_.emplace_back(std::move(*atomic_replace_range_tombstone_));
+  std::rotate(files_to_ingest_.begin(), files_to_ingest_.end() - 1,
+              files_to_ingest_.end());
+  atomic_replace_range_tombstone_.reset();
+  atomic_replace_range_tombstone_active_ = true;
+  files_overlap_ = ComputeFilesOverlap(files_to_ingest_);
+  assert(files_overlap_);
+  DivideInputFilesIntoBatches();
+}
+
 Status ExternalSstFileIngestionJob::Prepare(
     const std::vector<std::string>& external_files_paths,
     const std::vector<std::string>& files_checksums,
     const std::vector<std::string>& files_checksum_func_names,
+    const std::vector<const PreparedFileInfo*>& file_infos,
     const std::optional<RangeOpt>& atomic_replace_range,
     const Temperature& file_temperature, uint64_t next_file_number,
     SuperVersion* sv) {
   Status status;
 
-  // Read the information of files we are ingesting
-  for (const std::string& file_path : external_files_paths) {
+  // Read the information of files we are ingesting.
+  for (size_t i = 0; i < external_files_paths.size(); i++) {
+    const std::string& file_path = external_files_paths[i];
     IngestedFileInfo file_to_ingest;
     // For temperature, first assume it matches provided hint
     file_to_ingest.file_temperature = file_temperature;
-    status =
-        GetIngestedFileInfo(file_path, next_file_number++, &file_to_ingest, sv);
+    file_to_ingest.prefetch_lmax_index_and_filter_blocks =
+        ingestion_options_.prefetch_lmax_index_and_filter_blocks;
+    const PreparedFileInfo* prepared_file_info =
+        file_infos.empty() ? nullptr : file_infos[i];
+    status = GetIngestedFileInfo(file_path, next_file_number++,
+                                 prepared_file_info, &file_to_ingest, sv);
     if (!status.ok()) {
       ROCKS_LOG_WARN(db_options_.info_log,
                      "Failed to get ingested file info: %s: %s",
@@ -75,31 +204,24 @@ Status ExternalSstFileIngestionJob::Prepare(
   auto num_files = files_to_ingest_.size();
   if (num_files == 0) {
     return Status::InvalidArgument("The list of files is empty");
-  } else if (num_files > 1) {
-    // Verify that passed files don't have overlapping ranges
-    autovector<const IngestedFileInfo*> sorted_files;
-    for (size_t i = 0; i < num_files; i++) {
-      sorted_files.push_back(&files_to_ingest_[i]);
-    }
-
-    std::sort(sorted_files.begin(), sorted_files.end(), file_range_checker_);
-
-    for (size_t i = 0; i + 1 < num_files; i++) {
-      if (file_range_checker_.Overlaps(*sorted_files[i], *sorted_files[i + 1],
-                                       /* known_sorted= */ true)) {
-        files_overlap_ = true;
-        break;
-      }
-    }
   }
+  // Detect whether the input files overlap one another; this drives how they
+  // are divided into batches below.
+  files_overlap_ = ComputeFilesOverlap(files_to_ingest_);
 
   if (atomic_replace_range.has_value()) {
     atomic_replace_range_.emplace();
 
     if (atomic_replace_range->start && atomic_replace_range->limit) {
+      if (ucmp_->CompareWithoutTimestamp(*atomic_replace_range->start,
+                                         *atomic_replace_range->limit) >= 0) {
+        return Status::InvalidArgument(
+            "Atomic replace range limit must be greater than start");
+      }
       // User keys to internal keys (with timestamps)
       const size_t ts_sz = ucmp_->timestamp_size();
-      std::string start_with_ts, limit_with_ts;
+      std::string start_with_ts;
+      std::string limit_with_ts;
       auto [start, limit] = MaybeAddTimestampsToRange(
           atomic_replace_range->start, atomic_replace_range->limit, ts_sz,
           &start_with_ts, &limit_with_ts);
@@ -107,8 +229,8 @@ Status ExternalSstFileIngestionJob::Prepare(
       assert(limit.has_value());
       atomic_replace_range_->smallest_internal_key.Set(
           *start, kMaxSequenceNumber, kValueTypeForSeek);
-      atomic_replace_range_->largest_internal_key.Set(
-          *limit, kMaxSequenceNumber, kValueTypeForSeek);
+      atomic_replace_range_->largest_internal_key =
+          RangeTombstone(*start, *limit, kMaxSequenceNumber).SerializeEndKey();
       // Check files to ingest against replace range
       for (size_t i = 0; i < num_files; i++) {
         if (!file_range_checker_.Contains(*atomic_replace_range_,
@@ -164,35 +286,21 @@ Status ExternalSstFileIngestionJob::Prepare(
         // It is unsafe to assume application had sync the file and file
         // directory before ingest the file. For integrity of RocksDB we need
         // to sync the file.
-
-        // TODO(xingbo), We should in general be moving away from production
-        // uses of ReuseWritableFile (except explicitly for WAL recycling),
-        // ReopenWritableFile, and NewRandomRWFile. We should create a
-        // FileSystem::SyncFile/FsyncFile API that by default does the
-        // re-open+sync+close combo but can (a) be reused easily, and (b) be
-        // overridden to do that more cleanly, e.g. in EncryptedEnv.
-        // https://github.com/facebook/rocksdb/issues/13741
-        std::unique_ptr<FSWritableFile> file_to_sync;
-        Status s = fs_->ReopenWritableFile(path_inside_db, env_options_,
-                                           &file_to_sync, nullptr);
-        TEST_SYNC_POINT_CALLBACK("ExternalSstFileIngestionJob::Prepare:Reopen",
-                                 &s);
+        TEST_SYNC_POINT("ExternalSstFileIngestionJob::BeforeSyncIngestedFile");
+        Status s = fs_->SyncFile(path_inside_db, env_options_, IOOptions(),
+                                 db_options_.use_fsync, nullptr);
+        TEST_SYNC_POINT("ExternalSstFileIngestionJob::AfterSyncIngestedFile");
+        TEST_SYNC_POINT_CALLBACK(
+            "ExternalSstFileIngestionJob::CheckSyncReturnCode", &s);
         // Some file systems (especially remote/distributed) don't support
-        // reopening a file for writing and don't require reopening and
-        // syncing the file. Ignore the NotSupported error in that case.
+        // explicitly syncing the file and don't require it. Ignore the
+        // NotSupported error in that case.
         if (!s.IsNotSupported()) {
           status = s;
-          if (status.ok()) {
-            TEST_SYNC_POINT(
-                "ExternalSstFileIngestionJob::BeforeSyncIngestedFile");
-            status = SyncIngestedFile(file_to_sync.get());
-            TEST_SYNC_POINT(
-                "ExternalSstFileIngestionJob::AfterSyncIngestedFile");
-            if (!status.ok()) {
-              ROCKS_LOG_WARN(db_options_.info_log,
-                             "Failed to sync ingested file %s: %s",
-                             path_inside_db.c_str(), status.ToString().c_str());
-            }
+          if (!status.ok()) {
+            ROCKS_LOG_WARN(db_options_.info_log,
+                           "Failed to sync ingested file %s: %s",
+                           path_inside_db.c_str(), status.ToString().c_str());
           }
         }
       } else if (status.IsNotSupported() &&
@@ -251,6 +359,20 @@ Status ExternalSstFileIngestionJob::Prepare(
     ingestion_path_ids.insert(f.fd.GetPathId());
   }
 
+  if (status.ok() && CanUseAtomicReplaceRangeTombstone(atomic_replace_range) &&
+      HasPartialOverlap(sv->current->storage_info())) {
+    assert(atomic_replace_range->start.has_value());
+    assert(atomic_replace_range->limit.has_value());
+    status = PrepareAtomicReplaceRangeTombstone(*atomic_replace_range->start,
+                                                *atomic_replace_range->limit,
+                                                next_file_number, sv);
+    if (status.ok()) {
+      assert(atomic_replace_range_tombstone_.has_value());
+      ingestion_path_ids.insert(
+          atomic_replace_range_tombstone_->fd.GetPathId());
+    }
+  }
+
   TEST_SYNC_POINT("ExternalSstFileIngestionJob::BeforeSyncDir");
   if (status.ok()) {
     for (auto path_id : ingestion_path_ids) {
@@ -268,28 +390,23 @@ Status ExternalSstFileIngestionJob::Prepare(
   }
   TEST_SYNC_POINT("ExternalSstFileIngestionJob::AfterSyncDir");
 
-  // Generate and check the sst file checksum. Note that, if
-  // IngestExternalFileOptions::write_global_seqno is true, we will not update
-  // the checksum information in the files_to_ingests_ here, since the file is
-  // updated with the new global_seqno. After global_seqno is updated, DB will
-  // generate the new checksum and store it in the Manifest. In all other cases
-  // if ingestion_options_.write_global_seqno == true and
-  // verify_file_checksum is false, we only check the checksum function name.
+  // Generate and check the SST file checksum.
   if (status.ok() && db_options_.file_checksum_gen_factory != nullptr) {
+    bool need_generate_file_checksum;
     if (ingestion_options_.verify_file_checksum == false &&
         files_checksums.size() == files_to_ingest_.size() &&
         files_checksum_func_names.size() == files_to_ingest_.size()) {
       // Only when verify_file_checksum == false and the checksum for ingested
       // files are provided, DB will use the provided checksum and does not
       // generate the checksum for ingested files.
-      need_generate_file_checksum_ = false;
+      need_generate_file_checksum = false;
     } else {
-      need_generate_file_checksum_ = true;
+      need_generate_file_checksum = true;
     }
     std::vector<std::string> generated_checksums;
     std::vector<std::string> generated_checksum_func_names;
     // Step 1: generate the checksum for ingested sst file.
-    if (need_generate_file_checksum_) {
+    if (need_generate_file_checksum) {
       for (size_t i = 0; i < files_to_ingest_.size(); i++) {
         std::string generated_checksum;
         std::string generated_checksum_func_name;
@@ -329,11 +446,9 @@ Status ExternalSstFileIngestionJob::Prepare(
                          status.ToString().c_str());
           break;
         }
-        if (ingestion_options_.write_global_seqno == false) {
-          files_to_ingest_[i].file_checksum = generated_checksum;
-          files_to_ingest_[i].file_checksum_func_name =
-              generated_checksum_func_name;
-        }
+        files_to_ingest_[i].file_checksum = generated_checksum;
+        files_to_ingest_[i].file_checksum_func_name =
+            generated_checksum_func_name;
         generated_checksums.push_back(generated_checksum);
         generated_checksum_func_names.push_back(generated_checksum_func_name);
       }
@@ -446,6 +561,60 @@ void ExternalSstFileIngestionJob::DivideInputFilesIntoBatches() {
   }
 }
 
+bool ExternalSstFileIngestionJob::ComputeFilesOverlap(
+    const autovector<IngestedFileInfo>& files) const {
+  const size_t num_files = files.size();
+  if (num_files <= 1) {
+    return false;
+  }
+  // Verify whether the files have overlapping ranges by sorting copies of the
+  // file ranges and checking adjacent pairs.
+  autovector<const IngestedFileInfo*> sorted_files;
+  for (size_t i = 0; i < num_files; i++) {
+    sorted_files.push_back(&files[i]);
+  }
+  std::sort(sorted_files.begin(), sorted_files.end(), file_range_checker_);
+  for (size_t i = 0; i + 1 < num_files; i++) {
+    if (file_range_checker_.Overlaps(*sorted_files[i], *sorted_files[i + 1],
+                                     /* known_sorted= */ true)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Status ExternalSstFileIngestionJob::MergeForSameColumnFamily(
+    ExternalSstFileIngestionJob* other) {
+  assert(other != nullptr);
+  assert(other != this);
+  assert(cfd_ == other->cfd_);
+  if (atomic_replace_range_.has_value() ||
+      other->atomic_replace_range_.has_value()) {
+    return Status::NotSupported(
+        "cannot merge file ingestion handles for the same column family when "
+        "atomic_replace_range is used");
+  }
+  if (!(ingestion_options_ == other->ingestion_options_)) {
+    return Status::InvalidArgument(
+        "file ingestion handles for the same column family must be prepared "
+        "with the same IngestExternalFileOptions");
+  }
+  // Append the other job's prepared files after this job's so that, for any
+  // overlapping keys, the other job's data wins via a higher assigned sequence
+  // number -- the same semantics as passing all the files to a single ingestion
+  // call in this order. Recompute overlap and rebuild the batches over the
+  // union.
+  for (IngestedFileInfo& file : other->files_to_ingest_) {
+    files_to_ingest_.push_back(std::move(file));
+  }
+  other->files_to_ingest_.clear();
+  other->file_batches_to_ingest_.clear();
+  files_overlap_ = ComputeFilesOverlap(files_to_ingest_);
+  file_batches_to_ingest_.clear();
+  DivideInputFilesIntoBatches();
+  return Status::OK();
+}
+
 Status ExternalSstFileIngestionJob::NeedsFlush(bool* flush_needed,
                                                SuperVersion* super_version) {
   Status status;
@@ -458,9 +627,7 @@ Status ExternalSstFileIngestionJob::NeedsFlush(bool* flush_needed,
       assert(!atomic_replace_range_->smallest_internal_key.unset());
       assert(!atomic_replace_range_->largest_internal_key.unset());
       // NOTE: we already checked in Prepare() that the atomic_replace_range
-      // covers all the files_to_ingest
-      // FIXME: need to make upper bound key exclusive (not easy here because
-      // the existing internal APIs deal in inclusive upper bound user keys)
+      // covers all the files_to_ingest.
       ranges.emplace_back(
           atomic_replace_range_->smallest_internal_key.user_key(),
           atomic_replace_range_->largest_internal_key.user_key());
@@ -472,7 +639,8 @@ Status ExternalSstFileIngestionJob::NeedsFlush(bool* flush_needed,
       }
     }
     status = cfd_->RangesOverlapWithMemtables(
-        ranges, super_version, db_options_.allow_data_in_errors, flush_needed);
+        ranges, super_version, db_options_.allow_data_in_errors, flush_needed,
+        atomic_replace_range_.has_value() && !atomic_replace_range_->unset());
     if (!status.ok()) {
       ROCKS_LOG_WARN(db_options_.info_log,
                      "Failed to check ranges overlap with memtables: %s",
@@ -551,10 +719,12 @@ Status ExternalSstFileIngestionJob::Run() {
     } else {
       assert(!atomic_replace_range_->smallest_internal_key.unset());
       assert(!atomic_replace_range_->largest_internal_key.unset());
+      bool has_partial_overlap = false;
       for (int lvl = 0; lvl < cfd_->NumberLevels(); lvl++) {
         if (cfd_->RangeOverlapWithCompaction(
                 atomic_replace_range_->smallest_internal_key.user_key(),
-                atomic_replace_range_->largest_internal_key.user_key(), lvl)) {
+                atomic_replace_range_->largest_internal_key.user_key(), lvl,
+                /*range_limit_exclusive=*/true)) {
           return Status::InvalidArgument(
               "Atomic replace range overlaps with pending compaction");
         }
@@ -566,20 +736,36 @@ Status ExternalSstFileIngestionJob::Run() {
               // Set up to delete file to be replaced
               edit_.DeleteFile(lvl, file->fd.GetNumber());
             } else {
-              // TODO: generate and ingest a tombstone file also
-              return Status::InvalidArgument(
-                  "Atomic replace range partially overlaps with existing file");
+              has_partial_overlap = true;
             }
           }
         }
+      }
+      if (has_partial_overlap) {
+        if (ingestion_options_.fail_if_not_bottommost_level &&
+            SupportsAtomicReplaceRangeTombstone()) {
+          return Status::TryAgain(
+              "Atomic replace range partially overlaps with an existing file, "
+              "so replacement files cannot all be ingested to Lmax");
+        }
+        if (!atomic_replace_range_tombstone_.has_value()) {
+          if (SupportsAtomicReplaceRangeTombstone()) {
+            return Status::TryAgain(
+                "Atomic replace range acquired a partial overlap after "
+                "preparation; retry ingestion");
+          }
+          return Status::InvalidArgument(
+              "Atomic replace range partially overlaps with existing file");
+        }
+        ActivateAtomicReplaceRangeTombstone();
       }
     }
   }
 
   // Find levels to ingest into
   std::optional<int> prev_batch_uppermost_level;
-  // batches at the front of file_batches_to_ingest_ contains older updates and
-  // are placed in smaller levels.
+  // Batches at the front contain older updates and are placed deeper in the
+  // LSM tree than later overlapping batches.
   for (auto& batch : file_batches_to_ingest_) {
     int batch_uppermost_level = 0;
     status = AssignLevelsForOneBatch(batch, super_version, force_global_seqno,
@@ -621,7 +807,8 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
     // that we just learned. Only overwrite sequence number zero. There could
     // be a nonzero sequence number already to indicate a range tombstone's
     // exclusive endpoint.
-    ParsedInternalKey smallest_parsed, largest_parsed;
+    ParsedInternalKey smallest_parsed;
+    ParsedInternalKey largest_parsed;
     if (status.ok()) {
       status = ParseInternalKey(*(file->smallest_internal_key.rep()),
                                 &smallest_parsed, false /* log_err_key */);
@@ -669,21 +856,13 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
     }
     max_assigned_seqno_ = std::max(max_assigned_seqno_, assigned_seqno);
 
-    status = GenerateChecksumForIngestedFile(file);
-    if (!status.ok()) {
-      ROCKS_LOG_WARN(db_options_.info_log,
-                     "Failed to generate checksum for ingested file: %s",
-                     status.ToString().c_str());
-      return status;
-    }
-
-    // We use the import time as the ancester time. This is the time the data
+    // We use the import time as the ancestor time. This is the time the data
     // is written to the database.
     int64_t temp_current_time = 0;
     uint64_t current_time = kUnknownFileCreationTime;
-    uint64_t oldest_ancester_time = kUnknownOldestAncesterTime;
+    uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
     if (clock_->GetCurrentTime(&temp_current_time).ok()) {
-      current_time = oldest_ancester_time =
+      current_time = oldest_ancestor_time =
           static_cast<uint64_t>(temp_current_time);
     }
     uint64_t tail_size = FileMetaData::CalculateTailSize(
@@ -707,7 +886,7 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
         file->fd.GetNumber(), file->fd.GetPathId(), file->fd.GetFileSize(),
         file->smallest_internal_key, file->largest_internal_key, smallest_seqno,
         largest_seqno, false, file->file_temperature, kInvalidBlobFileNumber,
-        oldest_ancester_time, current_time,
+        oldest_ancestor_time, current_time,
         ingestion_options_.ingest_behind
             ? kReservedEpochNumberForFileIngestedBehind
             : cfd_->NewEpochNumber(),  // orders files ingested to L0
@@ -715,10 +894,41 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
         tail_size, file->user_defined_timestamps_persisted, "", "");
     f_metadata.temperature = file->file_temperature;
     f_metadata.marked_for_compaction = marked_for_compaction;
+    f_metadata.skip_index_and_filter_blocks_prefetch =
+        !file->prefetch_lmax_index_and_filter_blocks &&
+        file->picked_level == cfd_->NumberLevels() - 1;
     // Extract min/max timestamps from table properties for UDT support.
     // This ensures ingested files have proper timestamp ranges in FileMetaData,
     // similar to files created by flush and compaction.
     ExtractTimestampFromTableProperties(file->table_properties, &f_metadata);
+    // Retrieve file open metadata for fast SST open
+    if (mutable_db_options_.fast_sst_open) {
+      std::unique_ptr<FSRandomAccessFile> readable_file;
+      FileOptions fopts{env_options_};
+      fopts.file_checksum = f_metadata.file_checksum;
+      fopts.file_checksum_func_name = f_metadata.file_checksum_func_name;
+      IOStatus io_s = fs_->NewRandomAccessFile(file->internal_file_path, fopts,
+                                               &readable_file, nullptr);
+      if (io_s.ok()) {
+        io_s =
+            readable_file->GetFileOpenMetadata(&f_metadata.file_open_metadata);
+        if (io_s.ok() && !f_metadata.file_open_metadata.empty() &&
+            f_metadata.file_open_metadata.size() <=
+                FSRandomAccessFile::kMaxFileOpenMetadataSize) {
+          RecordTick(db_options_.stats, FILE_OPEN_METADATA_RETRIEVED);
+        } else {
+          if (io_s.ok() && f_metadata.file_open_metadata.size() >
+                               FSRandomAccessFile::kMaxFileOpenMetadataSize) {
+            ROCKS_LOG_WARN(db_options_.info_log,
+                           "File open metadata for %s too large (%zu bytes), "
+                           "ignoring",
+                           file->internal_file_path.c_str(),
+                           f_metadata.file_open_metadata.size());
+          }
+          f_metadata.file_open_metadata.clear();
+        }
+      }
+    }
     edit_.AddFile(file->picked_level, f_metadata);
 
     *batch_uppermost_level =
@@ -861,9 +1071,27 @@ void ExternalSstFileIngestionJob::Cleanup(const Status& status) {
     // remove all the files we copied
     DeleteInternalFiles();
     files_overlap_ = false;
-  } else if (status.ok() && ingestion_options_.move_files) {
+  } else {
+    if (atomic_replace_range_tombstone_.has_value()) {
+      Status s =
+          fs_->DeleteFile(atomic_replace_range_tombstone_->internal_file_path,
+                          io_opts, nullptr);
+      if (!s.ok()) {
+        ROCKS_LOG_WARN(
+            db_options_.info_log,
+            "Failed to remove unused atomic replace range tombstone %s: %s",
+            atomic_replace_range_tombstone_->internal_file_path.c_str(),
+            s.ToString().c_str());
+      }
+      atomic_replace_range_tombstone_.reset();
+    }
+  }
+  if (status.ok() && ingestion_options_.move_files) {
     // The files were moved and added successfully, remove original file links
     for (IngestedFileInfo& f : files_to_ingest_) {
+      if (f.generated_for_ingestion) {
+        continue;
+      }
       Status s = fs_->DeleteFile(f.external_file_path, io_opts, nullptr);
       if (!s.ok()) {
         ROCKS_LOG_WARN(
@@ -889,6 +1117,19 @@ void ExternalSstFileIngestionJob::DeleteInternalFiles() {
                      f.internal_file_path.c_str(), s.ToString().c_str());
     }
   }
+  if (atomic_replace_range_tombstone_.has_value() &&
+      !atomic_replace_range_tombstone_->internal_file_path.empty()) {
+    Status s = fs_->DeleteFile(
+        atomic_replace_range_tombstone_->internal_file_path, io_opts, nullptr);
+    if (!s.ok()) {
+      ROCKS_LOG_WARN(
+          db_options_.info_log,
+          "AddFile() clean up for generated tombstone file %s failed : %s",
+          atomic_replace_range_tombstone_->internal_file_path.c_str(),
+          s.ToString().c_str());
+    }
+    atomic_replace_range_tombstone_.reset();
+  }
 }
 
 Status ExternalSstFileIngestionJob::ResetTableReader(
@@ -899,6 +1140,7 @@ Status ExternalSstFileIngestionJob::ResetTableReader(
   std::unique_ptr<FSRandomAccessFile> sst_file;
   FileOptions fo{env_options_};
   fo.temperature = file_to_ingest->file_temperature;
+  fo.file_checksum_func_name = kNoFileChecksumFuncName;
   Status status =
       fs_->NewRandomAccessFile(external_file, fo, &sst_file, nullptr);
   if (!status.ok()) {
@@ -941,18 +1183,14 @@ Status ExternalSstFileIngestionJob::ResetTableReader(
 }
 
 Status ExternalSstFileIngestionJob::SanityCheckTableProperties(
-    const std::string& external_file, uint64_t new_file_number,
-    SuperVersion* sv, IngestedFileInfo* file_to_ingest,
-    std::unique_ptr<TableReader>* table_reader) {
-  // Get the external file properties
-  auto props = table_reader->get()->GetTableProperties();
-  assert(props.get());
-  const auto& uprops = props->user_collected_properties;
+    const std::string& external_file, const TableProperties& props,
+    IngestedFileInfo* file_to_ingest) {
+  const auto& uprops = props.user_collected_properties;
 
   // Get table version
   auto version_iter = uprops.find(ExternalSstFilePropertyNames::kVersion);
   if (version_iter == uprops.end()) {
-    assert(!SstFileWriter::CreatedBySstFileWriter(*props));
+    assert(!SstFileWriter::CreatedBySstFileWriter(props));
     if (!ingestion_options_.allow_db_generated_files) {
       return Status::Corruption("External file version not found");
     } else {
@@ -961,7 +1199,7 @@ Status ExternalSstFileIngestionJob::SanityCheckTableProperties(
       file_to_ingest->version = 0;
     }
   } else {
-    assert(SstFileWriter::CreatedBySstFileWriter(*props));
+    assert(SstFileWriter::CreatedBySstFileWriter(props));
     file_to_ingest->version = DecodeFixed32(version_iter->second.c_str());
   }
 
@@ -975,12 +1213,6 @@ Status ExternalSstFileIngestionJob::SanityCheckTableProperties(
 
     // Set the global sequence number
     file_to_ingest->original_seqno = DecodeFixed64(seqno_iter->second.c_str());
-    if (props->external_sst_file_global_seqno_offset == 0) {
-      file_to_ingest->global_seqno_offset = 0;
-      return Status::Corruption("Was not able to find file global seqno field");
-    }
-    file_to_ingest->global_seqno_offset =
-        static_cast<size_t>(props->external_sst_file_global_seqno_offset);
   } else if (file_to_ingest->version == 1) {
     // SST file V1 should not have global seqno field
     assert(seqno_iter == uprops.end());
@@ -994,30 +1226,26 @@ Status ExternalSstFileIngestionJob::SanityCheckTableProperties(
     // allow_db_generated_files is true
     assert(seqno_iter == uprops.end());
     file_to_ingest->original_seqno = 0;
-    file_to_ingest->global_seqno_offset = 0;
   } else {
     return Status::InvalidArgument("External file version " +
                                    std::to_string(file_to_ingest->version) +
                                    " is not supported");
   }
 
-  file_to_ingest->cf_id = static_cast<uint32_t>(props->column_family_id);
-  // This assignment works fine even though `table_reader` may later be reset,
-  // since that will not affect how table properties are parsed, and this
-  // assignment is making a copy.
-  file_to_ingest->table_properties = *props;
+  file_to_ingest->cf_id = static_cast<uint32_t>(props.column_family_id);
+  file_to_ingest->table_properties = props;
 
   // Get number of entries in table
-  file_to_ingest->num_entries = props->num_entries;
-  file_to_ingest->num_range_deletions = props->num_range_deletions;
+  file_to_ingest->num_entries = props.num_entries;
+  file_to_ingest->num_range_deletions = props.num_range_deletions;
 
   // Validate table properties related to comparator name and user defined
   // timestamps persisted flag.
   file_to_ingest->user_defined_timestamps_persisted =
-      static_cast<bool>(props->user_defined_timestamps_persisted);
+      static_cast<bool>(props.user_defined_timestamps_persisted);
   bool mark_sst_file_has_no_udt = false;
   Status s = ValidateUserDefinedTimestampsOptions(
-      cfd_->user_comparator(), props->comparator_name,
+      cfd_->user_comparator(), props.comparator_name,
       cfd_->ioptions().persist_user_defined_timestamps,
       file_to_ingest->user_defined_timestamps_persisted,
       &mark_sst_file_has_no_udt);
@@ -1025,7 +1253,9 @@ Status ExternalSstFileIngestionJob::SanityCheckTableProperties(
     // A column family that enables user-defined timestamps in Memtable only
     // feature can also ingest external files created by a setting that disables
     // user-defined timestamps. In that case, we need to re-mark the
-    // user_defined_timestamps_persisted flag for the file.
+    // user_defined_timestamps_persisted flag for the file. The open-and-scan
+    // caller is then responsible for reopening its `TableReader` with the
+    // updated flag.
     file_to_ingest->user_defined_timestamps_persisted = false;
   } else if (!s.ok()) {
     ROCKS_LOG_WARN(
@@ -1035,22 +1265,84 @@ Status ExternalSstFileIngestionJob::SanityCheckTableProperties(
     return s;
   }
 
-  // `TableReader` is initialized with `user_defined_timestamps_persisted` flag
-  // to be true. If its value changed to false after this sanity check, we
-  // need to reset the `TableReader`.
-  if (ucmp_->timestamp_size() > 0 &&
-      !file_to_ingest->user_defined_timestamps_persisted) {
-    s = ResetTableReader(external_file, new_file_number,
-                         file_to_ingest->user_defined_timestamps_persisted, sv,
-                         file_to_ingest, table_reader);
-  }
   return s;
 }
 
-Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
+Status ExternalSstFileIngestionJob::GetIngestedFileInfoFromFileInfo(
+    const std::string& external_file,
+    const PreparedFileInfo& prepared_file_info,
+    IngestedFileInfo* file_to_ingest) {
+  // Boundaries, size, and table properties were obtained without opening the
+  // file (e.g. produced by SstFileWriter::Finish). We reuse them directly.
+  file_to_ingest->file_size = prepared_file_info.file_size;
+  Status status = SanityCheckTableProperties(
+      external_file, prepared_file_info.table_properties, file_to_ingest);
+  if (!status.ok()) {
+    ROCKS_LOG_WARN(
+        db_options_.info_log,
+        "Failed to sanity check table properties for external file %s: %s",
+        external_file.c_str(), status.ToString().c_str());
+    return status;
+  }
+
+  const size_t ts_sz = ucmp_->timestamp_size();
+  if (ts_sz > 0 && !file_to_ingest->user_defined_timestamps_persisted) {
+    auto pad_timestamp = [ts_sz](std::string* result, const Slice& key) {
+      assert(result->empty());
+      if (ExtractValueType(key) == kTypeRangeDeletion) {
+        PadInternalKeyWithMaxTimestamp(result, key, ts_sz);
+      } else {
+        PadInternalKeyWithMinTimestamp(result, key, ts_sz);
+      }
+    };
+    pad_timestamp(file_to_ingest->smallest_internal_key.rep(),
+                  prepared_file_info.smallest.Encode());
+    pad_timestamp(file_to_ingest->largest_internal_key.rep(),
+                  prepared_file_info.largest.Encode());
+  } else {
+    file_to_ingest->smallest_internal_key = prepared_file_info.smallest;
+    file_to_ingest->largest_internal_key = prepared_file_info.largest;
+  }
+
+  if (ingestion_options_.allow_db_generated_files) {
+    // Sequence numbers are preserved (not reassigned), so the bounds must be
+    // known before we skip the GetSeqnoBoundaryForFile scan.
+    if (!file_to_ingest->table_properties.HasKeyLargestSeqno()) {
+      return Status::Corruption("Unknown largest seqno for db generated file.");
+    }
+    file_to_ingest->largest_seqno =
+        file_to_ingest->table_properties.key_largest_seqno;
+    if (file_to_ingest->largest_seqno == 0) {
+      file_to_ingest->smallest_seqno = 0;
+    } else {
+      if (!file_to_ingest->table_properties.HasKeySmallestSeqno()) {
+        return Status::Corruption(
+            "Unknown smallest seqno for db generated file.");
+      }
+      file_to_ingest->smallest_seqno =
+          file_to_ingest->table_properties.key_smallest_seqno;
+    }
+  } else {
+    // Normal ingestion reassigns a global sequence number later, so the file's
+    // keys must currently be at seqno 0 (mirror of the open-and-scan check).
+    SequenceNumber largest_seqno =
+        file_to_ingest->table_properties.key_largest_seqno;
+    // UINT64_MAX means unknown and the file is generated before table property
+    // `key_largest_seqno` is introduced.
+    if (largest_seqno != UINT64_MAX && largest_seqno > 0) {
+      return Status::Corruption(
+          "External file has non zero largest sequence number " +
+          std::to_string(largest_seqno));
+    }
+  }
+  return Status::OK();
+}
+
+Status ExternalSstFileIngestionJob::GetIngestedFileInfoFromFile(
     const std::string& external_file, uint64_t new_file_number,
-    IngestedFileInfo* file_to_ingest, SuperVersion* sv) {
-  file_to_ingest->external_file_path = external_file;
+    IngestedFileInfo* file_to_ingest, SuperVersion* sv,
+    std::unique_ptr<TableReader>* out_table_reader) {
+  TEST_SYNC_POINT("ExternalSstFileIngestionJob::GetIngestedFileInfo:ReadPath");
 
   // Get external file size
   Status status = fs_->GetFileSize(external_file, IOOptions(),
@@ -1062,15 +1354,11 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
     return status;
   }
 
-  // Assign FD with number
-  file_to_ingest->fd =
-      FileDescriptor(new_file_number, 0, file_to_ingest->file_size);
-
-  // Create TableReader for external file
+  // Create TableReader for external file.
   std::unique_ptr<TableReader> table_reader;
   // Initially create the `TableReader` with flag
-  // `user_defined_timestamps_persisted` to be true since that's the most common
-  // case
+  // `user_defined_timestamps_persisted` to be true since that's the most
+  // common case
   status = ResetTableReader(external_file, new_file_number,
                             /*user_defined_timestamps_persisted=*/true, sv,
                             file_to_ingest, &table_reader);
@@ -1081,14 +1369,31 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
     return status;
   }
 
-  status = SanityCheckTableProperties(external_file, new_file_number, sv,
-                                      file_to_ingest, &table_reader);
+  status = SanityCheckTableProperties(
+      external_file, *table_reader->GetTableProperties(), file_to_ingest);
   if (!status.ok()) {
     ROCKS_LOG_WARN(
         db_options_.info_log,
         "Failed to sanity check table properties for external file %s: %s",
         external_file.c_str(), status.ToString().c_str());
     return status;
+  }
+
+  // The `TableReader` above was opened with `user_defined_timestamps_persisted`
+  // assumed true. If the sanity check determined the file has no persisted
+  // timestamps (UDT-in-Memtable-only feature), reopen it with the corrected
+  // flag so keys are parsed properly by the scan below.
+  if (ucmp_->timestamp_size() > 0 &&
+      !file_to_ingest->user_defined_timestamps_persisted) {
+    status = ResetTableReader(external_file, new_file_number,
+                              file_to_ingest->user_defined_timestamps_persisted,
+                              sv, file_to_ingest, &table_reader);
+    if (!status.ok()) {
+      ROCKS_LOG_WARN(db_options_.info_log,
+                     "Failed to reset table reader for external file %s: %s",
+                     external_file.c_str(), status.ToString().c_str());
+      return status;
+    }
   }
 
   const bool allow_data_in_errors = db_options_.allow_data_in_errors;
@@ -1112,30 +1417,12 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
   } else {
     SequenceNumber largest_seqno =
         table_reader.get()->GetTableProperties()->key_largest_seqno;
-    // UINT64_MAX means unknown and the file is generated before table property
-    // `key_largest_seqno` is introduced.
+    // UINT64_MAX means unknown and the file is generated before table
+    // property `key_largest_seqno` is introduced.
     if (largest_seqno != UINT64_MAX && largest_seqno > 0) {
       return Status::Corruption(
           "External file has non zero largest sequence number " +
           std::to_string(largest_seqno));
-    }
-  }
-
-  if (ingestion_options_.verify_checksums_before_ingest) {
-    // If customized readahead size is needed, we can pass a user option
-    // all the way to here. Right now we just rely on the default readahead
-    // to keep things simple.
-    // TODO: plumb Env::IOActivity, Env::IOPriority
-    ReadOptions ro;
-    ro.readahead_size = ingestion_options_.verify_checksums_readahead_size;
-    ro.fill_cache = ingestion_options_.fill_cache;
-    status = table_reader->VerifyChecksum(
-        ro, TableReaderCaller::kExternalSSTIngestion);
-    if (!status.ok()) {
-      ROCKS_LOG_WARN(db_options_.info_log,
-                     "Failed to verify checksum for table reader: %s",
-                     status.ToString().c_str());
-      return status;
     }
   }
 
@@ -1218,12 +1505,97 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
             "External file has a range deletion with non zero sequence "
             "number.");
       }
+#ifndef NDEBUG
+      // To keep aligned with the fast path that expects range deletion keys to
+      // always use max ts.
+      const size_t ts_sz = ucmp_->timestamp_size();
+      if (ts_sz > 0) {
+        const std::string max_ts(ts_sz, '\xff');
+        assert(key.user_key.size() >= ts_sz);
+        assert(ucmp_->CompareTimestamp(
+                   ExtractTimestampFromUserKey(key.user_key, ts_sz), max_ts) ==
+               0);
+        assert(range_del_iter->value().size() >= ts_sz);
+        assert(ucmp_->CompareTimestamp(
+                   ExtractTimestampFromUserKey(range_del_iter->value(), ts_sz),
+                   max_ts) == 0);
+      }
+#endif
       RangeTombstone tombstone(key, range_del_iter->value());
       file_range_checker_.MaybeUpdateRange(tombstone.SerializeKey(),
                                            tombstone.SerializeEndKey(),
                                            file_to_ingest);
     }
   }
+
+  *out_table_reader = std::move(table_reader);
+  return Status::OK();
+}
+
+Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
+    const std::string& external_file, uint64_t new_file_number,
+    const PreparedFileInfo* prepared_file_info,
+    IngestedFileInfo* file_to_ingest, SuperVersion* sv) {
+  file_to_ingest->external_file_path = external_file;
+
+  std::unique_ptr<TableReader> table_reader;
+  Status status =
+      prepared_file_info != nullptr
+          ? GetIngestedFileInfoFromFileInfo(external_file, *prepared_file_info,
+                                            file_to_ingest)
+          : GetIngestedFileInfoFromFile(external_file, new_file_number,
+                                        file_to_ingest, sv, &table_reader);
+  if (!status.ok()) {
+    return status;
+  }
+
+  assert(file_to_ingest->file_size > 0);
+  assert(!file_to_ingest->unset());
+  assert(file_to_ingest->table_properties.num_entries > 0 ||
+         file_to_ingest->table_properties.num_range_deletions > 0);
+  if (ingestion_options_.allow_db_generated_files) {
+    // These files keep their original sequence numbers (derived, not
+    // reassigned), so the bounds must be valid here.
+    assert(file_to_ingest->smallest_seqno <= file_to_ingest->largest_seqno);
+    assert(file_to_ingest->largest_seqno < kMaxSequenceNumber);
+  }
+
+  // Verify the file checksum if requested. The open-and-scan path already has a
+  // `TableReader` open; the fast-path opens one here only when verification is
+  // requested -- otherwise it performs no file I/O.
+  if (ingestion_options_.verify_checksums_before_ingest) {
+    if (table_reader == nullptr) {
+      status =
+          ResetTableReader(external_file, new_file_number,
+                           file_to_ingest->user_defined_timestamps_persisted,
+                           sv, file_to_ingest, &table_reader);
+      if (!status.ok()) {
+        ROCKS_LOG_WARN(db_options_.info_log,
+                       "Failed to reset table reader for external file %s: %s",
+                       external_file.c_str(), status.ToString().c_str());
+        return status;
+      }
+    }
+    // If customized readahead size is needed, we can pass a user option all the
+    // way to here. Right now we just rely on the default readahead to keep
+    // things simple.
+    // TODO: plumb Env::IOActivity, Env::IOPriority
+    ReadOptions ro;
+    ro.readahead_size = ingestion_options_.verify_checksums_readahead_size;
+    ro.fill_cache = ingestion_options_.fill_cache;
+    status = table_reader->VerifyChecksum(
+        ro, TableReaderCaller::kExternalSSTIngestion);
+    if (!status.ok()) {
+      ROCKS_LOG_WARN(db_options_.info_log,
+                     "Failed to verify checksum for external file %s: %s",
+                     external_file.c_str(), status.ToString().c_str());
+      return status;
+    }
+  }
+
+  // Assign FD with number.
+  file_to_ingest->fd =
+      FileDescriptor(new_file_number, 0, file_to_ingest->file_size);
 
   const size_t ts_sz = ucmp_->timestamp_size();
   Slice smallest = file_to_ingest->smallest_internal_key.user_key();
@@ -1303,17 +1675,23 @@ Status ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile(
       ingestion_options_.allow_db_generated_files
           ? cfd_->NumberLevels()
           : assigned_level_exclusive_end;
+  const bool is_generated_range_tombstone =
+      atomic_replace_range_tombstone_active_ &&
+      file_to_ingest->generated_for_ingestion;
   for (int lvl = 0; lvl < overlap_checking_exclusive_end; lvl++) {
     if (lvl > 0 && lvl < vstorage->base_level()) {
       continue;
     }
     if (lvl < assigned_level_exclusive_end &&
-        atomic_replace_range_.has_value()) {
+        atomic_replace_range_.has_value() &&
+        !atomic_replace_range_tombstone_active_) {
       target_level = lvl;
       continue;
     }
     if (cfd_->RangeOverlapWithCompaction(file_to_ingest->start_ukey,
-                                         file_to_ingest->limit_ukey, lvl)) {
+                                         file_to_ingest->limit_ukey, lvl,
+                                         /*range_limit_exclusive=*/
+                                         is_generated_range_tombstone)) {
       // We must use L0 or any level higher than `lvl` to be able to overwrite
       // the compaction output keys that we overlap with in this level, We also
       // need to assign this file a seqno to overwrite the compaction output
@@ -1413,105 +1791,18 @@ Status ExternalSstFileIngestionJob::AssignGlobalSeqnoForIngestedFile(
     assert(seqno == 0);
     assert(file_to_ingest->original_seqno == 0);
   }
-  if (file_to_ingest->original_seqno == seqno) {
-    // This file already has the correct global seqno.
-    return Status::OK();
-  } else if (!ingestion_options_.allow_global_seqno) {
-    return Status::InvalidArgument("Global seqno is required, but disabled");
-  } else if (ingestion_options_.write_global_seqno &&
-             file_to_ingest->global_seqno_offset == 0) {
-    return Status::InvalidArgument(
-        "Trying to set global seqno for a file that don't have a global seqno "
-        "field");
-  }
-
-  if (ingestion_options_.write_global_seqno) {
-    // Determine if we can write global_seqno to a given offset of file.
-    // If the file system does not support random write, then we should not.
-    // Otherwise we should.
-    std::unique_ptr<FSRandomRWFile> rwfile;
-    Status status = fs_->NewRandomRWFile(file_to_ingest->internal_file_path,
-                                         env_options_, &rwfile, nullptr);
-    TEST_SYNC_POINT_CALLBACK("ExternalSstFileIngestionJob::NewRandomRWFile",
-                             &status);
-    if (status.ok()) {
-      FSRandomRWFilePtr fsptr(std::move(rwfile), io_tracer_,
-                              file_to_ingest->internal_file_path);
-      std::string seqno_val;
-      PutFixed64(&seqno_val, seqno);
-      status = fsptr->Write(file_to_ingest->global_seqno_offset, seqno_val,
-                            IOOptions(), nullptr);
-      if (!status.ok()) {
-        ROCKS_LOG_WARN(db_options_.info_log,
-                       "Failed to write global seqno to %s: %s",
-                       file_to_ingest->internal_file_path.c_str(),
-                       status.ToString().c_str());
-        return status;
-      }
-
-      if (status.ok()) {
-        TEST_SYNC_POINT("ExternalSstFileIngestionJob::BeforeSyncGlobalSeqno");
-        status = SyncIngestedFile(fsptr.get());
-        TEST_SYNC_POINT("ExternalSstFileIngestionJob::AfterSyncGlobalSeqno");
-        if (!status.ok()) {
-          ROCKS_LOG_WARN(db_options_.info_log,
-                         "Failed to sync ingested file %s after writing global "
-                         "sequence number: %s",
-                         file_to_ingest->internal_file_path.c_str(),
-                         status.ToString().c_str());
-        }
-      }
-      if (!status.ok()) {
-        return status;
-      }
-    } else if (!status.IsNotSupported()) {
-      ROCKS_LOG_WARN(
-          db_options_.info_log,
-          "Failed to open ingested file %s for random read/write: %s",
-          file_to_ingest->internal_file_path.c_str(),
-          status.ToString().c_str());
-      return status;
+  if (file_to_ingest->original_seqno != seqno) {
+    if (!ingestion_options_.allow_global_seqno) {
+      return Status::InvalidArgument("Global seqno is required, but disabled");
+    }
+    if (file_to_ingest->original_seqno != 0) {
+      return Status::InvalidArgument(
+          "External file global seqno does not match assigned seqno");
     }
   }
 
   file_to_ingest->assigned_seqno = seqno;
   return Status::OK();
-}
-
-IOStatus ExternalSstFileIngestionJob::GenerateChecksumForIngestedFile(
-    IngestedFileInfo* file_to_ingest) {
-  if (db_options_.file_checksum_gen_factory == nullptr ||
-      need_generate_file_checksum_ == false ||
-      ingestion_options_.write_global_seqno == false) {
-    // If file_checksum_gen_factory is not set, we are not able to generate
-    // the checksum. if write_global_seqno is false, it means we will use
-    // file checksum generated during Prepare(). This step will be skipped.
-    return IOStatus::OK();
-  }
-  std::string file_checksum;
-  std::string file_checksum_func_name;
-  std::string requested_checksum_func_name;
-  // TODO: rate limit file reads for checksum calculation during file ingestion.
-  // TODO: plumb Env::IOActivity
-  ReadOptions ro;
-  FileOptions gen_fopts;
-  gen_fopts.file_checksum_func_name = kNoFileChecksumFuncName;
-  IOStatus io_s = GenerateOneFileChecksum(
-      fs_.get(), file_to_ingest->internal_file_path,
-      db_options_.file_checksum_gen_factory.get(), requested_checksum_func_name,
-      &file_checksum, &file_checksum_func_name,
-      ingestion_options_.verify_checksums_readahead_size,
-      db_options_.allow_mmap_reads, io_tracer_, db_options_.rate_limiter.get(),
-      ro, db_options_.stats, db_options_.clock, gen_fopts);
-  if (!io_s.ok()) {
-    ROCKS_LOG_WARN(
-        db_options_.info_log, "Failed to generate checksum for %s: %s",
-        file_to_ingest->internal_file_path.c_str(), io_s.ToString().c_str());
-    return io_s;
-  }
-  file_to_ingest->file_checksum = std::move(file_checksum);
-  file_to_ingest->file_checksum_func_name = std::move(file_checksum_func_name);
-  return IOStatus::OK();
 }
 
 bool ExternalSstFileIngestionJob::IngestedFileFitInLevel(
@@ -1534,16 +1825,6 @@ bool ExternalSstFileIngestionJob::IngestedFileFitInLevel(
 
   // File did not overlap with level files, nor compaction output
   return true;
-}
-
-template <typename TWritableFile>
-Status ExternalSstFileIngestionJob::SyncIngestedFile(TWritableFile* file) {
-  assert(file != nullptr);
-  if (db_options_.use_fsync) {
-    return file->Fsync(IOOptions(), nullptr);
-  } else {
-    return file->Sync(IOOptions(), nullptr);
-  }
 }
 
 Status ExternalSstFileIngestionJob::GetSeqnoBoundaryForFile(

@@ -11,6 +11,7 @@
 
 #include "db/blob/blob_index.h"
 #include "db/version_set.h"
+#include "db/wide/wide_column_serialization.h"
 #include "logging/event_logger.h"
 #include "rocksdb/slice.h"
 #include "table/unique_id_impl.h"
@@ -29,7 +30,7 @@ PinnedTableReader& PinnedTableReader::operator=(
   TableReader* r = other.reader_.load(std::memory_order_acquire);
   // Only read handle_ when reader_ is non-null. Pin() writes handle_ before
   // reader_ (with release), so a non-null reader_ guarantees handle_ is stable.
-  // If reader_ is null, Pin() may be in progress — avoid reading handle_.
+  // If reader_ is null, Pin() may be in progress -- avoid reading handle_.
   handle_ = (r != nullptr) ? other.handle_ : nullptr;
   reader_.store(r, std::memory_order_release);
   return *this;
@@ -64,14 +65,26 @@ uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
 Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
                                       SequenceNumber seqno,
                                       ValueType value_type) {
-  if (value_type == kTypeBlobIndex) {
-    BlobIndex blob_index;
-    const Status s = blob_index.DecodeFrom(value);
-    if (!s.ok()) {
-      return s;
-    }
-
+  // Helper: update oldest_blob_file_number from a single BlobIndex.
+  auto update_oldest_blob = [&](const BlobIndex& blob_index) -> Status {
     if (!blob_index.IsInlined() && !blob_index.HasTTL()) {
+      // INTEGRITY TRIPWIRE -- do not weaken. This is generic file metadata on
+      // the table-build output path (flush / compaction / recovery, via
+      // BuildTable and CompactionOutputs), which must only ever see external
+      // blob-file references. file_number 0 is kInvalidBlobFileNumber, which is
+      // deliberately also the same-file ("embedded") sentinel
+      // kCurrentFileBlobIndexFileNumber (see blob_constants.h). Reaching here
+      // with 0 means one of:
+      //   * a same-file/embedded reference leaked into the output stream
+      //     unresolved -- e.g. EmbeddedBlobResolvingIterator failed to resolve
+      //     and fell back to the raw value on a blob-region read error
+      //     (T277566778); or
+      //   * an uninitialized/corrupt BlobIndex (default file number never set).
+      // Rejecting it flags the bug closer to its root cause. Do NOT relax this
+      // to skip same-file refs (e.g. via BlobIndex::IsSameFile()): that would
+      // mask real corruption AND could persist unresolvable same-file
+      // references into ordinary (non-embedded) SSTs, turning a transient error
+      // into permanent data loss.
       if (blob_index.file_number() == kInvalidBlobFileNumber) {
         return Status::Corruption("Invalid blob file number");
       }
@@ -80,6 +93,24 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
           oldest_blob_file_number > blob_index.file_number()) {
         oldest_blob_file_number = blob_index.file_number();
       }
+    }
+    return Status::OK();
+  };
+
+  if (value_type == kTypeBlobIndex) {
+    BlobIndex blob_index;
+    if (Status s = blob_index.DecodeFrom(value); !s.ok()) {
+      return s;
+    }
+
+    if (Status s = update_oldest_blob(blob_index); !s.ok()) {
+      return s;
+    }
+  } else if (value_type == kTypeWideColumnEntity) {
+    if (Status s = WideColumnSerialization::ForEachBlobFileNumber(
+            value, update_oldest_blob);
+        !s.ok()) {
+      return s;
     }
   }
 
@@ -94,6 +125,17 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
 }
 
 void VersionEdit::Clear() { *this = VersionEdit(); }
+
+bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
+    uint64_t current_log_number) const {
+  return (HasLogNumber() && GetLogNumber() > current_log_number) ||
+         NumEntries() > 0 || HasComparatorName() || HasPrevLogNumber() ||
+         HasNextFile() || HasMaxColumnFamily() || HasMinLogNumberToKeep() ||
+         HasLastSequence() || !GetCompactCursors().empty() || HasDbId() ||
+         IsColumnFamilyManipulation() || IsInAtomicGroup() ||
+         HasFullHistoryTsLow() || HasPersistUserDefinedTimestamps() ||
+         HasSubcompactionProgress() || HasCommittedOptionsFileNumber();
+}
 
 bool VersionEdit::EncodeTo(std::string* dst,
                            std::optional<size_t> ts_sz) const {
@@ -215,6 +257,20 @@ bool VersionEdit::EncodeTo(std::string* dst,
     PutLengthPrefixedSlice(dst, progress_data);
   }
 
+  if (has_last_compacted_manifest_file_size_) {
+    PutVarint32(dst, kLastCompactedManifestFileSize);
+    std::string varint_size;
+    PutVarint64(&varint_size, last_compacted_manifest_file_size_);
+    PutLengthPrefixedSlice(dst, Slice(varint_size));
+  }
+
+  if (has_committed_options_file_number_) {
+    PutVarint32(dst, kCommittedOptionsFileNumber);
+    std::string encoded;
+    PutVarint64(&encoded, committed_options_file_number_);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
+
   return true;
 }
 
@@ -255,12 +311,12 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
   //   tag kNeedCompaction:
   //        now only can take one char value 1 indicating need-compaction
   //
-  PutVarint32(dst, NewFileCustomTag::kOldestAncesterTime);
-  std::string varint_oldest_ancester_time;
-  PutVarint64(&varint_oldest_ancester_time, f.oldest_ancester_time);
-  TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:VarintOldestAncesterTime",
-                           &varint_oldest_ancester_time);
-  PutLengthPrefixedSlice(dst, Slice(varint_oldest_ancester_time));
+  PutVarint32(dst, NewFileCustomTag::kOldestAncestorTime);
+  std::string varint_oldest_ancestor_time;
+  PutVarint64(&varint_oldest_ancestor_time, f.oldest_ancestor_time);
+  TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:VarintOldestAncestorTime",
+                           &varint_oldest_ancestor_time);
+  PutLengthPrefixedSlice(dst, Slice(varint_oldest_ancestor_time));
 
   PutVarint32(dst, NewFileCustomTag::kFileCreationTime);
   std::string varint_file_creation_time;
@@ -347,6 +403,10 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     PutVarint32(dst, NewFileCustomTag::kMaxTimestamp);
     PutLengthPrefixedSlice(dst, Slice(f.max_timestamp));
   }
+  if (!f.file_open_metadata.empty()) {
+    PutVarint32(dst, NewFileCustomTag::kFileOpenMetadata);
+    PutLengthPrefixedSlice(dst, Slice(f.file_open_metadata));
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -414,9 +474,9 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
             return "path_id wrong vaue";
           }
           break;
-        case kOldestAncesterTime:
-          if (!GetVarint64(&field, &f.oldest_ancester_time)) {
-            return "invalid oldest ancester time";
+        case kOldestAncestorTime:
+          if (!GetVarint64(&field, &f.oldest_ancestor_time)) {
+            return "invalid oldest ancestor time";
           }
           break;
         case kFileCreationTime:
@@ -491,6 +551,9 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
           break;
         case kMaxTimestamp:
           f.max_timestamp = field.ToString();
+          break;
+        case kFileOpenMetadata:
+          f.file_open_metadata = field.ToString();
           break;
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
@@ -858,6 +921,29 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         break;
       }
 
+      case kLastCompactedManifestFileSize: {
+        Slice encoded;
+        if (GetLengthPrefixedSlice(&input, &encoded) &&
+            GetVarint64(&encoded, &last_compacted_manifest_file_size_)) {
+          has_last_compacted_manifest_file_size_ = true;
+        } else {
+          msg = "last compacted manifest file size";
+        }
+        break;
+      }
+
+      case kCommittedOptionsFileNumber: {
+        Slice encoded;
+        if (GetLengthPrefixedSlice(&input, &encoded) &&
+            GetVarint64(&encoded, &committed_options_file_number_) &&
+            encoded.empty()) {
+          has_committed_options_file_number_ = true;
+        } else {
+          msg = "committed options file number";
+        }
+        break;
+      }
+
       default:
         if (tag & kTagSafeIgnoreMask) {
           // Tag from future which can be safely ignored.
@@ -956,8 +1042,9 @@ std::string VersionEdit::DebugString(bool hex_key) const {
       r.append(" blob_file:");
       AppendNumberTo(&r, f.oldest_blob_file_number);
     }
+    // Misspelled label kept for compatibility with tools parsing this output
     r.append(" oldest_ancester_time:");
-    AppendNumberTo(&r, f.oldest_ancester_time);
+    AppendNumberTo(&r, f.oldest_ancestor_time);
     r.append(" file_creation_time:");
     AppendNumberTo(&r, f.file_creation_time);
     r.append(" epoch_number:");
@@ -984,6 +1071,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     AppendNumberTo(&r, f.tail_size);
     r.append(" User-defined timestamps persisted: ");
     r.append(f.user_defined_timestamps_persisted ? "true" : "false");
+    if (!f.file_open_metadata.empty()) {
+      r.append(" file_open_metadata_size: ");
+      AppendNumberTo(&r, f.file_open_metadata.size());
+    }
   }
 
   for (const auto& blob_file_addition : blob_file_additions_) {
@@ -1027,6 +1118,14 @@ std::string VersionEdit::DebugString(bool hex_key) const {
   if (HasSubcompactionProgress()) {
     r.append("\n SubcompactionProgress: ");
     r.append(subcompaction_progress_.ToString());
+  }
+  if (has_last_compacted_manifest_file_size_) {
+    r.append("\n  LastCompactedManifestFileSize: ");
+    AppendNumberTo(&r, last_compacted_manifest_file_size_);
+  }
+  if (has_committed_options_file_number_) {
+    r.append("\n  CommittedOptionsFileNumber: ");
+    AppendNumberTo(&r, committed_options_file_number_);
   }
   r.append("\n}\n");
   return r;
@@ -1087,7 +1186,8 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       jw << "FileSize" << f.fd.GetFileSize();
       jw << "SmallestIKey" << f.smallest.DebugString(hex_key);
       jw << "LargestIKey" << f.largest.DebugString(hex_key);
-      jw << "OldestAncesterTime" << f.oldest_ancester_time;
+      // Misspelled key kept for compatibility with tools parsing this output
+      jw << "OldestAncesterTime" << f.oldest_ancestor_time;
       jw << "FileCreationTime" << f.file_creation_time;
       jw << "EpochNumber" << f.epoch_number;
       jw << "FileChecksum" << Slice(f.file_checksum).ToString(true);
@@ -1106,6 +1206,9 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       jw << "TailSize" << f.tail_size;
       jw << "UserDefinedTimestampsPersisted"
          << f.user_defined_timestamps_persisted;
+      if (!f.file_open_metadata.empty()) {
+        jw << "FileOpenMetadataSize" << f.file_open_metadata.size();
+      }
       jw.EndArrayedObject();
     }
 
@@ -1179,6 +1282,14 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
 
   if (HasSubcompactionProgress()) {
     jw << "SubcompactionProgress" << subcompaction_progress_.ToString();
+  }
+
+  if (has_last_compacted_manifest_file_size_) {
+    jw << "LastCompactedManifestFileSize" << last_compacted_manifest_file_size_;
+  }
+
+  if (has_committed_options_file_number_) {
+    jw << "CommittedOptionsFileNumber" << committed_options_file_number_;
   }
 
   jw.EndObject();

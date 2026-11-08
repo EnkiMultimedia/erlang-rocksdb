@@ -11,10 +11,17 @@
 #ifdef GFLAGS
 #pragma once
 
+#include <cstddef>
+#include <string>
+#include <vector>
+
 #include "db_stress_tool/db_stress_common.h"
 #include "db_stress_tool/db_stress_shared_state.h"
+#include "env/composite_env_wrapper.h"
 #include "rocksdb/experimental.h"
+#include "rocksdb/iterator.h"
 #include "rocksdb/user_defined_index.h"
+#include "rocksdb/utilities/checkpoint.h"
 #include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -22,16 +29,82 @@ class SystemClock;
 class Transaction;
 class TransactionDB;
 class OptimisticTransactionDB;
+class DbStressFSWrapper;
+class Iterator;
 struct TransactionDBOptions;
 using experimental::SstQueryFilterConfigsManager;
 
+std::string FormatDiagnosticSlice(const Slice& value);
+std::string SanitizeDiagnosticValue(const std::string& value);
+std::string FormatReadOptionsForDiagnostics(const ReadOptions& ro);
+
+class ScanWitnessLog {
+ public:
+  ScanWitnessLog(ThreadState* thread, const char* scan_type);
+
+  bool Enabled() const;
+
+  void Add(const std::string& event);
+
+  void AddIteratorState(const char* action, const char* label,
+                        const Iterator& iter, bool include_value);
+
+  void AddIteratorState(const char* action, size_t label, const Iterator& iter,
+                        bool include_value);
+
+  void Flush(const char* reason) const;
+
+ private:
+  ThreadState* thread_;
+  const char* scan_type_;
+  std::vector<std::string> entries_;
+  size_t next_entry_;
+  bool wrapped_;
+};
+
 class StressTest {
  public:
-  static bool IsErrorInjectedAndRetryable(const Status& error_s) {
-    assert(!error_s.ok());
-    return error_s.getState() &&
-           FaultInjectionTestFS::IsInjectedError(error_s) &&
-           !status_to_io_status(Status(error_s)).GetDataLoss();
+  // Returns true if `error_s` should be treated as retryable rather than a real
+  // failure. Covers injected fault-injection errors, and -- despite the name --
+  // also non-injected IO errors, but only when a remote backend (--env_uri /
+  // --fs_uri) is in use and --tolerate_non_injected_io_errors_for_remote_dbs is
+  // set (infrastructure behind a remote backend can return transient IO
+  // errors). Gating on a remote backend guarantees non-injected IO errors on
+  // local DBs are never masked. Data-loss errors are never retryable.
+  //
+  // Defined out-of-line in db_stress_test_base.cc: it reads FLAGS_env_uri /
+  // FLAGS_fs_uri, which db_stress_common.h declares only after it includes this
+  // header, so they are not visible here.
+  static bool IsErrorInjectedAndRetryable(const Status& error_s);
+
+  // Returns true if `error_s` is a non-injected, non-data-loss IO error that
+  // --tolerate_non_injected_io_errors_for_remote_dbs asks us to tolerate while
+  // a remote backend (--env_uri / --fs_uri) is in use. Infrastructure behind a
+  // remote backend can fail a read transiently with no RocksDB bug involved.
+  //
+  // Defined out-of-line in db_stress_test_base.cc for the same reason as
+  // IsErrorInjectedAndRetryable.
+  static bool IsTolerableNonInjectedRemoteIOError(const Status& error_s);
+
+  // Returns true if `error_s`, surfaced by an operation during which
+  // `injected_error_count` faults were injected, is retryable rather than a
+  // verification failure.
+  //
+  // An injected-error status is only trusted when this operation actually
+  // injected a fault, because otherwise the status did not come from fault
+  // injection. A tolerated non-injected remote IO error has no injected fault
+  // to correlate with, so `injected_error_count` must not gate it -- gating it
+  // would make --tolerate_non_injected_io_errors_for_remote_dbs a no-op
+  // whenever fault injection is disabled.
+  static bool IsRetryableOperationError(int injected_error_count,
+                                        const Status& error_s);
+
+  static bool IsTolerableCompactionFailure(const Status& s) {
+    // TOOD (hx235): allow an exact list of tolerable failures under stress
+    // test
+    return s.IsManualCompactionPaused() || s.IsCompactionAborted() ||
+           IsErrorInjectedAndRetryable(s) || s.IsAborted() ||
+           s.IsInvalidArgument() || s.IsNotSupported();
   }
 
   // Returns true if the status is an expected transactional error, including
@@ -40,11 +113,26 @@ class StressTest {
   // from optimistic transactions when conflict detection retries are exhausted.
   static bool IsExpectedTxnError(const Status& s);
 
-  StressTest();
+  StressTest(int db_index, const std::string& db_path,
+             const std::string& ev_path, const std::string& sec_path);
 
   virtual ~StressTest() {}
 
-  std::shared_ptr<Cache> NewCache(size_t capacity, int32_t num_shard_bits);
+  const std::string& GetDbLabel() const;
+  const std::string& GetDbPath() const;
+  const std::string& GetExpectedValuesDir() const;
+  const std::string& GetSecondariesBase() const;
+
+  // See db_fault_injection_fs_ member.
+  std::shared_ptr<FaultInjectionTestFS> GetDbFaultInjectionFs() const {
+    return db_fault_injection_fs_;
+  }
+
+  // See db_env_ member.
+  Env* GetDbEnv() const;
+
+  static std::shared_ptr<Cache> NewCache(size_t capacity,
+                                         int32_t num_shard_bits);
 
   static std::vector<std::string> GetBlobCompressionTags();
 
@@ -71,6 +159,11 @@ class StressTest {
   Options GetOptions(int cf_id);
   void CleanUp();
 
+ private:
+  void InitializeListenersForOpen(
+      SharedState* shared,
+      const std::vector<ColumnFamilyDescriptor>& cf_descriptors);
+
  protected:
   static int GetMinInjectedErrorCount(int error_count_1, int error_count_2) {
     if (error_count_1 > 0 && error_count_2 > 0) {
@@ -84,39 +177,34 @@ class StressTest {
     }
   }
 
-  void UpdateIfInitialWriteFails(Env* db_stress_env, const Status& write_s,
+  void UpdateIfInitialWriteFails(Env* env, const Status& write_s,
                                  Status* initial_write_s,
                                  bool* initial_wal_write_may_succeed,
                                  uint64_t* wait_for_recover_start_time,
                                  bool commit_bypass_memtable = false) {
-    assert(db_stress_env && initial_write_s && initial_wal_write_may_succeed &&
+    assert(env && initial_write_s && initial_wal_write_may_succeed &&
            wait_for_recover_start_time);
-    // Only update `initial_write_s`, `initial_wal_write_may_succeed` when the
-    // first write fails
     if (!write_s.ok() && (*initial_write_s).ok()) {
       *initial_write_s = write_s;
-      // With commit_bypass_memtable, we create a new WAL after WAL write
-      // succeeds, that wal creation may fail due to injected error. So the
-      // initial wal write may succeed even if status is failed to write to wal
       *initial_wal_write_may_succeed =
           commit_bypass_memtable ||
           !FaultInjectionTestFS::IsFailedToWriteToWALError(*initial_write_s);
-      *wait_for_recover_start_time = db_stress_env->NowMicros();
+      *wait_for_recover_start_time = env->NowMicros();
     }
   }
 
-  void PrintWriteRecoveryWaitTimeIfNeeded(Env* db_stress_env,
+  void PrintWriteRecoveryWaitTimeIfNeeded(Env* env,
                                           const Status& initial_write_s,
                                           bool initial_wal_write_may_succeed,
                                           uint64_t wait_for_recover_start_time,
                                           const std::string& thread_name) {
-    assert(db_stress_env);
+    assert(env);
     bool waited_for_recovery = !initial_write_s.ok() &&
                                IsErrorInjectedAndRetryable(initial_write_s) &&
                                initial_wal_write_may_succeed;
     if (waited_for_recovery) {
       uint64_t elapsed_sec =
-          (db_stress_env->NowMicros() - wait_for_recover_start_time) / 1000000;
+          (env->NowMicros() - wait_for_recover_start_time) / 1000000;
       if (elapsed_sec > 10) {
         fprintf(stdout,
                 "%s thread slept to wait for write recovery for "
@@ -211,6 +299,78 @@ class StressTest {
                                   const std::vector<int>& rand_column_families,
                                   const std::vector<int64_t>& rand_keys) = 0;
 
+  // True if lazy wide-column read coverage (FLAGS_lazy_entity_read_one_in) is
+  // enabled and applicable for this run. Cheap config-only check (no
+  // randomness); used by callers that must build key data before invoking the
+  // Maybe* helpers below. Requires open_files == -1 (the lazy API's
+  // requirement) and, as tracked follow-ups, excludes user-defined timestamps
+  // and transactions (see LazyEntityReadEnabled() in the .cc for details).
+  bool LazyEntityReadEnabled() const;
+
+  // Coverage for the lazy wide-column read API. When enabled and randomly
+  // triggered (FLAGS_lazy_entity_read_one_in), always reads `key` in `cfh` via
+  // GetEntityLazy and resolves a random subset of its columns (possibly none)
+  // under a pinned snapshot -- this exercises the lazy read paths for crash
+  // coverage. Additionally, when DB verification is enabled (!skip_verifydb),
+  // checks the lazy result matches an eager reference (enumeration: column
+  // count / names / known logical sizes, with no blob I/O; plus the resolved
+  // subset compared byte-for-byte). If the caller already read the entity under
+  // read_opts.snapshot, it should pass those columns as `eager_reference` so we
+  // reuse that (already-verified) result and skip a redundant eager read;
+  // otherwise (eager_reference == nullptr) we pin our own snapshot and read the
+  // reference here. Reports failures via thread->shared; tolerates
+  // injected/retryable read errors. No-op if not triggered. Meant to be called
+  // from the modes' TestGetEntity implementations.
+  //
+  // By default the read targets the primary `db_`. Pass `db` (with a `cfh` from
+  // that instance) to exercise a read-only or secondary instance instead; such
+  // a target has a stable view for the call (and secondary intentionally
+  // disallows snapshot reads), so it is read at latest with no pinned snapshot.
+  void MaybeTestGetEntityLazy(ThreadState* thread, const ReadOptions& read_opts,
+                              ColumnFamilyHandle* cfh, const Slice& key,
+                              const WideColumns* eager_reference = nullptr,
+                              DB* db = nullptr) const;
+
+  // Per-key eager reference for the MultiGetEntityLazy differential below: the
+  // caller's eager status for the key plus, when found, a pointer to its
+  // columns (all read under read_opts.snapshot). Carrying the status -- rather
+  // than just a columns-or-null pointer -- lets the differential tell a clean
+  // NotFound apart from an injected/other eager error, which must be skipped
+  // rather than compared against the lazy result.
+  struct EagerEntityRef {
+    Status status;
+    const WideColumns* columns = nullptr;  // valid iff status.ok()
+  };
+
+  // Batch analogue of MaybeTestGetEntityLazy for TestMultiGetEntity: always
+  // exercises MultiGetEntityLazy + LazyWideColumnsBatch::MultiResolve on a
+  // random cross-entity column subset, and (when !skip_verifydb) verifies
+  // against an eager reference. If the caller already read these keys under
+  // read_opts.snapshot, it should pass `eager_references` (size == num_keys,
+  // one EagerEntityRef per key) to reuse those verified results and skip a
+  // redundant eager MultiGetEntity; otherwise (eager_references == nullptr) we
+  // read the reference here. Single column family.
+  void MaybeTestMultiGetEntityLazy(
+      ThreadState* thread, const ReadOptions& read_opts,
+      ColumnFamilyHandle* cfh, size_t num_keys, const Slice* keys,
+      const std::vector<EagerEntityRef>* eager_references = nullptr);
+
+  // Exercises a lazily-read entity's no-I/O enumeration accessors, and (when
+  // `reference` is non-null) checks column count / names / known logical sizes
+  // against the eager reference. Reports mismatches via thread->shared and
+  // returns false; returns true when consistent (or when only exercising, i.e.
+  // reference == nullptr).
+  bool CheckLazyEntityEnumeration(ThreadState* thread, const std::string& key,
+                                  const WideColumns* reference,
+                                  const LazyWideColumns& lazy) const;
+
+  // Resolves a random subset of `lazy`'s columns (possibly none) via
+  // LazyWideColumns::MultiResolve to exercise the resolver; when `reference` is
+  // non-null, also verifies the resolved bytes against it.
+  void ResolveLazyEntity(ThreadState* thread, const std::string& key,
+                         const WideColumns* reference,
+                         LazyWideColumns& lazy) const;
+
   virtual Status TestPrefixScan(ThreadState* thread,
                                 const ReadOptions& read_opts,
                                 const std::vector<int>& rand_column_families,
@@ -303,19 +463,59 @@ class StressTest {
     kLastOpSeekToLast
   };
 
+  // Enum used to track MANIFEST verification mode during DB reopen.
+  // Verification is skipped when metadata write fault injection is enabled
+  // because recovery may have to abandon a partially written MANIFEST.
+  enum ManifestVerifyMode {
+    MANIFEST_VERIFY_NONE,
+    // MANIFEST file should be reused (same file number), CURRENT should not
+    // change. Used when reuse_manifest_on_open=1. Warnings are logged on
+    // failure but test continues.
+    MANIFEST_VERIFY_REUSE,
+    // MANIFEST file should be reused AND no recovery writes should occur.
+    // Used when both reuse_manifest_on_open=1 and
+    // optimize_manifest_for_recovery=1. Warnings are logged on failure but test
+    // continues.
+    MANIFEST_VERIFY_NO_WRITE,
+    // Strict verification: MANIFEST file must be reused with ZERO writes
+    // (complete avoidance). Used when ALL conditions for complete avoidance
+    // are met. Failures are FATAL and will terminate the test.
+    // Conditions for STRICT mode:
+    // - Both reuse_manifest_on_open=1 and optimize_manifest_for_recovery=1
+    // - Not in best_efforts_recovery mode
+    // - avoid_flush_during_recovery=true (no flush during recovery)
+    // - write_dbid_to_manifest=0 (no DB_ID write on open)
+    // - metadata_write_fault_one_in=0 (no fault injection)
+    // - open_metadata_write_fault_one_in=0 (no fault injection)
+    // - MANIFEST not corrupted, not at size limit
+    // Note: avoid_flush_during_shutdown is NOT required. If it leaves data
+    // in WAL but avoid_flush_during_recovery=true prevents flushing it,
+    // MANIFEST still won't be written.
+    MANIFEST_VERIFY_STRICT
+  };
+
   // Compare the two iterator, iter and cmp_iter are in the same position,
   // unless iter might be made invalidate or undefined because of
   // upper or lower bounds, or prefix extractor.
   // Will flag failure if the verification fails.
   // diverged = true if the two iterator is already diverged.
-  // True if verification passed, false if not.
+  // Returns true only when this call reports a verification failure. A false
+  // return with diverged = true means verification was intentionally skipped.
   // op_logs is the information to print when validation fails.
+  // verify_key is the seek target, or for SeekToFirst() under
+  // prefix_same_as_start the first key returned. Its prefix bounds the scan.
   template <typename IterType, typename VerifyFuncType>
-  void VerifyIterator(ThreadState* thread, ColumnFamilyHandle* cmp_cfh,
+  bool VerifyIterator(ThreadState* thread, ColumnFamilyHandle* cmp_cfh,
                       const ReadOptions& ro, IterType* iter, Iterator* cmp_iter,
-                      LastIterateOp op, const Slice& seek_key,
+                      LastIterateOp op, const Slice& verify_key,
+                      const std::vector<int>& rand_column_families,
                       const std::string& op_logs, VerifyFuncType verifyFunc,
                       bool* diverged);
+
+  void DumpIteratorDivergenceDiagnostics(
+      ColumnFamilyHandle* cmp_cfh, const ReadOptions& ro,
+      const Slice& verify_key,
+      const std::vector<int>& rand_column_families) const;
 
   virtual Status TestBackupRestore(ThreadState* thread,
                                    const std::vector<int>& rand_column_families,
@@ -329,7 +529,8 @@ class StressTest {
 
   void TestCompactFiles(ThreadState* thread, ColumnFamilyHandle* column_family);
 
-  Status TestFlush(const std::vector<int>& rand_column_families);
+  void TestFlush(ThreadState* thread,
+                 const std::vector<int>& rand_column_families);
 
   Status TestResetStats();
 
@@ -339,7 +540,11 @@ class StressTest {
 
   Status TestDisableManualCompaction(ThreadState* thread);
 
+  bool ShouldAbortAndResumeCompactions() const;
+
   Status TestAbortAndResumeCompactions(ThreadState* thread);
+
+  Status TestAbortAndResumeCfCompactions(ThreadState* thread);
 
   void TestAcquireSnapshot(ThreadState* thread, int rand_column_family,
                            const std::string& keystr, uint64_t i);
@@ -382,6 +587,14 @@ class StressTest {
   void VerificationAbort(SharedState* shared, int cf, int64_t key,
                          const Slice& value, const WideColumns& columns) const;
 
+  // Under --verify_cpu_corruption_dir, verifies the just-run op (named by
+  // `op_label`, e.g. "put"/"flush"/"compactrange") for a returned/read-back
+  // corruption or a silent data corruption. A no-op when the flag is empty. See
+  // the definition in db_stress_test_base.cc for the full behavior, startup
+  // requirements, performance cost, and result-file contract.
+  void MaybeVerifyCpuCorruption(ThreadState* thread, const char* op_label,
+                                const Status& op_status);
+
   static std::string DebugString(const Slice& value,
                                  const WideColumns& columns);
 
@@ -390,6 +603,13 @@ class StressTest {
   void Open(SharedState* shared, bool reopen = false);
 
   void Reopen(ThreadState* thread);
+
+  // Periodically opens a read-only DB instance on the primary's live directory
+  // while the primary keeps writing, then closes it. Exercises the concurrent
+  // primary + read-only-DB-on-the-same-directory topology to guard against a
+  // read-only DB's close deleting the primary's live SST files. Detection
+  // relies on db_stress's existing missing-file/corruption checks.
+  void MaybeOpenReadOnlyOnPrimary(ThreadState* thread);
 
   virtual void RegisterAdditionalListeners() {}
 
@@ -408,7 +628,25 @@ class StressTest {
 
   void CleanUpColumnFamilies();
 
-  std::shared_ptr<Cache> cache_;
+  Status VerifyOptionsFileStateBeforeOpen(
+      const std::vector<ColumnFamilyDescriptor>& cf_descriptors,
+      bool db_exists);
+  Status VerifyPersistedOptionsAfterOpen();
+
+  void RecordManifestStateBeforeReopen();
+  void VerifyManifestNotRewritten();
+
+  int db_index_;
+  std::string db_label_;
+  std::string db_path_;
+  std::string expected_values_path_;
+  std::string secondaries_path_;
+  // Wraps raw_env->GetFileSystem(). See DbStressFSWrapper.
+  std::shared_ptr<DbStressFSWrapper> db_stress_fs_;
+  // Wraps db_stress_fs_ when NeedsFaultInjection(). Null otherwise.
+  std::shared_ptr<FaultInjectionTestFS> db_fault_injection_fs_;
+  // Wraps the outermost FS above. Set as options_.env for all DB I/O.
+  std::unique_ptr<CompositeEnvWrapper> db_env_;
   std::shared_ptr<Cache> compressed_cache_;
   std::shared_ptr<const FilterPolicy> filter_policy_;
   std::unique_ptr<DB> db_owner_;
@@ -434,6 +672,15 @@ class StressTest {
   std::unique_ptr<DB> secondary_db_;
   std::vector<ColumnFamilyHandle*> secondary_cfhs_;
   bool is_db_stopped_;
+
+  std::unique_ptr<CheckpointEngine> checkpoint_engine_;
+
+  // MANIFEST verification state for reopen
+  ManifestVerifyMode manifest_verify_mode_;
+  uint64_t manifest_file_number_before_reopen_;
+  uint64_t manifest_file_size_before_reopen_;
+  std::string current_file_content_before_reopen_;
+  bool verify_options_manifest_tracking_ = false;
 };
 
 // Load options from OPTIONS file and populate `options`.

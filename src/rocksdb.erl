@@ -48,6 +48,8 @@
   enable_manual_compaction/1,
   abort_all_compactions/1,
   resume_all_compactions/1,
+  abort_compactions/2,
+  resume_compactions/2,
   stats/1, stats/2,
   get_property/2, get_property/3,
   get_approximate_sizes/3, get_approximate_sizes/4,
@@ -128,7 +130,11 @@
 %% ingest external file API
 -export([
   ingest_external_file/3,
-  ingest_external_file/4
+  ingest_external_file/4,
+  prepare_ingestion/3,
+  prepare_ingestion/4,
+  commit_ingestion/2,
+  abort_ingestion/1
 ]).
 
 %% sst file reader API
@@ -304,6 +310,7 @@
   sst_file_reader_itr/0,
   table_properties/0,
   ingest_external_file_option/0,
+  ingestion_handle/0,
   write_buffer_manager/0,
   statistics_handle/0,
   stats_level/0,
@@ -386,10 +393,12 @@
     file_creation_time := non_neg_integer(),
     slow_compression_estimated_data_size := non_neg_integer(),
     fast_compression_estimated_data_size := non_neg_integer(),
+    %% Deprecated: removed in RocksDB 11.13, always 0.
     external_sst_file_global_seqno_offset := non_neg_integer()
 }.
 -opaque db_handle() :: reference() | binary().
 -opaque cf_handle() :: reference() | binary().
+-opaque ingestion_handle() :: reference() | binary().
 -opaque itr_handle() :: reference() | binary().
 -opaque snapshot_handle() :: reference() | binary().
 -opaque batch_handle() :: reference() | binary().
@@ -421,12 +430,14 @@
                                       {block_cache, cache_handle()} |
                                       {block_cache_size, pos_integer()} |
                                       {bloom_filter_policy, BitsPerKey :: pos_integer()} |
-                                      {format_version, 2 | 3 | 4 | 5 | 6 | 7} |
+                                      {format_version, 2 | 3 | 4 | 5 | 6 | 7 | 8} |
                                       {cache_index_and_filter_blocks, boolean()} |
                                       %% RocksDB 11.0/11.1
                                       {index_block_search_type, binary_search | interpolation | auto} |
                                       {uniform_cv_threshold, float()} |
-                                      {prepopulate_block_cache, disable | flush_only | flush_and_compaction}].
+                                      {prepopulate_block_cache, disable | flush_only | flush_and_compaction} |
+                                      %% RocksDB 11.10+, needs format_version 8
+                                      {optimize_key_common_prefix, disabled | if_fast_seek | enabled}].
 
 -type merge_operator() :: erlang_merge_operator |
                           bitset_merge_operator |
@@ -457,6 +468,7 @@
 -type compaction_filter_opts() ::
     #{rules := [filter_rule()]} |
     #{handler := pid(),
+      %% accepted but has no effect: keys are sent one per message
       batch_size => pos_integer(),
       timeout => pos_integer()}.
 
@@ -510,7 +522,13 @@
                        {compaction_filter, compaction_filter_opts()} |
                        {target_file_size_is_upper_bound, boolean()} |
                        %% RocksDB 11.1+
-                       {memtable_batch_lookup_optimization, boolean()}
+                       {memtable_batch_lookup_optimization, boolean()} |
+                       {periodic_compaction_seconds, non_neg_integer()} |
+                       %% RocksDB 11.2+
+                       {read_triggered_compaction_threshold, number()} |
+                       {min_tombstones_for_range_conversion, non_neg_integer()} |
+                       %% RocksDB 11.9+
+                       {blob_file_writable_file_max_buffer_size, non_neg_integer()}
                       ].
 
 -type db_options() :: [{env, env()} |
@@ -569,7 +587,14 @@
                        %% open_files_async requires skip_stats_update_on_db_open = true
                        {open_files_async, boolean()} |
                        {enforce_write_buffer_manager_during_recovery, boolean()} |
-                       {verify_manifest_content_on_close, boolean()}].
+                       {verify_manifest_content_on_close, boolean()} |
+                       %% RocksDB 11.2+
+                       {max_compaction_trigger_wakeup_seconds, non_neg_integer()} |
+                       %% RocksDB 11.3+, experimental
+                       {optimize_manifest_for_recovery, boolean()} |
+                       {reuse_manifest_on_open, boolean()} |
+                       %% RocksDB 11.5+
+                       {use_direct_io_for_compaction_reads, boolean()}].
 
 -type options() :: db_options() | cf_options().
 
@@ -708,6 +733,10 @@
       bytes_per_write.
 
 -type transaction_histogram() :: num_op_per_transaction.
+
+%% RocksDB 11.5+, recorded for each successful ingestion
+-type ingestion_histogram() :: ingest_external_file_prepare_micros |
+      ingest_external_file_run_micros.
 
 -type compaction_ticker() :: compact_read_bytes |
       compact_write_bytes |
@@ -1515,10 +1544,9 @@ enable_manual_compaction(_DbHandle) ->
   ?nif_stub.
 
 %% @doc Abort all running and scheduled compactions (RocksDB 11.0+).
-%% In-progress compactions are actively cancelled and report a status for which
-%% `rocksdb:is_compaction_aborted/1' (a RocksDB `kCompactionAborted' status) is
-%% true. Call `resume_all_compactions/1' as many times as this was called to
-%% resume.
+%% In-progress compactions are actively cancelled and new ones, including
+%% `compact_range', return an error. Call `resume_all_compactions/1' as many
+%% times as this was called to resume.
 -spec abort_all_compactions(db_handle()) -> ok | {error, term()}.
 abort_all_compactions(_DbHandle) ->
   ?nif_stub.
@@ -1527,6 +1555,25 @@ abort_all_compactions(_DbHandle) ->
 %% (RocksDB 11.0+). Must be called as many times as `abort_all_compactions/1'.
 -spec resume_all_compactions(db_handle()) -> ok | {error, term()}.
 resume_all_compactions(_DbHandle) ->
+  ?nif_stub.
+
+%% @doc Abort running and scheduled compactions of one column family
+%% (RocksDB 11.9+). Automatic and manual compactions of `CFHandle' stop and new
+%% ones are rejected until `resume_compactions/2' is called. Other column
+%% families, and flushes, are not affected. Blocks until the running
+%% compactions of the column family have stopped.
+%%
+%% Calls are counted per column family and combine with
+%% `abort_all_compactions/1': compactions resume only once both counts are back
+%% to zero. Keep `CFHandle' alive until the matching `resume_compactions/2'.
+-spec abort_compactions(db_handle(), cf_handle()) -> ok.
+abort_compactions(_DbHandle, _CFHandle) ->
+  ?nif_stub.
+
+%% @doc Resume compactions of a column family aborted by `abort_compactions/2'
+%% (RocksDB 11.9+). Must be called as many times as `abort_compactions/2'.
+-spec resume_compactions(db_handle(), cf_handle()) -> ok.
+resume_compactions(_DbHandle, _CFHandle) ->
   ?nif_stub.
 
 %% @doc Return the current stats of the default column family
@@ -2580,6 +2627,58 @@ ingest_external_file(_DbHandle, _Files, _Options) ->
 ingest_external_file(_DbHandle, _CfHandle, _Files, _Options) ->
   ?nif_stub.
 
+%% @doc Prepare the ingestion of external SST files without making them
+%% visible (RocksDB 11.5+).
+%%
+%% Does the slow part of `ingest_external_file/3' (validating, reading and
+%% copying or linking the files into the database) without blocking writes.
+%% Make the files visible with `commit_ingestion/2', or cancel with
+%% `abort_ingestion/1'. Options are the same as `ingest_external_file/3'.
+%%
+%% Each handle can be committed or aborted once. A handle that is never
+%% committed is rolled back when it is garbage collected or when the database
+%% is closed.
+-spec prepare_ingestion(DbHandle, Files, Options) -> Result when
+    DbHandle :: db_handle(),
+    Files :: [file:filename_all()],
+    Options :: [ingest_external_file_option()],
+    Result :: {ok, ingestion_handle()} | {error, any()}.
+prepare_ingestion(_DbHandle, _Files, _Options) ->
+  ?nif_stub.
+
+%% @doc Same as `prepare_ingestion/3' for a column family.
+-spec prepare_ingestion(DbHandle, CfHandle, Files, Options) -> Result when
+    DbHandle :: db_handle(),
+    CfHandle :: cf_handle(),
+    Files :: [file:filename_all()],
+    Options :: [ingest_external_file_option()],
+    Result :: {ok, ingestion_handle()} | {error, any()}.
+prepare_ingestion(_DbHandle, _CfHandle, _Files, _Options) ->
+  ?nif_stub.
+
+%% @doc Commit ingestions prepared with `prepare_ingestion/3,4'.
+%%
+%% Given a list, all files become visible together in one atomic step, or
+%% none do. The list can mix column families. Handles for the same column
+%% family must use the same options; when they overlap, a later handle in the
+%% list wins.
+%%
+%% The handles are spent afterwards, even if the commit fails (it is then
+%% rolled back). A handle that was already used, or that belongs to another
+%% database, raises `badarg' and leaves the others in the list untouched.
+-spec commit_ingestion(DbHandle, Ingestions) -> ok | {error, any()} when
+    DbHandle :: db_handle(),
+    Ingestions :: ingestion_handle() | [ingestion_handle()].
+commit_ingestion(_DbHandle, _Ingestions) ->
+  ?nif_stub.
+
+%% @doc Cancel an ingestion prepared with `prepare_ingestion/3,4'. The files
+%% staged in the database are removed and the external files are left as they
+%% were.
+-spec abort_ingestion(ingestion_handle()) -> ok | {error, any()}.
+abort_ingestion(_Ingestion) ->
+  ?nif_stub.
+
 
 %% ===================================================================
 %% SstFileReader functions
@@ -2764,7 +2863,7 @@ statistics_ticker(_Statistics, _Ticker) ->
 %% Returns histogram information including median, percentiles, average, etc.
 %% For integrated BlobDB, relevant histograms are blob_db_blob_file_write_micros,
 %% blob_db_blob_file_read_micros, blob_db_compression_micros, etc.
--spec statistics_histogram(statistics_handle(), blob_db_histogram() | core_operation_histogram() | io_sync_histogram() | transaction_histogram()) -> {ok, histogram_info()}.
+-spec statistics_histogram(statistics_handle(), blob_db_histogram() | core_operation_histogram() | io_sync_histogram() | transaction_histogram() | ingestion_histogram()) -> {ok, histogram_info()}.
 statistics_histogram(_Statistics, _Histogram) ->
   ?nif_stub.
 

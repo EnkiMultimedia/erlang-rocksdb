@@ -5,6 +5,7 @@
 //
 // Testing various compression features
 
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 
@@ -15,6 +16,7 @@
 #include "table/block_based/block_builder.h"
 #include "table/block_based/data_block_footer.h"
 #include "test_util/testutil.h"
+#include "util/aligned_buffer.h"
 #include "util/auto_tune_compressor.h"
 #include "util/coding.h"
 #include "util/random.h"
@@ -521,7 +523,7 @@ class PresetCompressionDictTest
       public testing::WithParamInterface<std::tuple<CompressionType, bool>> {
  public:
   PresetCompressionDictTest()
-      : DBTestBase("db_test2", false /* env_do_fsync */),
+      : DBTestBase("compression_test_preset_dict", false /* env_do_fsync */),
         compression_type_(std::get<0>(GetParam())),
         bottommost_(std::get<1>(GetParam())) {}
 
@@ -927,6 +929,74 @@ TEST_P(CompressionFailuresTest, CompressionFailures) {
     ASSERT_EQ(s.code(), Status::kCorruption);
     ASSERT_NE(st, nullptr);
     ASSERT_EQ(std::string(st), "Seeded failure");
+  }
+}
+
+TEST_F(DBCompressionTest, VerifyCompressionChecksFinalCompressedBlockContents) {
+  CompressionType compression_type = kNoCompression;
+  for (CompressionType supported : GetSupportedCompressions()) {
+    if (supported != kNoCompression) {
+      compression_type = supported;
+      break;
+    }
+  }
+  if (compression_type == kNoCompression) {
+    return;
+  }
+
+  struct SyncPointCleanup {
+    ~SyncPointCleanup() {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+    }
+  } sync_point_cleanup;
+
+  for (uint32_t parallel_threads : {1, 4}) {
+    SCOPED_TRACE("parallel_threads=" + std::to_string(parallel_threads));
+
+    Options options = CurrentOptions();
+    options.compression = compression_type;
+    options.compression_opts.max_compressed_bytes_per_kb = 1024;
+    options.compression_opts.parallel_threads = parallel_threads;
+
+    BlockBasedTableOptions table_options;
+    table_options.block_size = 512;
+    table_options.verify_compression = true;
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+    DestroyAndReopen(options);
+
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    std::atomic<int> tamper_count{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "BlockBasedTableBuilder::CompressAndVerifyBlock:"
+        "TamperWithCompressedDataBeforeVerify",
+        [&](void* arg) {
+          auto* output = static_cast<GrowableBuffer*>(arg);
+          ASSERT_FALSE(output->empty());
+          output->data()[output->size() - 1]++;
+          tamper_count++;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    Random rnd(405);
+    constexpr int kValUnitSize = 16;
+    constexpr int kValSize = 256;
+    for (int i = 0; i < 5; i++) {
+      std::string value_unit = rnd.RandomString(kValUnitSize);
+      std::string value;
+      for (int j = 0; j < kValSize; j += kValUnitSize) {
+        value += value_unit;
+      }
+      ASSERT_OK(Put(Key(i), value));
+    }
+
+    Status s = Flush();
+
+    ASSERT_GT(tamper_count.load(), 0);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
   }
 }
 
@@ -1717,6 +1787,57 @@ TEST_P(DBCompressionTestMaybeParallel, CompressionManagerCustomCompression) {
   options.compression = kCustomCompression8B;
   ASSERT_EQ(TryReopen(options).code(), Status::Code::kInvalidArgument);
 
+  // Write data with mgr_claim_compatible (BuiltinV2 compat name) at fv=7
+  // using a built-in compression type. This should produce the new format
+  // compression_name property ("BuiltinV2;04;") and still be readable
+  // without the original compression manager.
+  options.compression_manager = mgr_claim_compatible;
+  options.compression = kLZ4Compression;
+  Reopen(options);
+  ASSERT_OK(Put("a1", test::CompressibleString(&rnd, 0.1, kValueSize, &value)));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("a1"), value);
+
+  // Verify it was compressed with the new format property
+  r = {"a1", "a10"};
+  tables_properties.clear();
+  ASSERT_OK(db_->GetPropertiesOfTablesInRange(db_->DefaultColumnFamily(), &r, 1,
+                                              &tables_properties));
+  ASSERT_EQ(tables_properties.size(), 1U);
+  EXPECT_LT(tables_properties.begin()->second->data_size, kValueSize / 2);
+  EXPECT_EQ(tables_properties.begin()->second->compression_name,
+            "BuiltinV2;04;");
+
+  // Re-open without original compression manager, just with defaults.
+  // Should work because the compat name is the built-in one.
+  // As a sanity check to ensure the custom compression manager isn't leaking
+  // into the re-open, verify that neither GetId() (used in OPTIONS files) nor
+  // CompatibilityName() (used in SST files) resolves to the custom manager.
+  // Both should resolve to the built-in manager instead.
+  {
+    ConfigOptions config_options;
+    std::shared_ptr<CompressionManager> tmp;
+    // GetId() is used in OPTIONS files. The custom manager's GetId()
+    // ("MyManager:BuiltinV2") is not registered, so CreateFromString
+    // returns OK with nullptr (unsupported options are ignored by default).
+    ASSERT_OK(CompressionManager::CreateFromString(
+        config_options, mgr_claim_compatible->GetId(), &tmp));
+    ASSERT_EQ(tmp, nullptr);
+    // CompatibilityName() is used in SST files. "BuiltinV2" resolves to
+    // the built-in manager, not MyManager.
+    ASSERT_OK(CompressionManager::CreateFromString(
+        config_options, mgr_claim_compatible->CompatibilityName(), &tmp));
+    ASSERT_NE(tmp, nullptr);
+    EXPECT_STREQ(tmp->CompatibilityName(), "BuiltinV2");
+    EXPECT_STRNE(tmp->Name(), mgr_claim_compatible->Name());
+  }
+  options.compression_manager = nullptr;
+  Reopen(options);
+  // Key "a" from fv=6 section still readable
+  ASSERT_EQ(Get("a").size(), kValueSize);
+  // Key "a1" from fv=7 section with BuiltinV2 compat name also readable
+  ASSERT_EQ(Get("a1"), value);
+
   // Custom compression schema, but specifying a custom compression type it
   // doesn't support.
   options.compression_manager = mgr_foo;
@@ -1728,7 +1849,7 @@ TEST_P(DBCompressionTestMaybeParallel, CompressionManagerCustomCompression) {
   Reopen(options);
   ASSERT_OK(Put("b", test::CompressibleString(&rnd, 0.1, kValueSize, &value)));
   ASSERT_OK(Flush());
-  ASSERT_EQ(NumTableFilesAtLevel(0), 2);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 3);
   ASSERT_EQ(Get("b"), value);
 
   // Verify it was compressed with LZ4
@@ -1749,7 +1870,7 @@ TEST_P(DBCompressionTestMaybeParallel, CompressionManagerCustomCompression) {
   ASSERT_OK(Put("c", test::CompressibleString(&rnd, 0.1, kValueSize, &value)));
   EXPECT_EQ(mgr_foo->used_compressor8A_count_, 0);
   ASSERT_OK(Flush());
-  ASSERT_EQ(NumTableFilesAtLevel(0), 3);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 4);
   ASSERT_EQ(Get("c"), value);
   EXPECT_EQ(mgr_foo->used_compressor8A_count_, 1);
 
@@ -1769,7 +1890,7 @@ TEST_P(DBCompressionTestMaybeParallel, CompressionManagerCustomCompression) {
   ASSERT_OK(dbfull()->SetOptions({{"compression", "kLZ4Compression"}}));
   ASSERT_OK(Put("d", test::CompressibleString(&rnd, 0.1, kValueSize, &value)));
   ASSERT_OK(Flush());
-  ASSERT_EQ(NumTableFilesAtLevel(0), 4);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 5);
   ASSERT_EQ(Get("d"), value);
 
   // Verify it was compressed with LZ4
@@ -1787,7 +1908,7 @@ TEST_P(DBCompressionTestMaybeParallel, CompressionManagerCustomCompression) {
   ASSERT_OK(dbfull()->SetOptions({{"compression", "kCustomCompression8B"}}));
   ASSERT_OK(Put("e", test::CompressibleString(&rnd, 0.1, kValueSize, &value)));
   ASSERT_OK(Flush());
-  ASSERT_EQ(NumTableFilesAtLevel(0), 5);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 6);
   ASSERT_EQ(Get("e"), value);
 
   // Verify it was compressed with custom format
@@ -1813,6 +1934,7 @@ TEST_P(DBCompressionTestMaybeParallel, CompressionManagerCustomCompression) {
 
   // Can still read everything
   ASSERT_EQ(Get("a").size(), kValueSize);
+  ASSERT_EQ(Get("a1").size(), kValueSize);
   ASSERT_EQ(Get("b").size(), kValueSize);
   ASSERT_EQ(Get("c").size(), kValueSize);
   ASSERT_EQ(Get("d").size(), kValueSize);
@@ -1821,7 +1943,7 @@ TEST_P(DBCompressionTestMaybeParallel, CompressionManagerCustomCompression) {
   // Add a file using mgr_bar
   ASSERT_OK(Put("f", test::CompressibleString(&rnd, 0.1, kValueSize, &value)));
   ASSERT_OK(Flush());
-  ASSERT_EQ(NumTableFilesAtLevel(0), 6);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 7);
   ASSERT_EQ(Get("f"), value);
 
   // Verify it was compressed appropriately
@@ -1853,6 +1975,7 @@ TEST_P(DBCompressionTestMaybeParallel, CompressionManagerCustomCompression) {
 
   // Can still read everything
   ASSERT_EQ(Get("a").size(), kValueSize);
+  ASSERT_EQ(Get("a1").size(), kValueSize);
   ASSERT_EQ(Get("b").size(), kValueSize);
   ASSERT_EQ(Get("c").size(), kValueSize);
   ASSERT_EQ(Get("d").size(), kValueSize);
@@ -1884,207 +2007,247 @@ TEST_F(DBCompressionTest, FailWhenCompressionNotSupportedTest) {
   }
 }
 
-class AutoSkipTestFlushBlockPolicy : public FlushBlockPolicy {
+// ===================== AutoSkip compression tests =====================
+// AutoSkip is a first-class CompressionOptions feature (see
+// CompressionOptions::auto_skip). These end-to-end tests drive it through the
+// block-based table builder. Large values plus a small target block size make
+// each Put land in roughly its own data block, so per-block AutoSkip decisions
+// map to individual Puts.
+class DBAutoSkipTest : public DBTestBase {
  public:
-  explicit AutoSkipTestFlushBlockPolicy(const int window,
-                                        const BlockBuilder& data_block_builder,
-                                        std::shared_ptr<Statistics> statistics)
-      : window_(window),
-        num_keys_(0),
-        data_block_builder_(data_block_builder),
-        statistics_(statistics) {}
+  DBAutoSkipTest() : DBTestBase("db_auto_skip_test", /*env_do_fsync=*/false) {}
 
-  bool Update(const Slice& /*key*/, const Slice& /*value*/) override {
-    auto nth_window = num_keys_ / window_;
-    if (data_block_builder_.empty()) {
-      // First key in this block
-      return false;
-    }
-    // Check every window
-    if (num_keys_ % window_ == 0) {
-      auto set_exploration = [&](void* arg) {
-        bool* exploration = static_cast<bool*>(arg);
-        *exploration = true;
-      };
-      auto unset_exploration = [&](void* arg) {
-        bool* exploration = static_cast<bool*>(arg);
-        *exploration = false;
-      };
-      SyncPoint::GetInstance()->DisableProcessing();
-      SyncPoint::GetInstance()->ClearAllCallBacks();
-      // We force exploration to set the predicted rejection ratio for odd
-      // window and then test that the prediction is exploited in the even
-      // window
-      if (nth_window % 2 == 0) {
-        SyncPoint::GetInstance()->SetCallBack(
-            "AutoSkipCompressorWrapper::CompressBlock::exploitOrExplore",
-            set_exploration);
-      } else {
-        SyncPoint::GetInstance()->SetCallBack(
-            "AutoSkipCompressorWrapper::CompressBlock::exploitOrExplore",
-            unset_exploration);
-      }
-      SyncPoint::GetInstance()->EnableProcessing();
-
-      auto compressed_count = PopStat(NUMBER_BLOCK_COMPRESSED);
-      auto bypassed_count = PopStat(NUMBER_BLOCK_COMPRESSION_BYPASSED);
-      auto rejected_count = PopStat(NUMBER_BLOCK_COMPRESSION_REJECTED);
-      auto total = compressed_count + rejected_count + bypassed_count;
-      int rejection_percentage, bypassed_percentage, compressed_percentage;
-      if (total != 0) {
-        rejection_percentage = static_cast<int>(rejected_count * 100 / total);
-        bypassed_percentage = static_cast<int>(bypassed_count * 100 / total);
-        compressed_percentage =
-            static_cast<int>(compressed_count * 100 / total);
-        // use nth window to detect test cases and set the expected
-        switch (nth_window) {
-          case 1:
-            // In first window we only explore and thus here we verify that the
-            // correct prediction has been made by the end of the window
-            // Since 6 of 10 blocks are compression unfriendly, the predicted
-            // rejection ratio should be 60%
-            EXPECT_EQ(rejection_percentage, 60);
-            EXPECT_EQ(bypassed_percentage, 0);
-            EXPECT_EQ(compressed_percentage, 40);
-            break;
-          case 2:
-            // With the rejection ratio set to 0.6 all the blocks should be
-            // bypassed in next window
-            EXPECT_EQ(rejection_percentage, 0);
-            EXPECT_EQ(bypassed_percentage, 100);
-            EXPECT_EQ(compressed_percentage, 0);
-            break;
-          case 3:
-            // In third window we only explore and verify that the correct
-            // prediction has been made by the end of the window
-            // since 4 of 10 blocks are compression ufriendly, the predicted
-            // rejection ratio should be 40%
-            EXPECT_EQ(rejection_percentage, 40);
-            EXPECT_EQ(bypassed_percentage, 0);
-            EXPECT_EQ(compressed_percentage, 60);
-            break;
-          case 4:
-            // With the rejection ratio set to 0.4 all the blocks should be
-            // attempted to be compressed
-            // 6 of 10 blocks are compression unfriendly and thus should be
-            // rejected 4 of 10 blocks are compression friendly and thus should
-            // be compressed
-            EXPECT_EQ(rejection_percentage, 60);
-            EXPECT_EQ(bypassed_percentage, 0);
-            EXPECT_EQ(compressed_percentage, 40);
-        }
-      }
-    }
-    num_keys_++;
-    return true;
-  }
-  uint64_t PopStat(Tickers t) { return statistics_->getAndResetTickerCount(t); }
-
- private:
-  int window_;
-  int num_keys_;
-  const BlockBuilder& data_block_builder_;
-  std::shared_ptr<Statistics> statistics_;
-};
-
-class AutoSkipTestFlushBlockPolicyFactory : public FlushBlockPolicyFactory {
- public:
-  explicit AutoSkipTestFlushBlockPolicyFactory(
-      const int window, std::shared_ptr<Statistics> statistics)
-      : window_(window), statistics_(statistics) {}
-
-  virtual const char* Name() const override {
-    return "AutoSkipTestFlushBlockPolicyFactory";
-  }
-
-  virtual FlushBlockPolicy* NewFlushBlockPolicy(
-      const BlockBasedTableOptions& /*table_options*/,
-      const BlockBuilder& data_block_builder) const override {
-    (void)data_block_builder;
-    return new AutoSkipTestFlushBlockPolicy(window_, data_block_builder,
-                                            statistics_);
-  }
-
- private:
-  int window_;
-  std::shared_ptr<Statistics> statistics_;
-};
-
-class DBAutoSkip : public DBTestBase {
- public:
-  Options options;
-  Random rnd_;
-  int key_index_;
-  DBAutoSkip()
-      : DBTestBase("db_auto_skip", /*env_do_fsync=*/true),
-        options(CurrentOptions()),
-        rnd_(231),
-        key_index_(0) {
-    options.compression_manager = CreateAutoSkipCompressionManager();
-    auto statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-    options.statistics = statistics;
+  Options MakeOptions(bool auto_skip, int sample_every,
+                      uint32_t parallel_threads, CompressionType type) {
+    Options options = CurrentOptions();
+    options.compression = type;
+    options.bottommost_compression = type;
+    options.compression_opts.auto_skip = auto_skip;
+    options.compression_opts.auto_skip_min_sample_every = sample_every;
+    options.compression_opts.parallel_threads = parallel_threads;
+    options.statistics = CreateDBStatistics();
     options.statistics->set_stats_level(StatsLevel::kExceptTimeForMutex);
     BlockBasedTableOptions bbto;
     bbto.enable_index_compression = false;
-    bbto.flush_block_policy_factory.reset(
-        new AutoSkipTestFlushBlockPolicyFactory(10, statistics));
+    bbto.block_size = 4096;
     options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+    return options;
   }
 
-  bool CompressionFriendlyPut(const int no_of_kvs, const int size_of_value) {
-    auto value = std::string(size_of_value, 'A');
-    for (int i = 0; i < no_of_kvs; ++i) {
-      auto status = Put(Key(key_index_), value);
-      EXPECT_EQ(status.ok(), true);
-      key_index_++;
-    }
-    return true;
+  // Returns the value written, so callers can verify read-back.
+  std::string PutOne(Random* rnd, int value_size, bool compressible) {
+    std::string value = compressible ? std::string(value_size, 'A')
+                                     : rnd->RandomBinaryString(value_size);
+    EXPECT_OK(Put(Key(key_index_++), value));
+    return value;
   }
-  bool CompressionUnfriendlyPut(const int no_of_kvs, const int size_of_value) {
-    auto value = rnd_.RandomBinaryString(size_of_value);
-    for (int i = 0; i < no_of_kvs; ++i) {
-      auto status = Put(Key(key_index_), value);
-      EXPECT_EQ(status.ok(), true);
-      key_index_++;
+
+  // First supported real (non-kNoCompression) codec, or kNoCompression if none.
+  static CompressionType FirstSupportedCompression() {
+    for (auto t : GetSupportedCompressions()) {
+      if (t != kNoCompression) {
+        return t;
+      }
     }
-    return true;
+    return kNoCompression;
   }
+
+  // First supported codec that actually keeps parallel compression enabled.
+  // Snappy (and the fast/accelerated levels of other codecs) recommend
+  // parallel_threads=1, which forces the serial path; any other codec with a
+  // non-fast level (>=1) keeps the requested parallelism.
+  static CompressionType FirstParallelCapableCompression() {
+    for (auto t : GetSupportedCompressions()) {
+      if (t != kNoCompression && t != kSnappyCompression) {
+        return t;
+      }
+    }
+    return kNoCompression;
+  }
+
+  int key_index_ = 0;
 };
 
-TEST_F(DBAutoSkip, AutoSkipCompressionManager) {
-  for (uint32_t max_dict_bytes : {0, 10000}) {
-    for (auto type : GetSupportedCompressions()) {
-      if (type == kNoCompression) {
-        continue;
-      }
-      options.compression = type;
-      options.bottommost_compression = type;
-      options.compression_opts.max_dict_bytes = max_dict_bytes;
-      DestroyAndReopen(options);
-      const int kValueSize = 20000;
-      // This will set the rejection ratio to 60%
-      CompressionUnfriendlyPut(6, kValueSize);
-      CompressionFriendlyPut(4, kValueSize);
-      // This will verify all the data block compressions are bypassed based on
-      // previous prediction
-      CompressionUnfriendlyPut(6, kValueSize);
-      CompressionFriendlyPut(4, kValueSize);
-      // This will set the rejection ratio to 40%
-      CompressionUnfriendlyPut(4, kValueSize);
-      CompressionFriendlyPut(6, kValueSize);
-      // This will verify all the data block compression are attempted based on
-      // previous prediction
-      // Compression will be rejected for 6 compression unfriendly blocks
-      // Compression will be accepted for 4 compression friendly blocks
-      CompressionUnfriendlyPut(6, kValueSize);
-      CompressionFriendlyPut(4, kValueSize);
-      // Extra block write to ensure that the all above cases are checked
-      CompressionFriendlyPut(6, kValueSize);
-      CompressionFriendlyPut(4, kValueSize);
-      ASSERT_OK(Flush());
+TEST_F(DBAutoSkipTest, SkipsSustainedIncompressibleData) {
+  const int kValueSize = 20000;
+  const int kNum = 600;
+  for (auto type : GetSupportedCompressions()) {
+    if (type == kNoCompression) {
+      continue;
     }
+    SCOPED_TRACE("compression=" + std::to_string(static_cast<int>(type)));
+    Options options = MakeOptions(/*auto_skip=*/true, /*sample_every=*/64,
+                                  /*parallel_threads=*/1, type);
+    DestroyAndReopen(options);
+    Random rnd(301);
+    for (int i = 0; i < kNum; ++i) {
+      PutOne(&rnd, kValueSize, /*compressible=*/false);
+    }
+    ASSERT_OK(Flush());
+    auto* stats = options.statistics.get();
+    uint64_t bypassed =
+        stats->getTickerCount(NUMBER_BLOCK_COMPRESSION_BYPASSED);
+    uint64_t attempted =
+        stats->getTickerCount(NUMBER_BLOCK_COMPRESSED) +
+        stats->getTickerCount(NUMBER_BLOCK_COMPRESSION_REJECTED);
+    // After the initial ramp-down and aside from occasional sampling, most
+    // incompressible data blocks are bypassed rather than pointlessly
+    // attempted.
+    EXPECT_GT(bypassed, attempted);
   }
 }
+
+TEST_F(DBAutoSkipTest, DoesNotSkipCompressibleData) {
+  const int kValueSize = 20000;
+  const int kNum = 300;
+  for (auto type : GetSupportedCompressions()) {
+    if (type == kNoCompression) {
+      continue;
+    }
+    SCOPED_TRACE("compression=" + std::to_string(static_cast<int>(type)));
+    Options options = MakeOptions(/*auto_skip=*/true, /*sample_every=*/64,
+                                  /*parallel_threads=*/1, type);
+    DestroyAndReopen(options);
+    Random rnd(302);
+    for (int i = 0; i < kNum; ++i) {
+      PutOne(&rnd, kValueSize, /*compressible=*/true);
+    }
+    ASSERT_OK(Flush());
+    // Highly compressible data keeps the estimate below the threshold, so we
+    // never enter the skip regime and never bypass a block.
+    EXPECT_EQ(0, options.statistics->getTickerCount(
+                     NUMBER_BLOCK_COMPRESSION_BYPASSED));
+  }
+}
+
+TEST_F(DBAutoSkipTest, DisabledByDefaultMatchesNoBypass) {
+  const int kValueSize = 20000;
+  const int kNum = 200;
+  CompressionType type = kNoCompression;
+  for (auto t : GetSupportedCompressions()) {
+    if (t != kNoCompression) {
+      type = t;
+      break;
+    }
+  }
+  if (type == kNoCompression) {
+    ROCKSDB_GTEST_SKIP("No compression library supported");
+    return;
+  }
+  // auto_skip=false disables AutoSkip: incompressible data is
+  // attempted-and-rejected (the pre-existing behavior), never
+  // AutoSkip-"bypassed".
+  Options options = MakeOptions(/*auto_skip=*/false, /*sample_every=*/0,
+                                /*parallel_threads=*/1, type);
+  DestroyAndReopen(options);
+  Random rnd(303);
+  for (int i = 0; i < kNum; ++i) {
+    PutOne(&rnd, kValueSize, /*compressible=*/false);
+  }
+  ASSERT_OK(Flush());
+  EXPECT_EQ(
+      0, options.statistics->getTickerCount(NUMBER_BLOCK_COMPRESSION_BYPASSED));
+}
+
+TEST_F(DBAutoSkipTest, ParallelCompressionIntegrity) {
+  CompressionType type = FirstParallelCapableCompression();
+  if (type == kNoCompression) {
+    ROCKSDB_GTEST_SKIP("No parallel-capable compression library supported");
+    return;
+  }
+  const int kValueSize = 20000;
+  const int kNum = 500;
+  Options options = MakeOptions(/*auto_skip=*/true, /*sample_every=*/32,
+                                /*parallel_threads=*/4, type);
+  // A non-fast level keeps parallel compression enabled for every codec chosen
+  // above (accelerated/fast variants would recommend parallel_threads=1).
+  options.compression_opts.level = 3;
+  DestroyAndReopen(options);
+
+  // Prove we actually entered the parallel compression path rather than
+  // silently falling back to serial (which would make this a weak test).
+  std::atomic<int> parallel_started{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTableBuilder::MaybeStartParallelCompression:Started",
+      [&](void* /*arg*/) { parallel_started.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Random rnd(304);
+  std::vector<std::string> values;
+  values.reserve(kNum);
+  // Alternate regimes so the estimate crosses the threshold both ways while
+  // parallel workers share it.
+  for (int i = 0; i < kNum; ++i) {
+    bool compressible = (i / 50) % 2 == 0;
+    values.push_back(PutOne(&rnd, kValueSize, compressible));
+  }
+  ASSERT_OK(Flush());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_GT(parallel_started.load(), 0);
+
+  // All data must round-trip regardless of which blocks were skipped, and which
+  // thread compressed/skipped them.
+  for (int i = 0; i < kNum; ++i) {
+    std::string got;
+    ASSERT_OK(db_->Get(ReadOptions(), Key(i), &got));
+    ASSERT_EQ(values[i], got);
+  }
+}
+
+TEST_F(DBAutoSkipTest, CarriesEstimateAcrossFiles) {
+  CompressionType type = FirstSupportedCompression();
+  if (type == kNoCompression) {
+    ROCKSDB_GTEST_SKIP("No compression library supported");
+    return;
+  }
+  const int kValueSize = 20000;
+  const int kNum = 400;
+  // Large sampling interval so periodic samples don't muddy the per-file
+  // attempt counts compared below.
+  Options options = MakeOptions(/*auto_skip=*/true, /*sample_every=*/1024,
+                                /*parallel_threads=*/1, type);
+  // A single flush thread guarantees consecutive flushes reuse the same thread,
+  // whose thread-local carryover is exactly what this test exercises.
+  options.max_background_jobs = 1;
+  DestroyAndReopen(options);
+  auto* stats = options.statistics.get();
+  Random rnd(305);
+
+  auto flush_and_count_attempts = [&](bool compressible) -> uint64_t {
+    for (int i = 0; i < kNum; ++i) {
+      PutOne(&rnd, kValueSize, compressible);
+    }
+    EXPECT_OK(Flush());
+    uint64_t attempted =
+        stats->getAndResetTickerCount(NUMBER_BLOCK_COMPRESSED) +
+        stats->getAndResetTickerCount(NUMBER_BLOCK_COMPRESSION_REJECTED);
+    stats->getAndResetTickerCount(NUMBER_BLOCK_COMPRESSION_BYPASSED);
+    return attempted;
+  };
+
+  // Warm the flush thread's carryover down to a low (compressible) estimate so
+  // this test is independent of whatever estimate earlier tests may have left
+  // on the pooled flush thread.
+  flush_and_count_attempts(/*compressible=*/true);
+
+  // The first incompressible file must ramp its estimate up from that low
+  // carried value, attempting many blocks before it is confident enough to
+  // skip.
+  uint64_t first_incompressible_attempts =
+      flush_and_count_attempts(/*compressible=*/false);
+
+  // The second incompressible file inherits the now-high estimate via the
+  // thread's carryover, so it skips from the start and attempts only the forced
+  // first block plus rare samples -- far fewer than the first file's ramp. If
+  // carryover were broken, this file would re-ramp and attempt about as many.
+  uint64_t second_incompressible_attempts =
+      flush_and_count_attempts(/*compressible=*/false);
+
+  EXPECT_GT(first_incompressible_attempts, second_incompressible_attempts + 8);
+}
+
 class CostAwareTestFlushBlockPolicy : public FlushBlockPolicy {
  public:
   explicit CostAwareTestFlushBlockPolicy(const int window,
@@ -2144,11 +2307,11 @@ class CostAwareTestFlushBlockPolicyFactory : public FlushBlockPolicyFactory {
   explicit CostAwareTestFlushBlockPolicyFactory(const int window)
       : window_(window) {}
 
-  virtual const char* Name() const override {
+  const char* Name() const override {
     return "CostAwareTestFlushBlockPolicyFactory";
   }
 
-  virtual FlushBlockPolicy* NewFlushBlockPolicy(
+  FlushBlockPolicy* NewFlushBlockPolicy(
       const BlockBasedTableOptions& /*table_options*/,
       const BlockBuilder& data_block_builder) const override {
     (void)data_block_builder;
@@ -2425,6 +2588,449 @@ TEST_F(DBCompressionTest, PreDefinedDictionaryCompression) {
   std::string value;
   ASSERT_EQ(db_->Get(ReadOptions(), Key(0), &value).code(),
             Status::kCorruption);
+}
+
+TEST_F(DBCompressionTest, GetRecommendedParallelThreads) {
+  // Verify that built-in compressors return parallel_threads from their
+  // CompressionOptions, except fast compressors override to 1
+  auto mgr = GetBuiltinV2CompressionManager();
+  CompressionOptions opts;
+
+  // Default parallel_threads is 1
+  opts.parallel_threads = 1;
+  for (auto type : {kSnappyCompression, kZlibCompression, kLZ4Compression,
+                    kLZ4HCCompression, kZSTD}) {
+    if (!mgr->SupportsCompressionType(type)) {
+      continue;
+    }
+    auto compressor = mgr->GetCompressor(opts, type);
+    ASSERT_NE(compressor, nullptr);
+    ASSERT_EQ(compressor->GetRecommendedParallelThreads(), 1U);
+  }
+
+  // Custom parallel_threads value (8) is returned unless a compressor overrides
+  // it to 1 for being "fast". Snappy always overrides; Zlib never does. (Use a
+  // positive level so it does not route ZSTD to an accelerated variant below.)
+  opts.parallel_threads = 8;
+  opts.level = 3;
+  for (auto type : {kSnappyCompression, kZlibCompression, kZSTD}) {
+    if (!mgr->SupportsCompressionType(type)) {
+      continue;
+    }
+    auto compressor = mgr->GetCompressor(opts, type);
+    ASSERT_NE(compressor, nullptr);
+    uint32_t expected = type == kSnappyCompression ? 1U : 8U;
+    ASSERT_EQ(compressor->GetRecommendedParallelThreads(), expected);
+  }
+
+  // LZ4 family: after unifying LZ4 and LZ4HC, the compression level (not the
+  // configured type) selects the variant, and that determines parallelism:
+  //   level <= 0 -> LZ4 fast -> overrides to 1
+  //   level >= 1 -> LZ4HC    -> no override (parallel allowed)
+  if (mgr->SupportsCompressionType(kLZ4Compression)) {
+    for (auto type : {kLZ4Compression, kLZ4HCCompression}) {
+      for (int level : {-10, -1, 0, 1, 4, 9, 12}) {
+        SCOPED_TRACE("type=" + std::to_string(static_cast<int>(type)) +
+                     " level=" + std::to_string(level));
+        opts.level = level;
+        auto compressor = mgr->GetCompressor(opts, type);
+        ASSERT_NE(compressor, nullptr);
+        uint32_t expected = level >= 1 ? 8U : 1U;
+        ASSERT_EQ(compressor->GetRecommendedParallelThreads(), expected);
+      }
+    }
+  }
+
+  // ZSTD: accelerated (negative) levels override to 1. Level 0 is intentionally
+  // left as a "backdoor" to allow parallel compression even though it otherwise
+  // behaves like the fast level -1.
+  if (mgr->SupportsCompressionType(kZSTD)) {
+    opts.level = -1;
+    auto compressor = mgr->GetCompressor(opts, kZSTD);
+    ASSERT_NE(compressor, nullptr);
+    ASSERT_EQ(compressor->GetRecommendedParallelThreads(), 1U);
+
+    opts.level = 0;
+    compressor = mgr->GetCompressor(opts, kZSTD);
+    ASSERT_NE(compressor, nullptr);
+    ASSERT_EQ(compressor->GetRecommendedParallelThreads(), 8U);
+  }
+}
+
+TEST_F(DBCompressionTest, CompressionManagerOverridesParallelThreads) {
+  // Test that a custom CompressionManager can override parallel_threads
+  // by modifying CompressionOptions in GetCompressorForSST, and that the
+  // override actually activates parallel compression.
+  if (!ZSTD_Supported()) {
+    ROCKSDB_GTEST_SKIP("ZSTD not supported");
+    return;
+  }
+
+  // A manager that forces parallel_threads to a specific value
+  class ParallelOverrideManager : public CompressionManagerWrapper {
+   public:
+    ParallelOverrideManager(std::shared_ptr<CompressionManager> wrapped,
+                            uint32_t forced_threads)
+        : CompressionManagerWrapper(std::move(wrapped)),
+          forced_threads_(forced_threads) {}
+
+    const char* Name() const override { return "ParallelOverrideManager"; }
+
+    const char* CompatibilityName() const override {
+      return wrapped_->CompatibilityName();
+    }
+
+    std::unique_ptr<Compressor> GetCompressorForSST(
+        const FilterBuildingContext& context, const CompressionOptions& opts,
+        CompressionType preferred) override {
+      CompressionOptions modified_opts = opts;
+      modified_opts.parallel_threads = forced_threads_;
+      return wrapped_->GetCompressorForSST(context, modified_opts, preferred);
+    }
+
+   private:
+    uint32_t forced_threads_;
+  };
+
+  Options options = CurrentOptions();
+  options.compression = kZSTD;
+  // Set parallel_threads=1 in the options, but the manager will override to 4
+  options.compression_opts.parallel_threads = 1;
+
+  auto mgr = std::make_shared<ParallelOverrideManager>(
+      GetBuiltinV2CompressionManager(), 4);
+  options.compression_manager = mgr;
+
+  // Use sync point to verify parallel compression is activated with the
+  // overridden thread count
+  uint32_t observed_threads = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTableBuilder::MaybeStartParallelCompression:Started",
+      [&](void* arg) { observed_threads = *static_cast<uint32_t*>(arg); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  DestroyAndReopen(options);
+
+  // Write enough data to produce some blocks
+  Random rnd(301);
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put(Key(i), rnd.RandomString(100)));
+  }
+  ASSERT_OK(Flush());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Verify parallel compression was activated with overridden thread count
+  ASSERT_EQ(observed_threads, 4U);
+
+  // Verify data is readable (parallel compression produced correct output)
+  for (int i = 0; i < 100; i++) {
+    std::string value;
+    ASSERT_OK(db_->Get(ReadOptions(), Key(i), &value));
+    ASSERT_EQ(value.size(), 100);
+  }
+}
+
+TEST_F(DBCompressionTest, CompressorOverridesCompressionOptions) {
+  // A Compressor can steer the subset of CompressionOptions that the builder
+  // (rather than the Compressor) is responsible for applying by overriding
+  // MaybeOverrideCompressionOptions(). Here it forces parallel_threads and we
+  // verify parallel compression activates with that thread count via the
+  // builder's sync point. This exercises the new hook directly, not the
+  // deprecated GetRecommendedParallelThreads() bridge.
+  if (!ZSTD_Supported()) {
+    ROCKSDB_GTEST_SKIP("ZSTD not supported");
+    return;
+  }
+
+  // Wraps a compressor and forces parallel_threads via the new hook.
+  class ForceParallelCompressor : public CompressorWrapper {
+   public:
+    ForceParallelCompressor(std::unique_ptr<Compressor> wrapped,
+                            uint32_t forced_threads)
+        : CompressorWrapper(std::move(wrapped)),
+          forced_threads_(forced_threads) {}
+
+    const char* Name() const override { return "ForceParallelCompressor"; }
+
+    void MaybeOverrideCompressionOptions(
+        CompressionOptions* to_modify) const override {
+      to_modify->parallel_threads = forced_threads_;
+    }
+
+    std::unique_ptr<Compressor> Clone() const override {
+      return std::make_unique<ForceParallelCompressor>(wrapped_->Clone(),
+                                                       forced_threads_);
+    }
+
+   private:
+    uint32_t forced_threads_;
+  };
+
+  // Returns the wrapping compressor for SSTs.
+  class ForceParallelManager : public CompressionManagerWrapper {
+   public:
+    ForceParallelManager(std::shared_ptr<CompressionManager> wrapped,
+                         uint32_t forced_threads)
+        : CompressionManagerWrapper(std::move(wrapped)),
+          forced_threads_(forced_threads) {}
+
+    const char* Name() const override { return "ForceParallelManager"; }
+
+    std::unique_ptr<Compressor> GetCompressorForSST(
+        const FilterBuildingContext& context, const CompressionOptions& opts,
+        CompressionType preferred) override {
+      auto inner = wrapped_->GetCompressorForSST(context, opts, preferred);
+      if (inner == nullptr) {
+        return nullptr;
+      }
+      return std::make_unique<ForceParallelCompressor>(std::move(inner),
+                                                       forced_threads_);
+    }
+
+   private:
+    uint32_t forced_threads_;
+  };
+
+  Options options = CurrentOptions();
+  options.compression = kZSTD;
+  // Configure single-threaded; the compressor's override raises it to 4.
+  options.compression_opts.parallel_threads = 1;
+
+  auto mgr = std::make_shared<ForceParallelManager>(
+      GetBuiltinV2CompressionManager(), 4);
+  options.compression_manager = mgr;
+
+  uint32_t observed_threads = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTableBuilder::MaybeStartParallelCompression:Started",
+      [&](void* arg) { observed_threads = *static_cast<uint32_t*>(arg); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  DestroyAndReopen(options);
+
+  Random rnd(301);
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put(Key(i), rnd.RandomString(100)));
+  }
+  ASSERT_OK(Flush());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Parallel compression activated with the compressor-overridden thread count.
+  ASSERT_EQ(observed_threads, 4U);
+
+  // Data is readable (parallel compression produced correct output).
+  for (int i = 0; i < 100; i++) {
+    std::string value;
+    ASSERT_OK(db_->Get(ReadOptions(), Key(i), &value));
+    ASSERT_EQ(value.size(), 100);
+  }
+}
+
+TEST_F(DBCompressionTest, UnifiedLZ4LZ4HCLevels) {
+  // LZ4 and LZ4HC share the same wire format and decompressor, so the
+  // compression level alone selects which algorithm runs. A given non-default
+  // level therefore produces identical output regardless of which of the two
+  // types is configured, and the recorded compression type follows the
+  // compressor actually used (LZ4 fast -> kLZ4Compression, LZ4HC ->
+  // kLZ4HCCompression).
+  auto mgr = GetBuiltinV2CompressionManager();
+  if (!mgr->SupportsCompressionType(kLZ4Compression)) {
+    ROCKSDB_GTEST_SKIP("LZ4 not supported");
+    return;
+  }
+  auto decompressor = mgr->GetDecompressor();
+
+  // Highly compressible input so compression is accepted.
+  std::string input;
+  for (int i = 0; i < 256; i++) {
+    input.append("abcdefgh");
+  }
+
+  auto compress_one = [&](CompressionType configured_type, int level,
+                          std::string* out, CompressionType* actual) {
+    CompressionOptions opts;
+    opts.level = level;
+    auto compressor = mgr->GetCompressor(opts, configured_type);
+    ASSERT_NE(compressor, nullptr);
+    out->resize(input.size() * 2 + 1024);
+    size_t out_size = out->size();
+    CompressionType type_out = kNoCompression;
+    ASSERT_OK(compressor->CompressBlock(input, out->data(), &out_size,
+                                        &type_out, nullptr));
+    ASSERT_NE(type_out, kNoCompression);
+    out->resize(out_size);
+    *actual = type_out;
+  };
+
+  auto round_trip = [&](const std::string& compressed, CompressionType type) {
+    Decompressor::Args args;
+    args.compression_type = type;
+    args.compressed_data = Slice(compressed);
+    ASSERT_OK(decompressor->ExtractUncompressedSize(args));
+    std::string uncompressed;
+    uncompressed.resize(args.uncompressed_size);
+    ASSERT_OK(decompressor->DecompressBlock(args, uncompressed.data()));
+    ASSERT_EQ(uncompressed, input);
+  };
+
+  // Non-default levels: the configured type does not matter (kLZ4Compression
+  // and kLZ4HCCompression produce identical output and the same recorded type,
+  // which the level itself selects). Levels that map to the same effective
+  // algorithm parameter after clamping compress identically: LZ4 fast uses
+  // acceleration 1 for level 0 or -1 and caps acceleration at 65537
+  // (level <= -65537); LZ4HC caps the level at 12.
+  std::string accel1;     // LZ4 fast, acceleration 1
+  std::string accel_max;  // LZ4 fast, acceleration clamped to 65537
+  std::string hc_max;     // LZ4HC, level clamped to 12
+  for (int level : {-1, 0, -3, -65537, -65538, -1000000, -2000000000, 1, 4, 9,
+                    12, 13, 100, 1000, 2000000000}) {
+    SCOPED_TRACE("level=" + std::to_string(level));
+    std::string out_lz4;
+    std::string out_lz4hc;
+    CompressionType actual_lz4;
+    CompressionType actual_lz4hc;
+    compress_one(kLZ4Compression, level, &out_lz4, &actual_lz4);
+    compress_one(kLZ4HCCompression, level, &out_lz4hc, &actual_lz4hc);
+
+    // The configured type does not affect the result for a given level.
+    ASSERT_EQ(actual_lz4, actual_lz4hc);
+    ASSERT_EQ(out_lz4, out_lz4hc);
+
+    // The level sign selects the algorithm (and the recorded type).
+    ASSERT_EQ(actual_lz4, level >= 1 ? kLZ4HCCompression : kLZ4Compression);
+
+    round_trip(out_lz4, actual_lz4);
+
+    // Levels that clamp to the same effective parameter compress identically.
+    if (level == -1) {
+      accel1 = out_lz4;
+    } else if (level == 0) {
+      ASSERT_EQ(out_lz4, accel1);
+    } else if (level == -65537) {
+      accel_max = out_lz4;
+    } else if (level < -65537) {
+      ASSERT_EQ(out_lz4, accel_max);
+    } else if (level == 12) {
+      hc_max = out_lz4;
+    } else if (level > 12) {
+      ASSERT_EQ(out_lz4, hc_max);
+    }
+  }
+
+  // Default level: the configured type selects fast (LZ4) vs HC (LZ4HC).
+  {
+    std::string out;
+    CompressionType actual;
+    compress_one(kLZ4Compression, CompressionOptions::kDefaultCompressionLevel,
+                 &out, &actual);
+    ASSERT_EQ(actual, kLZ4Compression);
+    round_trip(out, actual);
+
+    compress_one(kLZ4HCCompression,
+                 CompressionOptions::kDefaultCompressionLevel, &out, &actual);
+    ASSERT_EQ(actual, kLZ4HCCompression);
+    round_trip(out, actual);
+  }
+}
+
+TEST_F(DBCompressionTest, ZSTDLevelZeroMapsToMinusOne) {
+  // ZSTD itself treats a requested compression level of 0 as "use the default
+  // level" (historically 3). That makes level 0 a discontinuity in the
+  // otherwise monotonic level spectrum: it would compress more strongly than
+  // levels -1, -2, etc. RocksDB instead maps level 0 to -1 so the spectrum is
+  // continuous, which is friendlier to auto-tuning. Verify that level 0
+  // compresses identically to level -1 and differently from level 3 (the ZSTD
+  // default).
+  auto mgr = GetBuiltinV2CompressionManager();
+  if (!mgr->SupportsCompressionType(kZSTD)) {
+    ROCKSDB_GTEST_SKIP("ZSTD not supported");
+    return;
+  }
+  auto decompressor = mgr->GetDecompressor();
+
+  // Semi-compressible input large enough that nearby ZSTD levels (-1 vs 3)
+  // produce different output.
+  Random rnd(301);
+  std::string input;
+  for (int i = 0; i < 2000; i++) {
+    input.append(rnd.RandomString(16));
+    input.append(8, 'x');
+  }
+
+  auto compress_one = [&](int level, std::string* out) {
+    CompressionOptions opts;
+    opts.level = level;
+    auto compressor = mgr->GetCompressor(opts, kZSTD);
+    ASSERT_NE(compressor, nullptr);
+    out->resize(input.size() * 2 + 1024);
+    size_t out_size = out->size();
+    CompressionType type_out = kNoCompression;
+    ASSERT_OK(compressor->CompressBlock(input, out->data(), &out_size,
+                                        &type_out, nullptr));
+    ASSERT_EQ(type_out, kZSTD);
+    out->resize(out_size);
+  };
+
+  auto round_trip = [&](const std::string& compressed) {
+    Decompressor::Args args;
+    args.compression_type = kZSTD;
+    args.compressed_data = Slice(compressed);
+    ASSERT_OK(decompressor->ExtractUncompressedSize(args));
+    std::string uncompressed;
+    uncompressed.resize(args.uncompressed_size);
+    ASSERT_OK(decompressor->DecompressBlock(args, uncompressed.data()));
+    ASSERT_EQ(uncompressed, input);
+  };
+
+  std::string out_level0;
+  std::string out_level_minus1;
+  std::string out_level3;
+  compress_one(0, &out_level0);
+  compress_one(-1, &out_level_minus1);
+  compress_one(3, &out_level3);
+
+  // Level 0 behaves like level -1, not like the ZSTD default (3).
+  ASSERT_EQ(out_level0, out_level_minus1);
+  ASSERT_NE(out_level0, out_level3);
+
+  round_trip(out_level0);
+  round_trip(out_level_minus1);
+  round_trip(out_level3);
+}
+
+TEST_F(DBCompressionTest, ConfiguredCompressionTypeRecordedInProperties) {
+  // The configured compression type is recorded as a `_type=<decimal>`
+  // pseudo-option in the SST `rocksdb.compression_options` table property, so
+  // it can be recovered for debugging even when the per-block recorded type
+  // differs from the configured type.
+  if (!CompressionTypeSupported(kLZ4Compression)) {
+    ROCKSDB_GTEST_SKIP("LZ4 not supported");
+    return;
+  }
+  for (auto type : {kLZ4Compression, kLZ4HCCompression}) {
+    Options options = CurrentOptions();
+    options.compression = type;
+    DestroyAndReopen(options);
+    Random rnd(301);
+    for (int i = 0; i < 100; i++) {
+      ASSERT_OK(Put(Key(i), rnd.RandomString(100)));
+    }
+    ASSERT_OK(Flush());
+
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_FALSE(props.empty());
+    std::string expected = "_type=" + std::to_string(static_cast<int>(type));
+    for (const auto& kv : props) {
+      ASSERT_NE(kv.second->compression_options.find(expected),
+                std::string::npos)
+          << "compression_options=" << kv.second->compression_options;
+    }
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

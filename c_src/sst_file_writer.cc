@@ -137,6 +137,10 @@ SstFileWriterOpen(
         // Ignore unknown options to be lenient
     }
 
+    // keep the env alive as long as the writer
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[0], options, &env_ref);
+
     // Get file path
     std::string file_path;
     if (!get_file_path(env, argv[1], file_path)) {
@@ -157,6 +161,7 @@ SstFileWriterOpen(
 
     // Wrap in resource
     auto writer_ptr = SstFileWriterObject::CreateSstFileWriterResource(std::move(sst_writer));
+    writer_ptr->m_Env.Swap(env_ref);
     ERL_NIF_TERM result = enif_make_resource(env, writer_ptr);
     enif_release_resource(writer_ptr);
 

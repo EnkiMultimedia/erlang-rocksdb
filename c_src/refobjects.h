@@ -31,12 +31,13 @@
 #include "rocksdb/db.h"
 #include "rocksdb/utilities/transaction.h"
 
+#include "env.h"
+
 namespace rocksdb {
     class DB;
     class ColumnFamilyHandle;
     class Snapshot;
     class Iterator;
-    class TransactionLogIterator;
     class BackupEngine;
     class Slice;
     class Transaction;
@@ -121,6 +122,11 @@ public:
     //  destructor ... in which case the vtable is not valid
     static bool InitiateCloseRequest(ErlRefObject * Object);
 
+    // Take a reference unless a close was requested. The check and the
+    // increment happen under m_CloseMutex, the same lock that sets the close
+    // flag, so a concurrent close cannot destroy the object in between.
+    bool TryRefInc();
+
     static void AwaitCloseAndDestructor(ErlRefObject * Object);
 };  // class RefObject
 
@@ -170,6 +176,18 @@ public:
         }   // if
     };
 
+    // Like assign() for objects retrieved from an Erlang term: only takes the
+    // reference if the object is not closing. Returns false otherwise.
+    bool try_assign(TargetT * _t)
+    {
+        if (NULL!=t)
+            t->RefDec();
+        t=NULL;
+        if (NULL!=_t && _t->TryRefInc())
+            t=_t;
+        return NULL!=t;
+    };
+
     TargetT * get() const { return t; }
 
     TargetT * operator->() const { return t; }
@@ -187,17 +205,20 @@ public:
     rocksdb::DB* m_Db;                             // NULL or rocksdb database object
     bool m_IsPessimistic;                          //!< true if opened as PessimisticTransactionDB
     bool m_IsTTL;                                  //!< true if opened as DBWithTTL
+    EnvRef m_Env;                                  //!< keeps the env alive until m_Db is deleted
     std::mutex m_ItrMutex;                         //!< mutex protecting m_ItrList
     std::mutex m_SnapshotMutex;                    //!< mutex protecting m_SnapshotList
     std::mutex m_ColumnFamilyMutex;                //!< mutex protecting m_ColumnFamily
     std::mutex m_TLogItrMutex;                     //!< mutex protecting m_TransactionLogList
     std::mutex m_TransactionMutex;
+    std::mutex m_IngestionMutex;                   //!< mutex protecting m_IngestionList
 
     std::list<class ItrObject *> m_ItrList;        //!< ItrObjects holding ref count to this
     std::list<class SnapshotObject *> m_SnapshotList;
     std::list<class ColumnFamilyObject *> m_ColumnFamilyList;
     std::list<class TLogItrObject *> m_TLogItrList;
     std::list<class TransactionObject *> m_TransactionList;
+    std::list<class IngestionObject *> m_IngestionList;
 
 protected:
     static ErlNifResourceType* m_Db_RESOURCE;
@@ -237,6 +258,11 @@ public:
     void AddTransactionReference(class TransactionObject *);
 
     void RemoveTransactionReference(class TransactionObject *);
+
+    // manual back link to prepared ingestions holding reference to this
+    void AddIngestionReference(class IngestionObject *);
+
+    void RemoveIngestionReference(class IngestionObject *);
 
     static void CreateDbObjectType(ErlNifEnv * Env);
 
@@ -321,6 +347,7 @@ public:
 class ItrObject : public ErlRefObject
 {
 public:
+    ReferencePtr<SnapshotObject> m_SnapshotPtr; //!< read snapshot, alive as long as the iterator
     rocksdb::Iterator * m_Iterator;
     std::shared_ptr<erocksdb::ErlEnvCtr> env;
     ReferencePtr<DbObject> m_DbPtr;
@@ -363,6 +390,13 @@ public:
     //!< Pin an erlang resource (e.g. column family, transaction) for this
     //!< iterator's lifetime so GC cannot free it while the iterator uses it.
     void KeepResource(void * Resource);
+
+    //!< Keep the read snapshot alive for this iterator's lifetime: RocksDB
+    //!< reads it again when the iterator refreshes. The reference stops an
+    //!< explicit release from freeing it; enif_keep_resource stops garbage
+    //!< collection, whose cleanup would otherwise block a scheduler waiting
+    //!< for this reference to go away.
+    void KeepSnapshot(SnapshotObject * Snapshot);
 };  // class ItrObject
 
 /**
@@ -371,14 +405,14 @@ public:
 class TLogItrObject : public ErlRefObject
 {
 public:
-    rocksdb::TransactionLogIterator * m_Iter;
+    rocksdb::WalIterator * m_Iter;
     ReferencePtr<DbObject> m_DbPtr;
 
 protected:
     static ErlNifResourceType* m_TLogItr_RESOURCE;
 
 public:
-    TLogItrObject(DbObject *, rocksdb::TransactionLogIterator * Itr);
+    TLogItrObject(DbObject *, rocksdb::WalIterator * Itr);
 
     TLogItrObject() = delete;                                  // no default construct
     TLogItrObject(const TLogItrObject &) = delete;             // no copy
@@ -390,12 +424,60 @@ public:
 
     static void CreateTLogItrObjectType(ErlNifEnv * Env);
 
-    static TLogItrObject * CreateTLogItrObject(DbObject * Db, rocksdb::TransactionLogIterator * Itr);
+    static TLogItrObject * CreateTLogItrObject(DbObject * Db, rocksdb::WalIterator * Itr);
 
     static TLogItrObject * RetrieveTLogItrObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm);
 
     static void TLogItrObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
 };  // class TLogItrObject
+
+
+/**
+ * A prepared, not yet committed, external file ingestion
+ * (DB::PrepareFileIngestion). Created as erlang reference.
+ *
+ * RocksDB requires the handle to never outlive its DB: the object holds a
+ * reference to the DbObject and is closed by DbObject::Shutdown, and dropping
+ * a handle that was not committed rolls the ingestion back.
+ */
+class IngestionObject : public ErlRefObject
+{
+public:
+    ReferencePtr<DbObject> m_DbPtr;
+
+protected:
+    std::mutex m_HandleMutex;                                   //!< protects m_Handle
+    std::unique_ptr<rocksdb::FileIngestionHandle> m_Handle;     //!< NULL once committed or aborted
+
+    static ErlNifResourceType* m_Ingestion_RESOURCE;
+
+public:
+    IngestionObject(DbObject *, std::unique_ptr<rocksdb::FileIngestionHandle> Handle);
+
+    IngestionObject() = delete;
+    IngestionObject(const IngestionObject &) = delete;
+    IngestionObject & operator=(const IngestionObject &) = delete;
+
+    virtual ~IngestionObject();
+
+    virtual void Shutdown();
+
+    // Take the prepared handle out of the object. Returns NULL if it was
+    // already committed or aborted.
+    std::unique_ptr<rocksdb::FileIngestionHandle> TakeHandle();
+
+    // Put back a handle taken with TakeHandle (used when a batch commit is
+    // rejected before reaching RocksDB).
+    void RestoreHandle(std::unique_ptr<rocksdb::FileIngestionHandle> Handle);
+
+    static void CreateIngestionObjectType(ErlNifEnv * Env);
+
+    static IngestionObject * CreateIngestionObject(DbObject * Db, std::unique_ptr<rocksdb::FileIngestionHandle> Handle);
+
+    static IngestionObject * RetrieveIngestionObject(ErlNifEnv * Env, const ERL_NIF_TERM & Term);
+
+    static void IngestionObjectResourceCleanup(ErlNifEnv *Env, void * Arg);
+};  // class IngestionObject
 
 
 

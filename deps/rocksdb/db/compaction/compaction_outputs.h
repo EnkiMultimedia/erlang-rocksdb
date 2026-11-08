@@ -60,6 +60,7 @@ class CompactionOutputs {
   }
 
   const std::vector<Output>& GetOutputs() const { return outputs_; }
+  std::vector<Output>& GetMutableOutputs() { return outputs_; }
 
   // Set new table builder for the current output
   void NewBuilder(const TableBuilderOptions& tboptions);
@@ -244,6 +245,11 @@ class CompactionOutputs {
   // before processing the current key in compaction iterator.
   bool ShouldStopBefore(const CompactionIterator& c_iter);
 
+  // Re-establishes per-file state that depends on the first key accepted by a
+  // freshly opened builder. This keeps caller-requested file cuts equivalent to
+  // RocksDB's built-in file-boundary decisions for partition tracking.
+  void PrepareNewOutputForFirstKey(const CompactionIterator& c_iter);
+
   void Cleanup() {
     if (builder_ != nullptr) {
       // May happen if we get a shutdown call in the middle of compaction
@@ -348,8 +354,19 @@ class CompactionOutputs {
   const bool is_proximal_level_;
 
   // partitioner information
-  std::string last_key_for_partitioner_;
   std::unique_ptr<SstPartitioner> partitioner_;
+  // Previous user key, only maintained (copied per key) in the fallback mode
+  // (see below).
+  std::string last_key_for_partitioner_;
+  // Fast path for partitioners that support ShouldPartitionByPrefix(): when
+  // partitioner_prefix_valid_ is true, all keys in the current output file
+  // share partitioner_prefix_, and a partition boundary is requested at the
+  // first future key that does not start with that prefix. This is (re)derived
+  // once per output file from its first key, avoiding a per-key copy and
+  // virtual ShouldPartition() call. When false, we fall back to comparing
+  // against last_key_for_partitioner_ via ShouldPartition() on every key.
+  std::string partitioner_prefix_;
+  bool partitioner_prefix_valid_ = false;
 
   // A flag determines if this subcompaction has been split by the cursor
   // for RoundRobin compaction
@@ -359,7 +376,7 @@ class CompactionOutputs {
   // repetitive comparison in ShouldStopBefore()
   const InternalKey* local_output_split_key_ = nullptr;
 
-  // Some identified files with old oldest ancester time and the range should be
+  // Some identified files with old oldest ancestor time and the range should be
   // isolated out so that the output file(s) in that range can be merged down
   // for TTL and clear the timestamps for the range.
   std::vector<FileMetaData*> files_to_cut_for_ttl_;

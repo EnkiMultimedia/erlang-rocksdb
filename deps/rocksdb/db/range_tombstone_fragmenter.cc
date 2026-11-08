@@ -11,6 +11,7 @@
 #include <functional>
 #include <set>
 
+#include "db/read_callback.h"
 #include "util/autovector.h"
 #include "util/kv_map.h"
 #include "util/vector_iterator.h"
@@ -58,7 +59,8 @@ FragmentedRangeTombstoneList::FragmentedRangeTombstoneList(
   }
 
   // Sort the tombstones before fragmenting them.
-  std::vector<std::string> keys, values;
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
   keys.reserve(num_unfragmented_tombstones_);
   values.reserve(num_unfragmented_tombstones_);
   // Reset the counter to zero for the next iteration over keys.
@@ -76,6 +78,7 @@ FragmentedRangeTombstoneList::FragmentedRangeTombstoneList(
       values.emplace_back(value.data(), value.size());
     }
   }
+  num_unfragmented_tombstones_ = keys.size();
   if (pad_min_ts_for_end) {
     total_tombstone_payload_bytes_ += num_unfragmented_tombstones_ * ts_sz;
   }
@@ -489,6 +492,29 @@ SequenceNumber FragmentedRangeTombstoneIterator::MaxCoveringTombstoneSeqnum(
              : 0;
 }
 
+SequenceNumber FragmentedRangeTombstoneIterator::MaxCoveringTombstoneSeqnum(
+    const Slice& target_user_key, ReadCallback* callback) {
+  assert(callback != nullptr);
+  SeekToCoveringTombstone(target_user_key);
+  if (!ValidPos() ||
+      ucmp_->CompareWithoutTimestamp(start_key(), target_user_key) > 0) {
+    return 0;
+  }
+
+  const auto seq_end = tombstones_->seq_iter(pos_->seq_end_idx);
+  // Sequence numbers are ordered newest to oldest and seq_pos_ is already
+  // bounded by upper_bound_. Return the first tombstone the metadata callback
+  // considers newer than the read snapshot.
+  while (seq_pos_ != seq_end && *seq_pos_ >= lower_bound_) {
+    const SequenceNumber candidate_seq = *seq_pos_;
+    if (callback->IsNewerVisibleForMetadataRead(candidate_seq)) {
+      return candidate_seq;
+    }
+    ++seq_pos_;
+  }
+  return 0;
+}
+
 std::map<SequenceNumber, std::unique_ptr<FragmentedRangeTombstoneIterator>>
 FragmentedRangeTombstoneIterator::SplitBySnapshot(
     const std::vector<SequenceNumber>& snapshots) {
@@ -496,6 +522,9 @@ FragmentedRangeTombstoneIterator::SplitBySnapshot(
       splits;
   SequenceNumber lower = 0;
   SequenceNumber upper;
+  // Safe to dereference icmp_ below: SplitBySnapshot is construction-time work
+  // (called synchronously from the range-del aggregator while the reader that
+  // owns *icmp_ is alive). See the icmp_ note in the header.
   for (size_t i = 0; i <= snapshots.size(); i++) {
     if (i >= snapshots.size()) {
       upper = kMaxSequenceNumber;

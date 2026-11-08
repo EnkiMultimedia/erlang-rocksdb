@@ -17,6 +17,7 @@
 #include <string>
 #include <map>
 #include <set>
+#include <algorithm>
 #include <vector>
 #include <cstdint>
 #include <cstring>
@@ -146,7 +147,7 @@ static std::set<std::string> parse_posting_list_v1(
         bool is_tombstone = (*ptr != 0);
         ptr += 1;
 
-        if (ptr + len > end) break;
+        if (static_cast<size_t>(len) > static_cast<size_t>(end - ptr)) break;
 
         std::string key(reinterpret_cast<const char*>(ptr), len);
         ptr += len;
@@ -176,7 +177,7 @@ static std::set<std::string> parse_posting_list_v2(
     ptr += 1;
 
     // Read bitmap size
-    if (ptr + 4 > end) return result;
+    if (static_cast<size_t>(4) > static_cast<size_t>(end - ptr)) return result;
     uint32_t bitmap_size = (static_cast<uint32_t>(ptr[0]) << 24) |
                            (static_cast<uint32_t>(ptr[1]) << 16) |
                            (static_cast<uint32_t>(ptr[2]) << 8) |
@@ -184,11 +185,11 @@ static std::set<std::string> parse_posting_list_v2(
     ptr += 4;
 
     // Skip bitmap data
-    if (ptr + bitmap_size > end) return result;
+    if (bitmap_size > static_cast<size_t>(end - ptr)) return result;
     ptr += bitmap_size;
 
     // Read key count
-    if (ptr + 4 > end) return result;
+    if (static_cast<size_t>(4) > static_cast<size_t>(end - ptr)) return result;
     uint32_t key_count = (static_cast<uint32_t>(ptr[0]) << 24) |
                          (static_cast<uint32_t>(ptr[1]) << 16) |
                          (static_cast<uint32_t>(ptr[2]) << 8) |
@@ -203,7 +204,7 @@ static std::set<std::string> parse_posting_list_v2(
                        static_cast<uint32_t>(ptr[3]);
         ptr += 4;
 
-        if (ptr + len > end) break;
+        if (static_cast<size_t>(len) > static_cast<size_t>(end - ptr)) break;
 
         std::string key(reinterpret_cast<const char*>(ptr), len);
         ptr += len;
@@ -240,7 +241,7 @@ static roaring64_bitmap_t* extract_bitmap_v2(
     ptr += 1;
 
     // Read bitmap size
-    if (ptr + 4 > end) return nullptr;
+    if (static_cast<size_t>(4) > static_cast<size_t>(end - ptr)) return nullptr;
     uint32_t bitmap_size = (static_cast<uint32_t>(ptr[0]) << 24) |
                            (static_cast<uint32_t>(ptr[1]) << 16) |
                            (static_cast<uint32_t>(ptr[2]) << 8) |
@@ -248,7 +249,7 @@ static roaring64_bitmap_t* extract_bitmap_v2(
     ptr += 4;
 
     if (bitmap_size == 0) return nullptr;
-    if (ptr + bitmap_size > end) return nullptr;
+    if (static_cast<size_t>(bitmap_size) > static_cast<size_t>(end - ptr)) return nullptr;
 
     return roaring64_bitmap_portable_deserialize_safe(
         reinterpret_cast<const char*>(ptr), bitmap_size);
@@ -357,15 +358,18 @@ static bool binary_search_v2_keys(const unsigned char* data, size_t size,
     ptr += 1;
 
     // Skip bitmap
-    if (ptr + 4 > end) return false;
+    if (static_cast<size_t>(4) > static_cast<size_t>(end - ptr)) return false;
     uint32_t bitmap_size = (static_cast<uint32_t>(ptr[0]) << 24) |
                            (static_cast<uint32_t>(ptr[1]) << 16) |
                            (static_cast<uint32_t>(ptr[2]) << 8) |
                            static_cast<uint32_t>(ptr[3]);
-    ptr += 4 + bitmap_size;
+    ptr += 4;
+    // the sizes come from the binary, never trust them
+    if (bitmap_size > static_cast<size_t>(end - ptr)) return false;
+    ptr += bitmap_size;
 
     // Read key count
-    if (ptr + 4 > end) return false;
+    if (end - ptr < 4) return false;
     uint32_t key_count = (static_cast<uint32_t>(ptr[0]) << 24) |
                          (static_cast<uint32_t>(ptr[1]) << 16) |
                          (static_cast<uint32_t>(ptr[2]) << 8) |
@@ -374,18 +378,19 @@ static bool binary_search_v2_keys(const unsigned char* data, size_t size,
 
     if (key_count == 0) return false;
 
-    // Build index of key offsets for binary search
+    // Build index of key offsets for binary search. Each key takes at least
+    // its 4-byte length, which bounds how many the binary can really hold.
     std::vector<std::pair<const unsigned char*, uint32_t>> key_offsets;
-    key_offsets.reserve(key_count);
+    key_offsets.reserve(std::min<size_t>(key_count, static_cast<size_t>(end - ptr) / 4));
 
     const unsigned char* scan = ptr;
-    for (uint32_t i = 0; i < key_count && scan + 4 <= end; i++) {
+    for (uint32_t i = 0; i < key_count && end - scan >= 4; i++) {
         uint32_t len = (static_cast<uint32_t>(scan[0]) << 24) |
                        (static_cast<uint32_t>(scan[1]) << 16) |
                        (static_cast<uint32_t>(scan[2]) << 8) |
                        static_cast<uint32_t>(scan[3]);
         scan += 4;
-        if (scan + len > end) break;
+        if (len > static_cast<size_t>(end - scan)) break;
         key_offsets.push_back({scan, len});
         scan += len;
     }
@@ -477,7 +482,7 @@ ERL_NIF_TERM PostingListFind(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]
         bool is_tombstone = (*ptr != 0);
         ptr += 1;
 
-        if (ptr + len > end) break;
+        if (static_cast<size_t>(len) > static_cast<size_t>(end - ptr)) break;
 
         std::string key(reinterpret_cast<const char*>(ptr), len);
         ptr += len;
@@ -544,7 +549,7 @@ ERL_NIF_TERM PostingListToMap(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
             bool is_tombstone = (*ptr != 0);
             ptr += 1;
 
-            if (ptr + len > end) break;
+            if (static_cast<size_t>(len) > static_cast<size_t>(end - ptr)) break;
 
             std::string key(reinterpret_cast<const char*>(ptr), len);
             ptr += len;
@@ -916,5 +921,67 @@ ERL_NIF_TERM PostingsToBinary(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
     memcpy(buf, output.data(), output.size());
     return result_bin;
 }
+
+
+// Scheduling
+//
+// These functions take time linear in the size of the posting list, which the
+// caller controls. A normal scheduler should not be held much longer than a
+// millisecond, so large inputs move to a dirty CPU scheduler. Small ones,
+// the common case, stay inline and avoid the cost of rescheduling.
+
+static const size_t kDirtyInputBytes = 64 * 1024;  // binary inputs
+static const size_t kDirtyKeyCount = 4096;         // keys in a postings resource
+
+static size_t binary_args_size(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    size_t total = 0;
+    for (int i = 0; i < argc; i++) {
+        ErlNifBinary bin;
+        if (enif_inspect_binary(env, argv[i], &bin))
+            total += bin.size;
+    }
+    return total;
+}
+
+static size_t resource_key_count(ErlNifEnv* env, ERL_NIF_TERM term)
+{
+    PostingListResource* res;
+    if (!enif_get_resource(env, term, posting_list_resource_type, (void**)&res))
+        return 0;
+    return res->keys.size();
+}
+
+#define SCHEDULE_BY_BINARY_SIZE(NAME, FUN)                                         \
+    ERL_NIF_TERM FUN##Nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])     \
+    {                                                                              \
+        if (binary_args_size(env, argc, argv) > kDirtyInputBytes)                  \
+            return enif_schedule_nif(env, NAME, ERL_NIF_DIRTY_JOB_CPU_BOUND,       \
+                                     FUN, argc, argv);                             \
+        return FUN(env, argc, argv);                                               \
+    }
+
+#define SCHEDULE_BY_KEY_COUNT(NAME, FUN)                                           \
+    ERL_NIF_TERM FUN##Nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])     \
+    {                                                                              \
+        if (argc >= 1 && resource_key_count(env, argv[0]) > kDirtyKeyCount)        \
+            return enif_schedule_nif(env, NAME, ERL_NIF_DIRTY_JOB_CPU_BOUND,       \
+                                     FUN, argc, argv);                             \
+        return FUN(env, argc, argv);                                               \
+    }
+
+SCHEDULE_BY_BINARY_SIZE("posting_list_keys", PostingListKeys)
+SCHEDULE_BY_BINARY_SIZE("posting_list_contains", PostingListContains)
+SCHEDULE_BY_BINARY_SIZE("posting_list_find", PostingListFind)
+SCHEDULE_BY_BINARY_SIZE("posting_list_count", PostingListCount)
+SCHEDULE_BY_BINARY_SIZE("posting_list_to_map", PostingListToMap)
+SCHEDULE_BY_BINARY_SIZE("posting_list_intersection", PostingListIntersection)
+SCHEDULE_BY_BINARY_SIZE("posting_list_union", PostingListUnion)
+SCHEDULE_BY_BINARY_SIZE("posting_list_difference", PostingListDifference)
+SCHEDULE_BY_BINARY_SIZE("posting_list_intersection_count", PostingListIntersectionCount)
+SCHEDULE_BY_BINARY_SIZE("posting_list_bitmap_contains", PostingListBitmapContains)
+SCHEDULE_BY_BINARY_SIZE("postings_open", PostingsOpen)
+SCHEDULE_BY_KEY_COUNT("postings_keys", PostingsKeys)
+SCHEDULE_BY_KEY_COUNT("postings_to_binary", PostingsToBinary)
 
 } // namespace erocksdb

@@ -25,6 +25,10 @@ class Statistics;
 struct IODispatcherImplData;
 struct PendingPrefetchRequest;
 
+// EXPERIMENTAL
+// The interface defined in this file is experimental and the behavior and
+// interface are subject to change without notice.
+
 // Options for configuring IODispatcher behavior
 struct IODispatcherOptions {
   // Maximum memory (in bytes) for prefetching across all ReadSets.
@@ -148,6 +152,11 @@ class BlockBasedTable;
 struct JobOptions {
   uint64_t io_coalesce_threshold = 16 * 1024;
   ReadOptions read_options;
+
+  // True when IOJob::block_handles is already sorted by file offset. Callers
+  // that can guarantee sorted order may set this to let IODispatcher skip
+  // defensive sorting before cache lookup and coalescing.
+  bool block_handles_are_sorted = false;
 };
 
 class IOJob {
@@ -212,6 +221,15 @@ class ReadSet {
   uint64_t GetNumSyncReads() const { return num_sync_reads_; }
   uint64_t GetNumAsyncReads() const { return num_async_reads_; }
   uint64_t GetNumCacheHits() const { return num_cache_hits_; }
+  // Blocks for which a prefetch IO was dispatched (sync + async), the number of
+  // (coalesced) IO requests issued for them, the total bytes those requests
+  // span, and how many blocks were coalesced across a non-adjacent gap.
+  uint64_t GetNumBlocksPrefetched() const { return num_blocks_prefetched_; }
+  uint64_t GetNumIORequests() const { return num_io_requests_; }
+  uint64_t GetPrefetchBytes() const { return prefetch_bytes_; }
+  uint64_t GetNumCoalescedNonadjacent() const {
+    return num_coalesced_nonadjacent_;
+  }
 
  private:
   friend class IODispatcherImpl;
@@ -246,10 +264,27 @@ class ReadSet {
   std::atomic<uint64_t> num_sync_reads_ = 0;
   std::atomic<uint64_t> num_async_reads_ = 0;
   std::atomic<uint64_t> num_cache_hits_ = 0;
+  // Prefetch IO accounting, incremented as prefetch IO is dispatched (not on
+  // completion) so async and memory-deferred prefetches are all captured.
+  std::atomic<uint64_t> num_blocks_prefetched_ = 0;
+  std::atomic<uint64_t> num_io_requests_ = 0;
+  std::atomic<uint64_t> prefetch_bytes_ = 0;
+  std::atomic<uint64_t> num_coalesced_nonadjacent_ = 0;
 
-  // Poll and process a specific async IO request
-  Status PollAndProcessAsyncIO(
-      const std::shared_ptr<AsyncIOState>& async_state);
+  // Poll and process a specific async IO request. Takes ownership by value so
+  // async_io_map_ entries can be erased without destroying the state mid-loop.
+  Status PollAndProcessAsyncIO(std::shared_ptr<AsyncIOState> async_state);
+
+  // Release memory budget acquired for a prefetched block.
+  void ReleasePrefetchMemory(size_t block_index);
+
+  // Stop tracking one block from an in-flight async IO request. If this was
+  // the last block using the request, abort and delete the IO handle before the
+  // async state is released.
+  void ReleaseAsyncIOForBlock(size_t block_index);
+
+  // Delete a completed or aborted async IO handle exactly once.
+  void DeleteAsyncIOHandle(const std::shared_ptr<AsyncIOState>& async_state);
 
   // Perform synchronous read for a specific block
   Status SyncRead(size_t block_index);

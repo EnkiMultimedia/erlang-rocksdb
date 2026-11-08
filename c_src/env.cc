@@ -116,6 +116,90 @@ ManagedEnv::SetEncryption(
 
 const rocksdb::Env* ManagedEnv::env() { return env_; }
 
+void
+EnvRef::Keep(ManagedEnv * env)
+{
+    // keep first: env may be the one already held
+    if (env != nullptr)
+        enif_keep_resource(env);
+    Reset();
+    env_ = env;
+}
+
+void
+EnvRef::Adopt(ManagedEnv * env)
+{
+    Reset();
+    env_ = env;
+}
+
+void
+EnvRef::Reset()
+{
+    if (env_ != nullptr)
+    {
+        enif_release_resource(env_);
+        env_ = nullptr;
+    }
+}
+
+void
+ResolveEnvOption(
+    ErlNifEnv * env,
+    ERL_NIF_TERM options,
+    rocksdb::DBOptions & opts,
+    EnvRef * ref)
+{
+    ManagedEnv * found = nullptr;
+    bool memenv = false;
+    ERL_NIF_TERM head, tail = options;
+
+    while (enif_get_list_cell(env, tail, &head, &tail))
+    {
+        int arity;
+        const ERL_NIF_TERM * option;
+        if (!enif_get_tuple(env, head, &arity, &option) || arity != 2)
+            continue;
+
+        if (option[0] == erocksdb::ATOM_ENV)
+        {
+            if (option[1] == erocksdb::ATOM_MEMENV)
+            {
+                memenv = true;
+                found = nullptr;
+            }
+            else if (!enif_is_atom(env, option[1]))
+            {
+                ManagedEnv * env_ptr = ManagedEnv::RetrieveEnvResource(env, option[1]);
+                if (env_ptr != nullptr)
+                {
+                    found = env_ptr;
+                    memenv = false;
+                }
+            }
+        }
+        else if (option[0] == erocksdb::ATOM_IN_MEMORY && option[1] == erocksdb::ATOM_TRUE)
+        {
+            memenv = true;
+            found = nullptr;
+        }
+    }
+
+    if (found != nullptr)
+    {
+        ref->Keep(found);
+        opts.env = const_cast<rocksdb::Env*>(found->env());
+    }
+    else if (memenv)
+    {
+        rocksdb::Env * mem = rocksdb::NewMemEnv(rocksdb::Env::Default());
+        mem->CreateDir("test");
+        ref->Adopt(ManagedEnv::CreateEnvResource(mem, true));
+        opts.env = mem;
+        opts.create_if_missing = true;
+    }
+}
+
 // Extract a 32-byte AES-256 key term from either {encrypted, Key} or
 // #{encrypted => Key}. Returns true and fills key_term on success.
 static bool

@@ -41,6 +41,7 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
       ColumnFamilyData* cfd = nullptr;
       if (edit.IsInAtomicGroup()) {
         if (read_buffer_.IsFull()) {
+          last_valid_record_end_ = reader.LastRecordEnd();
           s = OnAtomicGroupReplayBegin();
           for (size_t i = 0; s.ok() && i < read_buffer_.replay_buffer().size();
                i++) {
@@ -56,6 +57,7 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
           }
         }
       } else {
+        last_valid_record_end_ = reader.LastRecordEnd();
         s = ApplyVersionEdit(edit, &cfd);
         if (s.ok()) {
           recovered_edits++;
@@ -371,6 +373,7 @@ void VersionEditHandler::CheckColumnFamilyId(const VersionEdit& edit,
 void VersionEditHandler::CheckIterationResult(const log::Reader& reader,
                                               Status* s) {
   assert(s != nullptr);
+  assert(version_set_ != nullptr);
   if (!s->ok()) {
     // Do nothing here.
   } else if (!version_edit_params_.HasLogNumber() ||
@@ -460,6 +463,11 @@ void VersionEditHandler::CheckIterationResult(const log::Reader& reader,
   if (s->ok()) {
     version_set_->manifest_file_size_ = reader.GetReadOffset();
     assert(version_set_->manifest_file_size_ > 0);
+    version_set_->manifest_recovery_last_valid_record_end_ =
+        last_valid_record_end_;
+    version_set_->manifest_last_valid_record_end_ = last_valid_record_end_;
+    version_set_->manifest_last_valid_record_end_file_number_ =
+        version_set_->manifest_file_number_;
     version_set_->next_file_number_.store(version_edit_params_.GetNextFile() +
                                           1);
     SequenceNumber last_seq = version_edit_params_.GetLastSequence();
@@ -492,7 +500,8 @@ ColumnFamilyData* VersionEditHandler::CreateCfAndInit(
     const ColumnFamilyOptions& cf_options, const VersionEdit& edit) {
   uint32_t cf_id = edit.GetColumnFamily();
   ColumnFamilyData* cfd = version_set_->CreateColumnFamily(
-      cf_options, read_options_, &edit, read_only_);
+      cf_options, read_options_, &edit, read_only_,
+      /*options_are_sanitized=*/false);
   assert(cfd != nullptr);
   cfd->set_initialized();
   assert(builders_.find(cf_id) == builders_.end());
@@ -640,6 +649,16 @@ Status VersionEditHandler::ExtractInfoFromVersionEdit(ColumnFamilyData* cfd,
              version_edit_params_.GetLastSequence() <= edit.GetLastSequence());
       version_edit_params_.SetLastSequence(edit.GetLastSequence());
     }
+    if (edit.HasLastCompactedManifestFileSize()) {
+      version_set_->last_compacted_manifest_file_size_ =
+          edit.GetLastCompactedManifestFileSize();
+      version_set_->TuneMaxManifestFileSize();
+    }
+    if (edit.HasCommittedOptionsFileNumber()) {
+      assert(version_set_ != nullptr);
+      version_set_->ApplyCommittedOptionsFileNumber(
+          edit.GetCommittedOptionsFileNumber());
+    }
     if (!version_edit_params_.HasPrevLogNumber()) {
       version_edit_params_.SetPrevLogNumber(0);
     }
@@ -710,19 +729,22 @@ VersionEditHandlerPointInTime::VersionEditHandlerPointInTime(
     bool read_only, std::vector<ColumnFamilyDescriptor> column_families,
     VersionSet* version_set, const std::shared_ptr<IOTracer>& io_tracer,
     const ReadOptions& read_options, bool allow_incomplete_valid_version,
+    bool trust_manifest_recovery, bool defer_sst_file_opening,
     EpochNumberRequirement epoch_number_requirement)
     : VersionEditHandler(read_only, column_families, version_set,
                          /*track_found_and_missing_files=*/true,
                          /*no_error_if_files_missing=*/true, io_tracer,
                          read_options, allow_incomplete_valid_version,
-                         epoch_number_requirement) {}
+                         epoch_number_requirement),
+      trust_manifest_recovery_(trust_manifest_recovery),
+      defer_sst_file_opening_(defer_sst_file_opening) {}
 
 VersionEditHandlerPointInTime::~VersionEditHandlerPointInTime() {
   for (const auto& cfid_and_version : atomic_update_versions_) {
-    delete cfid_and_version.second;
+    delete cfid_and_version.second.version;
   }
   for (const auto& elem : versions_) {
-    delete elem.second;
+    delete elem.second.version;
   }
   versions_.clear();
 }
@@ -752,7 +774,7 @@ Status VersionEditHandlerPointInTime::OnAtomicGroupReplayBegin() {
   // complete it. They must not be used for completing the upcoming
   // AtomicGroup since they are too old.
   for (auto& cfid_and_version : atomic_update_versions_) {
-    delete cfid_and_version.second;
+    delete cfid_and_version.second.version;
   }
 
   in_atomic_group_ = true;
@@ -762,7 +784,7 @@ Status VersionEditHandlerPointInTime::OnAtomicGroupReplayBegin() {
   // best-effort recovery.
   atomic_update_versions_.clear();
   for (const auto& cfid_and_builder : builders_) {
-    atomic_update_versions_[cfid_and_builder.first] = nullptr;
+    atomic_update_versions_[cfid_and_builder.first] = PointInTimeVersion();
   }
   atomic_update_versions_missing_ = atomic_update_versions_.size();
   return Status::OK();
@@ -806,10 +828,12 @@ void VersionEditHandlerPointInTime::CheckIterationResult(
       auto v_iter = versions_.find(cfd->GetID());
       auto builder_iter = builders_.find(cfd->GetID());
       if (v_iter != versions_.end()) {
-        assert(v_iter->second != nullptr);
+        assert(v_iter->second.version != nullptr);
         assert(builder_iter != builders_.end());
 
-        version_set_->AppendVersion(cfd, v_iter->second);
+        version_set_->AppendVersion(cfd, v_iter->second.version);
+        installed_version_log_numbers_[cfd->GetID()] =
+            v_iter->second.log_number;
         versions_.erase(v_iter);
         // Let's clear found_files, since any files in that are part of the
         // installed Version. Any files that got obsoleted would have already
@@ -819,7 +843,7 @@ void VersionEditHandlerPointInTime::CheckIterationResult(
     }
   } else {
     for (const auto& elem : versions_) {
-      delete elem.second;
+      delete elem.second.version;
     }
     versions_.clear();
   }
@@ -837,9 +861,10 @@ ColumnFamilyData* VersionEditHandlerPointInTime::DestroyCfAndCleanup(
   }
   auto v_iter = versions_.find(cfid);
   if (v_iter != versions_.end()) {
-    delete v_iter->second;
+    delete v_iter->second.version;
     versions_.erase(v_iter);
   }
+  installed_version_log_numbers_.erase(cfid);
   return cfd;
 }
 
@@ -865,7 +890,6 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
   assert(builder_iter != builders_.end());
   VersionBuilder* builder = builder_iter->second->version_builder();
   const bool valid_pit_before_edit = builder->ValidVersionAvailable();
-  builder->CreateOrReplaceSavePoint();
   s = builder->Apply(&edit);
   const bool valid_pit_after_edit = builder->ValidVersionAvailable();
 
@@ -881,25 +905,56 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
   if (s.ok() && !missing_info && !in_atomic_group_ &&
       ((!valid_pit_after_edit && valid_pit_before_edit) ||
        (valid_pit_after_edit && force_create_version))) {
+    // The Version to be created reflects the state *before* this edit. On a
+    // negative edge (valid before, invalid after), roll the just-applied edit
+    // back so the builder reflects the pre-edit state, build the Version from
+    // it, then redo to restore the post-edit state and continue replay. In the
+    // force case the edit is empty, so pre-edit == post-edit and no rollback is
+    // needed.
+    const bool negative_edge = valid_pit_before_edit && !valid_pit_after_edit;
+    if (negative_edge) {
+      builder->RollbackLastApply();
+    }
+    // `cfd->GetLogNumber()` describes exactly the state the Version about to be
+    // built reflects: VersionEditHandler::ExtractInfoFromVersionEdit() applies
+    // `edit`'s own log number only after this function returns, so on a
+    // negative edge it is still the pre-edit value.
+    const uint64_t log_number = cfd->GetLogNumber();
     const auto& mopts = cfd->GetLatestMutableCFOptions();
     auto* version = new Version(
         cfd, version_set_, version_set_->file_options_, mopts, io_tracer_,
         version_set_->current_version_number_++, epoch_number_requirement_);
-    s = builder->LoadSavePointTableHandlers(
-        cfd->internal_stats(),
-        version_set_->db_options_->max_file_opening_threads, false, true, mopts,
-        MaxFileSizeForL0MetaPin(mopts), read_options_);
-    if (!s.ok()) {
-      delete version;
-      if (s.IsCorruption()) {
-        s = Status::OK();
+    if (!trust_manifest_recovery_ && !defer_sst_file_opening_) {
+      s = builder->LoadTableHandlers(
+          cfd->internal_stats(),
+          version_set_->db_options_->max_file_opening_threads, false, true,
+          mopts, MaxFileSizeForL0MetaPin(mopts), read_options_);
+      if (!s.ok()) {
+        delete version;
+        if (negative_edge) {
+          builder->RedoLastApply();
+        }
+        if (s.IsCorruption() ||
+            (s.IsPathNotFound() && no_error_if_files_missing_)) {
+          // This point in time cannot be recovered; skip it and continue. A
+          // PathNotFound is a file the primary compacted away before this
+          // handler opened it, which open_files_async makes reachable during a
+          // secondary's catch-up by leaving recovery-time files unpinned until
+          // the background opener reaches them. Treat it as missing rather than
+          // latching the error, the same tolerance LoadTables() applies.
+          s = Status::OK();
+        }
+        builder->CommitLastApply();
+        return s;
       }
-      return s;
     }
-    s = builder->SaveSavePointTo(version->storage_info());
+    s = builder->SaveTo(version->storage_info());
+    if (negative_edge) {
+      builder->RedoLastApply();
+    }
     if (s.ok()) {
       if (AtomicUpdateVersionsContains(cfd->GetID())) {
-        AtomicUpdateVersionsPut(version);
+        AtomicUpdateVersionsPut(PointInTimeVersion{version, log_number});
         if (AtomicUpdateVersionsCompleted()) {
           AtomicUpdateVersionsApply();
         }
@@ -909,10 +964,11 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
             !version_set_->db_options_->skip_stats_update_on_db_open);
         auto v_iter = versions_.find(cfd->GetID());
         if (v_iter != versions_.end()) {
-          delete v_iter->second;
-          v_iter->second = version;
+          delete v_iter->second.version;
+          v_iter->second = PointInTimeVersion{version, log_number};
         } else {
-          versions_.emplace(cfd->GetID(), version);
+          versions_.emplace(cfd->GetID(),
+                            PointInTimeVersion{version, log_number});
         }
       }
     } else {
@@ -920,7 +976,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
     }
   }
 
-  builder->ClearSavePoint();
+  builder->CommitLastApply();
   return s;
 }
 
@@ -928,6 +984,11 @@ Status VersionEditHandlerPointInTime::VerifyFile(ColumnFamilyData* cfd,
                                                  const std::string& fpath,
                                                  int level,
                                                  const FileMetaData& fmeta) {
+  if (trust_manifest_recovery_ || defer_sst_file_opening_) {
+    // Trust the MANIFEST: do not stat/open the file to classify it. The
+    // compaction or asynchronous opener validates files later.
+    return Status::OK();
+  }
   return version_set_->VerifyFileMetadata(read_options_, cfd, fpath, level,
                                           fmeta);
 }
@@ -935,17 +996,23 @@ Status VersionEditHandlerPointInTime::VerifyFile(ColumnFamilyData* cfd,
 Status VersionEditHandlerPointInTime::VerifyBlobFile(
     ColumnFamilyData* cfd, uint64_t blob_file_num,
     const BlobFileAddition& blob_addition) {
+  if (trust_manifest_recovery_) {
+    // Trust the MANIFEST: do not open the blob file to classify it.
+    return Status::OK();
+  }
   BlobSource* blob_source = cfd->blob_source();
   assert(blob_source);
   CacheHandleGuard<BlobFileReader> blob_file_reader;
 
-  Status s = blob_source->GetBlobFileReader(read_options_, blob_file_num,
+  const BlobFileOpenInfo blob_file{blob_file_num,
+                                   blob_addition.GetChecksumValue(),
+                                   blob_addition.GetChecksumMethod()};
+  Status s = blob_source->GetBlobFileReader(read_options_, blob_file,
                                             &blob_file_reader);
   if (!s.ok()) {
     return s;
   }
   // TODO: verify checksum
-  (void)blob_addition;
   return s;
 }
 
@@ -964,6 +1031,15 @@ bool VersionEditHandlerPointInTime::HasMissingFiles() const {
   return false;
 }
 
+uint64_t VersionEditHandlerPointInTime::GetInstalledVersionLogNumber(
+    uint32_t cf_id) const {
+  auto iter = installed_version_log_numbers_.find(cf_id);
+  if (iter == installed_version_log_numbers_.end()) {
+    return 0;
+  }
+  return iter->second;
+}
+
 bool VersionEditHandlerPointInTime::AtomicUpdateVersionsCompleted() {
   return atomic_update_versions_missing_ == 0;
 }
@@ -977,42 +1053,44 @@ void VersionEditHandlerPointInTime::AtomicUpdateVersionsDropCf(uint32_t cfid) {
   assert(!AtomicUpdateVersionsCompleted());
   auto atomic_update_versions_iter = atomic_update_versions_.find(cfid);
   assert(atomic_update_versions_iter != atomic_update_versions_.end());
-  if (atomic_update_versions_iter->second == nullptr) {
+  if (atomic_update_versions_iter->second.version == nullptr) {
     atomic_update_versions_missing_--;
   } else {
-    delete atomic_update_versions_iter->second;
+    delete atomic_update_versions_iter->second.version;
   }
   atomic_update_versions_.erase(atomic_update_versions_iter);
 }
 
-void VersionEditHandlerPointInTime::AtomicUpdateVersionsPut(Version* version) {
+void VersionEditHandlerPointInTime::AtomicUpdateVersionsPut(
+    PointInTimeVersion pit_version) {
   assert(!AtomicUpdateVersionsCompleted());
+  assert(pit_version.version != nullptr);
   auto atomic_update_versions_iter =
-      atomic_update_versions_.find(version->cfd()->GetID());
+      atomic_update_versions_.find(pit_version.version->cfd()->GetID());
   assert(atomic_update_versions_iter != atomic_update_versions_.end());
-  if (atomic_update_versions_iter->second == nullptr) {
+  if (atomic_update_versions_iter->second.version == nullptr) {
     atomic_update_versions_missing_--;
   } else {
-    delete atomic_update_versions_iter->second;
+    delete atomic_update_versions_iter->second.version;
   }
-  atomic_update_versions_iter->second = version;
+  atomic_update_versions_iter->second = pit_version;
 }
 
 void VersionEditHandlerPointInTime::AtomicUpdateVersionsApply() {
   assert(AtomicUpdateVersionsCompleted());
   for (const auto& cfid_and_version : atomic_update_versions_) {
     uint32_t cfid = cfid_and_version.first;
-    Version* version = cfid_and_version.second;
-    assert(version != nullptr);
-    version->PrepareAppend(
+    const PointInTimeVersion& pit_version = cfid_and_version.second;
+    assert(pit_version.version != nullptr);
+    pit_version.version->PrepareAppend(
         read_options_,
         !version_set_->db_options_->skip_stats_update_on_db_open);
     auto versions_iter = versions_.find(cfid);
     if (versions_iter != versions_.end()) {
-      delete versions_iter->second;
-      versions_iter->second = version;
+      delete versions_iter->second.version;
+      versions_iter->second = pit_version;
     } else {
-      versions_.emplace(cfid, version);
+      versions_.emplace(cfid, pit_version);
     }
   }
   atomic_update_versions_.clear();
@@ -1099,6 +1177,13 @@ void ManifestTailer::CheckIterationResult(const log::Reader& reader,
   assert(s);
   if (s->ok()) {
     if (Mode::kRecovery == mode_) {
+      if (defer_sst_file_opening_) {
+        // Deferred verification treats each added SST as found. Discard files
+        // also deleted during initial replay so they are not reported as
+        // obsolete files from a later catch-up.
+        GetAndClearIntermediateFiles();
+      }
+      defer_sst_file_opening_ = false;
       mode_ = Mode::kCatchUp;
     } else {
       assert(Mode::kCatchUp == mode_);
@@ -1109,11 +1194,10 @@ void ManifestTailer::CheckIterationResult(const log::Reader& reader,
 std::vector<std::string> ManifestTailer::GetAndClearIntermediateFiles() {
   std::vector<std::string> res;
   for (const auto& builder : builders_) {
-    auto files =
+    std::vector<std::string> files =
         builder.second->version_builder()->GetAndClearIntermediateFiles();
     res.insert(res.end(), std::make_move_iterator(files.begin()),
                std::make_move_iterator(files.end()));
-    files.erase(files.begin(), files.end());
   }
   return res;
 }

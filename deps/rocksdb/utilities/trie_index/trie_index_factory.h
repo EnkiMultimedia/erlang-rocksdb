@@ -39,7 +39,13 @@
 #include "utilities/trie_index/louds_trie.h"
 
 namespace ROCKSDB_NAMESPACE {
+class ObjectLibrary;
+
 namespace trie_index {
+
+// Registers the built-in trie UDI in the supplied object library.
+int RegisterBuiltinTrieIndexFactory(ObjectLibrary& library,
+                                    const std::string& arg);
 
 // ============================================================================
 // TrieIndexBuilder: Implements UserDefinedIndexBuilder using LoudsTrieBuilder.
@@ -52,7 +58,7 @@ namespace trie_index {
 // The trie builder collects the separator keys from AddIndexEntry() and
 // builds a LOUDS-encoded trie during Finish().
 // ============================================================================
-class TrieIndexBuilder : public UserDefinedIndexBuilder {
+class TrieIndexBuilder final : public UserDefinedIndexBuilder {
  public:
   explicit TrieIndexBuilder(const Comparator* comparator);
   ~TrieIndexBuilder() override = default;
@@ -71,7 +77,7 @@ class TrieIndexBuilder : public UserDefinedIndexBuilder {
                       std::string* separator_scratch,
                       const IndexEntryContext& context) override;
 
-  // Called for each key added to the SST. Currently a no-op — the trie is
+  // Called for each key added to the SST. Currently a no-op -- the trie is
   // built entirely from separator keys provided via AddIndexEntry().
   void OnKeyAdded(const Slice& key, ValueType type,
                   const Slice& value) override;
@@ -79,42 +85,45 @@ class TrieIndexBuilder : public UserDefinedIndexBuilder {
   // Finalize the trie and return the serialized index data.
   Status Finish(Slice* index_contents) override;
 
+  // Returns an estimate of the current serialized index size.
+  uint64_t EstimatedSize() const override;
+
  private:
   const Comparator* comparator_;
   LoudsTrieBuilder trie_builder_;
   bool finished_;
 
-  // --- Sequence number handling for same-user-key boundaries ---
+  // --- Sequence number handling ---
   //
-  // When the same user key spans a data block boundary (e.g., "foo"|seq=100
-  // ends block N, "foo"|seq=50 starts block N+1), the trie's
-  // FindShortestSeparator("foo", "foo") returns "foo" — which cannot
-  // distinguish the two blocks. To handle this, we use the same all-or-nothing
-  // strategy as ShortenedIndexBuilder::must_use_separator_with_seq_:
+  // Seqno encoding is always enabled: AddIndexEntry() unconditionally sets
+  // must_use_separator_with_seq_ to true (the unconditional set at the end of
+  // AddIndexEntry()). This means the 8-byte-per-leaf seqno side-table overhead
+  // is always incurred. The flag exists so that Finish() can check it to decide
+  // whether to serialize the seqno side-table (true path) or emit a plain
+  // trie without seqno data (false/else path, only reachable for an empty
+  // trie with zero entries).
   //
-  // - Common case: all separators are user-key-only (zero overhead).
-  // - Rare case (any same-user-key boundary detected): ALL separators include
-  //   an 8-byte encoded seqno suffix. This decision is made at Finish() time.
+  // We buffer all separator entries during building, then at Finish() feed
+  // them to the trie with seqno side-table metadata.
   //
-  // We buffer all separator entries during building, then at Finish() either
-  // feed them to the trie as-is (common case) or re-encode them with seqnos.
-  //
-  // True if any same-user-key block boundary was detected during building.
-  // Once set, never cleared (sticky flag, same as internal index).
+  // Always set to true in AddIndexEntry() -- seqno encoding is
+  // unconditionally enabled. The 8-byte per-leaf overhead is always incurred.
   bool must_use_separator_with_seq_;
 
-  // Buffered separator entries: (separator_key, seqno, handle).
+  // Buffered separator entries: (separator_key, tag, handle).
   // The separator_key is the user-key-only separator computed by
-  // FindShortestSeparator. The seqno is:
-  //   - For same-user-key boundaries: the actual seqno of last_key
-  //   - For different-user-key boundaries: kMaxSequenceNumber (mapped to 0
-  //     at Finish() time as a sentinel meaning "never advance")
+  // FindShortestSeparator. The tag field stores:
+  //   - For same-user-key boundaries: the real tag of last_key
+  //   - For the last block: the real tag of last_key
+  //   - For intermediate non-boundary entries: 0 (sentinel)
   struct BufferedEntry {
     std::string separator_key;
-    SequenceNumber seqno{};
+    uint64_t tag{};
     TrieBlockHandle handle;
   };
   std::vector<BufferedEntry> buffered_entries_;
+  // Running total of separator key bytes for O(1) EstimatedSize().
+  uint64_t total_separator_bytes_ = 0;
 };
 
 // ============================================================================
@@ -124,7 +133,7 @@ class TrieIndexBuilder : public UserDefinedIndexBuilder {
 // Wraps LoudsTrieIterator and adapts it to the UDI iterator interface,
 // handling bounds checking against ScanOptions.
 // ============================================================================
-class TrieIndexIterator : public UserDefinedIndexIterator {
+class TrieIndexIterator final : public UserDefinedIndexIterator {
  public:
   // @param has_seqno_encoding: true if the trie was built with a seqno
   //   side-table (enabling post-seek correction for same-user-key boundaries).
@@ -140,9 +149,17 @@ class TrieIndexIterator : public UserDefinedIndexIterator {
   // leftmost leaf without a full seek traversal.
   Status SeekToFirstAndGetResult(IterateResult* result) override;
 
+  // Position at the very last index entry. Descends directly to the
+  // rightmost leaf without a full seek traversal.
+  Status SeekToLastAndGetResult(IterateResult* result) override;
+
+  // Move to the previous index entry. When in an overflow run, decrements
+  // within the run before moving to the previous trie leaf.
+  Status PrevAndGetResult(IterateResult* result) override;
+
   // Seek to the first index entry >= target. When has_seqno_encoding_ is
   // true, the trie is searched with user_key only, then post-seek correction
-  // uses target_seq from context to advance through overflow blocks as needed.
+  // uses target_tag from context to advance through overflow blocks.
   Status SeekAndGetResult(const Slice& target, IterateResult* result,
                           const SeekContext& context) override;
 
@@ -161,7 +178,7 @@ class TrieIndexIterator : public UserDefinedIndexIterator {
   // is the seek target, for Next this is the previous separator key.
   // The trie stores separator keys (upper bounds on block contents), not
   // first-in-block keys, so we cannot compare the current separator against
-  // the limit directly — see the UDI API contract in user_defined_index.h.
+  // the limit directly -- see the UDI API contract in user_defined_index.h.
   IterBoundCheck CheckBounds(const Slice& reference_key) const;
 
   const Comparator* comparator_;
@@ -186,6 +203,34 @@ class TrieIndexIterator : public UserDefinedIndexIterator {
   //   - value() may return overflow block handles
   //   - NextAndGetResult advances within overflow runs before trie leaves
   bool has_seqno_encoding_;
+
+  // Reset overflow state to the default single-block position.
+  void ResetOverflowState() {
+    overflow_run_index_ = 0;
+    overflow_run_size_ = 1;
+    overflow_base_idx_ = 0;
+  }
+
+  // Set up overflow state for the current trie leaf. When position_at_last
+  // is true (reverse iteration), positions at the last block in the run.
+  void SetupOverflowForCurrentLeaf(bool position_at_last) {
+    if (has_seqno_encoding_ && iter_.Valid()) {
+      uint64_t leaf_idx = iter_.LeafIndex();
+      uint32_t block_count = trie_->GetLeafBlockCount(leaf_idx);
+      overflow_run_size_ = block_count;
+      overflow_base_idx_ = trie_->GetOverflowBase(leaf_idx);
+      if (position_at_last) {
+        overflow_run_index_ = block_count - 1;
+      }
+    }
+  }
+
+  // Copy the current trie key into current_key_scratch_ and set the result.
+  void CopyTrieKeyToResult(IterateResult* result) {
+    Slice trie_key = iter_.Key();
+    current_key_scratch_.assign(trie_key.data(), trie_key.size());
+    result->key = Slice(current_key_scratch_);
+  }
 
   // ---- Overflow run state ----
   //
@@ -228,47 +273,31 @@ class TrieIndexReader : public UserDefinedIndexReader {
  private:
   const Comparator* comparator_;
   LoudsTrie trie_;
-  size_t data_size_;  // Size of the raw serialized data.
 };
 
 // ============================================================================
-// TrieIndexFactory: Implements UserDefinedIndexFactory.
+// TrieIndexFactory: Implements IndexFactory.
 //
 // Factory for creating TrieIndexBuilder (during SST file writes) and
 // TrieIndexReader (during SST file reads). Registered as a Customizable
 // with name "trie_index".
 // ============================================================================
-class TrieIndexFactory : public UserDefinedIndexFactory {
+class TrieIndexFactory : public IndexFactory {
  public:
   TrieIndexFactory() = default;
   ~TrieIndexFactory() override = default;
 
   static const char* kClassName() { return "trie_index"; }
   const char* Name() const override { return kClassName(); }
+  using IndexFactory::NewBuilder;
+  using IndexFactory::NewReader;
 
-  // Deprecated API (required by base class). Use the overloads that accept
-  // UserDefinedIndexOption instead. These must never be called; the new
-  // overloads with UserDefinedIndexOption are always used by the block-based
-  // table builder/reader. Abort unconditionally (in both debug and release
-  // builds) to surface programming errors immediately.
-  UserDefinedIndexBuilder* NewBuilder() const override {
-    abort();
-    return nullptr;
-  }
-  std::unique_ptr<UserDefinedIndexReader> NewReader(
-      Slice& /*index_block*/) const override {
-    abort();
-    return nullptr;
-  }
-
-  // New API with comparator.
   Status NewBuilder(
-      const UserDefinedIndexOption& option,
-      std::unique_ptr<UserDefinedIndexBuilder>& builder) const override;
+      const IndexFactoryOptions& option,
+      std::unique_ptr<IndexFactoryBuilder>& builder) const override;
 
-  Status NewReader(
-      const UserDefinedIndexOption& option, Slice& index_block,
-      std::unique_ptr<UserDefinedIndexReader>& reader) const override;
+  Status NewReader(const IndexFactoryOptions& option, Slice& index_block,
+                   std::unique_ptr<IndexFactoryReader>& reader) const override;
 };
 
 }  // namespace trie_index

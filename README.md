@@ -11,7 +11,7 @@ Feedback and pull requests welcome! If a particular feature of RocksDB is import
 
 ## Features
 
-- RocksDB 11.1.2 with snappy 1.2.1, lz4 1.10.0, zstd 1.5.7
+- RocksDB 11.13.2 with snappy 1.2.1, lz4 1.10.0, zstd 1.5.7
 - Erlang 22+ with dirty-nifs enabled
 - All basic db operations (get, put, delete, merge, multi_get)
 - Wide-column entity API (put_entity, get_entity, iterator_columns)

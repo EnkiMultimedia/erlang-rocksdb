@@ -288,6 +288,32 @@ io:format("  Max:    ~.2f us~n", [maps:get(max, GetHist)]).
 |-----------|-------------|
 | `num_op_per_transaction` | Number of operations per transaction |
 
+### Ingestion Histograms
+
+Recorded for each successful `ingest_external_file` or two-phase ingestion.
+
+| Histogram | Description |
+|-----------|-------------|
+| `ingest_external_file_prepare_micros` | Time spent checking and staging the files, writes are not blocked (microseconds) |
+| `ingest_external_file_run_micros` | Time spent making the files visible, writes are blocked (microseconds) |
+
+With two-phase ingestion, `prepare_ingestion` records the first and `commit_ingestion` the second.
+
+### Compaction Queue Properties
+
+These are database properties, read with `get_property/2,3`, not statistics. They tell you if compactions are falling behind.
+
+```erlang
+%% compactions waiting for a background thread
+{ok, Queued} = rocksdb:get_property(Db, <<"rocksdb.num-unscheduled-compactions">>),
+%% compactions running now
+{ok, Running} = rocksdb:get_property(Db, <<"rocksdb.num-running-compactions">>),
+%% compactions sent to a remote compaction service (RocksDB 11.9+)
+{ok, Remote} = rocksdb:get_property(Db, <<"rocksdb.num-running-remote-compactions">>).
+```
+
+The values are returned as binaries, for example `<<"0">>`.
+
 ---
 
 ## Example: Comprehensive Monitoring

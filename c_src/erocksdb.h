@@ -87,6 +87,11 @@ ERL_NIF_TERM DisableManualCompaction(ErlNifEnv* env, int argc, const ERL_NIF_TER
 ERL_NIF_TERM EnableManualCompaction(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM AbortAllCompactions(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM ResumeAllCompactions(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PrepareIngestion(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM CommitIngestion(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM AbortIngestion(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM AbortCompactions(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM ResumeCompactions(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM GetBlockCacheUsage(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM BlockCacheCapacity(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
@@ -225,6 +230,21 @@ ERL_NIF_TERM PostingsBitmapContains(ErlNifEnv* env, int argc, const ERL_NIF_TERM
 ERL_NIF_TERM PostingsCount(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PostingsKeys(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM PostingsToBinary(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+// posting list NIFs that move to a dirty scheduler for large inputs
+ERL_NIF_TERM PostingListKeysNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListContainsNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListFindNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListCountNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListToMapNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListIntersectionNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListUnionNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListDifferenceNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListIntersectionCountNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingListBitmapContainsNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsOpenNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsKeysNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM PostingsToBinaryNif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 bool init_posting_list_resource(ErlNifEnv* env);
 

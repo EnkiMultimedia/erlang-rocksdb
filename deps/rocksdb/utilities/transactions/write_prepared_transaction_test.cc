@@ -35,6 +35,11 @@
 #include "utilities/transactions/transaction_test.h"
 #include "utilities/transactions/write_prepared_txn_db.h"
 
+#if USE_COROUTINES
+#include "folly/coro/BlockingWait.h"
+#include "rocksdb/coro_db.h"
+#endif
+
 using std::string;
 
 namespace ROCKSDB_NAMESPACE {
@@ -314,7 +319,8 @@ TEST(CommitEntry64b, BasicTest) {
         uint64_t p = base + i + d;
         for (uint64_t c : {p, p + d / 2, p + d}) {
           uint64_t index = p % INDEX_SIZE;
-          CommitEntry before(p, c), after;
+          CommitEntry before(p, c);
+          CommitEntry after;
           CommitEntry64b entry64b(before, FORMAT);
           ok = entry64b.Parse(index, &after, FORMAT);
           ASSERT_TRUE(ok);
@@ -540,6 +546,69 @@ class WritePreparedTransactionTest
             std::get<4>(GetParam()), std::get<5>(GetParam())) {}
 };
 
+TEST_P(WritePreparedTransactionTest, SnapshotNewerVersionMetadataNotSupported) {
+  // Write-prepared DB-level snapshot reads require a custom visibility
+  // callback, so they must reject metadata tracking instead of forwarding past
+  // the transaction visibility layer.
+  assert(db);
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  const Snapshot* snapshot = db->GetSnapshot();
+  ReadOptions read_options;
+  read_options.snapshot = snapshot;
+
+  OutputMetadata output_metadata;
+  output_metadata.WantNewerVersionPresent();
+  std::string value;
+  ASSERT_TRUE(db->GetWithMetadata(read_options, "key", &value, &output_metadata)
+                  .IsNotSupported());
+
+  MultiGetOutputMetadata multiget_output_metadata;
+  multiget_output_metadata.WantNewerVersionPresent();
+  std::vector<Slice> keys{"key"};
+  std::vector<std::string> values;
+  const std::vector<Status> statuses = db->MultiGetWithMetadata(
+      read_options, keys, &values, &multiget_output_metadata);
+  ASSERT_TRUE(statuses[0].IsNotSupported());
+
+  db->ReleaseSnapshot(snapshot);
+}
+
+TEST_P(WritePreparedTransactionTest,
+       NewIteratorsRejectsTableFilterWithRangeConversion) {
+  options.min_tombstones_for_range_conversion = 2;
+  ASSERT_OK(ReOpenNoDelete());
+
+  std::function<bool(const TableProperties&)> table_filter =
+      [](const TableProperties&) { return true; };
+  ReadOptions read_options;
+  read_options.table_filter = &table_filter;
+  const std::vector<ReadOptions> per_cf_read_options = {read_options};
+  const std::vector<ColumnFamilyHandle*> column_families = {
+      db->DefaultColumnFamily()};
+  std::vector<Iterator*> iterators;
+  const Status s =
+      db->NewIterators(per_cf_read_options, column_families, &iterators);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_TRUE(iterators.empty());
+}
+
+TEST_P(WritePreparedTransactionTest, NewIteratorsRejectsTailing) {
+  ReadOptions read_options;
+  read_options.tailing = true;
+  const std::vector<ColumnFamilyHandle*> column_families = {
+      db->DefaultColumnFamily()};
+  std::vector<Iterator*> iterators;
+
+  Status s = db->NewIterators(read_options, column_families, &iterators);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_TRUE(iterators.empty());
+
+  s = db->NewIterators(std::vector<ReadOptions>{read_options}, column_families,
+                       &iterators);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_TRUE(iterators.empty());
+}
+
 #if !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 class SnapshotConcurrentAccessTest
     : public WritePreparedTransactionTestBase,
@@ -725,12 +794,47 @@ INSTANTIATE_TEST_CASE_P(
 
 #endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
+#if USE_COROUTINES
+TEST_P(WritePreparedTransactionTest, CoroutineReadsDoNotExposeUncommittedData) {
+  ASSERT_OK(db->Put(WriteOptions(), "key", "committed"));
+  std::unique_ptr<Transaction> transaction(
+      db->BeginTransaction(WriteOptions()));
+  ASSERT_NE(nullptr, transaction);
+  ASSERT_OK(transaction->SetName("txn"));
+  ASSERT_OK(transaction->Put("key", "uncommitted"));
+  ASSERT_OK(transaction->Prepare());
+
+  PinnableSlice value;
+  Status status = folly::coro::blockingWait(
+      CoroDB::CoGet(db, ReadOptions(), db->DefaultColumnFamily(), "key", &value,
+                    /*timestamp=*/nullptr));
+
+  ColumnFamilyHandle* column_families[] = {db->DefaultColumnFamily(),
+                                           db->DefaultColumnFamily()};
+  const Slice keys[] = {Slice("key"), Slice("key")};
+  PinnableSlice values[2];
+  Status statuses[2];
+  folly::coro::blockingWait(CoroDB::CoMultiGet(
+      db, ReadOptions(), 2, column_families, keys, values,
+      /*timestamps=*/nullptr, statuses, /*sorted_input=*/false));
+
+  ASSERT_OK(transaction->Rollback());
+  ASSERT_OK(status);
+  ASSERT_EQ("committed", value.ToString());
+  ASSERT_OK(statuses[0]);
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ("committed", values[0].ToString());
+  ASSERT_EQ("committed", values[1].ToString());
+}
+#endif  // USE_COROUTINES
+
 TEST_P(WritePreparedTransactionTest, CommitMap) {
   WritePreparedTxnDB* wp_db = dynamic_cast<WritePreparedTxnDB*>(db);
   ASSERT_NE(wp_db, nullptr);
   ASSERT_NE(wp_db->db_impl_, nullptr);
   size_t size = wp_db->COMMIT_CACHE_SIZE;
-  CommitEntry c = {5, 12}, e;
+  CommitEntry c = {5, 12};
+  CommitEntry e;
   bool evicted = wp_db->AddCommitEntry(c.prep_seq % size, c, &e);
   ASSERT_FALSE(evicted);
 
@@ -782,7 +886,10 @@ TEST_P(WritePreparedTransactionTest, MaybeUpdateOldCommitMap) {
   // nonexistence could be interpreted as committed in the snapshot while it is
   // not true. We keep such entries around by adding them to the
   // old_commit_map_.
-  uint64_t p /*prepare*/, c /*commit*/, s /*snapshot*/, ns /*next_snapshot*/;
+  uint64_t p /*prepare*/;
+  uint64_t c /*commit*/;
+  uint64_t s /*snapshot*/;
+  uint64_t ns /*next_snapshot*/;
   p = 10l, c = 15l, s = 20l, ns = 21l;
   MaybeUpdateOldCommitMapTestWithNext(p, c, s, ns, false);
   // If we do not expect the old commit map to be updated, try also with a next
@@ -1619,7 +1726,8 @@ TEST_P(WritePreparedTransactionTest, SmallestUnCommittedSeq) {
   PinnableSlice pinnable_val;
   WriteOptions write_options;
   TransactionOptions txn_options;
-  std::vector<Transaction*> txns, committed_txns;
+  std::vector<Transaction*> txns;
+  std::vector<Transaction*> committed_txns;
 
   const int cnt = 100;
   for (int i = 0; i < cnt; i++) {
@@ -2358,6 +2466,62 @@ TEST_P(WritePreparedTransactionTest, Rollback) {
       }
     }
   }
+}
+
+TEST_P(WritePreparedTransactionTest, RollbackPreparedAfterCommitWriteFailure) {
+  // This covers the db_stress failure mode where a transaction is already in
+  // PreparedHeap and the commit marker write hits a retryable IO error. The
+  // test injects that commit failure and a retryable rollback failure, then
+  // verifies rollback can still be retried to remove the prepared entry before
+  // DB teardown.
+  options.max_bgerror_resume_count = 0;
+  ASSERT_OK(ReOpen());
+  fault_fs->SetFileTypesExcludedFromFaultInjection({FileType::kInfoLogFile});
+
+  WriteOptions woptions;
+  woptions.sync = true;
+  TransactionOptions txn_options;
+  std::unique_ptr<Transaction> txn(db->BeginTransaction(woptions, txn_options));
+  ASSERT_NE(nullptr, txn);
+  ASSERT_OK(txn->SetName("commit_write_failure"));
+  ASSERT_OK(txn->Put(Slice("key"), Slice("value")));
+  ASSERT_OK(txn->Prepare());
+
+  fault_fs->SetThreadLocalErrorContext(FaultInjectionIOType::kWrite,
+                                       /*seed=*/0, /*one_in=*/1,
+                                       /*retryable=*/true,
+                                       /*has_data_loss=*/false);
+  fault_fs->EnableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+  const Status commit_s = txn->Commit();
+  fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+
+  ASSERT_NOK(commit_s);
+  ASSERT_TRUE(FaultInjectionTestFS::IsInjectedError(commit_s))
+      << commit_s.ToString();
+  ASSERT_EQ(1, fault_fs->GetAndResetInjectedThreadLocalErrorCount(
+                   FaultInjectionIOType::kWrite));
+
+  ASSERT_OK(db->Resume());
+
+  fault_fs->SetThreadLocalErrorContext(FaultInjectionIOType::kWrite,
+                                       /*seed=*/1, /*one_in=*/1,
+                                       /*retryable=*/true,
+                                       /*has_data_loss=*/false);
+  fault_fs->EnableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+  const Status rollback_s = txn->Rollback();
+  fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+
+  ASSERT_NOK(rollback_s);
+  ASSERT_TRUE(FaultInjectionTestFS::IsInjectedError(rollback_s))
+      << rollback_s.ToString();
+  ASSERT_EQ(1, fault_fs->GetAndResetInjectedThreadLocalErrorCount(
+                   FaultInjectionIOType::kWrite));
+
+  ASSERT_OK(db->Resume());
+  ASSERT_OK(txn->Rollback());
+  txn.reset();
+
+  ASSERT_OK(ReOpenNoDelete());
 }
 
 TEST_P(WritePreparedTransactionTest, DisableGCDuringRecovery) {
@@ -4084,6 +4248,420 @@ TEST_P(WritePreparedTransactionTest, WC_WP_WALForwardIncompatibility) {
   bool empty_wal = true;
   CrossCompatibilityTest(WRITE_PREPARED, WRITE_COMMITTED, !empty_wal);
 }
+
+// With insert_seq = read iterator seqno, insertion depends on the latest
+// published read seq. In one-write-queue mode, the latest read seq reaches the
+// prepared seq, so insertion is blocked. In two-write-queues mode, the latest
+// published seq can still lag the prepared seq, so insertion remains safe and
+// is allowed.
+TEST_P(WritePreparedTransactionTest, RangeTombstoneInsertionWithWritePrepared) {
+  for (bool forward : {true, false}) {
+    SCOPED_TRACE(forward ? "forward" : "reverse");
+    options.min_tombstones_for_range_conversion = 4;
+    options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+    ASSERT_OK(ReOpenNoDelete());
+
+    std::vector<std::pair<std::string, std::string>> inserted_ranges;
+    SyncPoint::GetInstance()->SetCallBack(
+        "MemTable::AddLogicallyRedundantRangeTombstone:AddRange",
+        [&](void* arg) {
+          auto* range = static_cast<std::pair<Slice, Slice>*>(arg);
+          inserted_ranges.emplace_back(range->first.ToString(),
+                                       range->second.ToString());
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    for (char c = 'a'; c <= 'j'; c++) {
+      ASSERT_OK(db->Put(WriteOptions(), std::string(1, c), "val"));
+    }
+    ASSERT_OK(db->Flush(FlushOptions()));
+
+    // Delete 5 contiguous keys (> threshold of 4) directly (not in txn).
+    // These tombstones get sequence numbers lower than any prepared entry.
+    for (char c = 'c'; c <= 'g'; c++) {
+      ASSERT_OK(db->Delete(WriteOptions(), std::string(1, c)));
+    }
+
+    // Begin a transaction and prepare it -- the prepare_seq will be higher
+    // than the tombstone seqnos above.
+    std::unique_ptr<Transaction> txn(db->BeginTransaction(WriteOptions()));
+    ASSERT_NE(txn, nullptr);
+    ASSERT_OK(txn->SetName("txn1"));
+    ASSERT_OK(txn->Put("z", "txn_val"));
+    ASSERT_OK(txn->Prepare());
+
+    // Pre-commit: one-write-queue mode publishes the prepare seq to readers,
+    // so insertion must be discarded. Two-write-queues mode can still expose
+    // an older published seq to readers, so insertion remains safe.
+    {
+      ReadOptions read_opts;
+      std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
+      if (forward) {
+        for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        }
+      } else {
+        for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        }
+      }
+      EXPECT_OK(iter->status());
+    }
+    const size_t expected_insertions = options.two_write_queues ? 1u : 0u;
+    EXPECT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        expected_insertions);
+    EXPECT_EQ(inserted_ranges.size(), expected_insertions);
+    if (options.two_write_queues) {
+      EXPECT_EQ(inserted_ranges[0].first, "c");
+      EXPECT_EQ(inserted_ranges[0].second, "h");
+    }
+
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_OK(txn->Commit());
+  }
+}
+
+// When prepared entries have seqno <= max_tombstone_seq, range tombstone
+// insertion is blocked to prevent covering invisible prepared entries.
+TEST_P(WritePreparedTransactionTest,
+       RangeTombstoneInsertionBlockedByPreparedEntry) {
+  for (bool forward : {true, false}) {
+    SCOPED_TRACE(forward ? "forward" : "reverse");
+    options.min_tombstones_for_range_conversion = 4;
+    options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+    ASSERT_OK(ReOpenNoDelete());
+
+    // Write old keys.
+    for (char c = 'a'; c <= 'j'; c++) {
+      ASSERT_OK(db->Put(WriteOptions(), std::string(1, c), "val"));
+    }
+    ASSERT_OK(db->Flush(FlushOptions()));
+
+    // Prepare a transaction first -- the prepare_seq will be low.
+    std::unique_ptr<Transaction> txn(db->BeginTransaction(WriteOptions()));
+    ASSERT_NE(txn, nullptr);
+    ASSERT_OK(txn->SetName("txn1"));
+    ASSERT_OK(txn->Put("z", "txn_val"));
+    ASSERT_OK(txn->Prepare());
+
+    // Now delete 5 contiguous keys -- these tombstones get seqnos AFTER
+    // the prepare_seq, so max_tombstone_seq >= min_uncommitted.
+    for (char c = 'c'; c <= 'g'; c++) {
+      ASSERT_OK(db->Delete(WriteOptions(), std::string(1, c)));
+    }
+
+    // Pre-commit: a prepared transaction is still outstanding, so the
+    // synthesized range tombstone must be discarded.
+    {
+      ReadOptions read_opts;
+      std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
+      if (forward) {
+        for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        }
+      } else {
+        for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        }
+      }
+      ASSERT_OK(iter->status());
+    }
+    ASSERT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        0u);
+
+    ASSERT_OK(txn->Rollback());
+  }
+}
+
+// Regression test: when range tombstone insertion bumps the seqno to
+// earliest_seq of the active memtable, it can shadow a prepared-but-
+// uncommitted Put whose prepare_seq falls between range_tomb_max_seq_
+// and earliest_seq.  After the txn commits, the Put is incorrectly hidden.
+TEST_P(WritePreparedTransactionTest,
+       RangeTombstoneSeqnoBumpShadowsPreparedWrite) {
+  for (bool forward : {true, false}) {
+    SCOPED_TRACE(forward ? "forward" : "reverse");
+    options.min_tombstones_for_range_conversion = 2;
+    options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+    ASSERT_OK(ReOpenNoDelete());
+
+    // Step 1: Write base data and flush so it's in an SST.
+    for (char c = 'a'; c <= 'j'; c++) {
+      ASSERT_OK(db->Put(WriteOptions(), std::string(1, c), "val"));
+    }
+    ASSERT_OK(db->Flush(FlushOptions()));
+
+    // Step 2: Delete contiguous keys (committed, low seqnos).
+    for (char c = 'c'; c <= 'g'; c++) {
+      ASSERT_OK(db->Delete(WriteOptions(), std::string(1, c)));
+    }
+
+    // Step 3: Prepare a Put for key "e" (inside the deleted range).
+    // Its prepare_seq will be higher than the delete seqnos.
+    std::unique_ptr<Transaction> txn(db->BeginTransaction(WriteOptions()));
+    ASSERT_NE(txn, nullptr);
+    ASSERT_OK(txn->SetName("txn_put_e"));
+    ASSERT_OK(txn->Put("e", "txn_value"));
+    ASSERT_OK(txn->Prepare());
+
+    // Step 4: Force a memtable switch so that earliest_seq of the new
+    // memtable is higher than the prepare_seq.
+    ASSERT_OK(db->Flush(FlushOptions()));
+
+    // Write something to ensure the new memtable is active and has a
+    // high earliest_seq.
+    ASSERT_OK(db->Put(WriteOptions(), "z_dummy", "dummy"));
+
+    // Step 5: Iterate to trigger MaybeInsertRangeTombstone.
+    // The tombstones have max_seq < min_uncommitted (prepare_seq),
+    // so the check passes.  But insert_seq gets bumped to earliest_seq
+    // of the new memtable, which is > prepare_seq.
+    {
+      ReadOptions read_opts;
+      std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
+      if (forward) {
+        for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        }
+      } else {
+        for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        }
+      }
+      ASSERT_OK(iter->status());
+    }
+
+    // Step 6: Commit the prepared transaction.
+    ASSERT_OK(txn->Commit());
+
+    // Step 7: The committed Put("e", "txn_value") should be visible.
+    // BUG: If the range tombstone was inserted with a bumped seqno >
+    // prepare_seq, it shadows this committed write.
+    std::string value;
+    ASSERT_OK(db->Get(ReadOptions(), "e", &value));
+    ASSERT_EQ(value, "txn_value");
+  }
+}
+
+namespace {
+// Two column families holding value1/cf2_value1, a prepared but uncommitted
+// transaction writing value2/cf2_value2 over them, and a snapshot taken above
+// the prepared sequence.
+struct PreparedEntityScenario {
+  ColumnFamilyHandle* cf2 = nullptr;
+  std::unique_ptr<Transaction> txn;
+  const Snapshot* snapshot = nullptr;
+  ReadOptions snapshot_read_options;
+
+  void TearDown(DB* db) {
+    txn.reset();  // References cf2, so it has to go before the handle.
+    db->ReleaseSnapshot(snapshot);
+    ASSERT_OK(db->DestroyColumnFamilyHandle(cf2));
+  }
+};
+
+void SetUpPreparedEntityScenario(TransactionDB* db, const Options& options,
+                                 PreparedEntityScenario* scenario) {
+  ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(options), "cf2",
+                                   &scenario->cf2));
+
+  WriteOptions write_options;
+  ASSERT_OK(db->Put(write_options, "key1", "value1"));
+  ASSERT_OK(db->Put(write_options, scenario->cf2, "key1", "cf2_value1"));
+
+  scenario->txn.reset(
+      db->BeginTransaction(write_options, TransactionOptions()));
+  ASSERT_NE(scenario->txn, nullptr);
+  ASSERT_OK(scenario->txn->SetName("prepared_txn"));
+  ASSERT_OK(scenario->txn->Put("key1", "value2"));
+  ASSERT_OK(scenario->txn->Put(scenario->cf2, "key1", "cf2_value2"));
+  ASSERT_OK(scenario->txn->Prepare());
+
+  // Publishes a sequence number above the prepared one. Without it the
+  // two_write_queues configurations leave the prepared sequence unpublished,
+  // hence above the snapshot, where a plain sequence check hides it anyway.
+  ASSERT_OK(db->Put(write_options, "unrelated_key", "unrelated_value"));
+
+  scenario->snapshot = db->GetSnapshot();
+  ASSERT_NE(scenario->snapshot, nullptr);
+  scenario->snapshot_read_options.snapshot = scenario->snapshot;
+}
+
+// Verifies `key` in both column families through both GetEntity overloads.
+void VerifyGetEntity(DB* db, const ReadOptions& read_options,
+                     ColumnFamilyHandle* cf2, const Slice& key,
+                     const std::string& expected_default,
+                     const std::string& expected_cf2) {
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(
+        db->GetEntity(read_options, db->DefaultColumnFamily(), key, &columns));
+    ASSERT_FALSE(columns.columns().empty());
+    ASSERT_EQ(columns.columns()[0].value().ToString(), expected_default);
+  }
+
+  PinnableAttributeGroups result;
+  result.emplace_back(db->DefaultColumnFamily());
+  result.emplace_back(cf2);
+  ASSERT_OK(db->GetEntity(read_options, key, &result));
+  // Read both statuses before asserting on values, so that a mismatch fails
+  // the test instead of aborting an ASSERT_STATUS_CHECKED build.
+  ASSERT_OK(result[0].status());
+  ASSERT_OK(result[1].status());
+  ASSERT_FALSE(result[0].columns().empty());
+  ASSERT_EQ(result[0].columns()[0].value().ToString(), expected_default);
+  ASSERT_FALSE(result[1].columns().empty());
+  ASSERT_EQ(result[1].columns()[0].value().ToString(), expected_cf2);
+}
+
+#if USE_COROUTINES
+// Coroutine counterpart of VerifyGetEntity, covering the same two overrides.
+void CoVerifyGetEntity(DB* db, const ReadOptions& read_options,
+                       ColumnFamilyHandle* cf2, const Slice& key,
+                       const std::string& expected_default,
+                       const std::string& expected_cf2) {
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(folly::coro::blockingWait(CoroDB::CoGetEntity(
+        db, read_options, db->DefaultColumnFamily(), key, &columns)));
+    ASSERT_FALSE(columns.columns().empty());
+    ASSERT_EQ(columns.columns()[0].value().ToString(), expected_default);
+  }
+
+  PinnableAttributeGroups result;
+  result.emplace_back(db->DefaultColumnFamily());
+  result.emplace_back(cf2);
+  ASSERT_OK(folly::coro::blockingWait(
+      CoroDB::CoGetEntity(db, read_options, key, &result)));
+  ASSERT_OK(result[0].status());
+  ASSERT_OK(result[1].status());
+  ASSERT_FALSE(result[0].columns().empty());
+  ASSERT_EQ(result[0].columns()[0].value().ToString(), expected_default);
+  ASSERT_FALSE(result[1].columns().empty());
+  ASSERT_EQ(result[1].columns()[0].value().ToString(), expected_cf2);
+}
+#endif  // USE_COROUTINES
+}  // namespace
+
+// GetEntity must not expose a prepared-but-uncommitted write. It sits below
+// the reader's snapshot, so only WritePreparedTxnReadCallback can hide it.
+TEST_P(WritePreparedTransactionTest, GetEntitySkipsPreparedUncommitted) {
+  PreparedEntityScenario scenario;
+  ASSERT_NO_FATAL_FAILURE(SetUpPreparedEntityScenario(db, options, &scenario));
+  ColumnFamilyHandle* cf2 = scenario.cf2;
+
+  {
+    SCOPED_TRACE("prepared, not yet committed");
+    VerifyGetEntity(db, scenario.snapshot_read_options, cf2, "key1", "value1",
+                    "cf2_value1");
+    VerifyGetEntity(db, ReadOptions(), cf2, "key1", "value1", "cf2_value1");
+  }
+
+  {
+    SCOPED_TRACE("null column family handle");
+    // A null handle fails the query without any column family being read.
+    PinnableAttributeGroups result;
+    result.emplace_back(db->DefaultColumnFamily());
+    result.emplace_back(nullptr);
+    Status s = db->GetEntity(scenario.snapshot_read_options, "key1", &result);
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_TRUE(result[1].status().IsInvalidArgument());
+    ASSERT_TRUE(result[0].status().IsIncomplete());
+  }
+
+  ASSERT_OK(scenario.txn->Commit());
+
+  {
+    SCOPED_TRACE("committed after the snapshot was taken");
+    VerifyGetEntity(db, scenario.snapshot_read_options, cf2, "key1", "value1",
+                    "cf2_value1");
+    VerifyGetEntity(db, ReadOptions(), cf2, "key1", "value2", "cf2_value2");
+  }
+
+  scenario.TearDown(db);
+}
+
+// Transaction entity reads must apply the same WritePrepared visibility rules
+// as their value-only counterparts.
+TEST_P(WritePreparedTransactionTest, TxnGetEntitySkipsPreparedUncommitted) {
+  PreparedEntityScenario scenario;
+  ASSERT_NO_FATAL_FAILURE(SetUpPreparedEntityScenario(db, options, &scenario));
+
+  std::unique_ptr<Transaction> reader(db->BeginTransaction(WriteOptions()));
+  ASSERT_NE(reader, nullptr);
+
+  {
+    SCOPED_TRACE("prepared, not yet committed");
+    EXPECT_NO_FATAL_FAILURE(VerifyTxnGetEntity(
+        reader.get(), scenario.snapshot_read_options, "key1", "value1"));
+    EXPECT_NO_FATAL_FAILURE(
+        VerifyTxnGetEntity(reader.get(), ReadOptions(), "key1", "value1"));
+  }
+
+  ASSERT_OK(scenario.txn->Commit());
+
+  {
+    SCOPED_TRACE("committed after the snapshot was taken");
+    EXPECT_NO_FATAL_FAILURE(VerifyTxnGetEntity(
+        reader.get(), scenario.snapshot_read_options, "key1", "value1"));
+    EXPECT_NO_FATAL_FAILURE(
+        VerifyTxnGetEntity(reader.get(), ReadOptions(), "key1", "value2"));
+    EXPECT_NO_FATAL_FAILURE(VerifyTxnGetEntityForUpdate(
+        reader.get(), scenario.snapshot_read_options, "key1", "value1"));
+  }
+
+  reader.reset();
+  scenario.TearDown(db);
+}
+
+#if USE_COROUTINES
+TEST_P(WritePreparedTransactionTest, GetEntityCoroutine) {
+  options.env = Env::Default();
+  // CoroDB::CoGetEntity silently falls back to the synchronous DB API when the
+  // FileSystem exposes no read executor, and the executor is only created by
+  // SetReadIOExecutorThreads. Without this the test would pass while never
+  // entering GetEntityCoroutine.
+  options.env->GetFileSystem()->SetReadIOExecutorThreads(1);
+  if (options.env->GetFileSystem()->GetReadExecutor() == nullptr) {
+    ROCKSDB_GTEST_SKIP(
+        "FileSystem has no read executor; coroutine reads would fall back to "
+        "the synchronous path");
+    return;
+  }
+  ASSERT_OK(ReOpen());
+
+  ASSERT_NE(nullptr, db->GetCoroDB());
+  ASSERT_NE(nullptr, db->GetFileSystem()->GetReadExecutor());
+
+  PreparedEntityScenario scenario;
+  ASSERT_NO_FATAL_FAILURE(SetUpPreparedEntityScenario(db, options, &scenario));
+  ColumnFamilyHandle* cf2 = scenario.cf2;
+
+  // Each scenario runs through both the synchronous and the coroutine
+  // overrides, so the two are held to the same expectations under one env.
+  auto verify = [&](const ReadOptions& read_options,
+                    const std::string& expected_default,
+                    const std::string& expected_cf2) {
+    VerifyGetEntity(db, read_options, cf2, "key1", expected_default,
+                    expected_cf2);
+    CoVerifyGetEntity(db, read_options, cf2, "key1", expected_default,
+                      expected_cf2);
+  };
+
+  {
+    SCOPED_TRACE("prepared, not yet committed");
+    verify(scenario.snapshot_read_options, "value1", "cf2_value1");
+    verify(ReadOptions(), "value1", "cf2_value1");
+  }
+
+  ASSERT_OK(scenario.txn->Commit());
+
+  {
+    SCOPED_TRACE("committed after the snapshot was taken");
+    verify(scenario.snapshot_read_options, "value1", "cf2_value1");
+    verify(ReadOptions(), "value2", "cf2_value2");
+  }
+
+  scenario.TearDown(db);
+}
+#endif  // USE_COROUTINES
 
 }  // namespace ROCKSDB_NAMESPACE
 

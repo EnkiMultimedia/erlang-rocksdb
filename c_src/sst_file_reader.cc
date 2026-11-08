@@ -24,6 +24,8 @@
 
 #include "atoms.h"
 #include "erocksdb_db.h"
+#include <mutex>
+
 #include "sst_file_reader.h"
 #include "util.h"
 
@@ -37,16 +39,26 @@ protected:
     static ErlNifResourceType* m_SstFileReaderItr_RESOURCE;
 
 public:
-    rocksdb::Iterator* m_Iterator;
-    SstFileReaderObject* m_ReaderRef;  // Keep reader alive
+    std::mutex m_Mutex;                // serializes move and close
+    rocksdb::Iterator* m_Iterator;     // NULL once closed
+    SstFileReaderObject* m_ReaderRef;  // kept with enif_keep_resource while the iterator lives
 
     SstFileReaderItrObject(rocksdb::Iterator* iter, SstFileReaderObject* reader)
         : m_Iterator(iter), m_ReaderRef(reader) {}
 
     ~SstFileReaderItrObject() {
+        Close();
+    }
+
+    // Delete the iterator, then release the reader it reads from.
+    void Close() {
         if (m_Iterator) {
             delete m_Iterator;
             m_Iterator = nullptr;
+        }
+        if (m_ReaderRef) {
+            enif_release_resource(m_ReaderRef);
+            m_ReaderRef = nullptr;
         }
     }
 
@@ -184,6 +196,10 @@ SstFileReaderOpen(
         }
     }
 
+    // keep the env alive as long as the reader
+    EnvRef env_ref;
+    ResolveEnvOption(env, argv[0], options, &env_ref);
+
     // Get file path
     std::string file_path;
     if (!get_file_path(env, argv[1], file_path)) {
@@ -201,6 +217,7 @@ SstFileReaderOpen(
 
     // Wrap in resource
     auto reader_ptr = SstFileReaderObject::CreateSstFileReaderResource(std::move(sst_reader));
+    reader_ptr->m_Env.Swap(env_ref);
     ERL_NIF_TERM result = enif_make_resource(env, reader_ptr);
     enif_release_resource(reader_ptr);
 
@@ -355,8 +372,9 @@ SstFileReaderGetTableProperties(
     keys.push_back(ATOM_FAST_COMPRESSION_ESTIMATED_DATA_SIZE);
     values.push_back(enif_make_uint64(env, props->fast_compression_estimated_data_size));
 
+    // Removed from RocksDB 11.13; kept in the map for compatibility.
     keys.push_back(ATOM_EXTERNAL_SST_FILE_GLOBAL_SEQNO_OFFSET);
-    values.push_back(enif_make_uint64(env, props->external_sst_file_global_seqno_offset));
+    values.push_back(enif_make_uint64(env, 0));
 
     ERL_NIF_TERM props_map;
     enif_make_map_from_arrays(env, keys.data(), values.data(), keys.size(), &props_map);
@@ -416,7 +434,11 @@ SstFileReaderIteratorMove(
     // argv[1]: Action (first, last, next, prev, {seek, Key}, {seek_for_prev, Key})
 
     SstFileReaderItrObject* itr_ptr = SstFileReaderItrObject::RetrieveSstFileReaderItrResource(env, argv[0]);
-    if (nullptr == itr_ptr || nullptr == itr_ptr->m_Iterator) {
+    if (nullptr == itr_ptr) {
+        return enif_make_badarg(env);
+    }
+    std::lock_guard<std::mutex> lock(itr_ptr->m_Mutex);
+    if (nullptr == itr_ptr->m_Iterator) {
         return enif_make_badarg(env);
     }
 
@@ -494,17 +516,8 @@ SstFileReaderIteratorClose(
         return ATOM_OK;
     }
 
-    // Release the reference to the reader that we kept
-    if (itr_ptr->m_ReaderRef != nullptr) {
-        enif_release_resource(itr_ptr->m_ReaderRef);
-        itr_ptr->m_ReaderRef = nullptr;
-    }
-
-    // Delete the iterator
-    if (itr_ptr->m_Iterator != nullptr) {
-        delete itr_ptr->m_Iterator;
-        itr_ptr->m_Iterator = nullptr;
-    }
+    std::lock_guard<std::mutex> lock(itr_ptr->m_Mutex);
+    itr_ptr->Close();
 
     return ATOM_OK;
 }
