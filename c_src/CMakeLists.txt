@@ -130,6 +130,7 @@ option(WITH_BUNDLE_LZ4 "Use bundled lz4 instead of system" OFF)
 option(WITH_BUNDLE_SNAPPY "Use bundled snappy instead of system" OFF)
 option(WITH_BUNDLE_ZSTD "Fallback to bundled zstd if system not found" ON)
 option(WITH_ZSTD "build with zstd" ON)
+option(WITH_STATIC_ZSTD "Prefer a static system libzstd.a (must be built with -fPIC)" OFF)
 option(WITH_ZLIB "build with zlib" OFF)
 option(WITH_BZ2 "build with bzip2" OFF)
 

@@ -30,6 +30,13 @@ list(APPEND rocksdb_CMAKE_ARGS -DWITH_LZ4=${LZ4_FOUND})
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_ZLIB=${ZLIB_FOUND})
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_BZ2=${BZIP2_FOUND})
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_ZSTD=${ZSTD_FOUND})
+# Propagate the resolved zstd lib+include to the inner rocksdb build. Without this
+# rocksdb runs its own find (grabbing the shared .so), so the wrapper's static
+# choice is ignored and libzstd.so leaks back in as a runtime dependency.
+if(ZSTD_FOUND)
+    list(APPEND rocksdb_CMAKE_ARGS -DZSTD_LIBRARIES=${ZSTD_LIBRARY})
+    list(APPEND rocksdb_CMAKE_ARGS -DZSTD_INCLUDE_DIRS=${ZSTD_INCLUDE_DIR})
+endif()
 
 # FreeBSD: ensure system include path is available for malloc_np.h
 if(CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
@@ -77,6 +84,13 @@ endif()
 
 if(WITH_BUNDLE_LZ4)
     ExternalProject_Add_StepDependencies(rocksdb build lz4)
+endif()
+
+# bundled zstd (build-zstd creates a 'zstd' ExternalProject) must finish before
+# rocksdb configures/builds — otherwise a parallel clean build races and rocksdb
+# can't find the not-yet-installed libzstd.a. snappy/lz4 already do this; zstd was missed.
+if(TARGET zstd)
+    ExternalProject_Add_StepDependencies(rocksdb build zstd)
 endif()
 
 if(MSVC)
