@@ -643,7 +643,7 @@ ColumnFamilyObject::CreateColumnFamilyObject(
 
     // manual reference increase to keep active until "close" called
     //  only inc local counter
-    ret_ptr->RefInc();
+    // creation reference already taken by the constructor
 
     // see IterTask::operator() for release of reference count
 
@@ -693,6 +693,11 @@ ColumnFamilyObject::ColumnFamilyObject(
         rocksdb::ColumnFamilyHandle *Handle)
         : m_ColumnFamily(Handle), m_DbPtr(DbPtr) {
 
+
+    // creation reference, released by Shutdown. Taken before the child is
+    // attached: a concurrent close could otherwise find it at zero and
+    // release it before it is even returned.
+    RefInc();
 
     if (NULL != DbPtr)
         m_Attached = DbPtr->AddColumnFamilyReference(this);
@@ -765,7 +770,7 @@ SnapshotObject::CreateSnapshotObject(
 
     // manual reference increase to keep active until "close" called
     //  only inc local counter
-    ret_ptr->RefInc();
+    // creation reference already taken by the constructor
 
     // see IterTask::operator() for release of reference count
 
@@ -824,6 +829,11 @@ SnapshotObject::SnapshotObject(
     const rocksdb::Snapshot* Snapshot)
     : m_Snapshot(Snapshot), m_DbPtr(DbPtr)
 {
+    // creation reference, released by Shutdown. Taken before the child is
+    // attached: a concurrent close could otherwise find it at zero and
+    // release it before it is even returned.
+    RefInc();
+
     if (NULL!=DbPtr)
         m_Attached = DbPtr->AddSnapshotReference(this);
 
@@ -902,7 +912,7 @@ ItrObject::CreateItrObject(
 
     // manual reference increase to keep active until "close" called
     //  only inc local counter
-    ret_ptr->RefInc();
+    // creation reference already taken by the constructor
 
     // see IterTask::operator() for release of reference count
 
@@ -986,10 +996,23 @@ ItrObject::ItrObject(
           lower_bound_slice(nullptr)
 {
 
-    if (NULL != DbPtr)
-        m_Attached = DbPtr->AddReference(this);
+    // creation reference, released by Shutdown
+    RefInc();
+
+    // not attached yet: the creating NIF calls Attach once the iterator is set
+    // up, so a concurrent database close never sees a half built iterator
+    m_Attached = false;
 
 }   // ItrObject::ItrObject
+
+
+bool
+ItrObject::Attach()
+{
+    if (nullptr != m_DbPtr.get())
+        m_Attached = m_DbPtr->AddReference(this);
+    return m_Attached;
+}   // ItrObject::Attach
 
 
 
@@ -1126,7 +1149,7 @@ TLogItrObject::CreateTLogItrObject(
 
     // manual reference increase to keep active until "close" called
     //  only inc local counter
-    ret_ptr->RefInc();
+    // creation reference already taken by the constructor
 
     // see IterTask::operator() for release of reference count
 
@@ -1180,6 +1203,11 @@ TLogItrObject::TLogItrObject(
         DbObject *DbPtr,
         rocksdb::WalIterator * Itr)
         : m_Iter(Itr), m_DbPtr(DbPtr) {
+
+    // creation reference, released by Shutdown. Taken before the child is
+    // attached: a concurrent close could otherwise find it at zero and
+    // release it before it is even returned.
+    RefInc();
 
     if (NULL != DbPtr)
         m_Attached = DbPtr->AddTLogReference(this);
@@ -1249,7 +1277,7 @@ IngestionObject::CreateIngestionObject(
     IngestionObject *ret_ptr = new(alloc_ptr) IngestionObject(DbPtr, std::move(Handle));
 
     // manual reference increase to keep active until "close" called
-    ret_ptr->RefInc();
+    // creation reference already taken by the constructor
 
     return ret_ptr;
 }   // IngestionObject::CreateIngestionObject
@@ -1288,6 +1316,11 @@ IngestionObject::IngestionObject(
         DbObject *DbPtr,
         std::unique_ptr<rocksdb::FileIngestionHandle> Handle)
         : m_DbPtr(DbPtr), m_Handle(std::move(Handle)) {
+
+    // creation reference, released by Shutdown. Taken before the child is
+    // attached: a concurrent close could otherwise find it at zero and
+    // release it before it is even returned.
+    RefInc();
 
     if (NULL != DbPtr)
         m_Attached = DbPtr->AddIngestionReference(this);
@@ -1488,7 +1521,7 @@ TransactionObject::CreateTransactionObject(
     // manual reference increase to keep active until "close" called
     //  only inc local counter, leave erl ref count alone ... will force
     //  erlang to call us if process holding ref dies
-    ret_ptr->RefInc();
+    // creation reference already taken by the constructor
 
     // see OpenTask::operator() for release of reference count
 
@@ -1540,6 +1573,11 @@ TransactionObject::TransactionObject(
     rocksdb::Transaction * TxPtr)
     : m_Tx(TxPtr), m_DbPtr(DbPtr)
     {
+
+      // creation reference, released by Shutdown. Taken before the child is
+      // attached: a concurrent close could otherwise find it at zero and
+      // release it before it is even returned.
+      RefInc();
 
       if (NULL!=DbPtr)
         m_Attached = DbPtr->AddTransactionReference(this);

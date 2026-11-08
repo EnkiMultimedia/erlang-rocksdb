@@ -449,6 +449,12 @@ public:
     //!< Same for column families whose handles RocksDB keeps in the iterator
     //!< (coalescing iterator): destroy_column_family must wait for it.
     void KeepColumnFamily(ColumnFamilyObject * Cf);
+
+    //!< Attach the iterator to its database once it is fully set up (snapshot,
+    //!< transaction and column families pinned, bounds set). Until then a
+    //!< database close cannot reach it. Returns false if the database is
+    //!< closing: the caller then refuses it with RefuseClosingChild.
+    bool Attach();
 };  // class ItrObject
 
 /**
