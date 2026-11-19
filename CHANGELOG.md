@@ -1,3 +1,9 @@
+## erlang-rocksdb (unreleased)
+
+### New Features
+
+- `flush/3` also takes a non-empty list of column families and flushes them in one call, atomically when the database is opened with `{atomic_flush, true}`. An empty list or an element that is not a column family of the database raises `badarg`.
+
 ## erlang-rocksdb 3.2.1, released on 2026/11/08
 
 ### Bug Fixes

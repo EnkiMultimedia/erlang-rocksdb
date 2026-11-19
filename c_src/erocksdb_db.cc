@@ -2320,6 +2320,7 @@ Flush(
     fold(env, argv[2], parse_flush_option, *opts);
 
     ReferencePtr<ColumnFamilyObject> cf_ptr;
+    unsigned int num_cfs;
     rocksdb::Status status;
     if(argv[1] == erocksdb::ATOM_DEFAULT_COLUMN_FAMILY)
     {
@@ -2328,6 +2329,27 @@ Flush(
     else if (enif_get_cf_of(env, argv[1], db_ptr.get(), &cf_ptr))
     {
         status = db_ptr->m_Db->Flush(*opts, cf_ptr->m_ColumnFamily);
+    }
+    else if (enif_get_list_length(env, argv[1], &num_cfs) && num_cfs > 0)
+    {
+        // the references keep each column family alive during the flush
+        std::vector<rocksdb::ColumnFamilyHandle*> column_families;
+        std::vector<ReferencePtr<ColumnFamilyObject>> cf_refs;
+        column_families.reserve(num_cfs);
+        cf_refs.reserve(num_cfs);
+        ERL_NIF_TERM head, tail = argv[1];
+        while(enif_get_list_cell(env, tail, &head, &tail))
+        {
+            cf_refs.emplace_back();
+            if(!enif_get_cf_of(env, head, db_ptr.get(), &cf_refs.back()))
+            {
+                delete opts;
+                opts = NULL;
+                return enif_make_badarg(env);
+            }
+            column_families.push_back(cf_refs.back()->m_ColumnFamily);
+        }
+        status = db_ptr->m_Db->Flush(*opts, column_families);
     }
     else
     {
