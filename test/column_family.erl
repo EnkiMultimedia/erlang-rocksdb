@@ -150,6 +150,59 @@ coalescing_iterator_test() ->
   destroy_and_rm(?DB, []),
   ok.
 
+flush_column_families_test() ->
+  destroy_and_rm(?DB, []),
+  ColumnFamilies = [{"default", []}, {"cf1", []}, {"cf2", []}],
+  {ok, Db, [DefaultH, Cf1H, Cf2H]} =
+    rocksdb:open(?DB, [{create_if_missing, true},
+                       {create_missing_column_families, true},
+                       {atomic_flush, true}], ColumnFamilies),
+  Handles = [DefaultH, Cf1H, Cf2H],
+  lists:foreach(fun(H) -> ok = rocksdb:put(Db, H, <<"k">>, <<"v">>, [{disable_wal, true}]) end, Handles),
+  ok = rocksdb:put(Db, Cf2H, <<"k2">>, <<"v2">>, [{disable_wal, true}]),
+
+  %% a single column family is flushed alone
+  ok = rocksdb:flush(Db, Cf2H, [{wait, true}]),
+  ?assertEqual({ok, <<"1">>}, rocksdb:get_property(Db, Cf2H, <<"rocksdb.num-files-at-level0">>)),
+  ?assertEqual({ok, <<"0">>}, rocksdb:get_property(Db, Cf1H, <<"rocksdb.num-files-at-level0">>)),
+  ok = rocksdb:put(Db, Cf2H, <<"k3">>, <<"v3">>, [{disable_wal, true}]),
+
+  %% a list flushes every listed column family
+  ok = rocksdb:flush(Db, Handles, [{wait, true}]),
+  lists:foreach(
+    fun({H, Files}) ->
+        ?assertEqual({ok, Files}, rocksdb:get_property(Db, H, <<"rocksdb.num-files-at-level0">>)),
+        ?assertEqual({ok, <<"0">>}, rocksdb:get_property(Db, H, <<"rocksdb.num-entries-active-mem-table">>))
+    end,
+    [{DefaultH, <<"1">>}, {Cf1H, <<"1">>}, {Cf2H, <<"2">>}]),
+  {ok, <<"v3">>} = rocksdb:get(Db, Cf2H, <<"k3">>, []),
+
+  rocksdb:close(Db),
+  destroy_and_rm(?DB, []),
+  ok.
+
+flush_column_families_badarg_test() ->
+  destroy_and_rm(?DB, []),
+  destroy_and_rm("test2.db", []),
+  {ok, Db, [DefaultH, Cf1H]} =
+    rocksdb:open(?DB, [{create_if_missing, true}, {create_missing_column_families, true}],
+                 [{"default", []}, {"cf1", []}]),
+  {ok, Db2, [OtherH]} = rocksdb:open("test2.db", [{create_if_missing, true}], [{"default", []}]),
+  ok = rocksdb:put(Db, Cf1H, <<"k">>, <<"v">>, []),
+  ?assertError(badarg, rocksdb:flush(Db, [], [])),
+  ?assertError(badarg, rocksdb:flush(Db, [DefaultH, not_a_cf], [])),
+  ?assertError(badarg, rocksdb:flush(Db, [Cf1H, OtherH], [])),
+  ?assertError(badarg, rocksdb:flush(Db, [Cf1H | DefaultH], [])),
+  %% nothing was flushed by the rejected calls
+  ?assertEqual({ok, <<"0">>}, rocksdb:get_property(Db, Cf1H, <<"rocksdb.num-files-at-level0">>)),
+  ok = rocksdb:flush(Db, [Cf1H], [{wait, true}]),
+  ?assertEqual({ok, <<"1">>}, rocksdb:get_property(Db, Cf1H, <<"rocksdb.num-files-at-level0">>)),
+  rocksdb:close(Db2),
+  rocksdb:close(Db),
+  destroy_and_rm("test2.db", []),
+  destroy_and_rm(?DB, []),
+  ok.
+
 destroy_and_rm(Dir, Options) ->
   rocksdb:destroy(Dir, Options),
   rocksdb_test_util:rm_rf(Dir).

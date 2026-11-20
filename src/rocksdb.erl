@@ -1493,8 +1493,16 @@ checkpoint(_DbHandle, _Path) ->
 flush(DbHandle, FlushOptions) ->
   flush(DbHandle, default_column_family, FlushOptions).
 
-%% @doc Flush all mem-table data for a column family
--spec flush(db_handle(), column_family(), flush_options()) -> ok | {error, term()}.
+%% @doc Flush all mem-table data for a column family, or for a list of
+%% column families.
+%%
+%% When a non-empty list of column families is given, they are flushed
+%% with a single call; if the database was opened with
+%% `{atomic_flush, true}' the flush is atomic across all of them. Every
+%% element must be a column family of this database, otherwise, and for an
+%% empty list, the call raises `badarg'.
+-spec flush(db_handle(), column_family() | [cf_handle(), ...], flush_options()) ->
+  ok | {error, term()}.
 flush(_DbHandle, _Cf, _FlushOptions) ->
   ?nif_stub.
 
